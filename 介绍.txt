@@ -1,0 +1,955 @@
+通达信量化项目文件组大纲说明
+================================
+
+项目名称：
+    tdx_modular_quant_project_v2_all_instruments
+
+项目路径：
+    F:\通信达量化\tdx_modular_quant_project_v2_all_instruments
+
+数据来源：
+    通达信本地日线数据文件：
+        F:\tongxinda\vipdoc\sh\lday
+        F:\tongxinda\vipdoc\sz\lday
+        F:\tongxinda\vipdoc\bj\lday
+
+当前项目目标：
+    先建立一个完整的本地量化研究流程。
+
+当前流程：
+    1. 读取通达信本地数据
+    2. 清洗基础行情数据
+    3. 生成因子特征
+    4. 根据因子进行策略选股
+    5. 导出策略选股结果
+    6. 执行简单回测
+    7. 保存回测数据和净值曲线图片
+
+
+一、主文件说明
+================================
+
+1. main.py
+--------------------------------
+作用：
+    项目的主控制文件。
+
+主要功能：
+    一键调用整个量化流程。
+
+当前可控制的步骤：
+    RUN_STEP_1_CONVERT_TDX
+        是否读取通达信本地日线数据。
+
+    RUN_STEP_2_CLEAN_DATA
+        是否清洗日线数据。
+
+    RUN_STEP_3_FEATURES
+        是否生成因子特征。
+
+    RUN_STEP_4_STRATEGY_SELECTION
+        是否执行策略选股。
+
+    RUN_STEP_5_VIEW_SELECTION
+        是否查看并导出策略选股结果。
+
+    RUN_STEP_6_BACKTEST
+        是否执行回测。
+
+常用方式：
+    如果第一次完整运行：
+        全部设置为 True。
+
+    如果只想重新跑策略选股：
+        RUN_STEP_1_CONVERT_TDX = False
+        RUN_STEP_2_CLEAN_DATA = False
+        RUN_STEP_3_FEATURES = False
+        RUN_STEP_4_STRATEGY_SELECTION = True
+        RUN_STEP_5_VIEW_SELECTION = True
+        RUN_STEP_6_BACKTEST = False
+
+    如果只想重新跑回测：
+        RUN_STEP_1_CONVERT_TDX = False
+        RUN_STEP_2_CLEAN_DATA = False
+        RUN_STEP_3_FEATURES = False
+        RUN_STEP_4_STRATEGY_SELECTION = False
+        RUN_STEP_5_VIEW_SELECTION = False
+        RUN_STEP_6_BACKTEST = True
+
+主要可改参数：
+    STRATEGY_SCORE_COL
+        选股使用的因子分数。
+
+    STRATEGY_TOP_N
+        每个调仓日选择多少个标的。
+
+    STRATEGY_FREQ
+        调仓频率。
+        ME    = 每月最后一个交易日。
+        QE    = 每季度最后一个交易日。
+        W-FRI = 每周调仓。
+
+    STRATEGY_START_DATE
+        策略选股开始日期。
+
+    STRATEGY_END_DATE
+        策略选股结束日期。
+
+    STRATEGY_INCLUDE_TYPES
+        策略允许选择的标的类型。
+
+    BACKTEST_INITIAL_CASH
+        回测初始净值。
+
+    BACKTEST_RISK_FREE_RATE
+        年化无风险利率。
+
+    BACKTEST_SHOW_PLOT
+        是否在 Spyder 右侧 Plots 窗口显示回测图。
+
+
+2. config.py
+--------------------------------
+作用：
+    项目配置文件。
+
+主要功能：
+    管理路径、数据范围、股票池范围、输出文件位置。
+
+核心路径：
+    TDX_DIR
+        通达信安装路径。
+        当前一般为：
+            F:\tongxinda
+
+    PROJECT_DIR
+        当前量化项目路径。
+        建议为：
+            F:\通信达量化\tdx_modular_quant_project_v2_all_instruments
+
+    DATA_DIR
+        数据文件夹。
+
+    PROCESSED_DIR
+        处理后的数据文件夹。
+
+    REPORT_DIR
+        报告文件夹。
+
+    RESULT_DIR
+        回测结果文件夹。
+
+核心参数：
+    START_DATE
+        清洗数据开始日期。
+        注意：
+            它不是策略开始日期。
+            它控制的是清洗后保留哪些行情数据。
+
+    END_DATE
+        清洗数据结束日期。
+        None 表示使用所有可用日期。
+
+    INCLUDE_MARKETS
+        读取哪些市场。
+        可选：
+            sh = 上海
+            sz = 深圳
+            bj = 北京
+
+    INCLUDE_INSTRUMENT_TYPES
+        读取哪些标的类型。
+        常见类型：
+            stock             股票
+            etf_fund          ETF / 场内基金
+            index             指数
+            bond              债券
+            convertible_bond  可转债
+            b_share           B 股
+            unknown           未分类标的
+
+    READ_LIMIT
+        限制读取多少个标的。
+        例如：
+            READ_LIMIT = 50
+            只读取前 50 个标的，用于测试。
+
+            READ_LIMIT = None
+            读取全部符合条件的标的。
+
+    ABNORMAL_RETURN_THRESHOLD
+        异常收益率阈值。
+        当前用于标记异常跳变，不是最终复权处理。
+
+
+二、functions 文件夹说明
+================================
+
+functions 文件夹保存所有功能模块。
+主文件 main.py 通过 import 调用这些函数。
+
+
+1. functions/tdx_day_file_reader.py
+--------------------------------
+作用：
+    直接读取通达信 .day 文件。
+
+主要函数：
+    classify_tdx_instrument(market, code)
+        根据市场和代码前缀，粗略判断标的类型。
+        例如：
+            stock
+            etf_fund
+            index
+            bond
+            convertible_bond
+            b_share
+            unknown
+
+    collect_tdx_day_files(tdx_dir, include_markets, include_types)
+        从通达信 vipdoc 文件夹中收集 .day 文件。
+        输出每个文件的：
+            market
+            code
+            symbol
+            instrument_type
+            file_path
+
+    read_tdx_day_file(file_path, market, code, symbol, instrument_type)
+        读取单个 .day 文件。
+        输出字段：
+            date
+            market
+            code
+            symbol
+            instrument_type
+            open
+            high
+            low
+            close
+            amount
+            volume
+
+注意：
+    这里使用 symbol 作为唯一标识。
+    例如：
+        sh000001 = 上证指数
+        sz000001 = 平安银行
+
+    不能只用 code，否则会混淆。
+
+
+2. functions/convert_tdx_daily.py
+--------------------------------
+作用：
+    批量读取通达信本地 .day 文件，并保存为 parquet 数据。
+
+主要函数：
+    convert_tdx_daily(limit=None)
+
+输入：
+    通达信本地 .day 文件。
+
+输出：
+    data/processed/tdx_daily_raw.parquet
+        原始读取后的日线数据。
+
+    data/reports/failed_codes.csv
+        读取失败的标的记录。
+
+流程：
+    1. 检查通达信路径。
+    2. 收集符合条件的 .day 文件。
+    3. 逐个读取。
+    4. 合并成一个大表。
+    5. 保存为 parquet。
+
+
+3. functions/clean_daily_data.py
+--------------------------------
+作用：
+    清洗基础日线行情数据。
+
+主要函数：
+    basic_clean_daily(df)
+        基础清洗函数。
+
+    clean_daily_data()
+        清洗主函数。
+
+输入：
+    data/processed/tdx_daily_raw.parquet
+
+输出：
+    data/processed/tdx_daily_clean.parquet
+
+主要处理：
+    1. 转换 date 为日期格式。
+    2. 统一 code 和 symbol。
+    3. 转换 open/high/low/close/amount/volume 为数值。
+    4. 删除关键字段缺失的数据。
+    5. 去除重复的 symbol-date 行。
+    6. 按 START_DATE 和 END_DATE 过滤日期。
+    7. 调用 quality_checks.py 添加质量标记。
+
+
+4. functions/quality_checks.py
+--------------------------------
+作用：
+    数据质量检查和质量报告生成。
+
+主要函数：
+    add_quality_flags(df, group_col, abnormal_threshold)
+        给行情数据添加质量标记。
+
+    build_instrument_info(df, group_col)
+        生成每个标的的数据概况。
+
+    build_data_quality_summary(df)
+        生成整体数据质量汇总。
+
+    save_quality_reports(df, group_col)
+        保存质量报告。
+
+生成字段：
+    valid_price
+        价格是否有效。
+
+    valid_volume
+        成交量和成交额是否有效。
+
+    raw_ret
+        原始日收益率。
+
+    abnormal_jump
+        是否出现异常价格跳变。
+
+    rough_limit_up
+        粗略涨停标记。
+
+    rough_limit_down
+        粗略跌停标记。
+
+    is_trading
+        是否为可交易状态。
+
+输出：
+    data/reports/instrument_info.csv
+    data/reports/abnormal_return_rows.csv
+    data/reports/data_quality_summary.csv
+
+
+5. functions/feature_engineering.py
+--------------------------------
+作用：
+    生成因子特征。
+
+主要函数：
+    add_return_features(df)
+        生成收益率因子。
+        例如：
+            ret_1
+            ret_5
+            ret_10
+            ret_20
+            ret_60
+
+    add_moving_average_features(df)
+        生成均线和成交量均线。
+        例如：
+            ma_5
+            ma_20
+            ma_60
+            ma_120
+            volume_ma_20
+
+    add_volatility_features(df)
+        生成波动率因子。
+        例如：
+            volatility_10
+            volatility_20
+            volatility_60
+
+    add_kline_shape_features(df)
+        生成 K 线形态因子。
+        例如：
+            amplitude
+            intraday_ret
+            upper_shadow
+            lower_shadow
+            body_ratio
+
+    add_amount_features(df)
+        生成成交额相关因子。
+        例如：
+            amount_ma20
+            amount_ratio_20
+
+    add_simple_score_features(df)
+        生成简单综合分数。
+        当前：
+            score_mom_lowvol = ret_20 - volatility_20
+
+    generate_daily_features()
+        因子生成主函数。
+
+输入：
+    data/processed/tdx_daily_clean.parquet
+
+输出：
+    data/processed/tdx_daily_features.parquet
+
+注意：
+    这里是放技术因子的地方。
+    后续如果加资金流、基本面、龙虎榜等因子，建议新建独立因子模块。
+
+
+6. functions/strategy_selection.py
+--------------------------------
+作用：
+    根据因子分数，在每个调仓日选择标的。
+
+主要函数：
+    get_rebalance_dates(df, freq)
+        获取调仓日期。
+
+    select_instruments_by_score(...)
+        在每个调仓日期，根据 score_col 排名，选择前 top_n 个标的。
+
+    run_strategy_selection(...)
+        策略选股主函数。
+
+输入：
+    data/processed/tdx_daily_features.parquet
+
+输出：
+    data/processed/strategy_selection.parquet
+    data/reports/strategy_selection_summary.csv
+
+核心参数：
+    score_col
+        用哪个因子排序。
+
+    top_n
+        每期选择多少个标的。
+
+    freq
+        调仓频率。
+        ME    = 月度。
+        QE    = 季度。
+        W-FRI = 周度。
+
+    include_types
+        允许进入策略池的标的类型。
+
+    start_date
+        策略选股开始日期。
+
+    end_date
+        策略选股结束日期。
+
+当前逻辑：
+    1. 读取因子数据。
+    2. 按日期过滤。
+    3. 按 instrument_type 过滤。
+    4. 按 is_trading 过滤。
+    5. 剔除 abnormal_jump。
+    6. 删除 score 缺失数据。
+    7. 每个调仓日按 score 从高到低排序。
+    8. 选择前 top_n。
+    9. 等权配置 weight。
+
+
+7. functions/view_strategy_selection.py
+--------------------------------
+作用：
+    查看并导出策略选股结果。
+
+主要函数：
+    view_strategy_selection(export_excel=True, print_rows=30)
+
+输入：
+    data/processed/strategy_selection.parquet
+
+输出：
+    data/reports/strategy_selection_view.xlsx
+    data/reports/strategy_selection_view.csv
+
+主要功能：
+    1. 打印选股表前几行。
+    2. 打印选股表后几行。
+    3. 统计标的类型。
+    4. 统计哪些标的被选中最多。
+    5. 查看最近一个调仓日的选股结果。
+    6. 导出 Excel 和 CSV。
+
+备注：
+    如果加入 os.startfile(REPORT_DIR)，可以自动打开报告文件夹。
+
+
+8. functions/backtest_engine.py
+--------------------------------
+作用：
+    执行第一版简化回测。
+
+主要函数：
+    prepare_daily_returns(feature_data)
+        从 close 计算每个标的的每日收益率。
+
+    build_backtest_daily_result(selection, returns, initial_cash)
+        根据策略选股结果，计算组合每日收益和净值。
+
+    plot_equity_curve(daily_result, drawdown, output_file, show_plot=True)
+        保存净值曲线图片。
+        如果 show_plot=True，也会在 Spyder 右侧 Plots 窗口显示图。
+
+    run_backtest(initial_cash=1.0, risk_free_rate=0.0, show_plot=True)
+        回测主函数。
+
+输入：
+    data/processed/tdx_daily_features.parquet
+    data/processed/strategy_selection.parquet
+
+输出：
+    results/backtest_daily_result.csv
+    results/backtest_daily_result.parquet
+    results/backtest_metrics.csv
+    results/backtest_holdings.csv
+    results/equity_curve.png
+
+当前回测规则：
+    1. 在 rebalance_date 生成持仓。
+    2. 从 rebalance_date 后一个交易日开始计算收益。
+    3. 持有到下一个 rebalance_date。
+    4. 使用策略选股表中的 weight。
+    5. 用收盘价计算收益。
+
+重要限制：
+    当前是第一版简化回测。
+    还没有处理：
+        手续费
+        滑点
+        涨跌停无法成交
+        停牌
+        前复权价格
+        真实开盘价成交
+
+
+9. functions/metrics.py
+--------------------------------
+作用：
+    计算回测指标。
+
+主要函数：
+    calc_max_drawdown(net_value)
+        计算最大回撤。
+
+    calc_backtest_metrics(daily_result, risk_free_rate=0.0)
+        计算回测指标。
+
+输出指标：
+    start_date
+    end_date
+    trading_days
+    final_net_value
+    total_return
+    annual_return
+    annual_volatility
+    sharpe
+    max_drawdown
+    win_rate
+
+
+10. functions/report_utils.py
+--------------------------------
+作用：
+    打印项目当前配置。
+
+主要函数：
+    print_project_status()
+
+打印内容：
+    TDX_DIR
+    PROJECT_DIR
+    READ_LIMIT
+    START_DATE
+    END_DATE
+    INCLUDE_INSTRUMENT_TYPES
+    RAW_DAILY_PARQUET
+    CLEAN_DAILY_PARQUET
+    FEATURE_DAILY_PARQUET
+
+
+三、data 文件夹说明
+================================
+
+1. data/processed
+--------------------------------
+保存程序中间数据和主要数据表。
+
+常见文件：
+    tdx_daily_raw.parquet
+        原始读取后的通达信日线数据。
+
+    tdx_daily_clean.parquet
+        清洗后的日线数据。
+
+    tdx_daily_features.parquet
+        加入因子后的数据。
+
+    strategy_selection.parquet
+        策略选股结果。
+
+
+2. data/reports
+--------------------------------
+保存检查报告和方便人工查看的表格。
+
+常见文件：
+    failed_codes.csv
+        读取失败的标的。
+
+    instrument_info.csv
+        每个标的的数据概况。
+
+    abnormal_return_rows.csv
+        异常收益率行。
+
+    data_quality_summary.csv
+        整体数据质量汇总。
+
+    strategy_selection_summary.csv
+        每个调仓日选股概况。
+
+    strategy_selection_view.xlsx
+        策略选股 Excel 查看版。
+
+    strategy_selection_view.csv
+        策略选股 CSV 查看版。
+
+
+四、results 文件夹说明
+================================
+
+results 文件夹保存回测输出。
+
+常见文件：
+    backtest_daily_result.csv
+        每日组合收益、净值和回撤。
+
+    backtest_daily_result.parquet
+        每日回测结果的 parquet 版本。
+
+    backtest_metrics.csv
+        回测指标。
+
+    backtest_holdings.csv
+        每个调仓周期的持仓记录。
+
+    equity_curve.png
+        净值曲线和回撤图。
+
+
+五、当前完整运行流程
+================================
+
+完整流程如下：
+
+    main.py
+        ↓
+    convert_tdx_daily()
+        ↓
+    clean_daily_data()
+        ↓
+    generate_daily_features()
+        ↓
+    run_strategy_selection()
+        ↓
+    view_strategy_selection()
+        ↓
+    run_backtest()
+
+对应数据流：
+
+    通达信 .day 文件
+        ↓
+    tdx_daily_raw.parquet
+        ↓
+    tdx_daily_clean.parquet
+        ↓
+    tdx_daily_features.parquet
+        ↓
+    strategy_selection.parquet
+        ↓
+    backtest_daily_result.csv
+    backtest_metrics.csv
+    equity_curve.png
+
+
+六、常见修改位置
+================================
+
+1. 想改读取哪些市场
+--------------------------------
+修改：
+    config.py
+
+参数：
+    INCLUDE_MARKETS
+
+例子：
+    INCLUDE_MARKETS = ("sh", "sz")
+
+表示只读取沪深市场。
+
+
+2. 想改读取哪些标的类型
+--------------------------------
+修改：
+    config.py
+
+参数：
+    INCLUDE_INSTRUMENT_TYPES
+
+例子：
+    INCLUDE_INSTRUMENT_TYPES = (
+        "stock",
+        "etf_fund",
+    )
+
+表示只读取股票和 ETF。
+
+
+3. 想改读取数量
+--------------------------------
+修改：
+    config.py
+
+参数：
+    READ_LIMIT
+
+例子：
+    READ_LIMIT = 300
+        只读取前 300 个标的。
+
+    READ_LIMIT = None
+        读取全部标的。
+
+
+4. 想改数据清洗起始日期
+--------------------------------
+修改：
+    config.py
+
+参数：
+    START_DATE
+
+例子：
+    START_DATE = "2018-01-01"
+
+
+5. 想改策略开始日期
+--------------------------------
+修改：
+    main.py
+
+参数：
+    STRATEGY_START_DATE
+
+例子：
+    STRATEGY_START_DATE = "2021-01-01"
+
+
+6. 想改每期选几个标的
+--------------------------------
+修改：
+    main.py
+
+参数：
+    STRATEGY_TOP_N
+
+例子：
+    STRATEGY_TOP_N = 5
+
+
+7. 想改调仓频率
+--------------------------------
+修改：
+    main.py
+
+参数：
+    STRATEGY_FREQ
+
+例子：
+    STRATEGY_FREQ = "ME"
+        每月调仓。
+
+    STRATEGY_FREQ = "QE"
+        每季度调仓。
+
+    STRATEGY_FREQ = "W-FRI"
+        每周调仓。
+
+
+8. 想改选股因子
+--------------------------------
+修改：
+    main.py
+
+参数：
+    STRATEGY_SCORE_COL
+
+例子：
+    STRATEGY_SCORE_COL = "score_mom_lowvol"
+
+如果未来新增其他因子，可以改成：
+    STRATEGY_SCORE_COL = "new_factor_score"
+
+
+9. 想加新的技术因子
+--------------------------------
+修改：
+    functions/feature_engineering.py
+
+建议：
+    可以新建单独模块，例如：
+        functions/factor_price_volume.py
+        functions/factor_fund_flow.py
+        functions/factor_fundamental.py
+
+
+10. 想改回测逻辑
+--------------------------------
+修改：
+    functions/backtest_engine.py
+
+常见修改：
+    加手续费。
+    加滑点。
+    改成下一个交易日开盘买入。
+    加涨跌停限制。
+    加停牌限制。
+    换成前复权价格。
+
+
+七、当前项目限制
+================================
+
+当前版本适合：
+    1. 跑通本地量化系统流程。
+    2. 学习数据读取、清洗、因子、选股、回测之间的关系。
+    3. 做第一版策略验证。
+
+当前版本还不适合作为严肃实盘结论。
+
+主要限制：
+    1. 通达信 .day 数据大概率是不复权价。
+    2. 当前没有使用前复权价格。
+    3. 回测没有手续费和滑点。
+    4. 回测没有处理涨跌停无法成交。
+    5. 回测没有处理停牌。
+    6. 当前标的分类是规则分类，可能有误分类。
+    7. ETF、指数、可转债等不同标的最好分开回测。
+    8. 财务因子、资金流、北向资金、龙虎榜、大宗交易还没有接入。
+
+
+八、推荐学习顺序
+================================
+
+第一步：
+    理解 main.py。
+    知道每个开关控制什么。
+
+第二步：
+    理解 config.py。
+    知道路径、市场、标的类型、读取数量在哪里改。
+
+第三步：
+    理解数据流。
+    .day 文件如何变成 raw、clean、features。
+
+第四步：
+    理解 feature_engineering.py。
+    知道每个因子怎么算。
+
+第五步：
+    理解 strategy_selection.py。
+    知道每个月为什么选这些标的。
+
+第六步：
+    理解 backtest_engine.py。
+    知道选股结果如何变成净值曲线。
+
+第七步：
+    再开始加新因子、新数据源、新回测规则。
+
+
+九、建议的后续升级路线
+================================
+
+V1：
+    当前版本。
+    完成数据读取、清洗、因子、选股、简化回测。
+
+V2：
+    加入前复权价格。
+    修正长期收益率和均线因子。
+
+V3：
+    加入手续费和滑点。
+    提高回测真实性。
+
+V4：
+    加入涨跌停、停牌过滤。
+    更接近 A 股真实交易。
+
+V5：
+    加入资金流、龙虎榜、大宗交易。
+
+V6：
+    加入财务基本面因子。
+    注意财务数据发布时间，避免未来函数。
+
+V7：
+    加入机器学习排序模型。
+    例如 XGBoost、RandomForest、LightGBM。
+
+V8：
+    增加完整组合分析。
+    包括基准对比、超额收益、换手率、行业暴露等。
+
+
+十、快速检查清单
+================================
+
+如果程序没输出文件，检查：
+    1. PROJECT_DIR 是否正确。
+    2. data/processed 是否存在。
+    3. data/reports 是否存在。
+    4. results 是否存在。
+    5. RUN_STEP 开关是否为 True。
+    6. READ_LIMIT 是否太小。
+    7. INCLUDE_MARKETS 是否选对。
+    8. INCLUDE_INSTRUMENT_TYPES 是否过滤太严格。
+
+如果策略选股为空，检查：
+    1. STRATEGY_START_DATE 是否太晚。
+    2. STRATEGY_END_DATE 是否太早。
+    3. STRATEGY_SCORE_COL 是否存在。
+    4. score 是否全是 NaN。
+    5. include_types 是否有对应标的。
+    6. is_trading 是否过滤掉太多。
+    7. abnormal_jump 是否过滤掉太多。
+
+如果回测为空，检查：
+    1. strategy_selection.parquet 是否存在。
+    2. tdx_daily_features.parquet 是否存在。
+    3. selection 中 symbol 是否能在 features 中找到。
+    4. 调仓日后是否有下一段收益数据。
+    5. 日期格式是否为 datetime。
+
+如果图不显示，检查：
+    1. BACKTEST_SHOW_PLOT 是否为 True。
+    2. Spyder 的 Graphics Backend 是否为 Inline。
+    3. plot_equity_curve 中是否调用 plt.show()。
+    4. results/equity_curve.png 是否已经保存。
