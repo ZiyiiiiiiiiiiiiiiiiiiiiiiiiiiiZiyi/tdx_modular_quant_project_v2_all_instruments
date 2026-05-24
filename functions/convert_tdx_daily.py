@@ -11,6 +11,40 @@ from config import (
 )
 from functions.tdx_day_file_reader import collect_tdx_day_files, read_tdx_day_file
 
+
+def limit_file_rows_balanced(file_rows, limit):
+    """Limit debug samples with a market-balanced round-robin selection."""
+    if limit is None or limit >= len(file_rows):
+        return file_rows
+
+    market_order = []
+    market_buckets = {}
+    for row in file_rows:
+        market = row["market"]
+        if market not in market_buckets:
+            market_buckets[market] = []
+            market_order.append(market)
+        market_buckets[market].append(row)
+
+    selected = []
+    bucket_index = 0
+    while len(selected) < limit and market_order:
+        market = market_order[bucket_index % len(market_order)]
+        bucket = market_buckets[market]
+        if bucket:
+            selected.append(bucket.pop(0))
+
+        empty_markets = [name for name in market_order if not market_buckets[name]]
+        if empty_markets:
+            market_order = [name for name in market_order if market_buckets[name]]
+            bucket_index = 0
+            continue
+
+        bucket_index += 1
+
+    return selected
+
+
 def convert_tdx_daily(limit=None):
     print("TDX_DIR:", TDX_DIR)
     print("TDX exists:", TDX_DIR.exists())
@@ -23,7 +57,7 @@ def convert_tdx_daily(limit=None):
     )
 
     if limit is not None:
-        file_rows = file_rows[:limit]
+        file_rows = limit_file_rows_balanced(file_rows, limit)
 
     print("Total selected instruments:", len(file_rows))
     print("First 20 instruments:")

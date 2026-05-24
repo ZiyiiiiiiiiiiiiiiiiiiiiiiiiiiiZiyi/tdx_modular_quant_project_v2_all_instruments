@@ -65,7 +65,7 @@ INCLUDE_INSTRUMENT_TYPES = (
 
 # First test with 50. Change to None for all. None
 
-READ_LIMIT = 20
+READ_LIMIT = 100
 
 
 ABNORMAL_RETURN_THRESHOLD = 0.20
