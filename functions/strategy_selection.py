@@ -24,7 +24,7 @@ def get_rebalance_dates(df, freq="ME"):
 def select_instruments_by_score(
     df,
     score_col="score_mom_lowvol",
-    top_n=5,
+    top_n=20,
     freq="ME",
     include_types=("stock", "etf_fund"),
     start_date=None,
@@ -98,7 +98,7 @@ def select_instruments_by_score(
 
 def run_strategy_selection(
     score_col="score_mom_lowvol",
-    top_n=5,
+    top_n=20,
     freq="ME",
     include_types=("stock", "etf_fund"),
     start_date=None,
@@ -175,7 +175,7 @@ def run_strategy_selection(
 if __name__ == "__main__":
     run_strategy_selection(
         score_col="score_mom_lowvol",
-        top_n=5,
+        top_n=20,
         freq="ME",
         include_types=("stock", "etf_fund"),
         start_date=None,

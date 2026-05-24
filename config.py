@@ -26,7 +26,7 @@ INCLUDE_INSTRUMENT_TYPES = (
     "etf_fund",
 )
 
-READ_LIMIT = 100
+READ_LIMIT = 200
 
 这样输出的 strategy_selection.parquet 里应该就是 ETF / 场内基金。
 
@@ -65,10 +65,17 @@ INCLUDE_INSTRUMENT_TYPES = (
 
 # First test with 50. Change to None for all. None
 
-READ_LIMIT = 100
+READ_LIMIT = 200
 
 
 ABNORMAL_RETURN_THRESHOLD = 0.20
+
+HOT_THEME_SLOT_RATIO = 0.7
+HOT_THEME_WEIGHTS = {
+    "ai_infrastructure": 1.00,
+    "robotics_automation": 0.90,
+    "low_altitude_aerospace": 0.80,
+}
 
 RAW_DAILY_PARQUET = PROCESSED_DIR / "tdx_daily_raw.parquet"
 CLEAN_DAILY_PARQUET = PROCESSED_DIR / "tdx_daily_clean.parquet"

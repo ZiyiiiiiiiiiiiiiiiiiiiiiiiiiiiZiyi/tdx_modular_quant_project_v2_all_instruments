@@ -2,12 +2,18 @@
 import numpy as np
 import pandas as pd
 
-from config import CLEAN_DAILY_PARQUET, FEATURE_DAILY_PARQUET
+from config import (
+    CLEAN_DAILY_PARQUET,
+    FEATURE_DAILY_PARQUET,
+    HOT_THEME_SLOT_RATIO,
+    HOT_THEME_WEIGHTS,
+)
 from functions.factors.factor_learning import (
     LEARNING_STRATEGY_DESCRIPTIONS,
     generate_learning_module_scores,
 )
 from functions.factors.factor_ml import compute_factor as compute_ml_factor
+from functions.sector_taxonomy import attach_sector_labels
 from functions.strategy_selection import get_rebalance_dates
 
 
@@ -33,6 +39,7 @@ STRATEGY_FACTOR_DESCRIPTIONS.update(LEARNING_STRATEGY_DESCRIPTIONS)
 def generate_daily_features_multi():
     df = pd.read_parquet(CLEAN_DAILY_PARQUET)
     df = df.sort_values([GROUP_COL, "date"]).copy()
+    df = attach_sector_labels(df)
     grouped = df.groupby(GROUP_COL, group_keys=False)
 
     for n in [1, 5, 10, 20, 60]:
@@ -74,12 +81,14 @@ def generate_daily_features_multi():
 def select_instruments_by_score(
     df,
     score_col,
-    top_n=5,
+    top_n=20,
     freq="ME",
     include_types=("stock", "etf_fund"),
     start_date=None,
     end_date=None,
     ascending=False,
+    hot_theme_weights=None,
+    hot_theme_slot_ratio=0.0,
 ):
     """Select top instruments only on configured rebalance dates."""
     df_sel = df.copy()
@@ -105,16 +114,33 @@ def select_instruments_by_score(
     if df_sel.empty:
         return df_sel
 
-    df_sel = df_sel.sort_values(["date", score_col], ascending=[True, ascending])
-    df_sel["rank"] = df_sel.groupby("date")[score_col].rank(
+    rows = []
+    for rebalance_date, one_day in df_sel.groupby("date", sort=True):
+        selected = _select_one_rebalance_day(
+            one_day=one_day,
+            score_col=score_col,
+            top_n=top_n,
+            ascending=ascending,
+            hot_theme_weights=hot_theme_weights,
+            hot_theme_slot_ratio=hot_theme_slot_ratio,
+        )
+        if selected.empty:
+            continue
+
+        selected["rebalance_date"] = rebalance_date
+        selected["score"] = selected[score_col]
+        selected["weight"] = 1.0 / len(selected)
+        rows.append(selected)
+
+    if not rows:
+        return df_sel.iloc[0:0].copy()
+
+    result = pd.concat(rows, ignore_index=True)
+    result["rank"] = result.groupby("rebalance_date")["selection_score"].rank(
         method="first",
-        ascending=ascending,
+        ascending=False,
     )
-    df_sel = df_sel[df_sel["rank"] <= top_n].copy()
-    df_sel["rebalance_date"] = df_sel["date"]
-    df_sel["score"] = df_sel[score_col]
-    df_sel["weight"] = 1.0 / df_sel.groupby("rebalance_date")["symbol"].transform("count")
-    return df_sel
+    return result.sort_values(["rebalance_date", "rank", "symbol"]).reset_index(drop=True)
 
 
 def generate_multi_strategies(
@@ -153,6 +179,8 @@ def generate_multi_strategies(
             start_date=start_date,
             end_date=end_date,
             ascending=ascending,
+            hot_theme_weights=HOT_THEME_WEIGHTS,
+            hot_theme_slot_ratio=HOT_THEME_SLOT_RATIO,
         )
 
     strategies["momentum"] = select("ret_20")
@@ -197,6 +225,104 @@ def _strategy_rebalance_dates(df, freq, include_types, start_date, end_date):
     if base.empty:
         return pd.Series(dtype="datetime64[ns]")
     return get_rebalance_dates(base, freq=freq)
+
+
+def _select_one_rebalance_day(
+    one_day,
+    score_col,
+    top_n,
+    ascending,
+    hot_theme_weights,
+    hot_theme_slot_ratio,
+):
+    day = one_day.copy()
+    day["selection_score"] = _build_selection_score(
+        day,
+        score_col=score_col,
+        ascending=ascending,
+        hot_theme_weights=hot_theme_weights,
+    )
+    day = day.sort_values(["selection_score", "symbol"], ascending=[False, True]).reset_index(drop=True)
+
+    hot_theme_weights = hot_theme_weights or {}
+    hot_slots = min(int(round(top_n * hot_theme_slot_ratio)), top_n)
+    quota_map = _allocate_hot_theme_slots(day, hot_slots=hot_slots, hot_theme_weights=hot_theme_weights)
+
+    selected_frames = []
+    selected_symbols = set()
+    if quota_map:
+        for theme_name, quota in quota_map.items():
+            themed = day[
+                (day["sector_parent"] == theme_name)
+                & (~day["symbol"].isin(selected_symbols))
+            ].head(quota)
+            if themed.empty:
+                continue
+            selected_frames.append(themed)
+            selected_symbols.update(themed["symbol"].tolist())
+
+    remaining_slots = top_n - sum(len(frame) for frame in selected_frames)
+    if remaining_slots > 0:
+        fallback = day[~day["symbol"].isin(selected_symbols)].head(remaining_slots)
+        if not fallback.empty:
+            selected_frames.append(fallback)
+
+    if not selected_frames:
+        return day.head(top_n).copy()
+
+    selected = pd.concat(selected_frames, ignore_index=True)
+    return selected.sort_values(["selection_score", "symbol"], ascending=[False, True]).head(top_n).copy()
+
+
+def _build_selection_score(day, score_col, ascending, hot_theme_weights):
+    score = pd.to_numeric(day[score_col], errors="coerce")
+    base_score = -score if ascending else score
+    rank_component = base_score.rank(method="first", pct=True, ascending=True)
+    theme_bonus = day["sector_parent"].map(hot_theme_weights or {}).fillna(day["sector_parent_heat"]).fillna(0.0)
+    if "sector_branch_heat" in day.columns:
+        branch_bonus = pd.to_numeric(day["sector_branch_heat"], errors="coerce").fillna(0.0)
+    else:
+        branch_bonus = pd.Series(0.0, index=day.index)
+    return rank_component + 0.20 * theme_bonus + 0.05 * branch_bonus
+
+
+def _allocate_hot_theme_slots(day, hot_slots, hot_theme_weights):
+    if hot_slots <= 0 or not hot_theme_weights:
+        return {}
+
+    available = (
+        day[day["sector_parent"].isin(hot_theme_weights)]
+        .groupby("sector_parent")["symbol"]
+        .nunique()
+    )
+    available = available[available > 0]
+    if available.empty:
+        return {}
+
+    weights = pd.Series(hot_theme_weights, dtype=float).reindex(available.index).fillna(0.0)
+    if weights.sum() <= 0:
+        return {}
+
+    raw_quota = weights / weights.sum() * min(hot_slots, int(available.sum()))
+    quota = raw_quota.astype(int).clip(upper=available)
+    remaining = int(min(hot_slots, int(available.sum())) - quota.sum())
+
+    if remaining > 0:
+        remainders = (raw_quota - quota).sort_values(ascending=False)
+        while remaining > 0:
+            assigned = False
+            for theme_name in remainders.index:
+                if quota.loc[theme_name] >= available.loc[theme_name]:
+                    continue
+                quota.loc[theme_name] += 1
+                remaining -= 1
+                assigned = True
+                if remaining == 0:
+                    break
+            if not assigned:
+                break
+
+    return {theme_name: int(value) for theme_name, value in quota.items() if int(value) > 0}
 
 
 def run_backtest(df_features, strategies, initial_cash=1.0):
