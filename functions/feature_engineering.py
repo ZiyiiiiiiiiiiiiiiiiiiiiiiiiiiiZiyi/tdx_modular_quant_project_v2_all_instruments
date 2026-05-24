@@ -3,6 +3,10 @@ import numpy as np
 import pandas as pd
 
 from config import CLEAN_DAILY_PARQUET, FEATURE_DAILY_PARQUET
+from functions.factors.factor_learning import (
+    LEARNING_STRATEGY_DESCRIPTIONS,
+    generate_learning_module_scores,
+)
 from functions.factors.factor_ml import compute_factor as compute_ml_factor
 from functions.strategy_selection import get_rebalance_dates
 
@@ -17,31 +21,36 @@ STRATEGY_FACTOR_DESCRIPTIONS = {
     "ma_break": "收盘价相对20日均线偏离 close_to_ma20，从高到低选取",
     "kline_shape": "日内振幅 amplitude，从高到低选取",
     "mom_lowvol": "20日收益率 ret_20 - 20日波动率 volatility_20",
-    "ml_elasticnet": "ElasticNet 机器学习综合分 score_ml",
-    "ml_xgboost": "XGBoost 机器学习综合分 score_ml",
-    "ml_lightgbm": "LightGBM 机器学习综合分 score_ml",
-    "event_factor": "占位事件因子：当前暂用20日收益率 ret_20",
-    "alternative_factor": "占位另类因子：当前暂用20日收益率 ret_20",
+    "ml_elasticnet": "ElasticNet 机器学习综合分数 score_ml",
+    "ml_xgboost": "XGBoost 机器学习综合分数 score_ml",
+    "ml_lightgbm": "LightGBM 机器学习综合分数 score_ml",
+    "event_factor": "占位事件因子：当前暂用 20日收益率 ret_20",
+    "alternative_factor": "占位另类因子：当前暂用 20日收益率 ret_20",
 }
+STRATEGY_FACTOR_DESCRIPTIONS.update(LEARNING_STRATEGY_DESCRIPTIONS)
 
 
 def generate_daily_features_multi():
     df = pd.read_parquet(CLEAN_DAILY_PARQUET)
-    df = df.sort_values([GROUP_COL, "date"])
-    g = df.groupby(GROUP_COL, group_keys=False)
+    df = df.sort_values([GROUP_COL, "date"]).copy()
+    grouped = df.groupby(GROUP_COL, group_keys=False)
 
     for n in [1, 5, 10, 20, 60]:
-        df[f"ret_{n}"] = g["close"].pct_change(n)
+        df[f"ret_{n}"] = grouped["close"].pct_change(n)
 
     for n in [5, 10, 20, 60, 120]:
-        df[f"ma_{n}"] = g["close"].transform(lambda x: x.rolling(n, min_periods=n).mean())
-        df[f"volume_ma_{n}"] = g["volume"].transform(lambda x: x.rolling(n, min_periods=n).mean())
+        df[f"ma_{n}"] = grouped["close"].transform(lambda x: x.rolling(n, min_periods=n).mean())
+        df[f"volume_ma_{n}"] = grouped["volume"].transform(
+            lambda x: x.rolling(n, min_periods=n).mean()
+        )
 
     df["close_to_ma20"] = df["close"] / df["ma_20"] - 1
     df["close_to_ma60"] = df["close"] / df["ma_60"] - 1
 
     for n in [10, 20, 60]:
-        df[f"volatility_{n}"] = g["ret_1"].transform(lambda x: x.rolling(n, min_periods=n).std())
+        df[f"volatility_{n}"] = grouped["ret_1"].transform(
+            lambda x: x.rolling(n, min_periods=n).std()
+        )
 
     df["amplitude"] = df["high"] / df["low"] - 1
     df["intraday_ret"] = df["close"] / df["open"] - 1
@@ -52,13 +61,12 @@ def generate_daily_features_multi():
     price_range = (df["high"] - df["low"]).replace(0, np.nan)
     df["body_ratio"] = (df["close"] - df["open"]).abs() / price_range
 
-    df["amount_ma20"] = g["amount"].transform(lambda x: x.rolling(20, min_periods=20).mean())
+    df["amount_ma20"] = grouped["amount"].transform(lambda x: x.rolling(20, min_periods=20).mean())
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"] - 1
 
     df["score_mom_lowvol"] = df["ret_20"] - df["volatility_20"]
 
     df.to_parquet(FEATURE_DAILY_PARQUET, index=False)
-
     print("Feature shape:", df.shape)
     return df
 
@@ -119,15 +127,22 @@ def generate_multi_strategies(
 ):
     """Generate all configured strategy selections."""
     strategies = {}
+    candidate_dates = _strategy_rebalance_dates(
+        df=df,
+        freq=freq,
+        include_types=include_types,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
     def select(score_col, ascending=False, source_df=None):
         selection_source = df
         if source_df is not None:
+            extra_cols = [col for col in source_df.columns if col not in {"date", "symbol"}]
             selection_source = df.merge(
-                source_df[["date", "symbol", score_col]],
+                source_df[["date", "symbol", *extra_cols]],
                 on=["date", "symbol"],
                 how="left",
-                suffixes=("", "_score"),
             )
         return select_instruments_by_score(
             selection_source,
@@ -148,13 +163,17 @@ def generate_multi_strategies(
     strategies["kline_shape"] = select("amplitude")
     strategies["mom_lowvol"] = select("score_mom_lowvol")
 
-    df_ml_en = compute_ml_factor(df, model_type="elasticnet")
-    df_ml_xgb = compute_ml_factor(df, model_type="xgboost")
-    df_ml_lgb = compute_ml_factor(df, model_type="lightgbm")
+    df_ml_en = compute_ml_factor(df, model_type="elasticnet", rebalance_dates=candidate_dates)
+    df_ml_xgb = compute_ml_factor(df, model_type="xgboost", rebalance_dates=candidate_dates)
+    df_ml_lgb = compute_ml_factor(df, model_type="lightgbm", rebalance_dates=candidate_dates)
 
     strategies["ml_elasticnet"] = select("score_ml", source_df=df_ml_en)
     strategies["ml_xgboost"] = select("score_ml", source_df=df_ml_xgb)
     strategies["ml_lightgbm"] = select("score_ml", source_df=df_ml_lgb)
+
+    learning_score_tables = generate_learning_module_scores(df, rebalance_dates=candidate_dates)
+    for strategy_name, score_df in learning_score_tables.items():
+        strategies[strategy_name] = select("score_learning", source_df=score_df)
 
     strategies["event_factor"] = select("ret_20")
     strategies["alternative_factor"] = select("ret_20")
@@ -162,12 +181,29 @@ def generate_multi_strategies(
     return strategies
 
 
+def _strategy_rebalance_dates(df, freq, include_types, start_date, end_date):
+    base = df.copy()
+    base["date"] = pd.to_datetime(base["date"])
+    if start_date is not None:
+        base = base[base["date"] >= pd.to_datetime(start_date)]
+    if end_date is not None:
+        base = base[base["date"] <= pd.to_datetime(end_date)]
+    if include_types is not None and "instrument_type" in base.columns:
+        base = base[base["instrument_type"].isin(include_types)]
+    if "is_trading" in base.columns:
+        base = base[base["is_trading"] == True]
+    if "abnormal_jump" in base.columns:
+        base = base[base["abnormal_jump"] == False]
+    if base.empty:
+        return pd.Series(dtype="datetime64[ns]")
+    return get_rebalance_dates(base, freq=freq)
+
+
 def run_backtest(df_features, strategies, initial_cash=1.0):
     """Legacy helper kept for compatibility; prefer functions.backtest_engine."""
     results = {}
     for name, df_sel in strategies.items():
-        df_sel = df_sel.copy()
-        df_sel = df_sel.sort_values(["symbol", "date"])
+        df_sel = df_sel.copy().sort_values(["symbol", "date"])
         df_sel["daily_ret"] = df_sel.groupby("symbol")["ret_1"].shift(-1)
         df_sel = df_sel.dropna(subset=["daily_ret"])
         df_sel["weight"] = 1 / df_sel.groupby("date")["symbol"].transform("count")

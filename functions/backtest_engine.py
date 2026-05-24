@@ -1,10 +1,25 @@
 # -*- coding: utf-8 -*-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 from config import FEATURE_DAILY_PARQUET, RESULT_DIR
 from functions.metrics import calc_backtest_metrics
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+LEARNING_METADATA_COLUMNS = [
+    "learning_module",
+    "reward_method",
+    "profile_tier",
+    "training_window_days",
+    "feature_budget",
+    "qubit_count",
+    "fitted_feature_count",
+    "feature_list",
+]
 
 
 def prepare_daily_returns(feature_data):
@@ -74,14 +89,30 @@ def run_backtest(
         one_holdings = df_sel[df_sel["rebalance_date"] == rebalance_date][
             ["rebalance_date", "symbol", "weight"]
         ].copy()
+        one_holding_count = one_holdings["symbol"].nunique()
         one_returns = returns[returns["date"].isin(period_dates)][
             ["date", "symbol", "daily_symbol_return"]
         ]
-        expanded = one_returns.merge(one_holdings, on="symbol", how="inner")
-        expanded = expanded.dropna(subset=["daily_symbol_return", "weight"])
-        if expanded.empty:
-            continue
-
+        period_calendar = pd.MultiIndex.from_product(
+            [period_dates.tolist(), one_holdings["symbol"].tolist()],
+            names=["date", "symbol"],
+        ).to_frame(index=False)
+        expanded = period_calendar.merge(
+            one_holdings[["symbol", "weight"]],
+            on="symbol",
+            how="left",
+        )
+        expanded = expanded.merge(
+            one_returns,
+            on=["date", "symbol"],
+            how="left",
+        )
+        expanded["daily_symbol_return"] = pd.to_numeric(
+            expanded["daily_symbol_return"],
+            errors="coerce",
+        ).fillna(0.0)
+        expanded["weight"] = pd.to_numeric(expanded["weight"], errors="coerce").fillna(0.0)
+        expanded["holding_count"] = one_holding_count
         expanded["portfolio_ret_part"] = expanded["daily_symbol_return"] * expanded["weight"]
         period_frames.append(expanded)
 
@@ -93,7 +124,7 @@ def run_backtest(
         expanded_returns.groupby("date")
         .agg(
             portfolio_ret=("portfolio_ret_part", "sum"),
-            holding_count=("symbol", "nunique"),
+            holding_count=("holding_count", "max"),
         )
         .reset_index()
         .sort_values("date")
@@ -130,11 +161,13 @@ def run_backtest(
     metrics_csv = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
     holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}.csv"
     plot_file = RESULT_DIR / f"equity_curve_{strategy_name}.png"
+    learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)
     metrics.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
     holdings_record.to_csv(holdings_csv, index=False, encoding="utf-8-sig")
+    _save_learning_metadata(df_sel, learning_meta_csv)
 
     _plot_equity_curve(
         daily_result,
@@ -153,6 +186,8 @@ def run_backtest(
     print("Saved daily Parquet:", daily_parquet)
     print("Saved metrics:", metrics_csv)
     print("Saved holdings:", holdings_csv)
+    if learning_meta_csv.exists():
+        print("Saved learning metadata:", learning_meta_csv)
     print("Saved equity curve:", plot_file)
 
     return daily_result, metrics, holdings_record
@@ -169,6 +204,10 @@ def _plot_equity_curve(
     holdings_record=None,
 ):
     """Plot net value, drawdown, and holding count with Chinese labels."""
+    if plt is None:
+        print("Skip equity plot: matplotlib is not installed in current environment.")
+        return
+
     plt.rcParams["font.sans-serif"] = [
         "Microsoft YaHei",
         "SimHei",
@@ -253,6 +292,18 @@ def _metric_value(metrics, metric_name):
     if metric_name not in metrics["metric"].values:
         return np.nan
     return metrics.loc[metrics["metric"] == metric_name, "value"].iloc[0]
+
+
+def _save_learning_metadata(df_selection, output_file):
+    meta_cols = [col for col in LEARNING_METADATA_COLUMNS if col in df_selection.columns]
+    if not meta_cols:
+        return
+
+    meta = df_selection[meta_cols].dropna(how="all").drop_duplicates()
+    if meta.empty:
+        return
+
+    meta.to_csv(output_file, index=False, encoding="utf-8-sig")
 
 
 if __name__ == "__main__":
