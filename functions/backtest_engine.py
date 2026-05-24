@@ -60,6 +60,7 @@ def run_backtest(
 
     df_sel["rebalance_date"] = pd.to_datetime(df_sel["rebalance_date"])
     returns["date"] = pd.to_datetime(returns["date"])
+    feature_data["date"] = pd.to_datetime(feature_data["date"])
     df_sel = df_sel.sort_values(["rebalance_date", "symbol"]).copy()
 
     if "weight" not in df_sel.columns:
@@ -74,6 +75,7 @@ def run_backtest(
     all_trade_dates = pd.Series(returns["date"].drop_duplicates().sort_values()).reset_index(drop=True)
 
     period_frames = []
+    oracle_period_frames = []
     for idx, rebalance_date in rebalance_dates.items():
         next_rebalance = (
             rebalance_dates.iloc[idx + 1]
@@ -116,6 +118,43 @@ def run_backtest(
         expanded["portfolio_ret_part"] = expanded["daily_symbol_return"] * expanded["weight"]
         period_frames.append(expanded)
 
+        oracle_holdings = _build_oracle_holdings(
+            feature_data=feature_data,
+            returns=returns,
+            rebalance_date=rebalance_date,
+            period_dates=period_dates,
+            holding_count=one_holding_count,
+            allowed_instrument_types=df_sel.get("instrument_type"),
+        )
+        if not oracle_holdings.empty:
+            oracle_calendar = pd.MultiIndex.from_product(
+                [period_dates.tolist(), oracle_holdings["symbol"].tolist()],
+                names=["date", "symbol"],
+            ).to_frame(index=False)
+            oracle_expanded = oracle_calendar.merge(
+                oracle_holdings[["symbol", "weight"]],
+                on="symbol",
+                how="left",
+            )
+            oracle_expanded = oracle_expanded.merge(
+                one_returns,
+                on=["date", "symbol"],
+                how="left",
+            )
+            oracle_expanded["daily_symbol_return"] = pd.to_numeric(
+                oracle_expanded["daily_symbol_return"],
+                errors="coerce",
+            ).fillna(0.0)
+            oracle_expanded["weight"] = pd.to_numeric(
+                oracle_expanded["weight"],
+                errors="coerce",
+            ).fillna(0.0)
+            oracle_expanded["holding_count"] = len(oracle_holdings)
+            oracle_expanded["portfolio_ret_part"] = (
+                oracle_expanded["daily_symbol_return"] * oracle_expanded["weight"]
+            )
+            oracle_period_frames.append(oracle_expanded)
+
     if not period_frames:
         raise ValueError(f"Strategy {strategy_name} has no matched daily returns after expansion")
 
@@ -147,6 +186,20 @@ def run_backtest(
 
     daily_result["nav"] = (1 + daily_result["daily_return"]).cumprod() * initial_cash
     daily_result["net_value"] = daily_result["nav"]
+
+    theoretical_summary = None
+    if oracle_period_frames:
+        theoretical_daily = _build_daily_result(
+            period_frames=oracle_period_frames,
+            initial_date=initial_date,
+            initial_holding_count=initial_holding_count,
+            initial_cash=initial_cash,
+        )
+        theoretical_metrics, _ = calc_backtest_metrics(
+            daily_result=theoretical_daily,
+            risk_free_rate=risk_free_rate,
+        )
+        theoretical_summary = _metrics_to_dict(theoretical_metrics)
 
     metrics, drawdown = calc_backtest_metrics(
         daily_result=daily_result,
@@ -182,6 +235,28 @@ def run_backtest(
 
     print("\n========== Backtest Result ==========")
     print(metrics)
+    if theoretical_summary is not None:
+        print("\n========== Theoretical Upper Bound ==========")
+        print(
+            "Same rebalance dates and holding count, but each period picks the future best performers."
+        )
+        print(
+            "Theoretical final net value:",
+            _format_metric(theoretical_summary.get("final_net_value"), is_percent=False),
+        )
+        print(
+            "Theoretical total return:",
+            _format_metric(theoretical_summary.get("total_return"), is_percent=True),
+        )
+        print(
+            "Theoretical annual return:",
+            _format_metric(theoretical_summary.get("annual_return"), is_percent=True),
+        )
+        if "final_net_value" in theoretical_summary and "final_net_value" in _metrics_to_dict(metrics):
+            realized_nav = float(_metrics_to_dict(metrics).get("final_net_value"))
+            theoretical_nav = float(theoretical_summary.get("final_net_value"))
+            if realized_nav != 0:
+                print("Upper-bound multiple vs strategy:", f"{theoretical_nav / realized_nav:.2f}x")
     print("Saved daily CSV:", daily_csv)
     print("Saved daily Parquet:", daily_parquet)
     print("Saved metrics:", metrics_csv)
@@ -292,6 +367,100 @@ def _metric_value(metrics, metric_name):
     if metric_name not in metrics["metric"].values:
         return np.nan
     return metrics.loc[metrics["metric"] == metric_name, "value"].iloc[0]
+
+
+def _build_oracle_holdings(
+    feature_data,
+    returns,
+    rebalance_date,
+    period_dates,
+    holding_count,
+    allowed_instrument_types=None,
+):
+    candidates = feature_data[feature_data["date"] == rebalance_date].copy()
+    if candidates.empty or holding_count <= 0:
+        return pd.DataFrame(columns=["symbol", "weight"])
+
+    if allowed_instrument_types is not None:
+        allow_types = pd.Series(allowed_instrument_types).dropna().unique().tolist()
+        if allow_types and "instrument_type" in candidates.columns:
+            candidates = candidates[candidates["instrument_type"].isin(allow_types)]
+
+    if "is_trading" in candidates.columns:
+        candidates = candidates[candidates["is_trading"] == True]
+    if "abnormal_jump" in candidates.columns:
+        candidates = candidates[candidates["abnormal_jump"] == False]
+
+    if candidates.empty:
+        return pd.DataFrame(columns=["symbol", "weight"])
+
+    period_returns = returns[
+        (returns["date"].isin(period_dates)) & (returns["symbol"].isin(candidates["symbol"]))
+    ].copy()
+
+    if period_returns.empty:
+        candidates = candidates[["symbol"]].drop_duplicates().head(holding_count).copy()
+        candidates["weight"] = 1.0 / len(candidates)
+        return candidates
+
+    symbol_period_return = (
+        period_returns.groupby("symbol")["daily_symbol_return"]
+        .apply(lambda s: (1.0 + s.fillna(0.0)).prod() - 1.0)
+        .rename("period_return")
+        .reset_index()
+    )
+    ranked = candidates[["symbol"]].drop_duplicates().merge(
+        symbol_period_return,
+        on="symbol",
+        how="left",
+    )
+    ranked["period_return"] = pd.to_numeric(ranked["period_return"], errors="coerce").fillna(0.0)
+    ranked = ranked.sort_values(["period_return", "symbol"], ascending=[False, True]).head(holding_count)
+    ranked["weight"] = 1.0 / len(ranked)
+    return ranked[["symbol", "weight"]]
+
+
+def _build_daily_result(period_frames, initial_date, initial_holding_count, initial_cash):
+    daily_result = (
+        pd.concat(period_frames, ignore_index=True)
+        .groupby("date")
+        .agg(
+            portfolio_ret=("portfolio_ret_part", "sum"),
+            holding_count=("holding_count", "max"),
+        )
+        .reset_index()
+        .sort_values("date")
+    )
+    daily_result["daily_return"] = daily_result["portfolio_ret"]
+
+    if daily_result.empty or initial_date < daily_result["date"].min():
+        initial_row = pd.DataFrame(
+            {
+                "date": [initial_date],
+                "portfolio_ret": [0.0],
+                "holding_count": [initial_holding_count],
+                "daily_return": [0.0],
+            }
+        )
+        daily_result = pd.concat([initial_row, daily_result], ignore_index=True)
+        daily_result = daily_result.sort_values("date").reset_index(drop=True)
+
+    daily_result["nav"] = (1 + daily_result["daily_return"]).cumprod() * initial_cash
+    daily_result["net_value"] = daily_result["nav"]
+    return daily_result
+
+
+def _metrics_to_dict(metrics):
+    return dict(zip(metrics["metric"], metrics["value"]))
+
+
+def _format_metric(value, is_percent):
+    numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric_value):
+        return "nan"
+    if is_percent:
+        return f"{numeric_value:.2%}"
+    return f"{numeric_value:.4f}"
 
 
 def _save_learning_metadata(df_selection, output_file):

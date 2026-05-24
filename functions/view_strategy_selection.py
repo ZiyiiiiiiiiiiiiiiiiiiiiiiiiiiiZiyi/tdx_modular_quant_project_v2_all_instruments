@@ -72,6 +72,14 @@ def view_strategy_selection(
         print("\nMost selected symbols:")
         print(sel["symbol"].value_counts().head(30))
 
+    if "sector_parent" in sel.columns:
+        print("\nSector parent count:")
+        print(sel["sector_parent"].value_counts().head(20))
+
+    if "sector_branch" in sel.columns:
+        print("\nSector branch count:")
+        print(sel["sector_branch"].value_counts().head(30))
+
     if "rebalance_date" in sel.columns:
         dates = sel["rebalance_date"].drop_duplicates().sort_values()
 
