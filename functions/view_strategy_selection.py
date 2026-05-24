@@ -11,6 +11,7 @@ from config import PROCESSED_DIR, REPORT_DIR
 def view_strategy_selection(
     export_excel=True,
     print_rows=30,
+    strategy_names=None,
 ):
     """
     Load strategy selection result and export it for viewing.
@@ -23,17 +24,37 @@ def view_strategy_selection(
         Number of rows to print in console.
     """
 
-    selection_file = PROCESSED_DIR / "strategy_selection.parquet"
-
-    if not selection_file.exists():
-        raise FileNotFoundError(
-            f"Strategy selection file not found: {selection_file}"
+    if strategy_names is None:
+        files = sorted(
+            path for path in PROCESSED_DIR.glob("*.parquet")
+            if path.name not in {
+                "tdx_daily_raw.parquet",
+                "tdx_daily_clean.parquet",
+                "tdx_daily_features.parquet",
+            }
         )
+    else:
+        files = [PROCESSED_DIR / f"{name}.parquet" for name in strategy_names]
 
-    sel = pd.read_parquet(selection_file)
+    missing = [path for path in files if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Strategy selection file not found: "
+            + ", ".join(str(path) for path in missing)
+        )
+    if not files:
+        raise FileNotFoundError(f"No strategy selection parquet files found in {PROCESSED_DIR}")
+
+    frames = []
+    for selection_file in files:
+        one = pd.read_parquet(selection_file)
+        one.insert(0, "strategy_name", selection_file.stem)
+        frames.append(one)
+
+    sel = pd.concat(frames, ignore_index=True)
 
     print("\n========== Strategy Selection View ==========")
-    print("Selection file:", selection_file)
+    print("Selection files:", [str(path) for path in files])
     print("Shape:", sel.shape)
     print("Columns:", sel.columns.tolist())
 
