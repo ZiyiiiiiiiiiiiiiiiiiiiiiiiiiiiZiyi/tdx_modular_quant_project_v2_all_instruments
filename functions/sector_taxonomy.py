@@ -155,7 +155,34 @@ def build_sector_lookup():
                 "sector_branch_heat",
             ]
         )
-    return pd.DataFrame(rows).drop_duplicates(subset=["symbol"], keep="first")
+
+    raw_lookup = pd.DataFrame(rows)
+    aggregated_rows = []
+    for symbol, one_symbol in raw_lookup.groupby("symbol", sort=True):
+        parent_heats = (
+            one_symbol[["sector_parent", "sector_parent_heat"]]
+            .drop_duplicates()
+            .sort_values(["sector_parent_heat", "sector_parent"], ascending=[False, True])
+        )
+        branch_heats = (
+            one_symbol[["sector_branch", "sector_branch_heat"]]
+            .drop_duplicates()
+            .sort_values(["sector_branch_heat", "sector_branch"], ascending=[False, True])
+        )
+        primary_parent = parent_heats.iloc[0]["sector_parent"]
+        aggregated_rows.append(
+            {
+                "symbol": symbol,
+                "sector_parent": primary_parent,
+                "sector_parent_candidates": "|".join(parent_heats["sector_parent"].tolist()),
+                "sector_parent_conflict": int(parent_heats["sector_parent"].nunique() > 1),
+                "sector_branch": "|".join(branch_heats["sector_branch"].tolist()),
+                "sector_parent_heat": float(parent_heats["sector_parent_heat"].max()),
+                "sector_branch_heat": float(branch_heats["sector_branch_heat"].max()),
+                "sector_membership_count": int(branch_heats["sector_branch"].nunique()),
+            }
+        )
+    return pd.DataFrame(aggregated_rows)
 
 
 SECTOR_LOOKUP = build_sector_lookup()
@@ -164,6 +191,10 @@ SECTOR_LOOKUP = build_sector_lookup()
 def attach_sector_labels(df):
     labeled = df.merge(SECTOR_LOOKUP, on="symbol", how="left")
     labeled["sector_parent"] = labeled["sector_parent"].fillna("other")
+    if "sector_parent_candidates" in labeled.columns:
+        labeled["sector_parent_candidates"] = labeled["sector_parent_candidates"].fillna(
+            labeled["sector_parent"]
+        )
     labeled["sector_branch"] = labeled["sector_branch"].fillna("other")
     labeled["sector_parent_heat"] = pd.to_numeric(
         labeled["sector_parent_heat"],
@@ -177,4 +208,14 @@ def attach_sector_labels(df):
         0.7 * labeled["sector_parent_heat"] + 0.3 * labeled["sector_branch_heat"]
     )
     labeled["is_hot_sector"] = labeled["sector_parent_heat"] > 0
+    if "sector_membership_count" in labeled.columns:
+        labeled["sector_membership_count"] = pd.to_numeric(
+            labeled["sector_membership_count"],
+            errors="coerce",
+        ).fillna(0).astype(int)
+    if "sector_parent_conflict" in labeled.columns:
+        labeled["sector_parent_conflict"] = pd.to_numeric(
+            labeled["sector_parent_conflict"],
+            errors="coerce",
+        ).fillna(0).astype(int)
     return labeled

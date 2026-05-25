@@ -42,6 +42,7 @@ DATA_DIR = PROJECT_DIR / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
 REPORT_DIR = DATA_DIR / "reports"
 RESULT_DIR = PROJECT_DIR / "results"
+PIPELINE_CACHE_JSON = REPORT_DIR / "pipeline_run_cache.json"
 
 for folder in [DATA_DIR, PROCESSED_DIR, REPORT_DIR, RESULT_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
@@ -65,12 +66,11 @@ INCLUDE_INSTRUMENT_TYPES = (
 
 # First test with 50. Change to None for all. None
 
-READ_LIMIT = 200
-
+READ_LIMIT = None
 
 ABNORMAL_RETURN_THRESHOLD = 0.20
 
-HOT_THEME_SLOT_RATIO = 0.7
+HOT_THEME_SLOT_RATIO = 0.3
 HOT_THEME_WEIGHTS = {
     "ai_infrastructure": 1.00,
     "robotics_automation": 0.90,

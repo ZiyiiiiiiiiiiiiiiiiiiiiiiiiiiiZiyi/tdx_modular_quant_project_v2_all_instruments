@@ -31,6 +31,7 @@ def view_strategy_selection(
                 "tdx_daily_raw.parquet",
                 "tdx_daily_clean.parquet",
                 "tdx_daily_features.parquet",
+                "strategy_selection.parquet",
             }
         )
     else:
