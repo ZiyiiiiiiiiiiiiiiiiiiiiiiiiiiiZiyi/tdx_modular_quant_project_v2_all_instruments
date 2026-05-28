@@ -2,6 +2,7 @@
 import pandas as pd
 
 from config import RAW_DAILY_PARQUET, CLEAN_DAILY_PARQUET, START_DATE, END_DATE, ABNORMAL_RETURN_THRESHOLD
+from functions.pricing.price_views import attach_nominal_price_columns
 from functions.quality_checks import add_quality_flags, save_quality_reports
 
 def basic_clean_daily(df):
@@ -32,6 +33,7 @@ def clean_daily_data():
 
     clean = basic_clean_daily(df)
     clean = add_quality_flags(clean, group_col="symbol", abnormal_threshold=ABNORMAL_RETURN_THRESHOLD)
+    clean = attach_nominal_price_columns(clean)
     clean.to_parquet(CLEAN_DAILY_PARQUET, index=False)
 
     save_quality_reports(clean, group_col="symbol")

@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
+
+from functions.labels import default_label_specs
 
 try:
     import xgboost as xgb
@@ -16,6 +19,12 @@ except ImportError:
 DEFAULT_TARGET_COL = "_ml_target"
 DEFAULT_LOOKBACK_DAYS = 500
 DEFAULT_LABEL_HORIZON = 5
+DEFAULT_FEATURE_SUFFIX_PRIORITY = (
+    "_neutralized",
+    "_z",
+    "_robust",
+    "_winsor",
+)
 
 MODEL_CONFIGS = {
     "elasticnet": {
@@ -36,6 +45,26 @@ MODEL_CONFIGS = {
 }
 
 
+def list_ml_baseline_models():
+    return tuple(MODEL_CONFIGS.keys())
+
+
+def build_ml_baseline_contract():
+    rows = []
+    for model_name, config in MODEL_CONFIGS.items():
+        rows.append(
+            {
+                "model_name": model_name,
+                "min_train_rows": config["min_train_rows"],
+                "max_features": config["max_features"],
+                "alpha": config["alpha"],
+                "default_target_col": DEFAULT_TARGET_COL,
+                "default_label_horizon": DEFAULT_LABEL_HORIZON,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_factor(
     df_factors,
     target_col=None,
@@ -54,7 +83,8 @@ def compute_factor(
 
     for rebalance_date in rebalance_index:
         train_start = rebalance_date - pd.Timedelta(days=lookback_days)
-        train_mask = (data["date"] < rebalance_date) & (data["date"] >= train_start)
+        label_safe_cutoff = rebalance_date - BDay(DEFAULT_LABEL_HORIZON)
+        train_mask = (data["date"] < label_safe_cutoff) & (data["date"] >= train_start)
         predict_mask = data["date"] == rebalance_date
 
         train_data = data.loc[train_mask].copy()
@@ -90,6 +120,7 @@ def compute_factor(
         scored["score_ml"] = scores
         scored["ml_model"] = model_type
         scored["training_window_days"] = lookback_days
+        scored["label_purge_periods"] = DEFAULT_LABEL_HORIZON
         scored["fitted_feature_count"] = len(feature_cols)
         scored["feature_list"] = ",".join(feature_cols)
         rows.append(scored)
@@ -102,6 +133,7 @@ def compute_factor(
                 "score_ml",
                 "ml_model",
                 "training_window_days",
+                "label_purge_periods",
                 "fitted_feature_count",
                 "feature_list",
             ]
@@ -116,8 +148,12 @@ def _prepare_ml_frame(df_factors, target_col):
     data = data.sort_values(["symbol", "date"]).copy()
 
     if target_col is None:
-        future_close = data.groupby("symbol")["close"].shift(-DEFAULT_LABEL_HORIZON)
-        data[DEFAULT_TARGET_COL] = future_close / data["close"] - 1
+        label_name = f"future_ret_{DEFAULT_LABEL_HORIZON}"
+        if label_name in data.columns:
+            data[DEFAULT_TARGET_COL] = pd.to_numeric(data[label_name], errors="coerce")
+        else:
+            future_close = data.groupby("symbol")["close"].shift(-DEFAULT_LABEL_HORIZON)
+            data[DEFAULT_TARGET_COL] = future_close / data["close"] - 1
     else:
         data[DEFAULT_TARGET_COL] = pd.to_numeric(data[target_col], errors="coerce")
 
@@ -132,10 +168,13 @@ def _normalize_rebalance_dates(data, rebalance_dates):
 
 def _select_feature_columns(train_data, max_features):
     candidate_cols = []
+    preferred_aliases = _build_preferred_feature_aliases(train_data.columns)
     for col in train_data.columns:
         if col in {"date", "symbol", DEFAULT_TARGET_COL}:
             continue
         if col.startswith("future_ret_") or col.startswith("reward_") or col.startswith("score_"):
+            continue
+        if col in preferred_aliases and preferred_aliases[col] != col:
             continue
         if not pd.api.types.is_numeric_dtype(train_data[col]):
             continue
@@ -158,6 +197,24 @@ def _select_feature_columns(train_data, max_features):
 
     scored_candidates.sort(key=lambda item: (-item[1], item[0]))
     return [col for col, _ in scored_candidates[:max_features]]
+
+
+def _build_preferred_feature_aliases(columns):
+    columns = list(columns)
+    alias_map = {}
+    normalized_candidates = {}
+    for col in columns:
+        for suffix in DEFAULT_FEATURE_SUFFIX_PRIORITY:
+            if col.endswith(suffix):
+                base = col[: -len(suffix)]
+                normalized_candidates.setdefault(base, col)
+                break
+        else:
+            normalized_candidates.setdefault(col, col)
+
+    for col in columns:
+        alias_map[col] = normalized_candidates.get(col, col)
+    return alias_map
 
 
 def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, model_type, alpha):

@@ -45,7 +45,12 @@ def calc_backtest_metrics(daily_result, risk_free_rate=0.0):
     end_date = data["date"].max()
     trading_days = len(data)
 
-    total_return = data["net_value"].iloc[-1] / data["net_value"].iloc[0] - 1
+    initial_value = (
+        float(data["initial_cash"].iloc[0])
+        if "initial_cash" in data.columns and pd.notna(data["initial_cash"].iloc[0])
+        else data["net_value"].iloc[0]
+    )
+    total_return = data["net_value"].iloc[-1] / initial_value - 1
 
     if trading_days > 1:
         annual_return = (1 + total_return) ** (252 / trading_days) - 1

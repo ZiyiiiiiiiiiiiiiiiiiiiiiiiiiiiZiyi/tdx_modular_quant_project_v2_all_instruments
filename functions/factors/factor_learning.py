@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
+
+from functions.labels import LABEL_DEFAULT_HORIZONS
 
 
 GROUP_COL = "symbol"
@@ -94,9 +97,9 @@ def get_learning_strategy_configs():
             }
 
         for reward_method, reward_label in QUBIT_REWARD_METHODS.items():
-            strategy_name = f"qubit_ml_{reward_method}_{profile_name}"
+            strategy_name = f"quantum_inspired_{reward_method}_{profile_name}"
             configs[strategy_name] = {
-                "module": "qubit_ml",
+                "module": "quantum_inspired",
                 "reward_method": reward_method,
                 "reward_label": reward_label,
                 "profile_name": profile_name,
@@ -114,6 +117,26 @@ LEARNING_STRATEGY_DESCRIPTIONS = {
     strategy_name: config["description"]
     for strategy_name, config in LEARNING_STRATEGY_CONFIGS.items()
 }
+
+
+def build_learning_baseline_contract():
+    rows = []
+    for strategy_name, config in LEARNING_STRATEGY_CONFIGS.items():
+        profile = LEARNING_PROFILES[config["profile_name"]]
+        rows.append(
+            {
+                "strategy_name": strategy_name,
+                "module": config["module"],
+                "reward_method": config["reward_method"],
+                "profile_name": config["profile_name"],
+                "lookback_days": profile["lookback_days"],
+                "max_features": profile["max_features"],
+                "qubit_count": profile["qubit_count"],
+                "ridge_alpha": profile["ridge_alpha"],
+                "min_train_rows": profile["min_train_rows"],
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def generate_learning_module_scores(df, rebalance_dates):
@@ -138,9 +161,11 @@ def _prepare_learning_frame(df):
     data = data.sort_values([GROUP_COL, "date"]).copy()
     grouped = data.groupby(GROUP_COL, group_keys=False)
 
-    for horizon in [5, 10, 20]:
-        future_close = grouped["close"].shift(-horizon)
-        data[f"future_ret_{horizon}"] = future_close / data["close"] - 1
+    for horizon in LABEL_DEFAULT_HORIZONS:
+        label_name = f"future_ret_{horizon}"
+        if label_name not in data.columns:
+            future_close = grouped["close"].shift(-horizon)
+            data[label_name] = future_close / data["close"] - 1
 
     data["reward_classic_forward_return"] = data["future_ret_5"]
     data["reward_classic_risk_adjusted"] = data["future_ret_10"] / (
@@ -162,11 +187,13 @@ def _prepare_learning_frame(df):
 def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profile_name):
     profile = LEARNING_PROFILES[profile_name]
     target_col = _target_column(module_name, reward_method)
+    target_horizon = _target_horizon(module_name, reward_method)
     rows = []
 
     for rebalance_date in pd.to_datetime(pd.Series(rebalance_dates)).sort_values():
         train_start = rebalance_date - pd.Timedelta(days=profile["lookback_days"])
-        train_mask = (data["date"] < rebalance_date) & (data["date"] >= train_start)
+        label_safe_cutoff = rebalance_date - BDay(target_horizon)
+        train_mask = (data["date"] < label_safe_cutoff) & (data["date"] >= train_start)
         predict_mask = data["date"] == rebalance_date
 
         train_data = data.loc[train_mask].copy()
@@ -195,7 +222,7 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
                 target_col=target_col,
                 alpha=profile["ridge_alpha"],
             )
-        elif module_name == "qubit_ml":
+        elif module_name == "quantum_inspired":
             scores = _fit_qubit_model(
                 train_frame=train_data,
                 predict_frame=predict_data,
@@ -213,8 +240,9 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
         scored["reward_method"] = reward_method
         scored["profile_tier"] = profile_name
         scored["training_window_days"] = profile["lookback_days"]
+        scored["label_purge_periods"] = target_horizon
         scored["feature_budget"] = profile["max_features"]
-        scored["qubit_count"] = profile["qubit_count"] if module_name == "qubit_ml" else 0
+        scored["qubit_count"] = profile["qubit_count"] if module_name == "quantum_inspired" else 0
         scored["fitted_feature_count"] = len(feature_cols)
         scored["feature_list"] = ",".join(feature_cols)
         rows.append(scored)
@@ -229,6 +257,7 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
                 "reward_method",
                 "profile_tier",
                 "training_window_days",
+                "label_purge_periods",
                 "feature_budget",
                 "qubit_count",
                 "fitted_feature_count",
@@ -242,13 +271,14 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
 def _select_feature_columns(train_data, target_col, max_features):
     candidates = []
     for col in BASE_FEATURE_PRIORITY:
-        if col not in train_data.columns:
+        preferred_col = _preferred_feature_column(train_data.columns, col)
+        if preferred_col not in train_data.columns:
             continue
-        if not pd.api.types.is_numeric_dtype(train_data[col]):
+        if not pd.api.types.is_numeric_dtype(train_data[preferred_col]):
             continue
-        if train_data[col].notna().sum() < 30:
+        if train_data[preferred_col].notna().sum() < 30:
             continue
-        candidates.append(col)
+        candidates.append(preferred_col)
 
     if not candidates:
         return []
@@ -264,9 +294,30 @@ def _select_feature_columns(train_data, target_col, max_features):
             score = abs(corr) if pd.notna(corr) else 0.0
         correlations.append((col, score))
 
-    correlations.sort(key=lambda item: (-item[1], BASE_FEATURE_PRIORITY.index(item[0])))
+    correlations.sort(
+        key=lambda item: (
+            -item[1],
+            BASE_FEATURE_PRIORITY.index(_base_feature_name(item[0])),
+        )
+    )
     selected = [col for col, _ in correlations[:max_features]]
     return selected
+
+
+def _preferred_feature_column(columns, base_name):
+    columns = set(columns)
+    for suffix in ("_neutralized", "_z", "_robust", "_winsor"):
+        candidate = f"{base_name}{suffix}"
+        if candidate in columns:
+            return candidate
+    return base_name
+
+
+def _base_feature_name(column_name):
+    for suffix in ("_neutralized", "_z", "_robust", "_winsor"):
+        if column_name.endswith(suffix):
+            return column_name[: -len(suffix)]
+    return column_name
 
 
 def _fit_classic_model(train_frame, predict_frame, feature_cols, target_col, alpha):
@@ -329,13 +380,23 @@ def _target_column(module_name, reward_method):
     mapping = {
         ("classic_ml", "forward_return"): "reward_classic_forward_return",
         ("classic_ml", "risk_adjusted"): "reward_classic_risk_adjusted",
-        ("qubit_ml", "phase_alignment"): "reward_qubit_phase_alignment",
-        ("qubit_ml", "stability_tunneling"): "reward_qubit_stability_tunneling",
+        ("quantum_inspired", "phase_alignment"): "reward_qubit_phase_alignment",
+        ("quantum_inspired", "stability_tunneling"): "reward_qubit_stability_tunneling",
     }
     key = (module_name, reward_method)
     if key not in mapping:
         raise ValueError(f"Unsupported reward method: {key}")
     return mapping[key]
+
+
+def _target_horizon(module_name, reward_method):
+    mapping = {
+        ("classic_ml", "forward_return"): 5,
+        ("classic_ml", "risk_adjusted"): 10,
+        ("quantum_inspired", "phase_alignment"): 10,
+        ("quantum_inspired", "stability_tunneling"): 20,
+    }
+    return mapping[(module_name, reward_method)]
 
 
 def _ridge_predict(x_train, y_train, x_predict, alpha):
