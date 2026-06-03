@@ -73,6 +73,23 @@ def normalize_market_cap_history(raw_df, source_name="manual_csv"):
     return normalized[REQUIRED_MARKET_CAP_COLUMNS].copy()
 
 
+def load_market_cap_input(input_path, source_name="manual_file"):
+    """Load a provider or manually exported market-cap file into the project schema."""
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Market-cap input file does not exist: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".parquet":
+        raw = pd.read_parquet(path)
+    elif suffix in {".csv", ".txt"}:
+        raw = pd.read_csv(path)
+    elif suffix in {".xls", ".xlsx"}:
+        raw = pd.read_excel(path)
+    else:
+        raise ValueError(f"Unsupported market-cap input format: {suffix}")
+    return normalize_market_cap_history(raw, source_name=source_name)
+
+
 def detect_market_cap_jump_flags(market_cap_df, jump_ratio=0.30):
     if market_cap_df.empty:
         return market_cap_df.copy()

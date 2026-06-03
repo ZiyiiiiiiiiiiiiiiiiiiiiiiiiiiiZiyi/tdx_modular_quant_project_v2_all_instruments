@@ -45,6 +45,12 @@ def main():
     parser.add_argument("--skip-dividends", action="store_true")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument(
+        "--dividend-batch-size",
+        type=int,
+        default=5,
+        help="Dividend symbols staged per checkpoint. Keep this small because each symbol queries multiple years.",
+    )
+    parser.add_argument(
         "--request-delay-seconds",
         type=float,
         default=0.35,
@@ -58,6 +64,12 @@ def main():
     )
     parser.add_argument("--login-retries", type=int, default=3)
     parser.add_argument("--login-retry-delay-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--socket-timeout-seconds",
+        type=float,
+        default=30.0,
+        help="Abort a stalled BaoStock socket request so a later run can resume from staged data.",
+    )
     parser.add_argument("--publish", action="store_true", help="Publish completed full-universe results.")
     parser.add_argument("--resume", action="store_true", help="Resume a staged fetch.")
     args = parser.parse_args()
@@ -70,6 +82,7 @@ def main():
     stage_label = "validation" if args.limit is not None else "full"
     factor_stage = RAW_EXTERNAL_DIR / f"baostock_adjustment_{stage_label}.parquet"
     factor_error_stage = RAW_EXTERNAL_DIR / f"baostock_adjustment_{stage_label}_errors.csv"
+    factor_completion_stage = RAW_EXTERNAL_DIR / f"baostock_adjustment_{stage_label}_completed_symbols.csv"
     factors, factor_errors = _fetch_in_batches(
         symbols=symbols,
         fetcher=lambda batch: fetch_adjustment_factors(
@@ -79,9 +92,11 @@ def main():
             request_delay_seconds=args.request_delay_seconds,
             login_retries=args.login_retries,
             login_retry_delay_seconds=args.login_retry_delay_seconds,
+            socket_timeout_seconds=args.socket_timeout_seconds,
         ),
         data_path=factor_stage,
         error_path=factor_error_stage,
+        completion_path=factor_completion_stage,
         batch_size=args.batch_size,
         resume=args.resume,
         batch_delay_seconds=args.batch_delay_seconds,
@@ -104,6 +119,7 @@ def main():
     if not args.skip_dividends:
         action_stage = RAW_EXTERNAL_DIR / f"baostock_dividend_{stage_label}.parquet"
         action_error_stage = RAW_EXTERNAL_DIR / f"baostock_dividend_{stage_label}_errors.csv"
+        action_completion_stage = RAW_EXTERNAL_DIR / f"baostock_dividend_{stage_label}_completed_symbols.csv"
         actions, action_errors = _fetch_in_batches(
             symbols=symbols,
             fetcher=lambda batch: fetch_dividend_actions(
@@ -113,10 +129,12 @@ def main():
                 request_delay_seconds=args.request_delay_seconds,
                 login_retries=args.login_retries,
                 login_retry_delay_seconds=args.login_retry_delay_seconds,
+                socket_timeout_seconds=args.socket_timeout_seconds,
             ),
             data_path=action_stage,
             error_path=action_error_stage,
-            batch_size=args.batch_size,
+            completion_path=action_completion_stage,
+            batch_size=args.dividend_batch_size,
             resume=args.resume,
             batch_delay_seconds=args.batch_delay_seconds,
         )
@@ -137,17 +155,38 @@ def main():
             print(f"Published corporate action data: {CORPORATE_ACTIONS_PARQUET}")
 
 
-def _fetch_in_batches(symbols, fetcher, data_path, error_path, batch_size, resume, batch_delay_seconds):
+def _fetch_in_batches(
+    symbols,
+    fetcher,
+    data_path,
+    error_path,
+    completion_path,
+    batch_size,
+    resume,
+    batch_delay_seconds,
+):
     data_path.parent.mkdir(parents=True, exist_ok=True)
     existing_data = pd.read_parquet(data_path) if resume and data_path.exists() else pd.DataFrame()
     try:
         existing_errors = pd.read_csv(error_path) if resume and error_path.exists() else pd.DataFrame()
     except EmptyDataError:
         existing_errors = pd.DataFrame()
+    try:
+        existing_completed = pd.read_csv(completion_path) if resume and completion_path.exists() else pd.DataFrame()
+    except EmptyDataError:
+        existing_completed = pd.DataFrame()
     done = set(existing_data.get("symbol", pd.Series(dtype=str)).dropna())
     if "symbol" in existing_errors.columns:
         done.update(existing_errors["symbol"].dropna())
+    if "symbol" in existing_completed.columns:
+        done.update(existing_completed["symbol"].dropna())
     pending = [symbol for symbol in symbols if symbol not in done]
+    completed_symbols = set(existing_completed.get("symbol", pd.Series(dtype=str)).dropna())
+    print(
+        f"Resume checkpoint: completed={len(done)}, pending={len(pending)}, "
+        f"batch_size={batch_size}, completion_file={completion_path.name}",
+        flush=True,
+    )
     data_frames = [existing_data] if not existing_data.empty else []
     error_frames = [existing_errors] if not existing_errors.empty else []
     for offset in range(0, len(pending), batch_size):
@@ -162,7 +201,14 @@ def _fetch_in_batches(symbols, fetcher, data_path, error_path, batch_size, resum
         data.to_parquet(data_path, index=False)
         if not errors.empty:
             errors.to_csv(error_path, index=False, encoding="utf-8-sig")
-        print(f"Fetched {min(offset + batch_size, len(pending))}/{len(pending)} pending symbols")
+        completed_symbols.update(batch)
+        pd.DataFrame({"symbol": sorted(completed_symbols)}).to_csv(
+            completion_path, index=False, encoding="utf-8-sig"
+        )
+        print(
+            f"Fetched and checkpointed {min(offset + batch_size, len(pending))}/{len(pending)} pending symbols",
+            flush=True,
+        )
         if batch_delay_seconds > 0 and offset + batch_size < len(pending):
             time.sleep(batch_delay_seconds)
     data = pd.concat(data_frames, ignore_index=True) if data_frames else pd.DataFrame()

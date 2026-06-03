@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.offsets import BDay
 
-from functions.labels import LABEL_DEFAULT_HORIZONS
+from config import LABEL_DEFAULT_HORIZONS
+from functions.progress import progress_iter, progress_step
 
 
 GROUP_COL = "symbol"
@@ -121,7 +122,12 @@ LEARNING_STRATEGY_DESCRIPTIONS = {
 
 def build_learning_baseline_contract():
     rows = []
-    for strategy_name, config in LEARNING_STRATEGY_CONFIGS.items():
+    for strategy_name, config in progress_iter(
+        LEARNING_STRATEGY_CONFIGS.items(),
+        desc="learning strategies",
+        total=len(LEARNING_STRATEGY_CONFIGS),
+    ):
+        progress_step(f"learning strategy: {strategy_name}")
         profile = LEARNING_PROFILES[config["profile_name"]]
         rows.append(
             {
@@ -155,10 +161,36 @@ def generate_learning_module_scores(df, rebalance_dates):
     return score_tables
 
 
+def generate_learning_strategy_scores(df, strategy_name, rebalance_dates):
+    """Generate scores for one learning strategy to keep memory bounded."""
+    if strategy_name not in LEARNING_STRATEGY_CONFIGS:
+        raise KeyError(f"Unknown learning strategy: {strategy_name}")
+    config = LEARNING_STRATEGY_CONFIGS[strategy_name]
+    data = _prepare_learning_frame(df)
+    return _score_one_strategy(
+        data=data,
+        rebalance_dates=rebalance_dates,
+        module_name=config["module"],
+        reward_method=config["reward_method"],
+        profile_name=config["profile_name"],
+    )
+
+
 def _prepare_learning_frame(df):
-    data = df.copy()
+    keep_cols = ["date", GROUP_COL, "close"]
+    for horizon in LABEL_DEFAULT_HORIZONS:
+        label_name = f"future_ret_{horizon}"
+        if label_name in df.columns:
+            keep_cols.append(label_name)
+    for base_col in BASE_FEATURE_PRIORITY:
+        for suffix in ("", "_neutralized", "_z", "_robust", "_winsor"):
+            col = f"{base_col}{suffix}"
+            if col in df.columns:
+                keep_cols.append(col)
+    keep_cols = list(dict.fromkeys(col for col in keep_cols if col in df.columns))
+    data = df.loc[:, keep_cols].copy()
     data["date"] = pd.to_datetime(data["date"])
-    data = data.sort_values([GROUP_COL, "date"]).copy()
+    data = data.sort_values([GROUP_COL, "date"])
     grouped = data.groupby(GROUP_COL, group_keys=False)
 
     for horizon in LABEL_DEFAULT_HORIZONS:
@@ -190,7 +222,12 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
     target_horizon = _target_horizon(module_name, reward_method)
     rows = []
 
-    for rebalance_date in pd.to_datetime(pd.Series(rebalance_dates)).sort_values():
+    ordered_dates = pd.to_datetime(pd.Series(rebalance_dates)).sort_values()
+    for rebalance_date in progress_iter(
+        ordered_dates,
+        desc=f"learning {module_name}/{reward_method}/{profile_name}",
+        total=len(ordered_dates),
+    ):
         train_start = rebalance_date - pd.Timedelta(days=profile["lookback_days"])
         label_safe_cutoff = rebalance_date - BDay(target_horizon)
         train_mask = (data["date"] < label_safe_cutoff) & (data["date"] >= train_start)

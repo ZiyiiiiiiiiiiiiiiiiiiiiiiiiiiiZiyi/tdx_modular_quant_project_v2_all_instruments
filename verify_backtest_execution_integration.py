@@ -44,7 +44,7 @@ def verify_backtest_execution_integration():
                 "is_trading": [True] * 10,
                 "abnormal_jump": [False] * 10,
                 "rough_limit_up": [False] * 10,
-                "rough_limit_down": [False, False, False, True, False] + [False] * 5,
+                "rough_limit_down": [False, False, False, False, True] + [False] * 5,
             }
         )
         feature_path = temp / "tdx_daily_features.parquet"

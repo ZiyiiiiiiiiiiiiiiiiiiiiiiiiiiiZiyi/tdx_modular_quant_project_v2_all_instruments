@@ -71,6 +71,13 @@ def _base_strategy_specs():
             description="20日收益率 ret_20 - 20日波动率 volatility_20",
         ),
         StrategySpec(
+            name="position_managed_kelly",
+            score_col="kelly_score",
+            ascending=False,
+            source="position_management",
+            description="仓位管理组主控策略：技术信号先聚合胜率/盈亏比，再用保守凯利公式决定目标权重",
+        ),
+        StrategySpec(
             name="ml_elasticnet",
             score_col="score_ml",
             ascending=False,

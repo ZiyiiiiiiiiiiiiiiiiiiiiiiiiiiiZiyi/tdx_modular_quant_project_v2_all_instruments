@@ -14,6 +14,7 @@ from config import (
     HOT_THEME_SLOT_RATIO,
     HOT_THEME_WEIGHTS,
     FORMAL_MODE_NAME,
+    MARKET_CAP_PARQUET,
     RESEARCH_RUN_MODE,
 )
 from functions.data_sources.adjustment_factors import attach_adjustment_factors_to_daily
@@ -29,7 +30,7 @@ from functions.feature_normalization import (
     winsorize_cross_section,
     zscore_cross_section,
 )
-from functions.factors.factor_learning import generate_learning_module_scores
+from functions.factors.factor_learning import generate_learning_module_scores, generate_learning_strategy_scores
 from functions.factors.factor_ml import compute_factor as compute_ml_factor
 from functions.labels import apply_default_labels
 from functions.pricing.price_views import (
@@ -37,8 +38,11 @@ from functions.pricing.price_views import (
     attach_nominal_price_columns,
     attach_point_in_time_adjusted_price_columns,
 )
+from functions.progress import progress_iter, progress_step
 from functions.sector_taxonomy import attach_sector_labels
 from functions.strategy_registry import STRATEGY_REGISTRY
+from functions.strategy_signal_generators import build_technical_strategy_features
+from functions.position_managed_selection import generate_position_managed_selection
 from functions.strategy_selection import get_rebalance_dates
 
 
@@ -54,14 +58,19 @@ NORMALIZED_FEATURE_COLUMNS = [
 
 
 def generate_daily_features_multi():
+    progress_step("feature step: load clean daily parquet")
     df = pd.read_parquet(CLEAN_DAILY_PARQUET)
     if ADJUSTMENT_FACTORS_PARQUET.exists():
+        progress_step("feature step: attach adjustment factors")
         df = attach_adjustment_factors_to_daily(df, pd.read_parquet(ADJUSTMENT_FACTORS_PARQUET))
+    progress_step("feature step: build feature frame")
     df = build_feature_frame(df)
 
+    progress_step("feature step: save feature reports")
     _save_feature_reports(df)
     _save_feature_registry_validation(df)
 
+    progress_step("feature step: write feature parquet")
     df.to_parquet(FEATURE_DAILY_PARQUET, index=False)
     print("Feature shape:", df.shape)
     return df
@@ -69,6 +78,9 @@ def generate_daily_features_multi():
 
 def build_feature_frame(df):
     df = df.sort_values([GROUP_COL, "date"]).copy()
+    progress_step("feature frame: attach market cap history")
+    df = _attach_market_cap_history(df)
+    progress_step("feature frame: attach price views")
     df = attach_nominal_price_columns(df)
     if "backward_factor" in df.columns:
         df = attach_point_in_time_adjusted_price_columns(df)
@@ -86,13 +98,14 @@ def build_feature_frame(df):
         "adj_factor_available", pd.Series(False, index=df.index)
     ).fillna(False)
     df["feature_timestamp"] = pd.to_datetime(df["date"])
+    progress_step("feature frame: attach sector labels")
     df = attach_sector_labels(df)
     grouped = df.groupby(GROUP_COL, group_keys=False)
 
-    for n in [1, 5, 10, 20, 60]:
-        df[f"ret_{n}"] = grouped[close_col].pct_change(n)
+    for n in progress_iter([1, 5, 10, 20, 60], desc="returns"):
+        df[f"ret_{n}"] = grouped[close_col].pct_change(n, fill_method=None)
 
-    for n in [5, 10, 20, 60, 120]:
+    for n in progress_iter([5, 10, 20, 60, 120], desc="moving averages"):
         df[f"ma_{n}"] = grouped[close_col].transform(lambda x: x.rolling(n, min_periods=n).mean())
         df[f"volume_ma_{n}"] = grouped["volume"].transform(
             lambda x: x.rolling(n, min_periods=n).mean()
@@ -101,7 +114,7 @@ def build_feature_frame(df):
     df["close_to_ma20"] = df[close_col] / df["ma_20"] - 1
     df["close_to_ma60"] = df[close_col] / df["ma_60"] - 1
 
-    for n in [10, 20, 60]:
+    for n in progress_iter([10, 20, 60], desc="volatility"):
         df[f"volatility_{n}"] = grouped["ret_1"].transform(
             lambda x: x.rolling(n, min_periods=n).std()
         )
@@ -119,10 +132,37 @@ def build_feature_frame(df):
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"] - 1
 
     df["score_mom_lowvol"] = df["ret_20"] - df["volatility_20"]
+    progress_step("feature frame: attach technical strategy factors")
+    df = build_technical_strategy_features(df)
 
+    progress_step("feature frame: apply labels")
     df = apply_default_labels(df, price_col=close_col)
+    progress_step("feature frame: attach normalized feature views")
     df = _attach_normalized_feature_views(df)
     return df
+
+
+def _attach_market_cap_history(df):
+    if not MARKET_CAP_PARQUET.exists():
+        return df
+    market_cap = pd.read_parquet(
+        MARKET_CAP_PARQUET,
+        columns=[
+            "symbol",
+            "date",
+            "total_cap",
+            "float_cap",
+            "market_cap_jump_flag",
+            "float_cap_jump_flag",
+            "jump_event_type",
+            "stabilized_total_cap",
+            "stabilized_float_cap",
+        ],
+    )
+    market_cap["date"] = pd.to_datetime(market_cap["date"])
+    frame = df
+    frame["date"] = pd.to_datetime(frame["date"])
+    return frame.merge(market_cap, on=["symbol", "date"], how="left")
 
 
 def _attach_normalized_feature_views(df):
@@ -130,9 +170,9 @@ def _attach_normalized_feature_views(df):
     if not available_cols:
         return df
 
-    frame = df.copy()
+    frame = df
     grouped = frame.groupby("date", sort=False)
-    for col in available_cols:
+    for col in progress_iter(available_cols, desc="normalize features"):
         lower = grouped[col].transform(lambda s: s.quantile(0.01))
         upper = grouped[col].transform(lambda s: s.quantile(0.99))
         winsor = frame[col].clip(lower=lower, upper=upper)
@@ -216,7 +256,21 @@ def select_instruments_by_score(
     hot_theme_slot_ratio=0.0,
 ):
     """Select top instruments only on configured rebalance dates."""
-    df_sel = df.copy()
+    needed_cols = [
+        "date",
+        "symbol",
+        "close",
+        score_col,
+        "instrument_type",
+        "is_trading",
+        "abnormal_jump",
+        "formal_price_eligible",
+        "sector_parent",
+        "sector_parent_heat",
+        "sector_branch_heat",
+    ]
+    needed_cols = list(dict.fromkeys(col for col in needed_cols if col in df.columns))
+    df_sel = df.loc[:, needed_cols].copy()
     df_sel["date"] = pd.to_datetime(df_sel["date"])
 
     if start_date is not None:
@@ -291,10 +345,24 @@ def generate_multi_strategies(
     )
 
     def select(score_col, ascending=False, source_df=None):
-        selection_source = df
+        base_cols = [
+            "date",
+            "symbol",
+            "close",
+            score_col,
+            "instrument_type",
+            "is_trading",
+            "abnormal_jump",
+            "formal_price_eligible",
+            "sector_parent",
+            "sector_parent_heat",
+            "sector_branch_heat",
+        ]
+        base_cols = list(dict.fromkeys(col for col in base_cols if col in df.columns))
+        selection_source = df.loc[:, base_cols]
         if source_df is not None:
             extra_cols = [col for col in source_df.columns if col not in {"date", "symbol"}]
-            selection_source = df.merge(
+            selection_source = selection_source.merge(
                 source_df[["date", "symbol", *extra_cols]],
                 on=["date", "symbol"],
                 how="left",
@@ -317,8 +385,13 @@ def generate_multi_strategies(
     ml_score_tables = {}
     learning_score_tables = None
 
-    for strategy_name, spec in STRATEGY_REGISTRY.items():
+    for strategy_name, spec in progress_iter(
+        STRATEGY_REGISTRY.items(),
+        desc="generate strategies",
+        total=len(STRATEGY_REGISTRY),
+    ):
         source_df = None
+        progress_step(f"strategy: {strategy_name} source={spec.source}")
 
         if spec.source == "ml":
             if spec.model_type not in ml_score_tables:
@@ -335,6 +408,16 @@ def generate_multi_strategies(
                     rebalance_dates=candidate_dates,
                 )
             source_df = learning_score_tables[strategy_name]
+        elif spec.source == "position_management":
+            strategies[strategy_name], _ = generate_position_managed_selection(
+                df,
+                top_n=top_n,
+                freq=freq,
+                start_date=start_date,
+                end_date=end_date,
+                strategy_name=strategy_name,
+            )
+            continue
 
         strategies[strategy_name] = select(
             spec.score_col,
@@ -345,8 +428,120 @@ def generate_multi_strategies(
     return strategies
 
 
+def generate_one_strategy(
+    df,
+    strategy_name,
+    top_n,
+    freq="ME",
+    include_types=("stock", "etf_fund"),
+    start_date=None,
+    end_date=None,
+):
+    """Generate one configured strategy selection with bounded intermediate state."""
+    spec = STRATEGY_REGISTRY[strategy_name]
+    candidate_dates = _strategy_rebalance_dates(
+        df=df,
+        freq=freq,
+        include_types=include_types,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    source_df = None
+    if spec.source == "ml":
+        source_df = compute_ml_factor(
+            df,
+            model_type=spec.model_type,
+            rebalance_dates=candidate_dates,
+        )
+    elif spec.source in {"classic_ml", "quantum_inspired"}:
+        source_df = generate_learning_strategy_scores(
+            df,
+            strategy_name=strategy_name,
+            rebalance_dates=candidate_dates,
+        )
+    elif spec.source == "position_management":
+        selection, _ = generate_position_managed_selection(
+            df,
+            top_n=top_n,
+            freq=freq,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_name=strategy_name,
+        )
+        return selection
+
+    base_cols = _selection_source_columns(spec.score_col, df.columns)
+    selection_source = df.loc[:, base_cols]
+    if source_df is not None:
+        extra_cols = [col for col in source_df.columns if col not in {"date", "symbol"}]
+        selection_source = selection_source.merge(
+            source_df[["date", "symbol", *extra_cols]],
+            on=["date", "symbol"],
+            how="left",
+        )
+    return select_instruments_by_score(
+        selection_source,
+        spec.score_col,
+        top_n=top_n,
+        freq=freq,
+        include_types=include_types,
+        start_date=start_date,
+        end_date=end_date,
+        ascending=spec.ascending,
+        hot_theme_weights=HOT_THEME_WEIGHTS if ENABLE_HOT_THEME_BIAS else {},
+        hot_theme_slot_ratio=HOT_THEME_SLOT_RATIO if ENABLE_HOT_THEME_BIAS else 0.0,
+    )
+
+
+def required_feature_columns_for_strategy(strategy_name):
+    spec = STRATEGY_REGISTRY[strategy_name]
+    columns = set(_selection_source_columns(spec.score_col))
+    columns.update(["ret_1", "ret_5", "ret_10", "ret_20", "ret_60", "close"])
+    if spec.source == "ml":
+        from functions.factors.factor_ml import BASE_ML_FEATURE_COLUMNS, DEFAULT_FEATURE_SUFFIX_PRIORITY
+
+        columns.update(BASE_ML_FEATURE_COLUMNS)
+        for base_col in BASE_ML_FEATURE_COLUMNS:
+            for suffix in DEFAULT_FEATURE_SUFFIX_PRIORITY:
+                columns.add(f"{base_col}{suffix}")
+        columns.update(["future_ret_5"])
+    elif spec.source in {"classic_ml", "quantum_inspired"}:
+        from functions.factors.factor_learning import BASE_FEATURE_PRIORITY
+        from config import LABEL_DEFAULT_HORIZONS
+
+        columns.update(BASE_FEATURE_PRIORITY)
+        for base_col in BASE_FEATURE_PRIORITY:
+            for suffix in ("_neutralized", "_z", "_robust", "_winsor"):
+                columns.add(f"{base_col}{suffix}")
+        for horizon in LABEL_DEFAULT_HORIZONS:
+            columns.add(f"future_ret_{horizon}")
+    return sorted(columns)
+
+
+def _selection_source_columns(score_col, available_columns=None):
+    needed = [
+        "date",
+        "symbol",
+        "close",
+        score_col,
+        "instrument_type",
+        "is_trading",
+        "abnormal_jump",
+        "formal_price_eligible",
+        "sector_parent",
+        "sector_parent_heat",
+        "sector_branch_heat",
+    ]
+    if available_columns is None:
+        return list(dict.fromkeys(needed))
+    available = set(available_columns)
+    return list(dict.fromkeys(col for col in needed if col in available))
+
+
 def _strategy_rebalance_dates(df, freq, include_types, start_date, end_date):
-    base = df.copy()
+    needed_cols = ["date", "symbol", "instrument_type", "is_trading", "abnormal_jump"]
+    needed_cols = [col for col in needed_cols if col in df.columns]
+    base = df.loc[:, needed_cols].copy()
     base["date"] = pd.to_datetime(base["date"])
     if start_date is not None:
         base = base[base["date"] >= pd.to_datetime(start_date)]

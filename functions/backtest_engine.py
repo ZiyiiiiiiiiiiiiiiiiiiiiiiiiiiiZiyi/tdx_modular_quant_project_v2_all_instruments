@@ -9,6 +9,9 @@ from config import (
     MIN_LOT_SIZE,
     ORDER_LEDGER_PREFIX,
     RESULT_DIR,
+    CASH_LEDGER_PREFIX,
+    TAX_LEDGER_PREFIX,
+    VALUATION_LEDGER_PREFIX,
 )
 from functions.execution.liquidity_lock_handler import (
     build_liquidity_lock_report,
@@ -16,7 +19,14 @@ from functions.execution.liquidity_lock_handler import (
 )
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.order_simulator import build_delayed_order_queue, simulate_order_book
+from functions.execution.tax_ledger import build_trade_tax_ledger, tax_ledger_total
+from functions.execution.valuation import (
+    build_blocked_order_valuation_ledger,
+    valuation_discount_by_date,
+)
+from functions.governance import research_status_dict
 from functions.metrics import calc_backtest_metrics
+from functions.performance_charts import save_performance_diagnostics
 
 try:
     import matplotlib.pyplot as plt
@@ -107,11 +117,12 @@ def run_backtest(
         one_holdings = df_sel[df_sel["rebalance_date"] == rebalance_date][
             ["rebalance_date", "symbol", "weight"]
         ].copy()
+        execution_date = pd.Timestamp(period_dates.iloc[0])
         rebalance_orders = _build_rebalance_orders(
             one_holdings=one_holdings,
             previous_weights=actual_weights,
             feature_data=feature_data,
-            trade_date=rebalance_date,
+            trade_date=execution_date,
             initial_cash=initial_cash,
         )
         simulated_orders = simulate_order_book(rebalance_orders)
@@ -266,7 +277,14 @@ def run_backtest(
     daily_result["daily_return"] = daily_result["net_daily_return"]
     daily_result["nav"] = (1 + daily_result["daily_return"]).cumprod() * initial_cash
     daily_result["net_value"] = daily_result["nav"]
+    # The live exploratory engine has not integrated an independent frozen-position
+    # valuation model yet. Keep both views explicit and disclose the fallback.
+    daily_result["liquidatable_nav"] = daily_result["nav"]
+    daily_result["economic_nav"] = daily_result["nav"]
+    daily_result["valuation_model_version"] = "conservative_liquidity_discount_v1"
     daily_result["initial_cash"] = float(initial_cash)
+    for key, value in research_status_dict().items():
+        daily_result[key] = value
 
     theoretical_summary = None
     if oracle_period_frames:
@@ -287,6 +305,43 @@ def run_backtest(
         risk_free_rate=risk_free_rate,
     )
     gross_nav = (1 + daily_result["gross_daily_return"]).cumprod() * initial_cash
+    order_ledger = pd.concat(order_ledger_parts, ignore_index=True) if order_ledger_parts else pd.DataFrame()
+    tax_ledger = build_trade_tax_ledger(order_ledger)
+    valuation_ledger = build_blocked_order_valuation_ledger(order_ledger)
+    valuation_discount = valuation_discount_by_date(valuation_ledger)
+    if not valuation_discount.empty:
+        daily_result = daily_result.merge(valuation_discount, on="date", how="left")
+    if "valuation_discount_amount" not in daily_result.columns:
+        daily_result["valuation_discount_amount"] = 0.0
+    daily_result["valuation_discount_amount"] = pd.to_numeric(
+        daily_result["valuation_discount_amount"], errors="coerce"
+    ).fillna(0.0)
+    daily_result["economic_nav"] = (
+        daily_result["liquidatable_nav"] - daily_result["valuation_discount_amount"]
+    ).clip(lower=0.0)
+    total_orders = len(order_ledger)
+    blocked_orders = (
+        int((order_ledger["execution_status"] != "filled").sum())
+        if total_orders and "execution_status" in order_ledger.columns
+        else 0
+    )
+    tax_impact = tax_ledger_total(tax_ledger)
+    if total_orders:
+        frozen_orders = order_ledger.copy()
+        frozen_orders["frozen_notional"] = (
+            pd.to_numeric(frozen_orders.get("remaining_shares"), errors="coerce").fillna(0.0)
+            * pd.to_numeric(frozen_orders.get("price"), errors="coerce").fillna(0.0)
+        )
+        frozen_notional = float(
+            frozen_orders.groupby("trade_date")["frozen_notional"].sum().max()
+        )
+    else:
+        frozen_notional = 0.0
+    frozen_aum_ratio = frozen_notional / float(initial_cash)
+    final_cash_drag = max(1.0 - sum(actual_weights.values()), 0.0)
+    base_cost_ratio = float(daily_result["transaction_cost"].sum())
+    gross_total_return = gross_nav.iloc[-1] / float(initial_cash) - 1 if len(gross_nav) else np.nan
+    status = research_status_dict()
     execution_metrics = pd.DataFrame(
         {
             "metric": [
@@ -295,13 +350,43 @@ def run_backtest(
                 "turnover_ratio",
                 "transaction_cost_ratio",
                 "blocked_order_count",
+                "failed_order_ratio",
+                "tax_impact_ratio",
+                "frozen_aum_ratio",
+                "cash_drag",
+                "liquidatable_total_return",
+                "economic_total_return",
+                "benchmark_excess_return",
+                "cost_sensitivity_low_return",
+                "cost_sensitivity_base_return",
+                "cost_sensitivity_high_return",
+                "research_mode",
+                "formal_status",
+                "formal_eligible",
+                "formal_block_reason_code",
+                "execution_model_version",
             ],
             "value": [
-                gross_nav.iloc[-1] / float(initial_cash) - 1 if len(gross_nav) else np.nan,
+                gross_total_return,
                 daily_result["net_value"].iloc[-1] / float(initial_cash) - 1,
                 daily_result["gross_turnover"].sum() / float(initial_cash),
-                daily_result["transaction_cost"].sum(),
-                int(daily_result["blocked_order_count"].sum()),
+                base_cost_ratio,
+                blocked_orders,
+                blocked_orders / total_orders if total_orders else 0.0,
+                tax_impact / float(initial_cash),
+                frozen_aum_ratio,
+                final_cash_drag,
+                daily_result["liquidatable_nav"].iloc[-1] / float(initial_cash) - 1,
+                daily_result["economic_nav"].iloc[-1] / float(initial_cash) - 1,
+                np.nan,
+                gross_total_return - 0.5 * base_cost_ratio,
+                gross_total_return - base_cost_ratio,
+                gross_total_return - 2.0 * base_cost_ratio,
+                status["research_mode"],
+                status["formal_status"],
+                status["formal_eligible"],
+                status["formal_block_reason_code"],
+                status["execution_model_version"],
             ],
         }
     )
@@ -320,13 +405,20 @@ def run_backtest(
     plot_file = RESULT_DIR / f"equity_curve_{strategy_name}.png"
     learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}.csv"
     order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}.csv"
+    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}.csv"
+    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}.csv"
+    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)
     metrics.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
     holdings_record.to_csv(holdings_csv, index=False, encoding="utf-8-sig")
-    order_ledger = pd.concat(order_ledger_parts, ignore_index=True) if order_ledger_parts else pd.DataFrame()
     order_ledger.to_csv(order_ledger_csv, index=False, encoding="utf-8-sig")
+    tax_ledger.to_csv(tax_ledger_csv, index=False, encoding="utf-8-sig")
+    daily_result[
+        ["date", "initial_cash", "net_value", "liquidatable_nav", "economic_nav", "valuation_discount_amount"]
+    ].to_csv(cash_ledger_csv, index=False, encoding="utf-8-sig")
+    valuation_ledger.to_csv(valuation_ledger_csv, index=False, encoding="utf-8-sig")
     _save_learning_metadata(df_sel, learning_meta_csv)
     if not liquidity_report.empty:
         save_liquidity_lock_report(
@@ -343,6 +435,12 @@ def run_backtest(
         show_plot=show_plot,
         output_file=plot_file,
         holdings_record=holdings_record,
+    )
+    diagnostic_outputs = save_performance_diagnostics(
+        daily_result=daily_result,
+        strategy_name=strategy_name,
+        output_dir=RESULT_DIR,
+        selection=df_sel,
     )
 
     print("\n========== Backtest Result ==========")
@@ -374,11 +472,16 @@ def run_backtest(
     print("Saved metrics:", metrics_csv)
     print("Saved holdings:", holdings_csv)
     print("Saved order ledger:", order_ledger_csv)
+    print("Saved tax ledger:", tax_ledger_csv)
+    print("Saved cash ledger:", cash_ledger_csv)
+    print("Saved valuation ledger:", valuation_ledger_csv)
     if learning_meta_csv.exists():
         print("Saved learning metadata:", learning_meta_csv)
     if not liquidity_report.empty:
         print("Saved liquidity lock report:", LIQUIDITY_LOCK_REPORT_CSV)
     print("Saved equity curve:", plot_file)
+    for label, path in diagnostic_outputs.items():
+        print(f"Saved {label}:", path)
 
     return daily_result, metrics, holdings_record
 
@@ -599,6 +702,8 @@ def _load_feature_data():
             "instrument_type",
             "close",
             "close_nominal",
+            "open",
+            "open_nominal",
             "is_trading",
             "abnormal_jump",
             "rough_limit_up",
@@ -616,7 +721,12 @@ def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_
     if not symbols:
         return pd.DataFrame(columns=["symbol", "trade_date", "side", "target_shares", "price"])
 
-    price_col = "close_nominal" if "close_nominal" in feature_data.columns else "close"
+    price_col = next(
+        (col for col in ["open_nominal", "open", "close_nominal", "close"] if col in feature_data.columns),
+        None,
+    )
+    if price_col is None:
+        raise ValueError("No nominal execution price column is available")
     optional_cols = [
         col for col in ["is_trading", "rough_limit_up", "rough_limit_down"]
         if col in feature_data.columns

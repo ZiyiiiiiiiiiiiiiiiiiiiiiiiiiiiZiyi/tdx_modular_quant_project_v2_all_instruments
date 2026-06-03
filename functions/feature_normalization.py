@@ -73,8 +73,5 @@ def neutralize_by_group_and_size(
             part[f"{col}_neutralized"] = part[col] - industry_mean - size_centered.fillna(0.0)
         return part
 
-    return (
-        frame.groupby(group_col, group_keys=False)
-        .apply(_neutralize_slice)
-        .reset_index(drop=True)
-    )
+    parts = [_neutralize_slice(slice_df) for _, slice_df in frame.groupby(group_col, sort=False)]
+    return pd.concat(parts, ignore_index=True) if parts else frame

@@ -75,6 +75,43 @@ def default_factor_registry():
             category="ml",
             status="experimental",
         ),
+        "technical_strategy_factors": FactorSpec(
+            factor_name="technical_strategy_factors",
+            module_path="functions.strategy_signal_generators",
+            output_columns=(
+                "macd_dif",
+                "macd_dea",
+                "macd_hist",
+                "rsi_6",
+                "rsi_14",
+                "rsi_24",
+                "atr_20",
+                "turtle_breakout_20",
+                "turtle_breakout_55",
+                "mean_reversion_z20",
+                "bollinger_position_20",
+                "grid_width_pct",
+            ),
+            input_columns=("open", "high", "low", "close"),
+            category="technical_strategy",
+            status="experimental",
+        ),
+        "position_management_kelly": FactorSpec(
+            factor_name="position_management_kelly",
+            module_path="functions.decision_council.position_management",
+            output_columns=(
+                "p_win",
+                "p_loss",
+                "payoff_ratio",
+                "kelly_raw",
+                "kelly_adjusted",
+                "kelly_score",
+                "target_weight",
+            ),
+            input_columns=("symbol", "predicted_return", "confidence"),
+            category="position_management",
+            status="experimental",
+        ),
     }
     return specs
 

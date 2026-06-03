@@ -49,9 +49,11 @@ def fetch_adjustment_factors(
     request_delay_seconds=0.35,
     login_retries=3,
     login_retry_delay_seconds=5.0,
+    socket_timeout_seconds=30.0,
 ):
     bs = _import_baostock()
-    login_result = _login_with_retry(bs, login_retries, login_retry_delay_seconds)
+    _login_with_retry(bs, login_retries, login_retry_delay_seconds)
+    _set_provider_socket_timeout(socket_timeout_seconds)
     frames = []
     errors = []
     try:
@@ -111,20 +113,29 @@ def fetch_dividend_actions(
     request_delay_seconds=0.35,
     login_retries=3,
     login_retry_delay_seconds=5.0,
+    socket_timeout_seconds=30.0,
 ):
     bs = _import_baostock()
-    login_result = _login_with_retry(bs, login_retries, login_retry_delay_seconds)
+    _login_with_retry(bs, login_retries, login_retry_delay_seconds)
+    _set_provider_socket_timeout(socket_timeout_seconds)
     frames = []
     errors = []
+    symbols = list(symbols)
     try:
-        for symbol in symbols:
+        for symbol_index, symbol in enumerate(symbols, start=1):
             if request_delay_seconds > 0:
                 time.sleep(request_delay_seconds)
             provider_code = to_baostock_code(symbol)
             if provider_code is None:
                 continue
             for year in range(int(start_year), int(end_year) + 1):
-                result = bs.query_dividend_data(code=provider_code, year=str(year), yearType="report")
+                try:
+                    result = bs.query_dividend_data(code=provider_code, year=str(year), yearType="report")
+                except (OSError, TimeoutError) as exc:
+                    raise RuntimeError(
+                        f"BaoStock dividend request stopped at {symbol} year={year}: {exc}. "
+                        "Completed batches remain staged; rerun main.py to resume."
+                    ) from exc
                 if result.error_code != "0":
                     errors.append({"symbol": symbol, "year": year, "status": result.error_msg})
                     continue
@@ -142,6 +153,11 @@ def fetch_dividend_actions(
                 frame["rights_issue_price"] = pd.NA
                 frame["notes"] = "BaoStock dividend disclosure"
                 frames.append(frame)
+            print(
+                f"Dividend request progress: {symbol_index}/{len(symbols)} symbols in current batch "
+                f"(latest={symbol})",
+                flush=True,
+            )
     finally:
         bs.logout()
     raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -157,4 +173,18 @@ def _login_with_retry(bs, retries, delay_seconds):
             return last_result
         if attempt < int(retries) and delay_seconds > 0:
             time.sleep(delay_seconds)
-    raise RuntimeError(f"BaoStock login failed: {last_result.error_msg}")
+    raise RuntimeError(
+        "BaoStock login failed. DNS may still be healthy while the provider socket is blocked. "
+        "If a VPN or proxy is enabled, disable it and retry the validation fetch. "
+        f"Provider message: {last_result.error_msg}"
+    )
+
+
+def _set_provider_socket_timeout(timeout_seconds):
+    if timeout_seconds is None or float(timeout_seconds) <= 0:
+        return
+    from baostock.common import context
+
+    provider_socket = getattr(context, "default_socket", None)
+    if provider_socket is not None:
+        provider_socket.settimeout(float(timeout_seconds))

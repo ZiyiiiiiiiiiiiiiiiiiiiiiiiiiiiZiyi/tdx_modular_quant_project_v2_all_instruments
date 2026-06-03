@@ -4,6 +4,7 @@ import pandas as pd
 from pandas.tseries.offsets import BDay
 
 from functions.labels import default_label_specs
+from functions.progress import progress_iter, progress_step
 
 try:
     import xgboost as xgb
@@ -15,6 +16,7 @@ try:
 except ImportError:
     lgb = None
 
+USE_EXTERNAL_TREE_MODELS = False
 
 DEFAULT_TARGET_COL = "_ml_target"
 DEFAULT_LOOKBACK_DAYS = 500
@@ -24,6 +26,25 @@ DEFAULT_FEATURE_SUFFIX_PRIORITY = (
     "_z",
     "_robust",
     "_winsor",
+)
+BASE_ML_FEATURE_COLUMNS = (
+    "ret_1",
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "ret_60",
+    "close_to_ma20",
+    "close_to_ma60",
+    "volatility_10",
+    "volatility_20",
+    "volatility_60",
+    "amplitude",
+    "intraday_ret",
+    "upper_shadow",
+    "lower_shadow",
+    "body_ratio",
+    "amount_ratio_20",
+    "score_mom_lowvol",
 )
 
 MODEL_CONFIGS = {
@@ -81,7 +102,12 @@ def compute_factor(
     rebalance_index = _normalize_rebalance_dates(data=data, rebalance_dates=rebalance_dates)
     rows = []
 
-    for rebalance_date in rebalance_index:
+    progress_step(f"ML factor {model_type}: rebalance dates={len(rebalance_index)}")
+    for rebalance_date in progress_iter(
+        rebalance_index,
+        desc=f"ml {model_type}",
+        total=len(rebalance_index),
+    ):
         train_start = rebalance_date - pd.Timedelta(days=lookback_days)
         label_safe_cutoff = rebalance_date - BDay(DEFAULT_LABEL_HORIZON)
         train_mask = (data["date"] < label_safe_cutoff) & (data["date"] >= train_start)
@@ -143,12 +169,27 @@ def compute_factor(
 
 
 def _prepare_ml_frame(df_factors, target_col):
-    data = df_factors.copy()
+    label_name = f"future_ret_{DEFAULT_LABEL_HORIZON}"
+    keep_cols = ["date", "symbol"]
+    if target_col is not None:
+        keep_cols.append(target_col)
+    elif label_name in df_factors.columns:
+        keep_cols.append(label_name)
+    else:
+        keep_cols.append("close")
+
+    for base_col in BASE_ML_FEATURE_COLUMNS:
+        for suffix in ("", *DEFAULT_FEATURE_SUFFIX_PRIORITY):
+            col = f"{base_col}{suffix}"
+            if col in df_factors.columns:
+                keep_cols.append(col)
+
+    keep_cols = list(dict.fromkeys(col for col in keep_cols if col in df_factors.columns))
+    data = df_factors.loc[:, keep_cols].copy()
     data["date"] = pd.to_datetime(data["date"])
-    data = data.sort_values(["symbol", "date"]).copy()
+    data = data.sort_values(["symbol", "date"])
 
     if target_col is None:
-        label_name = f"future_ret_{DEFAULT_LABEL_HORIZON}"
         if label_name in data.columns:
             data[DEFAULT_TARGET_COL] = pd.to_numeric(data[label_name], errors="coerce")
         else:
@@ -229,7 +270,7 @@ def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, mod
         return _linear_shrinkage_predict(x_train, y_train, x_predict, alpha=alpha)
 
     if model_type == "xgboost":
-        if xgb is not None:
+        if USE_EXTERNAL_TREE_MODELS and xgb is not None:
             model = xgb.XGBRegressor(
                 objective="reg:squarederror",
                 n_estimators=120,
@@ -250,7 +291,7 @@ def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, mod
         return _linear_shrinkage_predict(transformed_train, y_train, transformed_predict, alpha=alpha)
 
     if model_type == "lightgbm":
-        if lgb is not None:
+        if USE_EXTERNAL_TREE_MODELS and lgb is not None:
             model = lgb.LGBMRegressor(
                 n_estimators=160,
                 learning_rate=0.05,

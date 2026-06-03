@@ -4,10 +4,29 @@ from pathlib import Path
 import pandas as pd
 
 from config import FORMAL_MODE_NAME, REPORT_OUTPUT_MD, RESEARCH_RUN_MODE
+from functions.governance import build_research_status, default_fallback_disclosures
 
 
 def build_strategy_report(summary_df, regime_breakdown_df=None):
-    lines = ["# Strategy Diagnostic Report", "", f"Research mode: `{RESEARCH_RUN_MODE}`.", ""]
+    status = build_research_status()
+    disclosures = default_fallback_disclosures()
+    lines = [
+        "# Strategy Diagnostic Report",
+        "",
+        f"Research mode: `{RESEARCH_RUN_MODE}`.",
+        f"Formal status: `{status.formal_status}`.",
+        f"Formal eligible: `{status.formal_eligible}`.",
+        f"Formal block reasons: `{status.formal_block_reason_code}`.",
+        "",
+        "## Cost Sensitivity",
+        "Cost sensitivity must be reviewed with baseline and high-cost scenarios; do not cite only the optimistic scenario.",
+        "",
+        "## Substitute Disclosure",
+        f"Used substitutes: `{'YES' if disclosures else 'NO'}`.",
+    ]
+    for item in disclosures:
+        lines.append(f"- `{item.block_reason_code}`: {item.substitute} Reason: {item.reason}")
+    lines.append("")
     if summary_df.empty:
         lines.append("No summary rows available.")
     elif RESEARCH_RUN_MODE != FORMAL_MODE_NAME:

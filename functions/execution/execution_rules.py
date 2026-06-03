@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
 
 from config import (
     ENABLE_PRICE_LIMIT_CHECK,
@@ -16,6 +17,49 @@ REQUIRED_ORDER_COLUMNS = [
     "target_shares",
     "price",
 ]
+
+
+def a_share_price_limit_ratio(symbol, *, is_st=False):
+    """Return configured daily price-limit ratio for common A-share boards."""
+    code = str(symbol).strip().lower()[2:]
+    market = str(symbol).strip().lower()[:2]
+    if is_st:
+        return 0.05
+    if market == "bj":
+        return 0.30
+    if code.startswith(("300", "301", "688", "689")):
+        return 0.20
+    return 0.10
+
+
+def rounded_price_limit(previous_close, ratio, direction):
+    """Exchange-style decimal rounding for displayed price limits."""
+    base = Decimal(str(previous_close))
+    multiplier = Decimal("1") + Decimal(str(ratio)) * (Decimal("1") if direction == "up" else Decimal("-1"))
+    return float((base * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def classify_daily_limit_feasibility(
+    *,
+    side,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    limit_price,
+    amount,
+    rolling_amount,
+    extreme_amount_ratio=0.02,
+):
+    """Classify daily-bar limit execution without pretending intraday certainty."""
+    prices = [open_price, high_price, low_price, close_price]
+    at_limit = [abs(float(price) - float(limit_price)) < 1e-9 for price in prices]
+    amount_ratio = float(amount) / float(rolling_amount) if float(rolling_amount) > 0 else 0.0
+    if all(at_limit) and amount_ratio <= float(extreme_amount_ratio):
+        return "blocked_limit_buy" if str(side).lower() == "buy" else "blocked_limit_sell"
+    if bool(at_limit[0]) and bool(at_limit[3]):
+        return "high_uncertainty_limit_event"
+    return "tradable_daily_proxy"
 
 
 def normalize_order_frame(order_df):

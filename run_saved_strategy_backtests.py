@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Run current registered strategies from saved selection parquet files."""
+"""Run current registered strategies from saved selection parquet files.
+
+This legacy entry point is intentionally disabled for full runs because the new
+batch runner gives safer memory control. Use run_strategy_batches.py instead.
+"""
 from __future__ import annotations
 
 import pandas as pd
@@ -12,6 +16,11 @@ from functions.strategy_registry import STRATEGY_FACTOR_DESCRIPTIONS, list_strat
 
 
 def main():
+    raise SystemExit(
+        "Use the low-memory runner instead, for example:\n"
+        "& \"C:\\Users\\Ziyi Wang\\.conda\\envs\\stock_ai\\python.exe\" "
+        "run_strategy_batches.py --mode backtest --batch-size 1 --batch-index 0"
+    )
     records = []
     missing = []
     for strategy_name in list_strategy_names():

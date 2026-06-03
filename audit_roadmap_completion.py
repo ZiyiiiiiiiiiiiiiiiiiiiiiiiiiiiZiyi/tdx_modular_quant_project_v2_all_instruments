@@ -14,6 +14,11 @@ from config import (
     MARKET_CAP_PARQUET,
     REPORT_DIR,
     RESEARCH_RUN_MODE,
+    FORMAL_ADMISSION_REPORT_CSV,
+    FORMAL_MANIFEST_JSON,
+    FEATURE_LINEAGE_CSV,
+    ADJUSTMENT_PTI_QUALITY_CSV,
+    BENCHMARK_REPORT_CSV,
 )
 
 
@@ -25,6 +30,11 @@ def audit_completion():
     rows.append(_orders_check())
     rows.append(_file_check("P0-3", "baseline_summary_v2", BACKTEST_SUMMARY_V2_CSV))
     rows.append(_file_check("P1-0", "market_cap_history", MARKET_CAP_PARQUET))
+    rows.append(_report_status_check("P0-2b", "adjustment_pti_quality_report", ADJUSTMENT_PTI_QUALITY_CSV))
+    rows.append(_file_check("P0-3", "feature_lineage", FEATURE_LINEAGE_CSV))
+    rows.append(_file_check("P0-11", "reproducibility_manifest", FORMAL_MANIFEST_JSON))
+    rows.append(_report_status_check("P0-12", "investable_benchmark_report", BENCHMARK_REPORT_CSV))
+    rows.append(_report_status_check("P2", "formal_admission_report", FORMAL_ADMISSION_REPORT_CSV))
     rows.append({
         "stage": "P0b",
         "check": "formal_mode_enabled",
@@ -42,6 +52,21 @@ def _file_check(stage, check, path):
         "status": "pass" if path.exists() else "missing",
         "detail": str(path),
     }
+
+
+def _report_status_check(stage, check, path):
+    path = Path(path)
+    if not path.exists():
+        return {"stage": stage, "check": check, "status": "missing", "detail": str(path)}
+    report = pd.read_csv(path)
+    statuses = set(report.get("status", pd.Series(dtype=str)).dropna().astype(str))
+    if statuses and statuses <= {"passed", "available"}:
+        status = "pass"
+    elif "failed" in statuses or "blocked" in statuses:
+        status = "blocked"
+    else:
+        status = "partial"
+    return {"stage": stage, "check": check, "status": status, "detail": f"{path}; statuses={sorted(statuses)}"}
 
 
 def _validated_factor_check():

@@ -118,7 +118,8 @@ def attach_adjustment_factors_to_daily(prices_df, factors_df):
                 direction="backward",
             ).drop(columns=["action_date"])
         attached_parts.append(part)
-    attached = pd.concat(attached_parts, ignore_index=True)
+    attached_parts = [part for part in attached_parts if not part.empty]
+    attached = pd.concat(attached_parts, ignore_index=True) if attached_parts else prices.iloc[0:0].copy()
     attached["adj_factor_available"] = attached["backward_factor"].notna()
     return attached.sort_values(["symbol", "date"]).reset_index(drop=True)
 

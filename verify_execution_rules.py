@@ -5,7 +5,10 @@ from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.execution_rules import (
     REQUIRED_ORDER_COLUMNS,
     apply_a_share_constraints,
+    a_share_price_limit_ratio,
+    classify_daily_limit_feasibility,
     normalize_order_frame,
+    rounded_price_limit,
 )
 
 
@@ -76,6 +79,7 @@ def verify_execution_rules():
         "commission_cost",
         "slippage_cost",
         "stamp_duty_cost",
+        "transfer_fee_cost",
         "total_cost",
     ]:
         if col not in costs.columns:
@@ -95,6 +99,32 @@ def verify_execution_rules():
         print("[FAIL] sell order should have positive stamp duty cost")
     else:
         print("[PASS] sell order stamp duty handling correct")
+
+    if a_share_price_limit_ratio("sh600000") != 0.10:
+        failures.append("main-board price limit should be 10%")
+    if a_share_price_limit_ratio("sz300001") != 0.20:
+        failures.append("ChiNext price limit should be 20%")
+    if a_share_price_limit_ratio("bj430001") != 0.30:
+        failures.append("BSE price limit should be 30%")
+    if a_share_price_limit_ratio("sh600000", is_st=True) != 0.05:
+        failures.append("ST price limit should be 5%")
+    if rounded_price_limit(10.03, 0.10, "up") != 11.03:
+        failures.append("price-limit decimal rounding mismatch")
+    if not any("price limit should" in item or "rounding mismatch" in item for item in failures):
+        print("[PASS] board/ST price-limit ratios and rounding correct")
+
+    blocked = classify_daily_limit_feasibility(
+        side="buy", open_price=11.0, high_price=11.0, low_price=11.0, close_price=11.0,
+        limit_price=11.0, amount=1.0, rolling_amount=100.0,
+    )
+    uncertain = classify_daily_limit_feasibility(
+        side="sell", open_price=9.0, high_price=9.1, low_price=9.0, close_price=9.0,
+        limit_price=9.0, amount=20.0, rolling_amount=100.0,
+    )
+    if blocked != "blocked_limit_buy" or uncertain != "high_uncertainty_limit_event":
+        failures.append("daily limit feasibility classification mismatch")
+    else:
+        print("[PASS] one-price board and high-uncertainty classification correct")
 
     print()
     if failures:
