@@ -1,0 +1,72 @@
+{
+  "code_snapshot": [
+    {
+      "exists": true,
+      "mtime_ns": 1779734123138338400,
+      "path": "main.py",
+      "sha256": "910305b727c76f8cc2a4e0fb09299d23c61e3cf4c51a0265709c4d4d0f0b9519",
+      "size": 17756
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779734069525733700,
+      "path": "config.py",
+      "sha256": "aa02cf3d26718739d45021e77c11eb2995ea81f8c10debe86b915c2a4d7e9c9e",
+      "size": 2286
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779729438931221000,
+      "path": "functions\\feature_engineering.py",
+      "sha256": "9e39118c71921f3d11df4d09f2e3135775e8f3c4a902f92c95d0e7366baafedf",
+      "size": 11842
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779729423114589400,
+      "path": "functions\\strategy_registry.py",
+      "sha256": "4062e05f1ee3071a50ce380a62de4b527433c617446de57571320a86aeb11410",
+      "size": 4630
+    }
+  ],
+  "completed_at": "2026-05-26T03:03:54",
+  "completion": {
+    "result": "ok"
+  },
+  "config_snapshot": {
+    "kind": "tracked_inputs_smoke",
+    "smoke": true
+  },
+  "cwd": "C:\\Users\\CodexSandboxOffline\\.codex\\.sandbox\\cwd\\61c3215ba02291b8",
+  "extra": {
+    "kind": "tracked_inputs_smoke"
+  },
+  "git_commit": "08a4bc770261192c03cc32681ddf14bfec7078a5",
+  "run_id": "run_20260526_030354_919197",
+  "started_at": "2026-05-26T03:03:54",
+  "status": "completed",
+  "tracked_inputs": [
+    {
+      "exists": true,
+      "mtime_ns": 1779642531452615000,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_raw.parquet",
+      "size": 678437177
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779642577574560500,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_clean.parquet",
+      "size": 465557678
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779642654310594800,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_features.parquet",
+      "size": 3291156261
+    },
+    {
+      "exists": false,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\reports\\pipeline_run_cache.json"
+    }
+  ]
+}

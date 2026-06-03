@@ -1,0 +1,48 @@
+{
+  "code_snapshot": [
+    {
+      "exists": true,
+      "mtime_ns": 1779734070290010100,
+      "path": "main.py",
+      "sha256": "fd7d9e31db26d2ec90d43f83968de8fc1257dc6562aa28d54df59564df264913",
+      "size": 17784
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779734069525733700,
+      "path": "config.py",
+      "sha256": "aa02cf3d26718739d45021e77c11eb2995ea81f8c10debe86b915c2a4d7e9c9e",
+      "size": 2286
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779729438931221000,
+      "path": "functions\\feature_engineering.py",
+      "sha256": "9e39118c71921f3d11df4d09f2e3135775e8f3c4a902f92c95d0e7366baafedf",
+      "size": 11842
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779729423114589400,
+      "path": "functions\\strategy_registry.py",
+      "sha256": "4062e05f1ee3071a50ce380a62de4b527433c617446de57571320a86aeb11410",
+      "size": 4630
+    }
+  ],
+  "completed_at": "2026-05-26T02:34:52",
+  "completion": {
+    "result": "ok"
+  },
+  "config_snapshot": {
+    "smoke": true
+  },
+  "cwd": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments",
+  "extra": {
+    "kind": "smoke_test"
+  },
+  "git_commit": "08a4bc770261192c03cc32681ddf14bfec7078a5",
+  "run_id": "run_20260526_023452",
+  "started_at": "2026-05-26T02:34:52",
+  "status": "completed",
+  "tracked_inputs": []
+}

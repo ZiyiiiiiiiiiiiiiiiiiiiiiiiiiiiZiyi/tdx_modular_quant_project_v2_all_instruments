@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
+from pandas.tseries.offsets import BDay
+
+from functions.labels import default_label_specs
+from functions.progress import progress_iter, progress_step
 
 try:
     import xgboost as xgb
@@ -12,10 +16,36 @@ try:
 except ImportError:
     lgb = None
 
+USE_EXTERNAL_TREE_MODELS = False
 
 DEFAULT_TARGET_COL = "_ml_target"
 DEFAULT_LOOKBACK_DAYS = 500
 DEFAULT_LABEL_HORIZON = 5
+DEFAULT_FEATURE_SUFFIX_PRIORITY = (
+    "_neutralized",
+    "_z",
+    "_robust",
+    "_winsor",
+)
+BASE_ML_FEATURE_COLUMNS = (
+    "ret_1",
+    "ret_5",
+    "ret_10",
+    "ret_20",
+    "ret_60",
+    "close_to_ma20",
+    "close_to_ma60",
+    "volatility_10",
+    "volatility_20",
+    "volatility_60",
+    "amplitude",
+    "intraday_ret",
+    "upper_shadow",
+    "lower_shadow",
+    "body_ratio",
+    "amount_ratio_20",
+    "score_mom_lowvol",
+)
 
 MODEL_CONFIGS = {
     "elasticnet": {
@@ -36,6 +66,26 @@ MODEL_CONFIGS = {
 }
 
 
+def list_ml_baseline_models():
+    return tuple(MODEL_CONFIGS.keys())
+
+
+def build_ml_baseline_contract():
+    rows = []
+    for model_name, config in MODEL_CONFIGS.items():
+        rows.append(
+            {
+                "model_name": model_name,
+                "min_train_rows": config["min_train_rows"],
+                "max_features": config["max_features"],
+                "alpha": config["alpha"],
+                "default_target_col": DEFAULT_TARGET_COL,
+                "default_label_horizon": DEFAULT_LABEL_HORIZON,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_factor(
     df_factors,
     target_col=None,
@@ -52,9 +102,15 @@ def compute_factor(
     rebalance_index = _normalize_rebalance_dates(data=data, rebalance_dates=rebalance_dates)
     rows = []
 
-    for rebalance_date in rebalance_index:
+    progress_step(f"ML factor {model_type}: rebalance dates={len(rebalance_index)}")
+    for rebalance_date in progress_iter(
+        rebalance_index,
+        desc=f"ml {model_type}",
+        total=len(rebalance_index),
+    ):
         train_start = rebalance_date - pd.Timedelta(days=lookback_days)
-        train_mask = (data["date"] < rebalance_date) & (data["date"] >= train_start)
+        label_safe_cutoff = rebalance_date - BDay(DEFAULT_LABEL_HORIZON)
+        train_mask = (data["date"] < label_safe_cutoff) & (data["date"] >= train_start)
         predict_mask = data["date"] == rebalance_date
 
         train_data = data.loc[train_mask].copy()
@@ -90,6 +146,7 @@ def compute_factor(
         scored["score_ml"] = scores
         scored["ml_model"] = model_type
         scored["training_window_days"] = lookback_days
+        scored["label_purge_periods"] = DEFAULT_LABEL_HORIZON
         scored["fitted_feature_count"] = len(feature_cols)
         scored["feature_list"] = ",".join(feature_cols)
         rows.append(scored)
@@ -102,6 +159,7 @@ def compute_factor(
                 "score_ml",
                 "ml_model",
                 "training_window_days",
+                "label_purge_periods",
                 "fitted_feature_count",
                 "feature_list",
             ]
@@ -111,13 +169,32 @@ def compute_factor(
 
 
 def _prepare_ml_frame(df_factors, target_col):
-    data = df_factors.copy()
+    label_name = f"future_ret_{DEFAULT_LABEL_HORIZON}"
+    keep_cols = ["date", "symbol"]
+    if target_col is not None:
+        keep_cols.append(target_col)
+    elif label_name in df_factors.columns:
+        keep_cols.append(label_name)
+    else:
+        keep_cols.append("close")
+
+    for base_col in BASE_ML_FEATURE_COLUMNS:
+        for suffix in ("", *DEFAULT_FEATURE_SUFFIX_PRIORITY):
+            col = f"{base_col}{suffix}"
+            if col in df_factors.columns:
+                keep_cols.append(col)
+
+    keep_cols = list(dict.fromkeys(col for col in keep_cols if col in df_factors.columns))
+    data = df_factors.loc[:, keep_cols].copy()
     data["date"] = pd.to_datetime(data["date"])
-    data = data.sort_values(["symbol", "date"]).copy()
+    data = data.sort_values(["symbol", "date"])
 
     if target_col is None:
-        future_close = data.groupby("symbol")["close"].shift(-DEFAULT_LABEL_HORIZON)
-        data[DEFAULT_TARGET_COL] = future_close / data["close"] - 1
+        if label_name in data.columns:
+            data[DEFAULT_TARGET_COL] = pd.to_numeric(data[label_name], errors="coerce")
+        else:
+            future_close = data.groupby("symbol")["close"].shift(-DEFAULT_LABEL_HORIZON)
+            data[DEFAULT_TARGET_COL] = future_close / data["close"] - 1
     else:
         data[DEFAULT_TARGET_COL] = pd.to_numeric(data[target_col], errors="coerce")
 
@@ -132,10 +209,13 @@ def _normalize_rebalance_dates(data, rebalance_dates):
 
 def _select_feature_columns(train_data, max_features):
     candidate_cols = []
+    preferred_aliases = _build_preferred_feature_aliases(train_data.columns)
     for col in train_data.columns:
         if col in {"date", "symbol", DEFAULT_TARGET_COL}:
             continue
         if col.startswith("future_ret_") or col.startswith("reward_") or col.startswith("score_"):
+            continue
+        if col in preferred_aliases and preferred_aliases[col] != col:
             continue
         if not pd.api.types.is_numeric_dtype(train_data[col]):
             continue
@@ -160,6 +240,24 @@ def _select_feature_columns(train_data, max_features):
     return [col for col, _ in scored_candidates[:max_features]]
 
 
+def _build_preferred_feature_aliases(columns):
+    columns = list(columns)
+    alias_map = {}
+    normalized_candidates = {}
+    for col in columns:
+        for suffix in DEFAULT_FEATURE_SUFFIX_PRIORITY:
+            if col.endswith(suffix):
+                base = col[: -len(suffix)]
+                normalized_candidates.setdefault(base, col)
+                break
+        else:
+            normalized_candidates.setdefault(col, col)
+
+    for col in columns:
+        alias_map[col] = normalized_candidates.get(col, col)
+    return alias_map
+
+
 def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, model_type, alpha):
     x_train, x_predict = _prepare_model_matrices(
         train_frame=train_frame,
@@ -172,7 +270,7 @@ def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, mod
         return _linear_shrinkage_predict(x_train, y_train, x_predict, alpha=alpha)
 
     if model_type == "xgboost":
-        if xgb is not None:
+        if USE_EXTERNAL_TREE_MODELS and xgb is not None:
             model = xgb.XGBRegressor(
                 objective="reg:squarederror",
                 n_estimators=120,
@@ -193,7 +291,7 @@ def _fit_predict_model(train_frame, predict_frame, feature_cols, target_col, mod
         return _linear_shrinkage_predict(transformed_train, y_train, transformed_predict, alpha=alpha)
 
     if model_type == "lightgbm":
-        if lgb is not None:
+        if USE_EXTERNAL_TREE_MODELS and lgb is not None:
             model = lgb.LGBMRegressor(
                 n_estimators=160,
                 learning_rate=0.05,

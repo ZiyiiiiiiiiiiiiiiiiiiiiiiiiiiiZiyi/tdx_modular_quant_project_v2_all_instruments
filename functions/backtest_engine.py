@@ -1,9 +1,32 @@
 # -*- coding: utf-8 -*-
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
-from config import FEATURE_DAILY_PARQUET, RESULT_DIR
+from config import (
+    FEATURE_DAILY_PARQUET,
+    LIQUIDITY_LOCK_REPORT_CSV,
+    MIN_LOT_SIZE,
+    ORDER_LEDGER_PREFIX,
+    RESULT_DIR,
+    CASH_LEDGER_PREFIX,
+    TAX_LEDGER_PREFIX,
+    VALUATION_LEDGER_PREFIX,
+)
+from functions.execution.liquidity_lock_handler import (
+    build_liquidity_lock_report,
+    save_liquidity_lock_report,
+)
+from functions.execution.cost_model import estimate_trade_costs
+from functions.execution.order_simulator import build_delayed_order_queue, simulate_order_book
+from functions.execution.tax_ledger import build_trade_tax_ledger, tax_ledger_total
+from functions.execution.valuation import (
+    build_blocked_order_valuation_ledger,
+    valuation_discount_by_date,
+)
+from functions.governance import research_status_dict
 from functions.metrics import calc_backtest_metrics
+from functions.performance_charts import save_performance_diagnostics
 
 try:
     import matplotlib.pyplot as plt
@@ -21,14 +44,18 @@ LEARNING_METADATA_COLUMNS = [
     "feature_list",
 ]
 
+_FEATURE_DATA_CACHE = None
+
 
 def prepare_daily_returns(feature_data):
-    """Calculate close-to-close daily returns for each instrument."""
+    """Calculate nominal close-to-close returns used by the execution ledger."""
     df = feature_data.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["symbol", "date"])
-    df["daily_symbol_return"] = df.groupby("symbol")["close"].pct_change()
-    return df[["date", "symbol", "daily_symbol_return", "close"]].copy()
+    trade_price_col = "close_nominal" if "close_nominal" in df.columns else "close"
+    df["trade_close"] = pd.to_numeric(df[trade_price_col], errors="coerce")
+    df["daily_symbol_return"] = df.groupby("symbol")["trade_close"].pct_change()
+    return df[["date", "symbol", "daily_symbol_return", "trade_close"]].copy()
 
 
 def run_backtest(
@@ -39,6 +66,7 @@ def run_backtest(
     show_plot=True,
     strategy_name="strategy",
     factor_description=None,
+    compute_theoretical_upper_bound=True,
 ):
     """
     Backtest one strategy by expanding rebalance selections into daily holdings.
@@ -47,7 +75,7 @@ def run_backtest(
     through the next rebalance date. Daily returns come from the full feature
     table, not from shifted rows inside the sparse selection table.
     """
-    feature_data = pd.read_parquet(FEATURE_DAILY_PARQUET)
+    feature_data = _load_feature_data()
     returns = prepare_daily_returns(feature_data)
 
     df_sel = df_selection.copy()
@@ -63,19 +91,17 @@ def run_backtest(
     feature_data["date"] = pd.to_datetime(feature_data["date"])
     df_sel = df_sel.sort_values(["rebalance_date", "symbol"]).copy()
 
-    if "weight" not in df_sel.columns:
-        df_sel["weight"] = 1.0 / df_sel.groupby("rebalance_date")["symbol"].transform("count")
-
-    default_weight = 1.0 / df_sel.groupby("rebalance_date")["symbol"].transform("count")
-    df_sel["weight"] = pd.to_numeric(df_sel["weight"], errors="coerce").fillna(default_weight)
-    df_sel["weight"] = df_sel["weight"].clip(upper=max_weight)
-    df_sel["weight"] = df_sel["weight"] / df_sel.groupby("rebalance_date")["weight"].transform("sum")
+    df_sel = _apply_weight_constraints(df_sel, max_weight=max_weight)
 
     rebalance_dates = pd.Series(df_sel["rebalance_date"].drop_duplicates().sort_values()).reset_index(drop=True)
     all_trade_dates = pd.Series(returns["date"].drop_duplicates().sort_values()).reset_index(drop=True)
 
     period_frames = []
     oracle_period_frames = []
+    actual_weights = {}
+    delayed_orders = []
+    rebalance_cost_records = []
+    order_ledger_parts = []
     for idx, rebalance_date in rebalance_dates.items():
         next_rebalance = (
             rebalance_dates.iloc[idx + 1]
@@ -91,16 +117,57 @@ def run_backtest(
         one_holdings = df_sel[df_sel["rebalance_date"] == rebalance_date][
             ["rebalance_date", "symbol", "weight"]
         ].copy()
-        one_holding_count = one_holdings["symbol"].nunique()
+        execution_date = pd.Timestamp(period_dates.iloc[0])
+        rebalance_orders = _build_rebalance_orders(
+            one_holdings=one_holdings,
+            previous_weights=actual_weights,
+            feature_data=feature_data,
+            trade_date=execution_date,
+            initial_cash=initial_cash,
+        )
+        simulated_orders = simulate_order_book(rebalance_orders)
+        simulated_orders = _enforce_cash_weight_budget(actual_weights, simulated_orders)
+        simulated_orders["rebalance_date"] = rebalance_date
+        order_ledger_parts.append(simulated_orders)
+        delayed_orders.append(build_delayed_order_queue(simulated_orders))
+        rebalance_cost_records.append(
+            {
+                "rebalance_date": rebalance_date,
+                "gross_turnover": float(simulated_orders["trade_notional"].sum()),
+                "transaction_cost": float(simulated_orders["total_cost"].sum()),
+                "blocked_order_count": int(
+                    (simulated_orders["execution_status"] != "filled").sum()
+                ),
+            }
+        )
+        actual_weights = _apply_filled_orders_to_weights(actual_weights, simulated_orders)
+        executed_holdings = pd.DataFrame(
+            {"symbol": list(actual_weights.keys()), "weight": list(actual_weights.values())}
+        )
+        executed_holdings = executed_holdings[executed_holdings["weight"] > 1e-12]
+        one_holding_count = executed_holdings["symbol"].nunique()
+        if executed_holdings.empty:
+            empty_period = pd.DataFrame(
+                {
+                    "date": period_dates,
+                    "symbol": pd.NA,
+                    "weight": 0.0,
+                    "daily_symbol_return": 0.0,
+                    "holding_count": 0,
+                    "portfolio_ret_part": 0.0,
+                }
+            )
+            period_frames.append(empty_period)
+            continue
         one_returns = returns[returns["date"].isin(period_dates)][
             ["date", "symbol", "daily_symbol_return"]
         ]
         period_calendar = pd.MultiIndex.from_product(
-            [period_dates.tolist(), one_holdings["symbol"].tolist()],
+            [period_dates.tolist(), executed_holdings["symbol"].tolist()],
             names=["date", "symbol"],
         ).to_frame(index=False)
         expanded = period_calendar.merge(
-            one_holdings[["symbol", "weight"]],
+            executed_holdings[["symbol", "weight"]],
             on="symbol",
             how="left",
         )
@@ -118,15 +185,18 @@ def run_backtest(
         expanded["portfolio_ret_part"] = expanded["daily_symbol_return"] * expanded["weight"]
         period_frames.append(expanded)
 
-        oracle_holdings = _build_oracle_holdings(
-            feature_data=feature_data,
-            returns=returns,
-            rebalance_date=rebalance_date,
-            period_dates=period_dates,
-            holding_count=one_holding_count,
-            allowed_instrument_types=df_sel.get("instrument_type"),
-        )
-        if not oracle_holdings.empty:
+        if compute_theoretical_upper_bound:
+            oracle_holdings = _build_oracle_holdings(
+                feature_data=feature_data,
+                returns=returns,
+                rebalance_date=rebalance_date,
+                period_dates=period_dates,
+                holding_count=one_holding_count,
+                allowed_instrument_types=df_sel.get("instrument_type"),
+            )
+        else:
+            oracle_holdings = pd.DataFrame(columns=["symbol", "weight"])
+        if compute_theoretical_upper_bound and not oracle_holdings.empty:
             oracle_calendar = pd.MultiIndex.from_product(
                 [period_dates.tolist(), oracle_holdings["symbol"].tolist()],
                 names=["date", "symbol"],
@@ -184,8 +254,37 @@ def run_backtest(
         daily_result = pd.concat([initial_row, daily_result], ignore_index=True)
         daily_result = daily_result.sort_values("date").reset_index(drop=True)
 
+    cost_frame = _expand_rebalance_costs(
+        rebalance_cost_records=rebalance_cost_records,
+        available_dates=daily_result["date"],
+        initial_cash=initial_cash,
+    )
+    daily_result = daily_result.merge(cost_frame, on="date", how="left")
+    daily_result["transaction_cost"] = pd.to_numeric(
+        daily_result["transaction_cost"],
+        errors="coerce",
+    ).fillna(0.0)
+    daily_result["gross_turnover"] = pd.to_numeric(
+        daily_result["gross_turnover"],
+        errors="coerce",
+    ).fillna(0.0)
+    daily_result["blocked_order_count"] = pd.to_numeric(
+        daily_result["blocked_order_count"],
+        errors="coerce",
+    ).fillna(0).astype(int)
+    daily_result["gross_daily_return"] = daily_result["daily_return"]
+    daily_result["net_daily_return"] = daily_result["gross_daily_return"] - daily_result["transaction_cost"]
+    daily_result["daily_return"] = daily_result["net_daily_return"]
     daily_result["nav"] = (1 + daily_result["daily_return"]).cumprod() * initial_cash
     daily_result["net_value"] = daily_result["nav"]
+    # The live exploratory engine has not integrated an independent frozen-position
+    # valuation model yet. Keep both views explicit and disclose the fallback.
+    daily_result["liquidatable_nav"] = daily_result["nav"]
+    daily_result["economic_nav"] = daily_result["nav"]
+    daily_result["valuation_model_version"] = "conservative_liquidity_discount_v1"
+    daily_result["initial_cash"] = float(initial_cash)
+    for key, value in research_status_dict().items():
+        daily_result[key] = value
 
     theoretical_summary = None
     if oracle_period_frames:
@@ -205,8 +304,98 @@ def run_backtest(
         daily_result=daily_result,
         risk_free_rate=risk_free_rate,
     )
+    gross_nav = (1 + daily_result["gross_daily_return"]).cumprod() * initial_cash
+    order_ledger = pd.concat(order_ledger_parts, ignore_index=True) if order_ledger_parts else pd.DataFrame()
+    tax_ledger = build_trade_tax_ledger(order_ledger)
+    valuation_ledger = build_blocked_order_valuation_ledger(order_ledger)
+    valuation_discount = valuation_discount_by_date(valuation_ledger)
+    if not valuation_discount.empty:
+        daily_result = daily_result.merge(valuation_discount, on="date", how="left")
+    if "valuation_discount_amount" not in daily_result.columns:
+        daily_result["valuation_discount_amount"] = 0.0
+    daily_result["valuation_discount_amount"] = pd.to_numeric(
+        daily_result["valuation_discount_amount"], errors="coerce"
+    ).fillna(0.0)
+    daily_result["economic_nav"] = (
+        daily_result["liquidatable_nav"] - daily_result["valuation_discount_amount"]
+    ).clip(lower=0.0)
+    total_orders = len(order_ledger)
+    blocked_orders = (
+        int((order_ledger["execution_status"] != "filled").sum())
+        if total_orders and "execution_status" in order_ledger.columns
+        else 0
+    )
+    tax_impact = tax_ledger_total(tax_ledger)
+    if total_orders:
+        frozen_orders = order_ledger.copy()
+        frozen_orders["frozen_notional"] = (
+            pd.to_numeric(frozen_orders.get("remaining_shares"), errors="coerce").fillna(0.0)
+            * pd.to_numeric(frozen_orders.get("price"), errors="coerce").fillna(0.0)
+        )
+        frozen_notional = float(
+            frozen_orders.groupby("trade_date")["frozen_notional"].sum().max()
+        )
+    else:
+        frozen_notional = 0.0
+    frozen_aum_ratio = frozen_notional / float(initial_cash)
+    final_cash_drag = max(1.0 - sum(actual_weights.values()), 0.0)
+    base_cost_ratio = float(daily_result["transaction_cost"].sum())
+    gross_total_return = gross_nav.iloc[-1] / float(initial_cash) - 1 if len(gross_nav) else np.nan
+    status = research_status_dict()
+    execution_metrics = pd.DataFrame(
+        {
+            "metric": [
+                "gross_total_return",
+                "net_total_return",
+                "turnover_ratio",
+                "transaction_cost_ratio",
+                "blocked_order_count",
+                "failed_order_ratio",
+                "tax_impact_ratio",
+                "frozen_aum_ratio",
+                "cash_drag",
+                "liquidatable_total_return",
+                "economic_total_return",
+                "benchmark_excess_return",
+                "cost_sensitivity_low_return",
+                "cost_sensitivity_base_return",
+                "cost_sensitivity_high_return",
+                "research_mode",
+                "formal_status",
+                "formal_eligible",
+                "formal_block_reason_code",
+                "execution_model_version",
+            ],
+            "value": [
+                gross_total_return,
+                daily_result["net_value"].iloc[-1] / float(initial_cash) - 1,
+                daily_result["gross_turnover"].sum() / float(initial_cash),
+                base_cost_ratio,
+                blocked_orders,
+                blocked_orders / total_orders if total_orders else 0.0,
+                tax_impact / float(initial_cash),
+                frozen_aum_ratio,
+                final_cash_drag,
+                daily_result["liquidatable_nav"].iloc[-1] / float(initial_cash) - 1,
+                daily_result["economic_nav"].iloc[-1] / float(initial_cash) - 1,
+                np.nan,
+                gross_total_return - 0.5 * base_cost_ratio,
+                gross_total_return - base_cost_ratio,
+                gross_total_return - 2.0 * base_cost_ratio,
+                status["research_mode"],
+                status["formal_status"],
+                status["formal_eligible"],
+                status["formal_block_reason_code"],
+                status["execution_model_version"],
+            ],
+        }
+    )
+    metrics = pd.concat([metrics, execution_metrics], ignore_index=True)
     daily_result["drawdown"] = drawdown.values
     holdings_record = daily_result[["date", "holding_count"]].copy()
+    liquidity_report = build_liquidity_lock_report(
+        pd.concat(delayed_orders, ignore_index=True) if delayed_orders else pd.DataFrame()
+    )
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
     daily_csv = RESULT_DIR / f"backtest_daily_result_{strategy_name}.csv"
@@ -215,12 +404,27 @@ def run_backtest(
     holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}.csv"
     plot_file = RESULT_DIR / f"equity_curve_{strategy_name}.png"
     learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}.csv"
+    order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}.csv"
+    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}.csv"
+    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}.csv"
+    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)
     metrics.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
     holdings_record.to_csv(holdings_csv, index=False, encoding="utf-8-sig")
+    order_ledger.to_csv(order_ledger_csv, index=False, encoding="utf-8-sig")
+    tax_ledger.to_csv(tax_ledger_csv, index=False, encoding="utf-8-sig")
+    daily_result[
+        ["date", "initial_cash", "net_value", "liquidatable_nav", "economic_nav", "valuation_discount_amount"]
+    ].to_csv(cash_ledger_csv, index=False, encoding="utf-8-sig")
+    valuation_ledger.to_csv(valuation_ledger_csv, index=False, encoding="utf-8-sig")
     _save_learning_metadata(df_sel, learning_meta_csv)
+    if not liquidity_report.empty:
+        save_liquidity_lock_report(
+            liquidity_report,
+            output_path=LIQUIDITY_LOCK_REPORT_CSV,
+        )
 
     _plot_equity_curve(
         daily_result,
@@ -231,6 +435,12 @@ def run_backtest(
         show_plot=show_plot,
         output_file=plot_file,
         holdings_record=holdings_record,
+    )
+    diagnostic_outputs = save_performance_diagnostics(
+        daily_result=daily_result,
+        strategy_name=strategy_name,
+        output_dir=RESULT_DIR,
+        selection=df_sel,
     )
 
     print("\n========== Backtest Result ==========")
@@ -261,9 +471,17 @@ def run_backtest(
     print("Saved daily Parquet:", daily_parquet)
     print("Saved metrics:", metrics_csv)
     print("Saved holdings:", holdings_csv)
+    print("Saved order ledger:", order_ledger_csv)
+    print("Saved tax ledger:", tax_ledger_csv)
+    print("Saved cash ledger:", cash_ledger_csv)
+    print("Saved valuation ledger:", valuation_ledger_csv)
     if learning_meta_csv.exists():
         print("Saved learning metadata:", learning_meta_csv)
+    if not liquidity_report.empty:
+        print("Saved liquidity lock report:", LIQUIDITY_LOCK_REPORT_CSV)
     print("Saved equity curve:", plot_file)
+    for label, path in diagnostic_outputs.items():
+        print(f"Saved {label}:", path)
 
     return daily_result, metrics, holdings_record
 
@@ -473,6 +691,168 @@ def _save_learning_metadata(df_selection, output_file):
         return
 
     meta.to_csv(output_file, index=False, encoding="utf-8-sig")
+
+
+def _load_feature_data():
+    global _FEATURE_DATA_CACHE
+    if _FEATURE_DATA_CACHE is None:
+        wanted_columns = [
+            "date",
+            "symbol",
+            "instrument_type",
+            "close",
+            "close_nominal",
+            "open",
+            "open_nominal",
+            "is_trading",
+            "abnormal_jump",
+            "rough_limit_up",
+            "rough_limit_down",
+        ]
+        available_columns = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
+        columns = [col for col in wanted_columns if col in available_columns]
+        _FEATURE_DATA_CACHE = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=columns)
+    return _FEATURE_DATA_CACHE.copy()
+
+
+def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_date, initial_cash):
+    current_weights = dict(zip(one_holdings["symbol"], one_holdings["weight"]))
+    symbols = sorted(set(previous_weights) | set(current_weights))
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "trade_date", "side", "target_shares", "price"])
+
+    price_col = next(
+        (col for col in ["open_nominal", "open", "close_nominal", "close"] if col in feature_data.columns),
+        None,
+    )
+    if price_col is None:
+        raise ValueError("No nominal execution price column is available")
+    optional_cols = [
+        col for col in ["is_trading", "rough_limit_up", "rough_limit_down"]
+        if col in feature_data.columns
+    ]
+    price_frame = feature_data[feature_data["date"] == trade_date][
+        ["symbol", price_col] + optional_cols
+    ].drop_duplicates("symbol")
+    price_map = dict(zip(price_frame["symbol"], price_frame[price_col]))
+    state_map = price_frame.set_index("symbol").to_dict(orient="index")
+    rows = []
+    for symbol in symbols:
+        prev_weight = float(previous_weights.get(symbol, 0.0))
+        new_weight = float(current_weights.get(symbol, 0.0))
+        delta_weight = new_weight - prev_weight
+        if abs(delta_weight) < 1e-12:
+            continue
+        price = float(price_map.get(symbol, 0.0) or 0.0)
+        if price <= 0:
+            continue
+        notional = abs(delta_weight) * float(initial_cash)
+        raw_shares = notional / price
+        target_shares = int(raw_shares // MIN_LOT_SIZE) * MIN_LOT_SIZE
+        if target_shares <= 0:
+            continue
+        side = "buy" if delta_weight > 0 else "sell"
+        trading_state = state_map.get(symbol, {})
+        suspension_blocked = (
+            "is_trading" in trading_state
+            and not bool(trading_state.get("is_trading"))
+        )
+        price_limit_blocked = (
+            bool(trading_state.get("rough_limit_up", False)) if side == "buy"
+            else bool(trading_state.get("rough_limit_down", False))
+        )
+        rows.append(
+            {
+                "symbol": symbol,
+                "trade_date": trade_date,
+                "side": side,
+                "target_shares": target_shares,
+                "price": price,
+                "previous_weight": prev_weight,
+                "target_weight": new_weight,
+                "delta_weight": delta_weight,
+                "same_day_sell_blocked": False,
+                "price_limit_blocked_flag": price_limit_blocked,
+                "suspension_blocked_flag": suspension_blocked,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "trade_date", "side", "target_shares", "price"])
+    return pd.DataFrame(rows)
+
+
+def _apply_filled_orders_to_weights(previous_weights, simulated_orders):
+    weights = dict(previous_weights)
+    if simulated_orders.empty:
+        return weights
+    for _, order in simulated_orders.iterrows():
+        if order["execution_status"] != "filled":
+            continue
+        symbol = order["symbol"]
+        weights[symbol] = float(order.get("target_weight", weights.get(symbol, 0.0)))
+        if weights[symbol] <= 1e-12:
+            weights.pop(symbol, None)
+    return weights
+
+
+def _enforce_cash_weight_budget(previous_weights, simulated_orders):
+    """Reject buys requiring proceeds from a blocked sell."""
+    if simulated_orders.empty:
+        return simulated_orders
+    orders = simulated_orders.copy()
+    weights = dict(previous_weights)
+    filled_sells = orders[
+        (orders["execution_status"] == "filled") & (orders["side"] == "sell")
+    ]
+    for _, order in filled_sells.iterrows():
+        weights[order["symbol"]] = float(order["target_weight"])
+    available_weight = max(1.0 - sum(weights.values()), 0.0)
+    buy_rows = orders[
+        (orders["execution_status"] == "filled") & (orders["side"] == "buy")
+    ].index
+    for row_index in buy_rows:
+        required = max(float(orders.at[row_index, "delta_weight"]), 0.0)
+        if required <= available_weight + 1e-12:
+            available_weight -= required
+            continue
+        orders.at[row_index, "execution_status"] = "pending_cash"
+        orders.at[row_index, "constraint_blocked"] = True
+        orders.at[row_index, "executed_shares"] = 0.0
+        orders.at[row_index, "remaining_shares"] = orders.at[row_index, "target_shares"]
+    return estimate_trade_costs(orders, shares_col="executed_shares")
+
+
+def _apply_weight_constraints(df_selection, max_weight):
+    data = df_selection.copy()
+    counts = data.groupby("rebalance_date")["symbol"].transform("count")
+    default_weight = 1.0 / counts
+    if "weight" not in data.columns:
+        data["weight"] = default_weight
+    else:
+        data["weight"] = pd.to_numeric(data["weight"], errors="coerce").fillna(default_weight)
+
+    group_total = data.groupby("rebalance_date")["weight"].transform("sum")
+    group_total = group_total.where(group_total > 0, 1.0)
+    data["weight"] = (data["weight"] / group_total).clip(lower=0.0, upper=max_weight)
+    return data
+
+
+def _expand_rebalance_costs(rebalance_cost_records, available_dates, initial_cash):
+    if not rebalance_cost_records:
+        return pd.DataFrame(
+            {
+                "date": pd.to_datetime(available_dates),
+                "transaction_cost": 0.0,
+                "gross_turnover": 0.0,
+                "blocked_order_count": 0,
+            }
+        )
+
+    cost_frame = pd.DataFrame(rebalance_cost_records).copy()
+    cost_frame["date"] = pd.to_datetime(cost_frame["rebalance_date"])
+    divisor = float(initial_cash) if float(initial_cash) != 0 else 1.0
+    cost_frame["transaction_cost"] = cost_frame["transaction_cost"] / divisor
+    return cost_frame[["date", "transaction_cost", "gross_turnover", "blocked_order_count"]]
 
 
 if __name__ == "__main__":

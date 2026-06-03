@@ -4,8 +4,10 @@ from config import (
     FEATURE_DAILY_PARQUET, READ_LIMIT, START_DATE, END_DATE,
     INCLUDE_INSTRUMENT_TYPES
 )
+from functions.governance import build_research_status, print_runtime_disclosure
 
 def print_project_status():
+    research_status = build_research_status()
     print("========== Project Status ==========")
     print("TDX_DIR:", TDX_DIR)
     print("PROJECT_DIR:", PROJECT_DIR)
@@ -16,4 +18,7 @@ def print_project_status():
     print("RAW_DAILY_PARQUET:", RAW_DAILY_PARQUET)
     print("CLEAN_DAILY_PARQUET:", CLEAN_DAILY_PARQUET)
     print("FEATURE_DAILY_PARQUET:", FEATURE_DAILY_PARQUET)
+    print("RESEARCH_MODE:", research_status.research_mode)
+    print("FORMAL_STATUS:", research_status.formal_status)
+    print("FORMAL_ELIGIBLE:", research_status.formal_eligible)
     print("====================================")

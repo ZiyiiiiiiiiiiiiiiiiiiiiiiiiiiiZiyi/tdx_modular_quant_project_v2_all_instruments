@@ -45,7 +45,12 @@ def calc_backtest_metrics(daily_result, risk_free_rate=0.0):
     end_date = data["date"].max()
     trading_days = len(data)
 
-    total_return = data["net_value"].iloc[-1] / data["net_value"].iloc[0] - 1
+    initial_value = (
+        float(data["initial_cash"].iloc[0])
+        if "initial_cash" in data.columns and pd.notna(data["initial_cash"].iloc[0])
+        else data["net_value"].iloc[0]
+    )
+    total_return = data["net_value"].iloc[-1] / initial_value - 1
 
     if trading_days > 1:
         annual_return = (1 + total_return) ** (252 / trading_days) - 1
@@ -62,6 +67,14 @@ def calc_backtest_metrics(daily_result, risk_free_rate=0.0):
     max_drawdown, drawdown = calc_max_drawdown(data["net_value"])
 
     win_rate = (data["daily_return"] > 0).mean()
+    downside = data.loc[data["daily_return"] < 0, "daily_return"]
+    downside_volatility = downside.std() * np.sqrt(252) if len(downside) else np.nan
+    sortino = (annual_return - risk_free_rate) / downside_volatility if downside_volatility and downside_volatility != 0 else np.nan
+    calmar = annual_return / abs(max_drawdown) if max_drawdown and max_drawdown != 0 else np.nan
+    drawdown_duration = _max_drawdown_duration(drawdown)
+    monthly = data.set_index("date")["daily_return"].resample("ME").apply(lambda s: (1.0 + s).prod() - 1.0)
+    monthly_win_rate = (monthly > 0).mean() if len(monthly) else np.nan
+    max_consecutive_loss_days = _max_consecutive_losses(data["daily_return"])
 
     metrics = pd.DataFrame({
         "metric": [
@@ -75,6 +88,11 @@ def calc_backtest_metrics(daily_result, risk_free_rate=0.0):
             "sharpe",
             "max_drawdown",
             "win_rate",
+            "sortino",
+            "calmar",
+            "max_drawdown_duration_days",
+            "monthly_win_rate",
+            "max_consecutive_loss_days",
         ],
         "value": [
             start_date,
@@ -87,7 +105,36 @@ def calc_backtest_metrics(daily_result, risk_free_rate=0.0):
             sharpe,
             max_drawdown,
             win_rate,
+            sortino,
+            calmar,
+            drawdown_duration,
+            monthly_win_rate,
+            max_consecutive_loss_days,
         ]
     })
 
     return metrics, drawdown
+
+
+def _max_drawdown_duration(drawdown):
+    duration = 0
+    max_duration = 0
+    for value in drawdown.fillna(0.0):
+        if value < 0:
+            duration += 1
+            max_duration = max(max_duration, duration)
+        else:
+            duration = 0
+    return max_duration
+
+
+def _max_consecutive_losses(returns):
+    streak = 0
+    max_streak = 0
+    for value in pd.to_numeric(returns, errors="coerce").fillna(0.0):
+        if value < 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak

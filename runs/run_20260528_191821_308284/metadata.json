@@ -1,0 +1,103 @@
+{
+  "code_snapshot": [
+    {
+      "exists": true,
+      "mtime_ns": 1779966668280495900,
+      "path": "main.py",
+      "sha256": "e59640ea831e16394c956cf4980a31130ddcb98600fdb3463ad39da2c29e3e5d",
+      "size": 20617
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779901216695382500,
+      "path": "config.py",
+      "sha256": "48707291d064080920bc150e3de420796f6c8f99e2f0c3cc91dd351200769bf1",
+      "size": 5106
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779967073149102300,
+      "path": "functions\\feature_engineering.py",
+      "sha256": "59839bfc95c91ed9cb10faaf2e458b1cdf3202b37b2f93f58991aff3cde516eb",
+      "size": 17531
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779899274120682100,
+      "path": "functions\\strategy_registry.py",
+      "sha256": "b9493f013366789b8f239fc4f961e8a68a33515c19b1b54a72661976507b9cf1",
+      "size": 5114
+    }
+  ],
+  "config_snapshot": {
+    "adjustment_data_version": "baostock_adjust_factor_v1",
+    "attempt_id": "attempt_01",
+    "baseline_version": "pre_p0_legacy",
+    "corporate_action_data_version": "baostock_dividend_v1",
+    "data_version": "tdx_daily_v2",
+    "enable_hot_theme_bias": true,
+    "enable_learning_strategies": true,
+    "enable_placeholder_strategies": false,
+    "enable_quantum_inspired_strategies": false,
+    "end_date": null,
+    "idea_id": "baseline_rebuild_v2",
+    "include_instrument_types": [
+      "stock",
+      "etf_fund",
+      "index",
+      "bond",
+      "convertible_bond",
+      "b_share",
+      "unknown"
+    ],
+    "include_markets": [
+      "sh",
+      "sz",
+      "bj"
+    ],
+    "learning_strategy_whitelist": null,
+    "read_limit": null,
+    "research_run_mode": "exploratory",
+    "start_date": "2018-01-01",
+    "strategy_end_date": null,
+    "strategy_freq": "ME",
+    "strategy_start_date": "2021-01-01",
+    "strategy_top_n": 20
+  },
+  "cwd": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments",
+  "error_message": "interrupted_by_operator_after_memory_or_runtime_limit; completed via run_saved_strategy_backtests.py",
+  "extra": {
+    "module_phase": "module_01_experiment_skeleton"
+  },
+  "failed_at": "2026-05-28T19:52:38",
+  "git_commit": "08a4bc770261192c03cc32681ddf14bfec7078a5",
+  "run_id": "run_20260528_191821_308284",
+  "started_at": "2026-05-28T19:18:21",
+  "status": "failed",
+  "tracked_inputs": [
+    {
+      "exists": true,
+      "mtime_ns": 1779801789024907100,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_raw.parquet",
+      "size": 684555300
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779966731880423000,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_clean.parquet",
+      "size": 627337714
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779802044242319100,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\processed\\tdx_daily_features.parquet",
+      "size": 3309315496
+    },
+    {
+      "exists": true,
+      "mtime_ns": 1779966736081977200,
+      "path": "F:\\通信达量化\\tdx_modular_quant_project_v2_all_instruments\\data\\reports\\pipeline_run_cache.json",
+      "size": 1312
+    }
+  ]
+}

@@ -3,79 +3,244 @@ import numpy as np
 import pandas as pd
 
 from config import (
+    ADJUSTMENT_FACTORS_PARQUET,
     CLEAN_DAILY_PARQUET,
+    ENABLE_HOT_THEME_BIAS,
     FEATURE_DAILY_PARQUET,
+    FEATURE_COVERAGE_REPORT_CSV,
+    FEATURE_DISTRIBUTION_REPORT_CSV,
+    FEATURE_REGISTRY_REPORT_CSV,
+    FEATURE_STABILITY_REPORT_CSV,
     HOT_THEME_SLOT_RATIO,
     HOT_THEME_WEIGHTS,
+    FORMAL_MODE_NAME,
+    MARKET_CAP_PARQUET,
+    RESEARCH_RUN_MODE,
 )
-from functions.factors.factor_learning import (
-    LEARNING_STRATEGY_DESCRIPTIONS,
-    generate_learning_module_scores,
+from functions.data_sources.adjustment_factors import attach_adjustment_factors_to_daily
+from functions.factor_registry import default_factor_registry
+from functions.feature_diagnostics import (
+    build_feature_coverage_report,
+    build_feature_distribution_report,
+    build_feature_stability_report,
 )
+from functions.feature_normalization import (
+    neutralize_by_group_and_size,
+    robust_scale_cross_section,
+    winsorize_cross_section,
+    zscore_cross_section,
+)
+from functions.factors.factor_learning import generate_learning_module_scores, generate_learning_strategy_scores
 from functions.factors.factor_ml import compute_factor as compute_ml_factor
+from functions.labels import apply_default_labels
+from functions.pricing.price_views import (
+    POINT_IN_TIME_ADJUSTED_PRICE_COLUMNS,
+    attach_nominal_price_columns,
+    attach_point_in_time_adjusted_price_columns,
+)
+from functions.progress import progress_iter, progress_step
 from functions.sector_taxonomy import attach_sector_labels
+from functions.strategy_registry import STRATEGY_REGISTRY
+from functions.strategy_signal_generators import build_technical_strategy_features
+from functions.position_managed_selection import generate_position_managed_selection
 from functions.strategy_selection import get_rebalance_dates
 
 
 GROUP_COL = "symbol"
-
-STRATEGY_FACTOR_DESCRIPTIONS = {
-    "momentum": "20日收益率 ret_20，从高到低选取",
-    "reversal": "5日收益率 ret_5，从低到高选取，短期反转",
-    "low_vol": "20日波动率 volatility_20，从低到高选取，低波动",
-    "volume_extreme": "20日成交量均值 volume_ma_20，从高到低选取",
-    "ma_break": "收盘价相对20日均线偏离 close_to_ma20，从高到低选取",
-    "kline_shape": "日内振幅 amplitude，从高到低选取",
-    "mom_lowvol": "20日收益率 ret_20 - 20日波动率 volatility_20",
-    "ml_elasticnet": "ElasticNet 机器学习综合分数 score_ml",
-    "ml_xgboost": "XGBoost 机器学习综合分数 score_ml",
-    "ml_lightgbm": "LightGBM 机器学习综合分数 score_ml",
-    "event_factor": "占位事件因子：当前暂用 20日收益率 ret_20",
-    "alternative_factor": "占位另类因子：当前暂用 20日收益率 ret_20",
-}
-STRATEGY_FACTOR_DESCRIPTIONS.update(LEARNING_STRATEGY_DESCRIPTIONS)
+NORMALIZED_FEATURE_COLUMNS = [
+    "ret_20",
+    "volatility_20",
+    "close_to_ma20",
+    "close_to_ma60",
+    "amount_ratio_20",
+    "score_mom_lowvol",
+]
 
 
 def generate_daily_features_multi():
+    progress_step("feature step: load clean daily parquet")
     df = pd.read_parquet(CLEAN_DAILY_PARQUET)
+    if ADJUSTMENT_FACTORS_PARQUET.exists():
+        progress_step("feature step: attach adjustment factors")
+        df = attach_adjustment_factors_to_daily(df, pd.read_parquet(ADJUSTMENT_FACTORS_PARQUET))
+    progress_step("feature step: build feature frame")
+    df = build_feature_frame(df)
+
+    progress_step("feature step: save feature reports")
+    _save_feature_reports(df)
+    _save_feature_registry_validation(df)
+
+    progress_step("feature step: write feature parquet")
+    df.to_parquet(FEATURE_DAILY_PARQUET, index=False)
+    print("Feature shape:", df.shape)
+    return df
+
+
+def build_feature_frame(df):
     df = df.sort_values([GROUP_COL, "date"]).copy()
+    progress_step("feature frame: attach market cap history")
+    df = _attach_market_cap_history(df)
+    progress_step("feature frame: attach price views")
+    df = attach_nominal_price_columns(df)
+    if "backward_factor" in df.columns:
+        df = attach_point_in_time_adjusted_price_columns(df)
+    use_pti_adjusted_prices = all(col in df.columns for col in POINT_IN_TIME_ADJUSTED_PRICE_COLUMNS)
+    price_suffix = "_adj_pti" if use_pti_adjusted_prices else ""
+    open_col = f"open{price_suffix}"
+    high_col = f"high{price_suffix}"
+    low_col = f"low{price_suffix}"
+    close_col = f"close{price_suffix}"
+    df["feature_price_source"] = (
+        "adjusted_point_in_time" if use_pti_adjusted_prices
+        else "nominal_unadjusted"
+    )
+    df["formal_price_eligible"] = use_pti_adjusted_prices & df.get(
+        "adj_factor_available", pd.Series(False, index=df.index)
+    ).fillna(False)
+    df["feature_timestamp"] = pd.to_datetime(df["date"])
+    progress_step("feature frame: attach sector labels")
     df = attach_sector_labels(df)
     grouped = df.groupby(GROUP_COL, group_keys=False)
 
-    for n in [1, 5, 10, 20, 60]:
-        df[f"ret_{n}"] = grouped["close"].pct_change(n)
+    for n in progress_iter([1, 5, 10, 20, 60], desc="returns"):
+        df[f"ret_{n}"] = grouped[close_col].pct_change(n, fill_method=None)
 
-    for n in [5, 10, 20, 60, 120]:
-        df[f"ma_{n}"] = grouped["close"].transform(lambda x: x.rolling(n, min_periods=n).mean())
+    for n in progress_iter([5, 10, 20, 60, 120], desc="moving averages"):
+        df[f"ma_{n}"] = grouped[close_col].transform(lambda x: x.rolling(n, min_periods=n).mean())
         df[f"volume_ma_{n}"] = grouped["volume"].transform(
             lambda x: x.rolling(n, min_periods=n).mean()
         )
 
-    df["close_to_ma20"] = df["close"] / df["ma_20"] - 1
-    df["close_to_ma60"] = df["close"] / df["ma_60"] - 1
+    df["close_to_ma20"] = df[close_col] / df["ma_20"] - 1
+    df["close_to_ma60"] = df[close_col] / df["ma_60"] - 1
 
-    for n in [10, 20, 60]:
+    for n in progress_iter([10, 20, 60], desc="volatility"):
         df[f"volatility_{n}"] = grouped["ret_1"].transform(
             lambda x: x.rolling(n, min_periods=n).std()
         )
 
-    df["amplitude"] = df["high"] / df["low"] - 1
-    df["intraday_ret"] = df["close"] / df["open"] - 1
-    max_open_close = df[["open", "close"]].max(axis=1)
-    min_open_close = df[["open", "close"]].min(axis=1)
-    df["upper_shadow"] = df["high"] / max_open_close - 1
-    df["lower_shadow"] = min_open_close / df["low"] - 1
-    price_range = (df["high"] - df["low"]).replace(0, np.nan)
-    df["body_ratio"] = (df["close"] - df["open"]).abs() / price_range
+    df["amplitude"] = df[high_col] / df[low_col] - 1
+    df["intraday_ret"] = df[close_col] / df[open_col] - 1
+    max_open_close = df[[open_col, close_col]].max(axis=1)
+    min_open_close = df[[open_col, close_col]].min(axis=1)
+    df["upper_shadow"] = df[high_col] / max_open_close - 1
+    df["lower_shadow"] = min_open_close / df[low_col] - 1
+    price_range = (df[high_col] - df[low_col]).replace(0, np.nan)
+    df["body_ratio"] = (df[close_col] - df[open_col]).abs() / price_range
 
     df["amount_ma20"] = grouped["amount"].transform(lambda x: x.rolling(20, min_periods=20).mean())
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"] - 1
 
     df["score_mom_lowvol"] = df["ret_20"] - df["volatility_20"]
+    progress_step("feature frame: attach technical strategy factors")
+    df = build_technical_strategy_features(df)
 
-    df.to_parquet(FEATURE_DAILY_PARQUET, index=False)
-    print("Feature shape:", df.shape)
+    progress_step("feature frame: apply labels")
+    df = apply_default_labels(df, price_col=close_col)
+    progress_step("feature frame: attach normalized feature views")
+    df = _attach_normalized_feature_views(df)
     return df
+
+
+def _attach_market_cap_history(df):
+    if not MARKET_CAP_PARQUET.exists():
+        return df
+    market_cap = pd.read_parquet(
+        MARKET_CAP_PARQUET,
+        columns=[
+            "symbol",
+            "date",
+            "total_cap",
+            "float_cap",
+            "market_cap_jump_flag",
+            "float_cap_jump_flag",
+            "jump_event_type",
+            "stabilized_total_cap",
+            "stabilized_float_cap",
+        ],
+    )
+    market_cap["date"] = pd.to_datetime(market_cap["date"])
+    frame = df
+    frame["date"] = pd.to_datetime(frame["date"])
+    return frame.merge(market_cap, on=["symbol", "date"], how="left")
+
+
+def _attach_normalized_feature_views(df):
+    available_cols = [col for col in NORMALIZED_FEATURE_COLUMNS if col in df.columns]
+    if not available_cols:
+        return df
+
+    frame = df
+    grouped = frame.groupby("date", sort=False)
+    for col in progress_iter(available_cols, desc="normalize features"):
+        lower = grouped[col].transform(lambda s: s.quantile(0.01))
+        upper = grouped[col].transform(lambda s: s.quantile(0.99))
+        winsor = frame[col].clip(lower=lower, upper=upper)
+        frame[f"{col}_winsor"] = winsor
+
+        mean = winsor.groupby(frame["date"], sort=False).transform("mean")
+        std = winsor.groupby(frame["date"], sort=False).transform("std").replace(0, 1.0).fillna(1.0)
+        frame[f"{col}_z"] = (winsor - mean) / std
+
+        median = winsor.groupby(frame["date"], sort=False).transform("median")
+        q75 = winsor.groupby(frame["date"], sort=False).transform(lambda s: s.quantile(0.75))
+        q25 = winsor.groupby(frame["date"], sort=False).transform(lambda s: s.quantile(0.25))
+        iqr = (q75 - q25).abs().replace(0, 1e-9).fillna(1e-9)
+        frame[f"{col}_robust"] = (winsor - median) / iqr
+
+        if "sector_parent" in frame.columns and "stabilized_float_cap" in frame.columns:
+            industry_mean = winsor.groupby([frame["date"], frame["sector_parent"]], sort=False).transform("mean")
+            size_rank = frame.groupby("date", sort=False)["stabilized_float_cap"].rank(method="average", pct=True)
+            size_centered = size_rank - size_rank.groupby(frame["date"], sort=False).transform("mean")
+            frame[f"{col}_neutralized"] = winsor - industry_mean - size_centered.fillna(0.0)
+        else:
+            frame[f"{col}_neutralized"] = winsor
+    return frame
+
+
+def _save_feature_reports(df):
+    report_cols = [col for col in NORMALIZED_FEATURE_COLUMNS if col in df.columns]
+    if not report_cols:
+        return
+
+    build_feature_coverage_report(df, report_cols).to_csv(
+        FEATURE_COVERAGE_REPORT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    build_feature_distribution_report(df, report_cols).to_csv(
+        FEATURE_DISTRIBUTION_REPORT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+    build_feature_stability_report(df, report_cols).to_csv(
+        FEATURE_STABILITY_REPORT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def _save_feature_registry_validation(df):
+    registry = default_factor_registry()
+    rows = []
+    available_columns = set(df.columns)
+    for spec in registry.values():
+        missing_outputs = sorted(set(spec.output_columns) - available_columns)
+        rows.append(
+            {
+                "factor_name": spec.factor_name,
+                "module_path": spec.module_path,
+                "status": spec.status,
+                "output_columns": ",".join(spec.output_columns),
+                "missing_output_columns": ",".join(missing_outputs),
+                "is_complete": len(missing_outputs) == 0,
+            }
+        )
+    pd.DataFrame(rows).to_csv(
+        FEATURE_REGISTRY_REPORT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def select_instruments_by_score(
@@ -91,7 +256,21 @@ def select_instruments_by_score(
     hot_theme_slot_ratio=0.0,
 ):
     """Select top instruments only on configured rebalance dates."""
-    df_sel = df.copy()
+    needed_cols = [
+        "date",
+        "symbol",
+        "close",
+        score_col,
+        "instrument_type",
+        "is_trading",
+        "abnormal_jump",
+        "formal_price_eligible",
+        "sector_parent",
+        "sector_parent_heat",
+        "sector_branch_heat",
+    ]
+    needed_cols = list(dict.fromkeys(col for col in needed_cols if col in df.columns))
+    df_sel = df.loc[:, needed_cols].copy()
     df_sel["date"] = pd.to_datetime(df_sel["date"])
 
     if start_date is not None:
@@ -104,6 +283,10 @@ def select_instruments_by_score(
         df_sel = df_sel[df_sel["is_trading"] == True]
     if "abnormal_jump" in df_sel.columns:
         df_sel = df_sel[df_sel["abnormal_jump"] == False]
+    if RESEARCH_RUN_MODE == FORMAL_MODE_NAME:
+        if "formal_price_eligible" not in df_sel.columns:
+            raise ValueError("Formal strategy selection requires point-in-time adjustment coverage")
+        df_sel = df_sel[df_sel["formal_price_eligible"] == True]
 
     df_sel = df_sel.dropna(subset=["date", "symbol", "close", score_col])
     if df_sel.empty:
@@ -162,14 +345,30 @@ def generate_multi_strategies(
     )
 
     def select(score_col, ascending=False, source_df=None):
-        selection_source = df
+        base_cols = [
+            "date",
+            "symbol",
+            "close",
+            score_col,
+            "instrument_type",
+            "is_trading",
+            "abnormal_jump",
+            "formal_price_eligible",
+            "sector_parent",
+            "sector_parent_heat",
+            "sector_branch_heat",
+        ]
+        base_cols = list(dict.fromkeys(col for col in base_cols if col in df.columns))
+        selection_source = df.loc[:, base_cols]
         if source_df is not None:
             extra_cols = [col for col in source_df.columns if col not in {"date", "symbol"}]
-            selection_source = df.merge(
+            selection_source = selection_source.merge(
                 source_df[["date", "symbol", *extra_cols]],
                 on=["date", "symbol"],
                 how="left",
             )
+        hot_theme_weights = HOT_THEME_WEIGHTS if ENABLE_HOT_THEME_BIAS else {}
+        hot_theme_slot_ratio = HOT_THEME_SLOT_RATIO if ENABLE_HOT_THEME_BIAS else 0.0
         return select_instruments_by_score(
             selection_source,
             score_col,
@@ -179,38 +378,170 @@ def generate_multi_strategies(
             start_date=start_date,
             end_date=end_date,
             ascending=ascending,
-            hot_theme_weights=HOT_THEME_WEIGHTS,
-            hot_theme_slot_ratio=HOT_THEME_SLOT_RATIO,
+            hot_theme_weights=hot_theme_weights,
+            hot_theme_slot_ratio=hot_theme_slot_ratio,
         )
 
-    strategies["momentum"] = select("ret_20")
-    strategies["reversal"] = select("ret_5", ascending=True)
-    strategies["low_vol"] = select("volatility_20", ascending=True)
-    strategies["volume_extreme"] = select("volume_ma_20")
-    strategies["ma_break"] = select("close_to_ma20")
-    strategies["kline_shape"] = select("amplitude")
-    strategies["mom_lowvol"] = select("score_mom_lowvol")
+    ml_score_tables = {}
+    learning_score_tables = None
 
-    df_ml_en = compute_ml_factor(df, model_type="elasticnet", rebalance_dates=candidate_dates)
-    df_ml_xgb = compute_ml_factor(df, model_type="xgboost", rebalance_dates=candidate_dates)
-    df_ml_lgb = compute_ml_factor(df, model_type="lightgbm", rebalance_dates=candidate_dates)
+    for strategy_name, spec in progress_iter(
+        STRATEGY_REGISTRY.items(),
+        desc="generate strategies",
+        total=len(STRATEGY_REGISTRY),
+    ):
+        source_df = None
+        progress_step(f"strategy: {strategy_name} source={spec.source}")
 
-    strategies["ml_elasticnet"] = select("score_ml", source_df=df_ml_en)
-    strategies["ml_xgboost"] = select("score_ml", source_df=df_ml_xgb)
-    strategies["ml_lightgbm"] = select("score_ml", source_df=df_ml_lgb)
+        if spec.source == "ml":
+            if spec.model_type not in ml_score_tables:
+                ml_score_tables[spec.model_type] = compute_ml_factor(
+                    df,
+                    model_type=spec.model_type,
+                    rebalance_dates=candidate_dates,
+                )
+            source_df = ml_score_tables[spec.model_type]
+        elif spec.source in {"classic_ml", "quantum_inspired"}:
+            if learning_score_tables is None:
+                learning_score_tables = generate_learning_module_scores(
+                    df,
+                    rebalance_dates=candidate_dates,
+                )
+            source_df = learning_score_tables[strategy_name]
+        elif spec.source == "position_management":
+            strategies[strategy_name], _ = generate_position_managed_selection(
+                df,
+                top_n=top_n,
+                freq=freq,
+                start_date=start_date,
+                end_date=end_date,
+                strategy_name=strategy_name,
+            )
+            continue
 
-    learning_score_tables = generate_learning_module_scores(df, rebalance_dates=candidate_dates)
-    for strategy_name, score_df in learning_score_tables.items():
-        strategies[strategy_name] = select("score_learning", source_df=score_df)
-
-    strategies["event_factor"] = select("ret_20")
-    strategies["alternative_factor"] = select("ret_20")
+        strategies[strategy_name] = select(
+            spec.score_col,
+            ascending=spec.ascending,
+            source_df=source_df,
+        )
 
     return strategies
 
 
+def generate_one_strategy(
+    df,
+    strategy_name,
+    top_n,
+    freq="ME",
+    include_types=("stock", "etf_fund"),
+    start_date=None,
+    end_date=None,
+):
+    """Generate one configured strategy selection with bounded intermediate state."""
+    spec = STRATEGY_REGISTRY[strategy_name]
+    candidate_dates = _strategy_rebalance_dates(
+        df=df,
+        freq=freq,
+        include_types=include_types,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    source_df = None
+    if spec.source == "ml":
+        source_df = compute_ml_factor(
+            df,
+            model_type=spec.model_type,
+            rebalance_dates=candidate_dates,
+        )
+    elif spec.source in {"classic_ml", "quantum_inspired"}:
+        source_df = generate_learning_strategy_scores(
+            df,
+            strategy_name=strategy_name,
+            rebalance_dates=candidate_dates,
+        )
+    elif spec.source == "position_management":
+        selection, _ = generate_position_managed_selection(
+            df,
+            top_n=top_n,
+            freq=freq,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_name=strategy_name,
+        )
+        return selection
+
+    base_cols = _selection_source_columns(spec.score_col, df.columns)
+    selection_source = df.loc[:, base_cols]
+    if source_df is not None:
+        extra_cols = [col for col in source_df.columns if col not in {"date", "symbol"}]
+        selection_source = selection_source.merge(
+            source_df[["date", "symbol", *extra_cols]],
+            on=["date", "symbol"],
+            how="left",
+        )
+    return select_instruments_by_score(
+        selection_source,
+        spec.score_col,
+        top_n=top_n,
+        freq=freq,
+        include_types=include_types,
+        start_date=start_date,
+        end_date=end_date,
+        ascending=spec.ascending,
+        hot_theme_weights=HOT_THEME_WEIGHTS if ENABLE_HOT_THEME_BIAS else {},
+        hot_theme_slot_ratio=HOT_THEME_SLOT_RATIO if ENABLE_HOT_THEME_BIAS else 0.0,
+    )
+
+
+def required_feature_columns_for_strategy(strategy_name):
+    spec = STRATEGY_REGISTRY[strategy_name]
+    columns = set(_selection_source_columns(spec.score_col))
+    columns.update(["ret_1", "ret_5", "ret_10", "ret_20", "ret_60", "close"])
+    if spec.source == "ml":
+        from functions.factors.factor_ml import BASE_ML_FEATURE_COLUMNS, DEFAULT_FEATURE_SUFFIX_PRIORITY
+
+        columns.update(BASE_ML_FEATURE_COLUMNS)
+        for base_col in BASE_ML_FEATURE_COLUMNS:
+            for suffix in DEFAULT_FEATURE_SUFFIX_PRIORITY:
+                columns.add(f"{base_col}{suffix}")
+        columns.update(["future_ret_5"])
+    elif spec.source in {"classic_ml", "quantum_inspired"}:
+        from functions.factors.factor_learning import BASE_FEATURE_PRIORITY
+        from config import LABEL_DEFAULT_HORIZONS
+
+        columns.update(BASE_FEATURE_PRIORITY)
+        for base_col in BASE_FEATURE_PRIORITY:
+            for suffix in ("_neutralized", "_z", "_robust", "_winsor"):
+                columns.add(f"{base_col}{suffix}")
+        for horizon in LABEL_DEFAULT_HORIZONS:
+            columns.add(f"future_ret_{horizon}")
+    return sorted(columns)
+
+
+def _selection_source_columns(score_col, available_columns=None):
+    needed = [
+        "date",
+        "symbol",
+        "close",
+        score_col,
+        "instrument_type",
+        "is_trading",
+        "abnormal_jump",
+        "formal_price_eligible",
+        "sector_parent",
+        "sector_parent_heat",
+        "sector_branch_heat",
+    ]
+    if available_columns is None:
+        return list(dict.fromkeys(needed))
+    available = set(available_columns)
+    return list(dict.fromkeys(col for col in needed if col in available))
+
+
 def _strategy_rebalance_dates(df, freq, include_types, start_date, end_date):
-    base = df.copy()
+    needed_cols = ["date", "symbol", "instrument_type", "is_trading", "abnormal_jump"]
+    needed_cols = [col for col in needed_cols if col in df.columns]
+    base = df.loc[:, needed_cols].copy()
     base["date"] = pd.to_datetime(base["date"])
     if start_date is not None:
         base = base[base["date"] >= pd.to_datetime(start_date)]
