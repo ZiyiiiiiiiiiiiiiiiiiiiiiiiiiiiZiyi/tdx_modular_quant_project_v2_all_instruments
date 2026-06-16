@@ -9,6 +9,17 @@ from functions.investable_universe import build_index_universe_quality_report, n
 
 
 def main():
+    normalized_formats = normalize_index_constituents(
+        pd.DataFrame(
+            [
+                {"index_code": "000300", "symbol": "600000.SH", "first_trade_date": "2024-01-02"},
+                {"index_code": "000300", "symbol": "000001.SZ", "first_trade_date": "2024-01-02"},
+                {"index_code": "000300", "symbol": "430047.BJ", "first_trade_date": "2024-01-02"},
+            ]
+        )
+    )
+    assert set(normalized_formats["symbol"]) == {"sh600000", "sz000001", "bj430047"}
+
     first = normalize_index_constituents(
         pd.DataFrame(
             [

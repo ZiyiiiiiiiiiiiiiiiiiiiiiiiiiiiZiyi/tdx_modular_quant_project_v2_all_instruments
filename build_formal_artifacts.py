@@ -13,6 +13,7 @@ from config import (
     FEATURE_DAILY_PARQUET,
 )
 from functions.benchmark import save_investable_benchmark_report
+from functions.data_integrity import save_data_integrity_artifacts
 from functions.execution.corporate_action_ledger import build_corporate_action_ledger
 from functions.formal_admission import save_formal_admission_report
 from functions.lineage import save_lineage_reports
@@ -35,6 +36,7 @@ def main():
     benchmark = save_investable_benchmark_report()
     manifest = save_reproducibility_manifest()
     admission = save_formal_admission_report()
+    integrity_outputs = save_data_integrity_artifacts()
     for path in [
         lineage,
         timestamp_audit,
@@ -43,6 +45,7 @@ def main():
         benchmark,
         manifest,
         admission,
+        *integrity_outputs,
     ]:
         print("Saved:", path)
 

@@ -3,12 +3,19 @@ from pathlib import Path
 import pandas as pd
 
 from config import (
+    ADJUSTMENT_PTI_QUALITY_CSV,
     CLEAN_DAILY_PARQUET,
+    DATA_CONTINUITY_REPORT_CSV,
     FEATURE_DAILY_PARQUET,
+    FEATURE_MEMORY_REPORT_CSV,
+    GOVERNANCE_OUTPUT_DIR,
     PROCESSED_DIR,
     RAW_DAILY_PARQUET,
     RESULT_DIR,
+    STRATEGY_END_DATE,
+    STRATEGY_START_DATE,
 )
+from functions.date_window import assert_date_window, window_identity
 from functions.strategy_registry import STRATEGY_REGISTRY, list_strategy_names
 
 
@@ -27,6 +34,13 @@ REQUIRED_SELECTION_COLUMNS = {
     "symbol",
     "score",
     "weight",
+    "strategy_source",
+    "weighting_mode",
+    "price_basis",
+    "neutralization_mode",
+    "ml_runtime_mode",
+    "date_window",
+    "degradation_flags",
 }
 
 REQUIRED_SUMMARY_COLUMNS = {
@@ -35,6 +49,33 @@ REQUIRED_SUMMARY_COLUMNS = {
     "sharpe",
     "max_drawdown",
     "composite_score",
+    "strategy_source",
+    "weighting_mode",
+    "benchmark_status",
+    "top1_weight",
+    "top5_weight_sum",
+    "effective_n",
+    "degradation_count",
+}
+
+REQUIRED_REPORT_SECTIONS = {
+    "## Summary",
+    "## Total Table",
+    "## Category Tables",
+    "## Diagnostics",
+    "## Resources",
+}
+
+REQUIRED_GOVERNANCE_SUMMARY_COLUMNS = {
+    "strategy",
+    "strategy_source",
+    "weighting_mode",
+    "governance_variant",
+    "safety_proxy_mode",
+    "exposure_cap_mode",
+    "trading_freeze_trigger_count",
+    "emergency_deleveraging_trigger_count",
+    "date_window",
 }
 
 
@@ -63,6 +104,9 @@ def verify_mainline_outputs():
     raw_ok = check_file_exists(RAW_DAILY_PARQUET, "raw parquet", failures)
     clean_ok = check_file_exists(CLEAN_DAILY_PARQUET, "clean parquet", failures)
     feature_ok = check_file_exists(FEATURE_DAILY_PARQUET, "feature parquet", failures)
+    check_file_exists(FEATURE_MEMORY_REPORT_CSV, "feature memory report", failures)
+    check_file_exists(DATA_CONTINUITY_REPORT_CSV, "data continuity report", failures)
+    check_file_exists(ADJUSTMENT_PTI_QUALITY_CSV, "adjustment pti coverage report", failures)
 
     if feature_ok:
         feature_df = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=list(REQUIRED_FEATURE_COLUMNS))
@@ -73,6 +117,7 @@ def verify_mainline_outputs():
     print(f"Configured strategy names: {strategy_names}")
 
     missing_strategy_files = []
+    empty_strategy_names = []
     for strategy_name in strategy_names:
         selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
         if not selection_path.exists():
@@ -87,6 +132,23 @@ def verify_mainline_outputs():
             f"strategy selection {strategy_name}",
             failures,
         )
+        if selection_df.empty:
+            empty_strategy_names.append(strategy_name)
+            print(f"[INFO] strategy selection {strategy_name}: empty selection, backtest summary row is optional")
+        else:
+            try:
+                assert_date_window(
+                    selection_df,
+                    "rebalance_date",
+                    start_date=STRATEGY_START_DATE,
+                    end_date=STRATEGY_END_DATE,
+                    label=f"strategy selection {strategy_name}",
+                )
+            except ValueError as exc:
+                print(f"[FAIL] {exc}")
+                failures.append(str(exc))
+            else:
+                print(f"[PASS] strategy selection {strategy_name}: configured date window enforced")
 
     if missing_strategy_files:
         failures.append(f"missing strategy selection files: {len(missing_strategy_files)}")
@@ -112,14 +174,34 @@ def verify_mainline_outputs():
     if summary_ok:
         summary_df = pd.read_csv(summary_path)
         check_columns(summary_df, REQUIRED_SUMMARY_COLUMNS, "backtest summary", failures)
+        identity = window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE)
+        for key, expected in identity.items():
+            column = f"configured_{key}"
+            if column not in summary_df.columns:
+                failures.append(f"backtest summary missing date identity column: {column}")
+                print(f"[FAIL] backtest summary missing date identity column: {column}")
+                continue
+            actual = summary_df[column].fillna("").astype(str)
+            expected_text = "" if expected is None else str(expected)
+            if not actual.eq(expected_text).all():
+                failures.append(f"backtest summary contains stale {column} values")
+                print(f"[FAIL] backtest summary contains stale {column} values")
+            else:
+                print(f"[PASS] backtest summary {column}: {expected_text or '-'}")
 
         summary_strategies = set(summary_df["strategy"].astype(str))
-        missing_from_summary = sorted(set(strategy_names) - summary_strategies)
+        expected_backtested = set(strategy_names) - set(empty_strategy_names)
+        missing_from_summary = sorted(expected_backtested - summary_strategies)
         unexpected_in_summary = sorted(summary_strategies - set(strategy_names))
         if missing_from_summary:
             print(f"[FAIL] backtest summary missing strategies: {missing_from_summary}")
             failures.append(
                 f"backtest summary missing configured strategies: {missing_from_summary}"
+            )
+        elif empty_strategy_names:
+            print(
+                "[PASS] backtest summary includes all non-empty configured strategies; "
+                f"empty selections skipped: {sorted(empty_strategy_names)}"
             )
         else:
             print("[PASS] backtest summary includes all configured strategies")
@@ -131,6 +213,37 @@ def verify_mainline_outputs():
             )
         else:
             print("[PASS] backtest summary contains no unexpected strategies")
+
+    report_path = RESULT_DIR / "strategy_diagnostic_report.md"
+    if check_file_exists(report_path, "strategy diagnostic report", failures):
+        report_text = report_path.read_text(encoding="utf-8")
+        missing_sections = sorted(section for section in REQUIRED_REPORT_SECTIONS if section not in report_text)
+        if missing_sections:
+            print(f"[FAIL] strategy diagnostic report missing sections: {missing_sections}")
+            failures.append(f"strategy diagnostic report missing sections: {missing_sections}")
+        else:
+            print("[PASS] strategy diagnostic report contains required sections")
+
+    governance_summary_path = GOVERNANCE_OUTPUT_DIR / "governance_strategy_summary.csv"
+    if check_file_exists(governance_summary_path, "governance strategy summary", failures):
+        governance_summary_df = pd.read_csv(governance_summary_path)
+        check_columns(
+            governance_summary_df,
+            REQUIRED_GOVERNANCE_SUMMARY_COLUMNS,
+            "governance strategy summary",
+            failures,
+        )
+
+    governance_report_path = GOVERNANCE_OUTPUT_DIR / "governance_strategy_report.md"
+    if check_file_exists(governance_report_path, "governance strategy report", failures):
+        governance_report_text = governance_report_path.read_text(encoding="utf-8")
+        required_governance_sections = REQUIRED_REPORT_SECTIONS | {"## Governance Summary"}
+        missing_sections = sorted(section for section in required_governance_sections if section not in governance_report_text)
+        if missing_sections:
+            print(f"[FAIL] governance strategy report missing sections: {missing_sections}")
+            failures.append(f"governance strategy report missing sections: {missing_sections}")
+        else:
+            print("[PASS] governance strategy report contains required sections")
 
     registry_duplicates = [
         name for name in strategy_names if strategy_names.count(name) > 1

@@ -8,6 +8,7 @@ state file, while provider fetchers keep their own staged resume files.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
 import json
@@ -20,25 +21,57 @@ from pathlib import Path
 
 from config import (
     ADJUSTMENT_FACTORS_PARQUET,
+    AUTO_COMPLETE_EXTERNAL_DATA_PYTHON,
+    AUTO_COMPLETE_LOCK_PATH,
+    AUTO_COMPLETE_LOCAL_GOVERNANCE_END_DATE,
+    AUTO_COMPLETE_LOCAL_GOVERNANCE_START_DATE,
+    AUTO_COMPLETE_MAIN_PYTHON,
+    AUTO_COMPLETE_MAX_STRATEGY_WORKERS,
+    AUTO_COMPLETE_STATE_PATH,
     CORPORATE_ACTIONS_PARQUET,
     MARKET_CAP_PARQUET,
     REPORT_DIR,
+    STRATEGY_BATCH_SIZE_DEFAULT,
+    STRATEGY_END_DATE,
+    STRATEGY_START_DATE,
+    AUTO_COMPLETE_FETCH_BATCH_DELAY_SECONDS,
+    AUTO_COMPLETE_FETCH_BATCH_SIZE,
+    AUTO_COMPLETE_FETCH_DIVIDEND_BATCH_SIZE,
+    AUTO_COMPLETE_FETCH_LOGIN_RETRIES,
+    AUTO_COMPLETE_FETCH_LOGIN_RETRY_DELAY_SECONDS,
+    AUTO_COMPLETE_FETCH_REQUEST_DELAY_SECONDS,
+    AUTO_COMPLETE_FETCH_SOCKET_TIMEOUT_SECONDS,
+    AUTO_COMPLETE_MARKET_CAP_SOURCE,
+    CLI_AUTO_COMPLETE_START_BATCH_INDEX,
+    CLI_AUTO_COMPLETE_STRATEGY_WORKERS,
+    CLI_GOVERNANCE_MAX_DAYS,
+    CLI_GOVERNANCE_SAFETY_PROXY_MODE,
+    assert_valid_configuration,
 )
+from functions.date_window import window_identity
 from functions.strategy_registry import list_strategy_names
 from functions.pipeline_cache import build_signature, code_file_fingerprint
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-MAIN_PYTHON = Path(r"E:\ForANACONDA\python.exe")
-EXTERNAL_DATA_PYTHON = Path(r"C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe")
-STATE_PATH = REPORT_DIR / "auto_complete_after_vpn_state.json"
-LOCK_PATH = REPORT_DIR / "auto_complete_after_vpn.lock"
+MAIN_PYTHON = AUTO_COMPLETE_MAIN_PYTHON
+EXTERNAL_DATA_PYTHON = AUTO_COMPLETE_EXTERNAL_DATA_PYTHON
+STATE_PATH = AUTO_COMPLETE_STATE_PATH
+LOCK_PATH = AUTO_COMPLETE_LOCK_PATH
+DEFAULT_LOCAL_GOVERNANCE_START_DATE = AUTO_COMPLETE_LOCAL_GOVERNANCE_START_DATE
+DEFAULT_LOCAL_GOVERNANCE_END_DATE = AUTO_COMPLETE_LOCAL_GOVERNANCE_END_DATE
+MAX_STRATEGY_WORKERS = AUTO_COMPLETE_MAX_STRATEGY_WORKERS
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Print the workflow without running commands.")
     parser.add_argument("--reset-state", action="store_true", help="Discard recorded stage progress and rerun all stages.")
+    parser.add_argument(
+        "--full-run",
+        action="store_true",
+        help="Run full governance history. Default is a local 2021 calendar-year run.",
+    )
     parser.add_argument("--force-data-refresh", action="store_true", help="Re-fetch and rebuild data even when spot checks pass.")
     parser.add_argument("--skip-external-fetch", action="store_true", help="Use already published provider artifacts.")
     parser.add_argument("--skip-market-cap", action="store_true", help="Keep the published market-cap artifact unchanged.")
@@ -49,20 +82,40 @@ def parse_args():
     )
     parser.add_argument("--skip-feature-rebuild", action="store_true", help="Keep the current feature parquet unchanged.")
     parser.add_argument("--skip-strategy-rerun", action="store_true", help="Do not regenerate and backtest all strategies.")
-    parser.add_argument("--skip-governance", action="store_true", help="Do not run the daily decision-council backtest.")
-    parser.add_argument("--skip-governance-ablations", action="store_true", help="Skip equal-weight governance baseline and ablation backtests.")
+    parser.add_argument("--skip-governance", action="store_true", help="Do not run decision-council stages.")
+    parser.add_argument("--skip-governance-industrial-build", action="store_true", help="Reuse existing industrial governance artifacts.")
+    parser.add_argument("--skip-governance-backtest", action="store_true", help="Skip the daily decision-council backtest only.")
     parser.add_argument("--governance-start-date", default=None, help="Optional first governance backtest date.")
     parser.add_argument("--governance-end-date", default=None, help="Optional last governance backtest date.")
-    parser.add_argument("--governance-max-days", type=int, default=None, help="Optional governance smoke-run limit.")
+    parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS, help="Optional governance smoke-run limit.")
     parser.add_argument(
         "--safety-proxy-mode",
         choices=["strict", "degraded_backtest"],
-        default="strict",
+        default=CLI_GOVERNANCE_SAFETY_PROXY_MODE,
         help="Use strict mode for normal one-click runs; degraded mode is exploratory only.",
     )
-    parser.add_argument("--batch-size", type=int, default=1, help="Strategies per fresh subprocess. Use 1 on low-memory machines.")
-    parser.add_argument("--start-batch-index", type=int, default=0, help="Start strategy rerun from this zero-based batch.")
-    return parser.parse_args()
+    parser.add_argument("--batch-size", type=int, default=STRATEGY_BATCH_SIZE_DEFAULT, help="Strategies per fresh subprocess. Use 1 on low-memory machines.")
+    parser.add_argument("--start-batch-index", type=int, default=CLI_AUTO_COMPLETE_START_BATCH_INDEX, help="Start strategy rerun from this zero-based batch.")
+    parser.add_argument(
+        "--strategy-workers",
+        type=int,
+        default=CLI_AUTO_COMPLETE_STRATEGY_WORKERS,
+        help="Parallel strategy batch subprocesses. Use 1 for lowest memory; 2 is the hard cap.",
+    )
+    args = parser.parse_args()
+    return _apply_local_runtime_defaults(args)
+
+
+def _apply_local_runtime_defaults(args):
+    args.strategy_workers = max(1, min(int(args.strategy_workers), MAX_STRATEGY_WORKERS))
+    args.local_fast_mode = not args.full_run
+    args.governance_date_range_defaulted = False
+    if args.local_fast_mode:
+        if args.governance_start_date is None and args.governance_end_date is None and args.governance_max_days is None:
+            args.governance_start_date = DEFAULT_LOCAL_GOVERNANCE_START_DATE
+            args.governance_end_date = DEFAULT_LOCAL_GOVERNANCE_END_DATE
+            args.governance_date_range_defaulted = True
+    return args
 
 
 def main():
@@ -71,6 +124,7 @@ def main():
 
 
 def _run_workflow():
+    assert_valid_configuration()
     args = parse_args()
     _validate_interpreters()
     state = {} if args.reset_state else _load_state()
@@ -126,19 +180,19 @@ def _run_workflow():
                 "--publish",
                 "--resume",
                 "--batch-size",
-                "50",
+                str(AUTO_COMPLETE_FETCH_BATCH_SIZE),
                 "--dividend-batch-size",
-                "5",
+                str(AUTO_COMPLETE_FETCH_DIVIDEND_BATCH_SIZE),
                 "--request-delay-seconds",
-                "0.6",
+                str(AUTO_COMPLETE_FETCH_REQUEST_DELAY_SECONDS),
                 "--batch-delay-seconds",
-                "3",
+                str(AUTO_COMPLETE_FETCH_BATCH_DELAY_SECONDS),
                 "--login-retries",
-                "5",
+                str(AUTO_COMPLETE_FETCH_LOGIN_RETRIES),
                 "--login-retry-delay-seconds",
-                "8",
+                str(AUTO_COMPLETE_FETCH_LOGIN_RETRY_DELAY_SECONDS),
                 "--socket-timeout-seconds",
-                "30",
+                str(AUTO_COMPLETE_FETCH_SOCKET_TIMEOUT_SECONDS),
             ],
             dry_run=args.dry_run,
             force_run=True,
@@ -167,7 +221,7 @@ def _run_workflow():
             EXTERNAL_DATA_PYTHON,
             "fetch_market_cap_history.py",
             "--source",
-            "tdx_finance",
+            AUTO_COMPLETE_MARKET_CAP_SOURCE,
             "--publish",
         ]
         if args.market_cap_existing_reports_only:
@@ -186,6 +240,13 @@ def _run_workflow():
             dry_run=args.dry_run,
             raise_on_failure=True,
         )
+        _record_reused_stage(
+            state,
+            "feature_rebuild",
+            [MAIN_PYTHON, "rebuild_feature_data.py"],
+            dry_run=args.dry_run,
+            extra={"skip_feature_rebuild": True},
+        )
     elif args.force_data_refresh or upstream_data_rebuilt or not _validate_existing_artifact(
         state,
         "feature_artifact_spot_check",
@@ -201,6 +262,13 @@ def _run_workflow():
         )
     else:
         print("\n[REUSE] feature_rebuild: existing artifact passed distributed spot check")
+        _record_reused_stage(
+            state,
+            "feature_rebuild",
+            [MAIN_PYTHON, "rebuild_feature_data.py"],
+            dry_run=args.dry_run,
+            extra={"reused_after_spot_check": True},
+        )
 
     if not args.skip_strategy_rerun:
         _run_strategy_batches(state, args, dry_run=args.dry_run)
@@ -209,16 +277,20 @@ def _run_workflow():
             "strategy_summary_finalize",
             [MAIN_PYTHON, "finalize_strategy_batch_summary.py"],
             dry_run=args.dry_run,
+            always_run=True,
         )
 
     if not args.skip_governance:
-        _run_stage(
-            state,
-            "decision_council_industrial_build",
-            [MAIN_PYTHON, "run_governance_industrial_pipeline.py"],
-            dry_run=args.dry_run,
-            extra={"governance_code_signature": _governance_code_signature()},
-        )
+        if not args.skip_governance_industrial_build:
+            _run_stage(
+                state,
+                "decision_council_industrial_build",
+                [MAIN_PYTHON, "run_governance_industrial_pipeline.py"],
+                dry_run=args.dry_run,
+                extra={"governance_code_signature": _governance_code_signature()},
+            )
+        else:
+            print("\n[SKIP] decision_council_industrial_build: requested by --skip-governance-industrial-build")
         governance_command = [
             MAIN_PYTHON,
             "run_governance_backtest.py",
@@ -231,13 +303,16 @@ def _run_workflow():
             governance_command.extend(["--end-date", args.governance_end_date])
         if args.governance_max_days is not None:
             governance_command.extend(["--max-days", str(args.governance_max_days)])
-        _run_stage(
-            state,
-            "decision_council_backtest",
-            governance_command,
-            dry_run=args.dry_run,
-            extra={"governance_code_signature": _governance_code_signature()},
-        )
+        if not args.skip_governance_backtest:
+            _run_stage(
+                state,
+                "decision_council_backtest",
+                governance_command,
+                dry_run=args.dry_run,
+                extra={"governance_code_signature": _governance_code_signature()},
+            )
+        else:
+            print("\n[SKIP] decision_council_backtest: requested by --skip-governance-backtest")
         _run_stage(
             state,
             "decision_council_verification",
@@ -266,26 +341,6 @@ def _run_workflow():
             dry_run=args.dry_run,
             always_run=True,
         )
-        if not args.skip_governance_ablations:
-            ablation_command = [
-                MAIN_PYTHON,
-                "run_governance_ablations.py",
-                "--safety-proxy-mode",
-                args.safety_proxy_mode,
-            ]
-            if args.governance_start_date:
-                ablation_command.extend(["--start-date", args.governance_start_date])
-            if args.governance_end_date:
-                ablation_command.extend(["--end-date", args.governance_end_date])
-            if args.governance_max_days is not None:
-                ablation_command.extend(["--max-days", str(args.governance_max_days)])
-            _run_stage(
-                state,
-                "decision_council_ablations",
-                ablation_command,
-                dry_run=args.dry_run,
-                extra={"governance_code_signature": _governance_code_signature()},
-            )
         _run_stage(
             state,
             "decision_council_evaluation",
@@ -308,6 +363,29 @@ def _run_workflow():
         dry_run=args.dry_run,
         always_run=True,
     )
+    _run_stage(
+        state,
+        "v6_governance_artifacts",
+        [MAIN_PYTHON, "build_v6_artifacts.py"],
+        dry_run=args.dry_run,
+        always_run=True,
+    )
+    for stage_name, script_name in [
+        ("centralized_configuration_verification", "verify_centralized_configuration.py"),
+        ("date_window_verification", "verify_date_window_enforcement.py"),
+        ("v6_core_verification", "verify_v6_core.py"),
+        ("v6_governance_verification", "verify_v6_governance.py"),
+        ("v6_decision_pipeline_verification", "verify_v6_decision_pipeline.py"),
+        ("probability_calibration_verification", "verify_probability_calibration.py"),
+        ("v6_completion_audit", "audit_v6_completion.py"),
+    ]:
+        _run_stage(
+            state,
+            stage_name,
+            [MAIN_PYTHON, script_name],
+            dry_run=args.dry_run,
+            always_run=True,
+        )
     _run_stage(
         state,
         "roadmap_audit",
@@ -337,25 +415,76 @@ def _run_strategy_batches(state, args, dry_run):
     names = list_strategy_names()
     batch_size = max(int(args.batch_size), 1)
     batch_count = (len(names) + batch_size - 1) // batch_size
+    batch_specs = []
+    strategy_window = window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE)
     for batch_index in range(max(args.start_batch_index, 0), batch_count):
         batch_names = names[batch_index * batch_size:(batch_index + 1) * batch_size]
         stage_name = f"strategy_batch_{batch_index:03d}"
-        _run_stage(
-            state,
-            stage_name,
-            [
-                MAIN_PYTHON,
-                "run_strategy_batches.py",
-                "--mode",
-                "all",
-                "--batch-size",
-                str(batch_size),
-                "--batch-index",
-                str(batch_index),
-            ],
-            dry_run=dry_run,
-            extra={"strategy_names": batch_names},
+        command = [
+            MAIN_PYTHON,
+            "run_strategy_batches.py",
+            "--mode",
+            "all",
+            "--batch-size",
+            str(batch_size),
+            "--batch-index",
+            str(batch_index),
+        ]
+        batch_specs.append(
+            (
+                stage_name,
+                command,
+                {
+                    "strategy_names": batch_names,
+                    "strategy_code_signature": _strategy_code_signature(),
+                    "strategy_date_window": strategy_window,
+                },
+            )
         )
+    if args.strategy_workers <= 1 or dry_run:
+        for stage_name, command, extra in batch_specs:
+            _run_stage(state, stage_name, command, dry_run=dry_run, extra=extra)
+        return
+    _run_strategy_batches_parallel(state, batch_specs, args.strategy_workers)
+
+
+def _run_strategy_batches_parallel(state, batch_specs, workers):
+    runnable = []
+    for stage_name, command, extra in batch_specs:
+        command = [str(item) for item in command]
+        record = state.get("stages", {}).get(stage_name, {})
+        if (
+            record.get("status") == "completed"
+            and record.get("command") == command
+            and record.get("extra", {}) == extra
+        ):
+            print(f"\n[SKIP] {stage_name}: already completed")
+            continue
+        print(f"\n[QUEUE] {stage_name}")
+        print(_format_command(command))
+        _record_stage(state, stage_name, "queued", command, extra=extra)
+        runnable.append((stage_name, command, extra))
+    if not runnable:
+        return
+    print(f"\n[PARALLEL] Running strategy batches with workers={workers}.")
+    failures = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {}
+        for stage_name, command, extra in runnable:
+            _record_stage(state, stage_name, "running", command, extra=extra)
+            future_map[executor.submit(_run_subprocess, command)] = (stage_name, command, extra)
+        for future in as_completed(future_map):
+            stage_name, command, extra = future_map[future]
+            try:
+                future.result()
+            except subprocess.CalledProcessError as exc:
+                _record_stage(state, stage_name, "failed", command, extra={"returncode": exc.returncode, **extra})
+                failures.append(stage_name)
+            else:
+                _record_stage(state, stage_name, "completed", command, extra=extra)
+                print(f"[DONE] {stage_name}")
+    if failures:
+        raise RuntimeError("Strategy batch failures: " + ", ".join(failures))
 
 
 def _run_stage(state, stage_name, command, *, dry_run, always_run=False, force_run=False, extra=None):
@@ -376,9 +505,7 @@ def _run_stage(state, stage_name, command, *, dry_run, always_run=False, force_r
         return
     _record_stage(state, stage_name, "running", command, extra=extra)
     try:
-        child_env = os.environ.copy()
-        child_env["PYTHONUNBUFFERED"] = "1"
-        subprocess.run(command, cwd=PROJECT_DIR, check=True, env=child_env)
+        _run_subprocess(command)
     except subprocess.CalledProcessError as exc:
         _record_stage(state, stage_name, "failed", command, extra={"returncode": exc.returncode, **(extra or {})})
         if stage_name == "network_diagnosis":
@@ -390,6 +517,12 @@ def _run_stage(state, stage_name, command, *, dry_run, always_run=False, force_r
     _record_stage(state, stage_name, "completed", command, extra=extra)
     if stage_name == "feature_rebuild":
         _invalidate_strategy_results(state)
+
+
+def _run_subprocess(command):
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.run(command, cwd=PROJECT_DIR, check=True, env=child_env)
 
 
 def _validate_existing_artifact(state, stage_name, command, *, dry_run, raise_on_failure=False):
@@ -423,6 +556,14 @@ def _record_stage(state, stage_name, status, command, extra=None):
         "extra": extra or {},
     }
     _save_state(state)
+
+
+def _record_reused_stage(state, stage_name, command, *, dry_run, extra=None):
+    if dry_run:
+        return
+    reuse_extra = {"reused_existing_artifact": True}
+    reuse_extra.update(extra or {})
+    _record_stage(state, stage_name, "completed", [str(item) for item in command], extra=reuse_extra)
 
 
 def _invalidate_strategy_results(state):
@@ -477,6 +618,18 @@ def _print_header(args, state):
     print("Main Python:", MAIN_PYTHON)
     print("External-data Python:", EXTERNAL_DATA_PYTHON)
     print("Dry run:", args.dry_run)
+    print("Local fast mode:", args.local_fast_mode)
+    print("Strategy workers:", args.strategy_workers)
+    strategy_window = window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE)
+    print(
+        "Strategy date range:",
+        f"{strategy_window['start_date'] or '-'} -> {strategy_window['end_date'] or '-'}",
+    )
+    if args.governance_start_date or args.governance_end_date:
+        suffix = " (default local range)" if args.governance_date_range_defaulted else ""
+        print(f"Governance date range: {args.governance_start_date or '-'} -> {args.governance_end_date or '-'}{suffix}")
+    if args.governance_max_days is not None:
+        print(f"Governance max days: {args.governance_max_days}")
     print("Recorded completed stages:", sum(1 for item in state.get("stages", {}).values() if item.get("status") == "completed"))
     print("=============================================")
 
@@ -490,7 +643,6 @@ def _governance_code_signature():
         "config.py",
         "run_governance_backtest.py",
         "run_governance_industrial_pipeline.py",
-        "run_governance_ablations.py",
         "evaluate_governance_results.py",
         "functions/decision_council/engine.py",
         "functions/decision_council/runner.py",
@@ -509,6 +661,26 @@ def _governance_code_signature():
         "functions/decision_council/monitoring.py",
         "functions/execution/cost_model.py",
         "functions/execution/corporate_action_ledger.py",
+    ]
+    return build_signature([code_file_fingerprint(path) for path in files])
+
+
+def _strategy_code_signature():
+    files = [
+        "config.py",
+        "run_strategy_batches.py",
+        "run_precomputed_technical_strategies.py",
+        "finalize_strategy_batch_summary.py",
+        "verify_mainline_outputs.py",
+        "functions/feature_engineering.py",
+        "functions/position_managed_selection.py",
+        "functions/strategy_registry.py",
+        "functions/strategy_selection.py",
+        "functions/strategy_signal_generators.py",
+        "functions/strategy_params.py",
+        "functions/backtest_engine.py",
+        "functions/metrics.py",
+        "functions/report_builder.py",
     ]
     return build_signature([code_file_fingerprint(path) for path in files])
 

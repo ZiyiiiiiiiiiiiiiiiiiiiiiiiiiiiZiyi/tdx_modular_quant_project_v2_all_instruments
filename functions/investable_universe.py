@@ -20,6 +20,11 @@ TARGET_INDEX_POOLS = {
     "csi_a500": {"index_code": "000510", "index_name": "中证A500"},
 }
 
+# Universe mode constants
+UNIVERSE_MODE_INDEX_POOL_STRICT = "index_pool_strict"
+UNIVERSE_MODE_QUALITY_FALLBACK = "quality_fallback"
+UNIVERSE_MODE_BLOCKED = "blocked"
+
 
 @dataclass(frozen=True)
 class UniverseFilterConfig:
@@ -67,7 +72,7 @@ def normalize_index_constituents(raw: pd.DataFrame, *, source: str = "manual_or_
     data["first_trade_date"] = data["first_trade_date"].fillna(data["in_date"])
     data["asof_date"] = data["asof_date"].fillna(pd.Timestamp.today().normalize())
     data["source"] = data.get("source", source)
-    data["symbol"] = data["symbol"].astype(str).str.lower().str.replace(".", "", regex=False)
+    data["symbol"] = data["symbol"].map(_normalize_a_share_symbol)
     data["index_code"] = data["index_code"].astype(str).str.zfill(6)
     columns = [
         "index_code",
@@ -106,6 +111,8 @@ def attach_index_pool_flags(features: pd.DataFrame, constituents: pd.DataFrame) 
         frame = one_day.copy()
         frame["index_pool_codes"] = frame["symbol"].astype(str).map(pool_map).fillna("")
         frame["in_target_index_pool"] = frame["index_pool_codes"] != ""
+        frame["universe_mode"] = UNIVERSE_MODE_INDEX_POOL_STRICT
+        frame["constituent_data_status"] = "available"
         result_parts.append(frame)
     return pd.concat(result_parts, ignore_index=True) if result_parts else data
 
@@ -115,17 +122,47 @@ def filter_investable_universe(
     constituents: pd.DataFrame | None = None,
     *,
     config: UniverseFilterConfig | None = None,
-) -> pd.DataFrame:
-    """Apply the required沪深300/中证500/中证A500 stock-pool filters."""
+    require_constituents: bool = True,
+    allow_fallback: bool = False,
+) -> tuple[pd.DataFrame, str]:
+    """Apply the required 沪深300/中证500/中证A500 stock-pool filters.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, str]
+        (filtered_data, universe_mode)
+        universe_mode is one of: "index_pool_strict", "quality_fallback", "blocked"
+    """
     cfg = config or UniverseFilterConfig()
     data = features.copy()
     data["date"] = pd.to_datetime(data["date"], errors="coerce")
     data = data.sort_values(["symbol", "date"]).copy()
-    if constituents is not None and not constituents.empty:
+
+    # Determine universe mode
+    has_constituents = constituents is not None and not constituents.empty
+
+    if has_constituents:
+        # Strict index pool mode
+        universe_mode = UNIVERSE_MODE_INDEX_POOL_STRICT
         data = attach_index_pool_flags(data, constituents)
         data = data[data["in_target_index_pool"]]
-    elif "in_target_index_pool" in data.columns:
-        data = data[data["in_target_index_pool"]]
+    elif require_constituents and not allow_fallback:
+        # Blocked: constituents required but missing
+        raise ValueError(
+            "Index constituents are required (strict mode) but unavailable. "
+            "Build data/processed/index_constituents.parquet first."
+        )
+    elif allow_fallback:
+        # Quality fallback mode
+        universe_mode = UNIVERSE_MODE_QUALITY_FALLBACK
+        data["universe_mode"] = UNIVERSE_MODE_QUALITY_FALLBACK
+        data["constituent_data_status"] = "missing"
+        data["in_target_index_pool"] = pd.NA  # Not applicable in fallback mode
+        data["index_pool_codes"] = ""
+    else:
+        universe_mode = UNIVERSE_MODE_BLOCKED
+        return pd.DataFrame(), universe_mode
+
     if "instrument_type" in data.columns:
         data = data[data["instrument_type"] == "stock"]
     for column, required_value in [("is_st", False), ("is_delisting", False), ("is_trading", True)]:
@@ -155,7 +192,7 @@ def filter_investable_universe(
     data = data[data["history_days"] >= cfg.min_history_days]
     data = data[pd.to_numeric(data["avg_amount_20"], errors="coerce").fillna(0.0) >= cfg.min_avg_amount_20]
     data = data[pd.to_numeric(data["amihud_20"], errors="coerce").fillna(0.0) <= cfg.max_amihud_20]
-    return data
+    return data, universe_mode
 
 
 def build_index_universe_quality_report(constituents: pd.DataFrame, *, start_date, end_date) -> pd.DataFrame:
@@ -199,3 +236,21 @@ def save_index_universe_quality_report(report: pd.DataFrame, output_path=INDEX_U
 
 def _has_normalized_columns(frame: pd.DataFrame) -> bool:
     return {"index_code", "symbol", "first_trade_date", "out_date"}.issubset(frame.columns)
+
+
+def _normalize_a_share_symbol(value) -> str:
+    raw = str(value).strip().lower()
+    compact = raw.replace(".", "")
+    if len(compact) == 8 and compact[:2] in {"sh", "sz", "bj"}:
+        return compact
+    if len(compact) == 8 and compact[-2:] in {"sh", "sz", "bj"}:
+        return compact[-2:] + compact[:6]
+    digits = "".join(character for character in compact if character.isdigit())
+    code = digits[-6:].zfill(6)
+    if code.startswith(("4", "8")):
+        market = "bj"
+    elif code.startswith(("0", "2", "3")):
+        market = "sz"
+    else:
+        market = "sh"
+    return market + code

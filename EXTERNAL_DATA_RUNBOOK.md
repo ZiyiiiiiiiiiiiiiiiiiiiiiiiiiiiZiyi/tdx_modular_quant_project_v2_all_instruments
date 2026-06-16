@@ -5,7 +5,7 @@
 Run this command first:
 
 ```powershell
-& "E:\ForANACONDA\python.exe" auto_complete_after_vpn.py
+& "E:\ForANACONDA\python.exe" run_auto.py
 ```
 
 It performs these stages automatically:
@@ -28,13 +28,13 @@ If the process stops, run the same command again. Completed stages are skipped.
 To deliberately rebuild everything from the beginning:
 
 ```powershell
-& "E:\ForANACONDA\python.exe" auto_complete_after_vpn.py --reset-state
+& "E:\ForANACONDA\python.exe" run_auto.py --reset-state
 ```
 
 Preview the commands without running them:
 
 ```powershell
-& "E:\ForANACONDA\python.exe" auto_complete_after_vpn.py --dry-run
+& "E:\ForANACONDA\python.exe" run_auto.py --dry-run
 ```
 
 ## Interpreter Split

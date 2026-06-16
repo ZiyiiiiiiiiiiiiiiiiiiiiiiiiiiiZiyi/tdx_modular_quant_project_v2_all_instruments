@@ -8,18 +8,17 @@ from __future__ import annotations
 
 import pandas as pd
 
-from config import FEATURE_DAILY_PARQUET
+from config import (
+    FEATURE_DAILY_PARQUET,
+    STRATEGY_END_DATE,
+    STRATEGY_FREQ,
+    STRATEGY_INCLUDE_TYPES,
+    STRATEGY_SCORE_COL,
+    STRATEGY_START_DATE,
+    STRATEGY_TOP_N,
+)
 from functions.feature_engineering import generate_multi_strategies
 from functions.strategy_selection import run_strategy_selection
-
-
-STRATEGY_TOP_N = 20
-STRATEGY_FREQ = "ME"
-STRATEGY_START_DATE = "2021-01-01"
-STRATEGY_END_DATE = None
-STRATEGY_INCLUDE_TYPES = ("stock", "etf_fund")
-STRATEGY_SCORE_COL = "score_mom_lowvol"
-
 
 def main():
     raise SystemExit(

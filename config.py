@@ -33,10 +33,12 @@ READ_LIMIT = 200
 
 """
 # -*- coding: utf-8 -*-
+import hashlib
+import json
 from pathlib import Path
 
 TDX_DIR = Path(r"F:\tongxinda")
-PROJECT_DIR = Path(r"F:\通信达量化\tdx_modular_quant_project_v2_all_instruments")
+PROJECT_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = PROJECT_DIR / "data"
 RAW_EXTERNAL_DIR = DATA_DIR / "raw_external"
@@ -111,12 +113,22 @@ FEATURE_WINSORIZE_LOWER = 0.01
 FEATURE_WINSORIZE_UPPER = 0.99
 FEATURE_ROBUST_SCALE_EPSILON = 1e-9
 FACTOR_MIN_COVERAGE_RATIO = 0.10
+FEATURE_PTI_ADJUSTMENT_MIN_COVERAGE_RATIO = 1.0
 FACTOR_REGISTRY_STATUS_DEFAULT = "experimental"
 REPORT_OUTPUT_MD = RESULT_DIR / "strategy_diagnostic_report.md"
 FEATURE_COVERAGE_REPORT_CSV = REPORT_DIR / "feature_coverage_report.csv"
 FEATURE_DISTRIBUTION_REPORT_CSV = REPORT_DIR / "feature_distribution_report.csv"
 FEATURE_STABILITY_REPORT_CSV = REPORT_DIR / "feature_stability_report.csv"
 FEATURE_REGISTRY_REPORT_CSV = REPORT_DIR / "feature_registry_validation_report.csv"
+FEATURE_MEMORY_REPORT_CSV = REPORT_DIR / "feature_memory_report.csv"
+MODEL_TRAINING_DIAGNOSTICS_CSV = REPORT_DIR / "model_training_diagnostics.csv"
+FEATURE_STORAGE_MODE = "pruned"
+FEATURE_DOWNCAST_FLOATS = True
+MULTI_WINDOW_BACKTEST_SUMMARY_CSV = RESULT_DIR / "multi_window_backtest_summary.csv"
+MULTI_WINDOW_BACKTEST_REPORT_MD = RESULT_DIR / "multi_window_backtest_report.md"
+MULTI_WINDOW_DEFAULT_MONTHS = 12
+MULTI_WINDOW_DEFAULT_STEP_MONTHS = 12
+RUNTIME_CONFIG_SNAPSHOT_JSON = REPORT_DIR / "runtime_config_snapshot.json"
 EVENT_DATA_PARQUET = PROCESSED_DIR / "event_data.parquet"
 EVENT_DATA_QUALITY_CSV = REPORT_DIR / "event_data_quality_report.csv"
 QML_MIN_TEST_WINDOWS = 5
@@ -140,19 +152,31 @@ SLIPPAGE_RATE = 0.0005
 MIN_LOT_SIZE = 100
 BACKTEST_INITIAL_CASH = 1_000_000.0
 BACKTEST_RISK_FREE_RATE = 0.0
+BACKTEST_SHOW_PLOT = False
 ENABLE_T_PLUS_ONE = True
 ENABLE_PRICE_LIMIT_CHECK = True
 ENABLE_SUSPENSION_CHECK = True
 MAX_LIQUIDITY_LOCK_DAYS = 10
 LIQUIDITY_LOCK_REPORT_CSV = RESULT_DIR / "extreme_liquidity_lock_report.csv"
+BACKTEST_SKIPPED_STRATEGIES_CSV = RESULT_DIR / "backtest_skipped_strategies.csv"
 ORDER_LEDGER_PREFIX = "backtest_orders"
 BACKTEST_SUMMARY_V2_CSV = RESULT_DIR / "backtest_strategy_summary_v2.csv"
 STRATEGY_RANK_SHIFT_REPORT_CSV = RESULT_DIR / "strategy_rank_shift_report.csv"
 FORMAL_ADMISSION_REPORT_CSV = REPORT_DIR / "formal_admission_report.csv"
 FORMAL_MANIFEST_JSON = REPORT_DIR / "formal_reproducibility_manifest.json"
+DATA_INTEGRITY_WHITEPAPER_MD = REPORT_DIR / "data_integrity_whitepaper.md"
+DATA_INTEGRITY_REPORT_CSV = REPORT_DIR / "data_integrity_report.csv"
+DATA_VERIFICATION_STATUS_JSON = REPORT_DIR / "data_verification_status.json"
+EVENT_DENSITY_REPORT_CSV = REPORT_DIR / "strategy_event_density_report.csv"
+STRATEGY_ADMISSION_REPORT_CSV = REPORT_DIR / "strategy_admission_report.csv"
+V6_GAP_MATRIX_CSV = REPORT_DIR / "v6_implementation_gap_matrix.csv"
+V6_RUNTIME_MONITORING_CSV = REPORT_DIR / "v6_runtime_monitoring.csv"
+V6_RUNTIME_STATUS_JSON = REPORT_DIR / "v6_runtime_status.json"
 FEATURE_LINEAGE_CSV = REPORT_DIR / "feature_lineage_report.csv"
 FEATURE_TIMESTAMP_AUDIT_CSV = REPORT_DIR / "feature_timestamp_audit.csv"
 BENCHMARK_REPORT_CSV = RESULT_DIR / "investable_benchmark_report.csv"
+DEFAULT_INVESTABLE_BENCHMARK_ID = "hs300_etf"
+DEFAULT_INVESTABLE_BENCHMARK_PRICE_COL = "close_nominal"
 TAX_LEDGER_PREFIX = "backtest_tax_ledger"
 CASH_LEDGER_PREFIX = "backtest_cash_ledger"
 VALUATION_LEDGER_PREFIX = "backtest_valuation_ledger"
@@ -186,6 +210,266 @@ FAILED_CODES_CSV = REPORT_DIR / "failed_codes.csv"
 STOCK_INFO_CSV = REPORT_DIR / "instrument_info.csv"
 ABNORMAL_RETURN_CSV = REPORT_DIR / "abnormal_return_rows.csv"
 DATA_QUALITY_SUMMARY_CSV = REPORT_DIR / "data_quality_summary.csv"
+DATA_CONTINUITY_REPORT_CSV = REPORT_DIR / "data_continuity_report.csv"
+DATA_CONTINUITY_GAP_DAYS_WARN = 10
+
+# User-facing strategy defaults. Keep these here so main.py, batch runners,
+# quick runners, and the auto-complete workflow cannot drift into different
+# date windows or selection sizes. Step on/off control now lives in
+# pipeline_steps.py.
+STRATEGY_SCORE_COL = "score_mom_lowvol"
+STRATEGY_TOP_N = 30
+STRATEGY_FREQ = "ME"
+STRATEGY_FREQ_OVERRIDES = {
+    "eod_close_strength": "D",
+    "limit_up_follow": "D",
+    "macd_cross": "D",
+    "ma_cross": "D",
+    "price_volume_breakout": "D",
+    "consecutive_decline_rebound": "D",
+    "holiday_effect": "D",
+    "kdj_oversold_cross": "D",
+    "low_volume_pullback": "D",
+}
+STRATEGY_START_DATE = "2021-01-01"
+STRATEGY_END_DATE = "2024-12-31"
+STRATEGY_INCLUDE_TYPES = ("stock", "etf_fund")
+EXPORT_SELECTION_EXCEL = True
+PRINT_SELECTION_ROWS = 30
+
+# Score qualification threshold: only stocks whose score percentile exceeds
+# this threshold (relative to the daily universe) can enter the portfolio.
+# If too few stocks qualify, remaining capital stays in previously qualified
+# stocks. If no stocks qualify, go to cash.
+# Range: 0.0 to 1.0. 0.0 = no filter, 0.5 = median, 0.8 = top 20%.
+# Note: This is the default value. When MarketRegimePolicy is enabled,
+# the actual threshold will be dynamically adjusted based on bull/bear regime.
+STRATEGY_MIN_SCORE_PERCENTILE = 0.80
+
+AUTO_COMPLETE_MAIN_PYTHON = Path(r"E:\ForANACONDA\python.exe")
+AUTO_COMPLETE_EXTERNAL_DATA_PYTHON = Path(r"C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe")
+AUTO_COMPLETE_STATE_PATH = REPORT_DIR / "auto_complete_after_vpn_state.json"
+AUTO_COMPLETE_LOCK_PATH = REPORT_DIR / "auto_complete_after_vpn.lock"
+AUTO_COMPLETE_LOCAL_GOVERNANCE_START_DATE = STRATEGY_START_DATE
+AUTO_COMPLETE_LOCAL_GOVERNANCE_END_DATE = STRATEGY_END_DATE
+AUTO_COMPLETE_MAX_STRATEGY_WORKERS = 2
+AUTO_COMPLETE_DEFAULT_BATCH_SIZE = 1
+STRATEGY_BATCH_SIZE_DEFAULT = 1
+REPORT_EFFECTIVE_N_RELATIVE_GAP_WARN = 0.50
+REPORT_TOP5_WEIGHT_SUM_GAP_WARN = 0.20
+FEATURE_PARQUET_GB_WARN = 1.0
+FEATURE_COLUMN_COUNT_WARN = 250
+
+# Centralized command-line and integration defaults. Scripts may expose
+# overrides, but their defaults must come from this section.
+CLI_MAIN_BATCH_SIZE = STRATEGY_BATCH_SIZE_DEFAULT
+CLI_MAIN_BATCH_INDEX = 0
+CLI_MAIN_MODE = "pipeline"
+MAIN_STRATEGY_EXECUTION_MODE = "auto"
+MAIN_STRATEGY_BOUNDED_PARQUET_GB_THRESHOLD = 1.0
+CLI_MAIN_SAFETY_PROXY_MODE = "strict"
+CLI_MAIN_GOVERNANCE_VARIANT = "rules_based_president"
+CLI_STRATEGY_BATCH_MODE = "all"
+CLI_STRATEGY_BATCH_OFFSET = 0
+CLI_STRATEGY_BATCH_INDEX = None
+CLI_AUTO_COMPLETE_STRATEGY_WORKERS = 1
+CLI_AUTO_COMPLETE_START_BATCH_INDEX = 0
+CLI_GOVERNANCE_START_DATE = STRATEGY_START_DATE
+CLI_GOVERNANCE_END_DATE = STRATEGY_END_DATE
+CLI_GOVERNANCE_MAX_DAYS = None
+CLI_GOVERNANCE_SAFETY_PROXY_MODE = "strict"
+CLI_GOVERNANCE_VARIANT = "rules_based_president"
+
+INDEX_CONSTITUENT_DEFAULT_SOURCE = "akshare"
+INDEX_CONSTITUENT_COVERAGE_START_DATE = "2024-09-23"
+INDEX_CONSTITUENT_COVERAGE_END_DATE = None
+
+EXTERNAL_DATA_FACTOR_HISTORY_START = "1990-01-01"
+EXTERNAL_DATA_END_DATE = None
+EXTERNAL_DATA_SYMBOL_LIMIT = None
+EXTERNAL_DATA_BATCH_SIZE = 50
+EXTERNAL_DATA_DIVIDEND_BATCH_SIZE = 5
+EXTERNAL_DATA_REQUEST_DELAY_SECONDS = 0.35
+EXTERNAL_DATA_BATCH_DELAY_SECONDS = 2.0
+EXTERNAL_DATA_LOGIN_RETRIES = 3
+EXTERNAL_DATA_LOGIN_RETRY_DELAY_SECONDS = 5.0
+EXTERNAL_DATA_SOCKET_TIMEOUT_SECONDS = 30.0
+
+AUTO_COMPLETE_FETCH_BATCH_SIZE = 50
+AUTO_COMPLETE_FETCH_DIVIDEND_BATCH_SIZE = 5
+AUTO_COMPLETE_FETCH_REQUEST_DELAY_SECONDS = 0.6
+AUTO_COMPLETE_FETCH_BATCH_DELAY_SECONDS = 3.0
+AUTO_COMPLETE_FETCH_LOGIN_RETRIES = 5
+AUTO_COMPLETE_FETCH_LOGIN_RETRY_DELAY_SECONDS = 8.0
+AUTO_COMPLETE_FETCH_SOCKET_TIMEOUT_SECONDS = 30.0
+AUTO_COMPLETE_MARKET_CAP_SOURCE = "tdx_finance"
+
+MARKET_CAP_DEFAULT_SOURCE = "tdx_finance"
+MARKET_CAP_REPORT_START_DATE = "2017-01-01"
+MARKET_CAP_MAX_REPORT_FILES = None
+MARKET_CAP_BATCH_SIZE = 50
+MARKET_CAP_REQUEST_DELAY_SECONDS = 0.35
+MARKET_CAP_BATCH_DELAY_SECONDS = 2.0
+
+ARTIFACT_VALIDATION_SYMBOL_SAMPLE_SIZE = 24
+ARTIFACT_VALIDATION_ROW_GROUP_SAMPLE_SIZE = 12
+ARTIFACT_VALIDATION_ROWS_PER_GROUP = 200
+
+EXTERNAL_DIAGNOSIS_DEPENDENCIES = ("baostock", "mootdx")
+EXTERNAL_DIAGNOSIS_HOSTS = ("public-api.baostock.com", "down.tdx.com.cn")
+EXTERNAL_DIAGNOSIS_TCP_ENDPOINTS = (("public-api.baostock.com", 10030),)
+EXTERNAL_DIAGNOSIS_SOCKET_TIMEOUT_SECONDS = 5.0
+
+STRATEGY_PARAMS_VERSION = "strategy_params_v3_technical_expansion"
+STRATEGY_PARAMS = {
+    "macd_trend": {
+        "fast": 12,
+        "slow": 26,
+        "signal": 9,
+        "horizon_days": 20,
+        "stop_loss_pct": -0.05,
+        "take_profit_pct": 0.10,
+        "max_holding_days": 20,
+    },
+    "rsi_reversal": {
+        "windows": (6, 14, 24),
+        "oversold": 30,
+        "overbought": 70,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 10,
+    },
+    "turtle_breakout": {
+        "entry_window": 20,
+        "long_window": 55,
+        "atr_window": 20,
+        "add_unit_atr": 0.5,
+        "max_units": 4,
+        "horizon_days": 20,
+        "stop_loss_atr": 2.0,
+        "take_profit_atr": 4.0,
+        "max_holding_days": 55,
+    },
+    "mean_reversion": {
+        "ma_window": 20,
+        "long_ma_window": 60,
+        "bollinger_std": 2.0,
+        "z_entry": -1.5,
+        "z_exit": 0.0,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.06,
+        "max_holding_days": 15,
+    },
+    "grid_trading": {
+        "atr_window": 20,
+        "grid_atr_multiplier": 1.0,
+        "horizon_days": 5,
+        "min_expected_return_to_cost": 3.0,
+        "max_position_adjustment": 0.02,
+        "max_abs_ret_20": 0.08,
+        "max_holding_days": 5,
+    },
+    "eod_close_strength": {
+        "min_close_location": 0.80,
+        "min_intraday_return": 0.01,
+        "min_volume_ratio": 1.20,
+        "horizon_days": 5,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 5,
+    },
+    "limit_up_follow": {
+        "min_close_location": 0.65,
+        "horizon_days": 5,
+        "stop_loss_pct": -0.05,
+        "take_profit_pct": 0.10,
+        "max_holding_days": 5,
+    },
+    "macd_cross": {
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 10,
+    },
+    "ma_cross": {
+        "fast": 5,
+        "slow": 20,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 10,
+    },
+    "price_volume_breakout": {
+        "lookback": 20,
+        "min_volume_ratio": 1.50,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.05,
+        "take_profit_pct": 0.10,
+        "max_holding_days": 10,
+    },
+    "consecutive_decline_rebound": {
+        "decline_days": 3,
+        "max_prior_return": -0.05,
+        "horizon_days": 5,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.07,
+        "max_holding_days": 5,
+    },
+    "holiday_effect": {
+        "minimum_calendar_gap_days": 4,
+        "horizon_days": 5,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.06,
+        "max_holding_days": 5,
+    },
+    "kdj_oversold_cross": {
+        "window": 9,
+        "oversold": 30,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 10,
+    },
+    "low_volume_pullback": {
+        "max_volume_ratio": 0.80,
+        "min_ret_5": -0.08,
+        "max_ret_5": 0.0,
+        "horizon_days": 10,
+        "stop_loss_pct": -0.04,
+        "take_profit_pct": 0.08,
+        "max_holding_days": 10,
+    },
+}
+
+PRECOMPUTED_STRATEGY_CONFIGS = {
+    "macd_trend": {"score_col": "score_macd_trend", "payoff_ratio": 2.0},
+    "turtle_breakout": {"score_col": "score_turtle_breakout", "payoff_ratio": 2.0},
+    "mean_reversion": {"score_col": "score_mean_reversion", "payoff_ratio": 1.5},
+    "rsi_reversal": {"score_col": "score_rsi_reversal", "payoff_ratio": 1.5},
+    "grid_trading": {"score_col": "score_grid_trading", "payoff_ratio": 1.2},
+    "alpha_hedge": {"score_col": "score_alpha_hedge", "payoff_ratio": 2.0},
+    "event_driven": {"score_col": "score_event_driven", "payoff_ratio": 2.0},
+    "eod_close_strength": {"score_col": "score_eod_close_strength", "payoff_ratio": 2.0},
+    "limit_up_follow": {"score_col": "score_limit_up_follow", "payoff_ratio": 2.0},
+    "macd_cross": {"score_col": "score_macd_cross", "payoff_ratio": 2.0},
+    "ma_cross": {"score_col": "score_ma_cross", "payoff_ratio": 2.0},
+    "price_volume_breakout": {"score_col": "score_price_volume_breakout", "payoff_ratio": 2.0},
+    "consecutive_decline_rebound": {"score_col": "score_consecutive_decline_rebound", "payoff_ratio": 1.75},
+    "holiday_effect": {"score_col": "score_holiday_effect", "payoff_ratio": 1.5},
+    "kdj_oversold_cross": {"score_col": "score_kdj_oversold_cross", "payoff_ratio": 2.0},
+    "low_volume_pullback": {"score_col": "score_low_volume_pullback", "payoff_ratio": 1.75},
+}
+
+
+def strategy_params_hash(params=None) -> str:
+    payload = {
+        "version": STRATEGY_PARAMS_VERSION,
+        "params": params or STRATEGY_PARAMS,
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=list).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 # Phase-one decision council. These settings are frozen for exploratory
 # rules-based governance backtests and must be included in run manifests.
@@ -195,12 +479,19 @@ SAFETY_PROXY_MODE = "strict"
 SAFETY_PROXY_SYMBOLS = ("sh510300", "sh510310", "sz159919")
 SAFETY_PROXY_MAX_LAG_DAYS = 1
 SAFETY_PROXY_MAX_MISSING_DAYS = 2
-SAFETY_WARNING_DRAWDOWN = 0.015
-SAFETY_HIGH_DRAWDOWN = 0.03
-SAFETY_CRISIS_DRAWDOWN = 0.05
-SAFETY_WARNING_LIQUIDITY_STRESS = 0.20
-SAFETY_HIGH_LIQUIDITY_STRESS = 0.35
-SAFETY_CRISIS_LIQUIDITY_STRESS = 0.50
+# Safety drawdown thresholds - adjusted to reduce excessive deleveraging.
+# When MarketRegimePolicy is enabled, these are dynamically adjusted:
+# - Bull market: More tolerant (higher thresholds)
+# - Bear market: More sensitive (lower thresholds)
+SAFETY_WARNING_DRAWDOWN = 0.020
+SAFETY_HIGH_DRAWDOWN = 0.04
+SAFETY_CRISIS_DRAWDOWN = 0.06
+SAFETY_WARNING_LIQUIDITY_STRESS = 0.25
+SAFETY_HIGH_LIQUIDITY_STRESS = 0.40
+SAFETY_CRISIS_LIQUIDITY_STRESS = 0.55
+SAFETY_WARNING_CONFIRM_DAYS = 3
+SAFETY_HIGH_CONFIRM_DAYS = 3
+SAFETY_CRISIS_CONFIRM_DAYS = 3
 SAFETY_SELL_FLOW_ALERT_RATIO = 0.02
 GOVERNANCE_PLAN_HORIZON_DAYS = 5
 GOVERNANCE_MIN_HOLDING_DAYS = 5
@@ -217,7 +508,7 @@ GOVERNANCE_LOCK_HAIRCUT_RATIO = 1.0
 GOVERNANCE_REWARD_DRAWDOWN_BUDGET = 0.05
 GOVERNANCE_REWARD_TURNOVER_PENALTY = 0.50
 GOVERNANCE_REWARD_DRAWDOWN_PENALTY = 3.0
-GOVERNANCE_REPUTATION_WARMUP_DAYS = 252
+GOVERNANCE_REPUTATION_WARMUP_DAYS = 60
 GOVERNANCE_REPUTATION_HALF_LIFE = 20
 GOVERNANCE_REPUTATION_UPDATE_DAYS = 5
 GOVERNANCE_REPUTATION_SENSITIVITY = 1.5
@@ -229,14 +520,45 @@ GOVERNANCE_TRAIN_EMBARGO_PERIODS = 5
 GOVERNANCE_ENVIRONMENT_MANIFEST_JSON = REPORT_DIR / "decision_council_environment_manifest.json"
 GOVERNANCE_OUTPUT_DIR = RESULT_DIR / "decision_council"
 GOVERNANCE_INITIAL_CASH = 1_000_000.0
-GOVERNANCE_ALPHA_MODELS = ("momentum_20", "mom_lowvol", "ma_break")
+GOVERNANCE_ALPHA_MODEL_FEATURES = {
+    "momentum_20": "ret_20",
+    "mom_lowvol": "score_mom_lowvol",
+    "ma_break": "close_to_ma20",
+    "macd_trend": "score_macd_trend",
+    "mean_reversion": "score_mean_reversion",
+    "rsi_reversal": "score_rsi_reversal",
+    "turtle_breakout": "score_turtle_breakout",
+    "alpha_hedge": "score_alpha_hedge",
+    "event_driven": "score_event_driven",
+    "grid_trading": "score_grid_trading",
+    "eod_close_strength": "score_eod_close_strength",
+    "limit_up_follow": "score_limit_up_follow",
+    "macd_cross": "score_macd_cross",
+    "ma_cross": "score_ma_cross",
+    "price_volume_breakout": "score_price_volume_breakout",
+    "consecutive_decline_rebound": "score_consecutive_decline_rebound",
+    "holiday_effect": "score_holiday_effect",
+    "kdj_oversold_cross": "score_kdj_oversold_cross",
+    "low_volume_pullback": "score_low_volume_pullback",
+    "ml_alpha": "score_ml_alpha",
+    # Fundamental factors
+    "value": "score_value",
+    "quality": "score_quality",
+    "growth": "score_growth",
+    "fundamental": "score_fundamental",
+}
+GOVERNANCE_ALPHA_MODELS = tuple(GOVERNANCE_ALPHA_MODEL_FEATURES)
 GOVERNANCE_ALPHA_CANDIDATE_LIMIT = 200
 GOVERNANCE_DEFAULT_TOP_N = 20
 GOVERNANCE_ENTRY_RANK_LIMIT = 20
 GOVERNANCE_HOLD_RANK_LIMIT = 100
 GOVERNANCE_NORMAL_REBALANCE_INTERVAL_DAYS = 5
-GOVERNANCE_DEFAULT_TURNOVER_BUDGET = 0.05
-GOVERNANCE_WEEKLY_TURNOVER_BUDGET = 0.20
+# Turnover budget - reduced to control trading costs.
+# When MarketRegimePolicy is enabled:
+# - Bull market: 4% turnover budget
+# - Bear market: 2% turnover budget
+GOVERNANCE_DEFAULT_TURNOVER_BUDGET = 0.03
+GOVERNANCE_WEEKLY_TURNOVER_BUDGET = 0.15
 GOVERNANCE_PARTIAL_ADJUSTMENT_RATE = 0.25
 GOVERNANCE_INITIAL_TRANSITION_DAYS = 20
 GOVERNANCE_ALLOWED_INSTRUMENT_TYPES = ("stock", "etf_fund")
@@ -248,17 +570,38 @@ GOVERNANCE_IMPACT_SQRT_COEFFICIENT = 0.001
 GOVERNANCE_IMPACT_MAX_RATE = 0.02
 GOVERNANCE_MIN_DAILY_HISTORY = 20
 GOVERNANCE_START_DATE = "2021-01-01"
-GOVERNANCE_END_DATE = None
+GOVERNANCE_END_DATE = "2024-12-31"
 GOVERNANCE_PRELOAD_CALENDAR_DAYS = 60
+
+# Market Regime Policy Configuration
+# Enable dynamic parameter adjustment based on bull/bear market detection.
+# When enabled, all strategy parameters (safety thresholds, Kelly sizing,
+# signal filtering, turnover budget) will be dynamically adjusted.
+ENABLE_MARKET_REGIME_POLICY = True
+MARKET_REGIME_BENCHMARK_SYMBOL = "sh510300"  # CSI 300 ETF as benchmark
+MARKET_REGIME_MA_PERIOD = 20
+MARKET_REGIME_MA_SLOPE_LOOKBACK = 5
+MARKET_REGIME_VOLATILITY_THRESHOLD = 0.025
+MARKET_REGIME_MIN_HISTORY_DAYS = 30
+
+# Buy signal quality filters (applied before scoring)
+ENABLE_BUY_QUALITY_FILTERS = True
+BUY_FILTER_MAX_VOLATILITY_MULTIPLIER = 1.5  # Exclude stocks with vol > 1.5x median
+BUY_FILTER_MIN_AMOUNT_MULTIPLIER = 2.0  # Require 2x minimum daily amount
+BUY_FILTER_MAX_DECLINE_20D = -0.05  # Exclude stocks with >5% decline in 20 days
+BUY_FILTER_MIN_RET_5D = -0.03  # Exclude stocks with >3% decline in 5 days
 
 # Position-management P0 contract defaults. These values define the first
 # conservative Kelly implementation and are intentionally explicit because the
 # decision matrix uses them as audited thresholds.
-POSITION_KELLY_SCALE = 0.25
+# When MarketRegimePolicy is enabled, these are dynamically adjusted:
+# - Bull market: kelly_scale=0.45, min_p_win=0.50
+# - Bear market: kelly_scale=0.35, min_p_win=0.55
+POSITION_KELLY_SCALE = 0.40
 POSITION_MIN_ENTRY_KELLY_SCORE = 0.02
 POSITION_HOLD_KELLY_SCORE = 0.03
-POSITION_SEVERE_EXIT_KELLY_SCORE = 0.01
-POSITION_MIN_P_WIN = 0.48
+POSITION_SEVERE_EXIT_KELLY_SCORE = 0.015
+POSITION_MIN_P_WIN = 0.52
 POSITION_EXIT_EXPECTED_RETURN_20D = -0.005
 POSITION_EXIT_HYSTERESIS_DAYS = 3
 POSITION_KELLY_DECLINE_DAYS = 5
@@ -267,6 +610,91 @@ POSITION_RISK_DISCOUNT_SMOOTH_DAYS = 5
 POSITION_EMERGENCY_SINGLE_DAY_DRAWDOWN = 0.07
 POSITION_A500_MIN_COVERAGE_RATIO = 0.80
 POSITION_DEFAULT_RETURN_HORIZON_DAYS = 20
+POSITION_REQUIRE_INDEX_CONSTITUENTS = True
+
+# Universe mode definitions - explicit, auditable, no silent fallback
+UNIVERSE_MODE_INDEX_POOL_STRICT = "index_pool_strict"
+UNIVERSE_MODE_QUALITY_FALLBACK = "quality_fallback"
+UNIVERSE_MODE_BLOCKED = "blocked"
+
+# When True: if constituents missing + strict required -> raise error
+# When False: allow quality_fallback mode
+POSITION_ALLOW_QUALITY_FALLBACK = False
+
+POSITION_STRATEGY_STATS_LOOKBACK_DAYS = 252
+POSITION_STRATEGY_STATS_MIN_SAMPLES = 20
+POSITION_BAYES_PRIOR_P = 0.50
+POSITION_BAYES_PRIOR_STRENGTH = 20.0
+POSITION_BAYES_LOWER_CONFIDENCE = 0.85
+POSITION_BAYES_PRIOR_SOURCE = "global_neutral_baseline"
+POSITION_BAYES_PRIOR_NOTE = "Neutral 50/50 baseline with pseudo-count strength for cold-start stabilization; review via sensitivity report before changing live research conclusions."
+POSITION_PAYOFF_TRIM_RATIO = 0.10
+POSITION_PAYOFF_MIN = 1.0
+POSITION_PAYOFF_MAX = 3.0
+POSITION_SINGLE_STOCK_CAP = 0.05
+POSITION_INDUSTRY_CAP = 0.20
+POSITION_STRATEGY_GROUP_CAP = 0.35
+POSITION_CONFLICT_REDUCE_THRESHOLD = 0.30
+POSITION_CONFLICT_BLOCK_THRESHOLD = 0.50
+POSITION_CONFLICT_EXIT_THRESHOLD = 0.60
+POSITION_MIN_REBALANCE_DAYS = 3
+POSITION_NEW_CONSTITUENT_WAIT_DAYS = 5
+POSITION_LIQUIDITY_ALERT_DAYS = 3
+POSITION_LIQUIDITY_ADV_QUANTILE = 0.05
+POSITION_LIQUIDITY_AMIHUD_QUANTILE = 0.95
+POSITION_PORTFOLIO_LIQUIDITY_ALERT_RATIO = 0.20
+KELLY_PRIOR_SENSITIVITY_CSV = REPORT_DIR / "kelly_prior_sensitivity.csv"
+KELLY_PRIOR_SENSITIVITY_MD = REPORT_DIR / "kelly_prior_sensitivity.md"
+
+# V6 strategy governance. Only the formal candidates can receive non-zero
+# admission weights. Observation strategies remain available for diagnostics.
+V6_FORMAL_STRATEGY_CANDIDATES = (
+    "macd_cross",
+    "rsi_reversal",
+    "low_volume_pullback",
+    "limit_up_follow",
+)
+V6_OBSERVATION_STRATEGIES = (
+    "ma_cross",
+    "kdj_oversold_cross",
+    "mean_reversion",
+    "consecutive_decline_rebound",
+    "price_volume_breakout",
+    "turtle_breakout",
+    "eod_close_strength",
+    "holiday_effect",
+    "grid_trading",
+    "alpha_hedge",
+    "event_driven",
+)
+V6_STRATEGY_GROUPS = {
+    "macd_cross": "trend",
+    "rsi_reversal": "reversal",
+    "low_volume_pullback": "price_volume",
+    "limit_up_follow": "event",
+}
+V6_STRATEGY_COOLDOWN_DAYS = {
+    "macd_cross": 5,
+    "rsi_reversal": 3,
+    "low_volume_pullback": 3,
+    "limit_up_follow": 0,
+}
+V6_STRATEGY_TARGET_HORIZONS = {
+    "macd_cross": 10,
+    "rsi_reversal": 5,
+    "low_volume_pullback": 5,
+    "limit_up_follow": 2,
+}
+V6_EVENT_DENSITY_WARNING_PER_YEAR = 50
+V6_PRIMARY_BENCHMARK = "CSI300_TOTAL_RETURN"
+V6_ML_INITIAL_WEIGHT = 0.10
+V6_ML_MAX_WEIGHT = 0.30
+V6_ML_WEIGHT_STEP = 0.05
+V6_ML_BRIER_IMPROVEMENT_REQUIRED = 0.10
+V6_ML_REQUIRED_CONSECUTIVE_WINDOWS = 2
+V6_LIQUIDITY_PARTICIPATION_RATE = 0.02
+V6_LIQUIDITY_STRESS_RATES = (0.01, 0.02, 0.05, 0.10)
+V6_RESEARCH_WATERMARK = "基于未完全验证数据，禁止引用为实盘期望收益"
 
 # P2-P7 industrial governance contracts. All stages run serially to keep
 # memory bounded on a research workstation.
@@ -293,3 +721,121 @@ GOVERNANCE_MOMENTUM_REBOUND_DRAWDOWN = -0.08
 GOVERNANCE_MOMENTUM_REBOUND_RETURN = 0.03
 GOVERNANCE_BANDIT_ACTION_BOUND_RATIO = 0.20
 GOVERNANCE_BANDIT_SHADOW_DAYS = 252
+GOVERNANCE_SUMMARY_CSV = GOVERNANCE_OUTPUT_DIR / "governance_strategy_summary.csv"
+GOVERNANCE_REPORT_MD = GOVERNANCE_OUTPUT_DIR / "governance_strategy_report.md"
+
+# Registry Framework Configuration
+# 4-layer extensible architecture: Universe, Alpha, Policy, Evaluation
+REGISTRY_FRAMEWORK_VERSION = "v1.0"
+REGISTRY_OUTPUT_DIR = RESULT_DIR / "registry"
+REGISTRY_VALIDATION_REPORT_CSV = REPORT_DIR / "registry_validation_report.csv"
+REGISTRY_COMPARISON_REPORT_CSV = REPORT_DIR / "registry_comparison_report.csv"
+
+# Default registry selections (can be overridden by CLI or experiment plan)
+DEFAULT_UNIVERSE_NAME = "hs300_csi500_a500_strict"
+DEFAULT_ALPHA_BUNDLE = "president_core_bundle"
+DEFAULT_GOVERNANCE_VARIANT = "rules_based_president"
+
+# Experiment output structure: results/governance/{universe}/{variant}/{bundle}/
+GOVERNANCE_EXPERIMENT_BASE_DIR = RESULT_DIR / "governance"
+
+
+def get_parameter(name: str):
+    """Return one centralized parameter for debugging or external interfaces."""
+    key = str(name).strip().upper()
+    if key not in globals() or key.startswith("_"):
+        raise KeyError(f"Unknown configuration parameter: {name}")
+    return globals()[key]
+
+
+def parameter_snapshot(*, include_paths: bool = True) -> dict:
+    """Return a JSON-serializable snapshot of all public configuration values."""
+    snapshot = {}
+    for name, value in sorted(globals().items()):
+        if not name.isupper() or name.startswith("_"):
+            continue
+        if not include_paths and isinstance(value, Path):
+            continue
+        snapshot[name] = _serialize_parameter(value)
+    return snapshot
+
+
+def validate_configuration() -> list[str]:
+    """Validate cross-parameter contracts before a pipeline starts."""
+    errors = []
+    try:
+        start = None if START_DATE is None else __import__("pandas").Timestamp(START_DATE)
+        end = None if END_DATE is None else __import__("pandas").Timestamp(END_DATE)
+        strategy_start = None if STRATEGY_START_DATE is None else __import__("pandas").Timestamp(STRATEGY_START_DATE)
+        strategy_end = None if STRATEGY_END_DATE is None else __import__("pandas").Timestamp(STRATEGY_END_DATE)
+    except Exception as exc:
+        errors.append(f"date parsing failed: {exc}")
+        return errors
+    if start is not None and end is not None and start > end:
+        errors.append("START_DATE must not be after END_DATE")
+    if strategy_start is not None and strategy_end is not None and strategy_start > strategy_end:
+        errors.append("STRATEGY_START_DATE must not be after STRATEGY_END_DATE")
+    if start is not None and strategy_start is not None and strategy_start < start:
+        errors.append("STRATEGY_START_DATE must not be before START_DATE")
+    if STRATEGY_TOP_N <= 0:
+        errors.append("STRATEGY_TOP_N must be positive")
+    if STRATEGY_BATCH_SIZE_DEFAULT <= 0:
+        errors.append("STRATEGY_BATCH_SIZE_DEFAULT must be positive")
+    if MAIN_STRATEGY_EXECUTION_MODE not in {"auto", "bounded"}:
+        errors.append("MAIN_STRATEGY_EXECUTION_MODE must be 'auto' or 'bounded'")
+    if float(MAIN_STRATEGY_BOUNDED_PARQUET_GB_THRESHOLD) <= 0:
+        errors.append("MAIN_STRATEGY_BOUNDED_PARQUET_GB_THRESHOLD must be positive")
+    if not 1 <= AUTO_COMPLETE_MAX_STRATEGY_WORKERS <= 2:
+        errors.append("AUTO_COMPLETE_MAX_STRATEGY_WORKERS must be between 1 and 2")
+    if POSITION_PAYOFF_MIN <= 0 or POSITION_PAYOFF_MAX < POSITION_PAYOFF_MIN:
+        errors.append("POSITION_PAYOFF_MIN/MAX are invalid")
+    for name in [
+        "COMMISSION_RATE",
+        "STAMP_DUTY_RATE",
+        "SLIPPAGE_RATE",
+        "TRANSFER_FEE_RATE",
+        "POSITION_KELLY_SCALE",
+        "POSITION_SINGLE_STOCK_CAP",
+        "POSITION_INDUSTRY_CAP",
+        "V6_LIQUIDITY_PARTICIPATION_RATE",
+    ]:
+        value = float(globals()[name])
+        if value < 0:
+            errors.append(f"{name} must not be negative")
+    if float(REPORT_EFFECTIVE_N_RELATIVE_GAP_WARN) < 0:
+        errors.append("REPORT_EFFECTIVE_N_RELATIVE_GAP_WARN must not be negative")
+    if float(REPORT_TOP5_WEIGHT_SUM_GAP_WARN) < 0:
+        errors.append("REPORT_TOP5_WEIGHT_SUM_GAP_WARN must not be negative")
+    if float(FEATURE_PARQUET_GB_WARN) <= 0:
+        errors.append("FEATURE_PARQUET_GB_WARN must be positive")
+    if int(FEATURE_COLUMN_COUNT_WARN) <= 0:
+        errors.append("FEATURE_COLUMN_COUNT_WARN must be positive")
+    if FEATURE_STORAGE_MODE not in {"full", "pruned"}:
+        errors.append("FEATURE_STORAGE_MODE must be 'full' or 'pruned'")
+    if int(MULTI_WINDOW_DEFAULT_MONTHS) <= 0:
+        errors.append("MULTI_WINDOW_DEFAULT_MONTHS must be positive")
+    if int(MULTI_WINDOW_DEFAULT_STEP_MONTHS) <= 0:
+        errors.append("MULTI_WINDOW_DEFAULT_STEP_MONTHS must be positive")
+    if errors:
+        return errors
+    return []
+
+
+def assert_valid_configuration() -> None:
+    errors = validate_configuration()
+    if errors:
+        raise ValueError("Invalid centralized configuration:\n- " + "\n- ".join(errors))
+
+
+def _serialize_parameter(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_serialize_parameter(item) for item in value]
+    if isinstance(value, list):
+        return [_serialize_parameter(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _serialize_parameter(item) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)

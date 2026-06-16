@@ -78,9 +78,8 @@ def validate_label_specs(specs=None):
 
 
 def apply_default_labels(df, price_col="close"):
-    data = df.copy()
+    data = df
     data["date"] = pd.to_datetime(data["date"])
-    data = data.sort_values(["symbol", "date"]).copy()
     if price_col not in data.columns:
         raise ValueError(f"Label price column is missing: {price_col}")
     grouped_close = data.groupby("symbol")[price_col]

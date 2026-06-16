@@ -8,16 +8,27 @@ from config import (
     ENABLE_HOT_THEME_BIAS,
     FEATURE_DAILY_PARQUET,
     FEATURE_COVERAGE_REPORT_CSV,
+    FEATURE_DOWNCAST_FLOATS,
+    FEATURE_MEMORY_REPORT_CSV,
+    MODEL_TRAINING_DIAGNOSTICS_CSV,
+    FEATURE_PTI_ADJUSTMENT_MIN_COVERAGE_RATIO,
     FEATURE_DISTRIBUTION_REPORT_CSV,
     FEATURE_REGISTRY_REPORT_CSV,
+    FEATURE_STORAGE_MODE,
     FEATURE_STABILITY_REPORT_CSV,
     HOT_THEME_SLOT_RATIO,
     HOT_THEME_WEIGHTS,
     FORMAL_MODE_NAME,
     MARKET_CAP_PARQUET,
     RESEARCH_RUN_MODE,
+    STRATEGY_FREQ_OVERRIDES,
+    STRATEGY_MIN_SCORE_PERCENTILE,
 )
-from functions.data_sources.adjustment_factors import attach_adjustment_factors_to_daily
+from functions.data_sources.adjustment_factors import (
+    attach_adjustment_factors_to_daily,
+    save_adjustment_pti_coverage_report,
+)
+from functions.benchmark import save_investable_benchmark_report
 from functions.factor_registry import default_factor_registry
 from functions.feature_diagnostics import (
     build_feature_coverage_report,
@@ -41,7 +52,7 @@ from functions.pricing.price_views import (
 from functions.progress import progress_iter, progress_step
 from functions.sector_taxonomy import attach_sector_labels
 from functions.strategy_registry import STRATEGY_REGISTRY
-from functions.strategy_signal_generators import build_technical_strategy_features
+from functions.strategy_signal_generators import PRECOMPUTED_COLUMNS_BY_SIGNAL, build_technical_strategy_features
 from functions.position_managed_selection import generate_position_managed_selection
 from functions.strategy_selection import get_rebalance_dates
 
@@ -56,6 +67,27 @@ NORMALIZED_FEATURE_COLUMNS = [
     "score_mom_lowvol",
 ]
 
+TRANSIENT_FEATURE_COLUMNS = {
+    "macd_dif",
+    "macd_dea",
+    "macd_cross_up",
+    "macd_cross_down",
+    "turtle_high_20",
+    "turtle_low_20",
+    "turtle_high_55",
+    "true_range",
+    "turtle_breakout_55",
+    "mean_reversion_ma20",
+    "bollinger_position_20",
+    "ma_cross_up",
+    "kdj_rsv",
+    "kdj_cross_up",
+    "close_location",
+    "intraday_return_proxy",
+    "next_trade_date",
+    "calendar_gap_days",
+}
+
 
 def generate_daily_features_multi():
     progress_step("feature step: load clean daily parquet")
@@ -66,14 +98,55 @@ def generate_daily_features_multi():
     progress_step("feature step: build feature frame")
     df = build_feature_frame(df)
 
+    progress_step("feature step: finalize feature frame for storage")
+    df, memory_report = finalize_feature_frame_for_storage(df)
     progress_step("feature step: save feature reports")
-    _save_feature_reports(df)
+    _save_feature_reports(df, memory_report=memory_report)
+    save_adjustment_pti_coverage_report(df)
+    save_investable_benchmark_report()
     _save_feature_registry_validation(df)
 
     progress_step("feature step: write feature parquet")
     df.to_parquet(FEATURE_DAILY_PARQUET, index=False)
     print("Feature shape:", df.shape)
     return df
+
+
+def finalize_feature_frame_for_storage(df):
+    frame = df.copy(deep=False)
+    rows_before = int(len(df))
+    columns_before = int(len(df.columns))
+    memory_before_bytes = int(df.memory_usage(deep=True).sum())
+    dropped_columns = []
+
+    if str(FEATURE_STORAGE_MODE).strip().lower() == "pruned":
+        dropped_columns = sorted(set(frame.columns) & TRANSIENT_FEATURE_COLUMNS)
+        if dropped_columns:
+            frame = frame.drop(columns=dropped_columns)
+
+    if bool(FEATURE_DOWNCAST_FLOATS):
+        frame = _downcast_numeric_columns(frame)
+
+    columns_after = int(len(frame.columns))
+    memory_after_bytes = int(frame.memory_usage(deep=True).sum())
+    memory_report = pd.DataFrame(
+        [
+            {
+                "feature_storage_mode": str(FEATURE_STORAGE_MODE),
+                "feature_downcast_floats": bool(FEATURE_DOWNCAST_FLOATS),
+                "rows": rows_before,
+                "columns_before": columns_before,
+                "columns_after": columns_after,
+                "dropped_column_count": len(dropped_columns),
+                "dropped_columns": ",".join(dropped_columns),
+                "memory_before_bytes": memory_before_bytes,
+                "memory_after_bytes": memory_after_bytes,
+                "memory_saved_bytes": max(memory_before_bytes - memory_after_bytes, 0),
+                "memory_saved_ratio": 0.0 if memory_before_bytes <= 0 else max(memory_before_bytes - memory_after_bytes, 0) / memory_before_bytes,
+            }
+        ]
+    )
+    return frame, memory_report
 
 
 def build_feature_frame(df):
@@ -84,7 +157,18 @@ def build_feature_frame(df):
     df = attach_nominal_price_columns(df)
     if "backward_factor" in df.columns:
         df = attach_point_in_time_adjusted_price_columns(df)
-    use_pti_adjusted_prices = all(col in df.columns for col in POINT_IN_TIME_ADJUSTED_PRICE_COLUMNS)
+    adjustment_coverage_ratio = float(
+        pd.to_numeric(df.get("adj_factor_available", pd.Series(False, index=df.index)), errors="coerce")
+        .fillna(False)
+        .astype(bool)
+        .mean()
+    ) if len(df) else 0.0
+    adjustment_coverage_threshold = float(FEATURE_PTI_ADJUSTMENT_MIN_COVERAGE_RATIO)
+    use_pti_adjusted_prices = (
+        all(col in df.columns for col in POINT_IN_TIME_ADJUSTED_PRICE_COLUMNS)
+        and adjustment_coverage_ratio >= adjustment_coverage_threshold
+        and adjustment_coverage_ratio > 0.0
+    )
     price_suffix = "_adj_pti" if use_pti_adjusted_prices else ""
     open_col = f"open{price_suffix}"
     high_col = f"high{price_suffix}"
@@ -94,12 +178,28 @@ def build_feature_frame(df):
         "adjusted_point_in_time" if use_pti_adjusted_prices
         else "nominal_unadjusted"
     )
+    df["adjustment_coverage_ratio"] = adjustment_coverage_ratio
+    df["adjustment_coverage_threshold"] = adjustment_coverage_threshold
+    df["price_basis_selection_mode"] = (
+        "adjusted_point_in_time_coverage_sufficient"
+        if use_pti_adjusted_prices
+        else "nominal_due_partial_adjustment_coverage"
+    )
     df["formal_price_eligible"] = use_pti_adjusted_prices & df.get(
         "adj_factor_available", pd.Series(False, index=df.index)
     ).fillna(False)
     df["feature_timestamp"] = pd.to_datetime(df["date"])
     progress_step("feature frame: attach sector labels")
     df = attach_sector_labels(df)
+    has_neutralization_inputs = {"sector_parent", "stabilized_float_cap"}.issubset(df.columns)
+    if has_neutralization_inputs:
+        df["neutralization_mode"] = np.where(
+            df["sector_parent"].notna() & df["stabilized_float_cap"].notna(),
+            "industry_size_neutralized",
+            "winsor_only",
+        )
+    else:
+        df["neutralization_mode"] = "winsor_only"
     grouped = df.groupby(GROUP_COL, group_keys=False)
 
     for n in progress_iter([1, 5, 10, 20, 60], desc="returns"):
@@ -132,11 +232,14 @@ def build_feature_frame(df):
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"] - 1
 
     df["score_mom_lowvol"] = df["ret_20"] - df["volatility_20"]
-    progress_step("feature frame: attach technical strategy factors")
-    df = build_technical_strategy_features(df)
 
     progress_step("feature frame: apply labels")
     df = apply_default_labels(df, price_col=close_col)
+    progress_step("feature frame: attach technical strategy factors")
+    df = build_technical_strategy_features(df)
+    if bool(FEATURE_DOWNCAST_FLOATS):
+        progress_step("feature frame: downcast working numeric columns")
+        df = _downcast_numeric_columns(df)
     progress_step("feature frame: attach normalized feature views")
     df = _attach_normalized_feature_views(df)
     return df
@@ -198,26 +301,56 @@ def _attach_normalized_feature_views(df):
     return frame
 
 
-def _save_feature_reports(df):
+def _save_feature_reports(df, memory_report=None):
     report_cols = [col for col in NORMALIZED_FEATURE_COLUMNS if col in df.columns]
-    if not report_cols:
-        return
-
-    build_feature_coverage_report(df, report_cols).to_csv(
-        FEATURE_COVERAGE_REPORT_CSV,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    build_feature_distribution_report(df, report_cols).to_csv(
-        FEATURE_DISTRIBUTION_REPORT_CSV,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    build_feature_stability_report(df, report_cols).to_csv(
-        FEATURE_STABILITY_REPORT_CSV,
-        index=False,
-        encoding="utf-8-sig",
-    )
+    if report_cols:
+        coverage_report = build_feature_coverage_report(df, report_cols)
+        extra_rows = pd.DataFrame(
+            [
+                {
+                    "feature": "__adjustment_coverage_ratio__",
+                    "non_null_rows": int(len(df)),
+                    "coverage_ratio": float(pd.to_numeric(df.get("adjustment_coverage_ratio"), errors="coerce").dropna().iloc[0])
+                    if "adjustment_coverage_ratio" in df.columns and not pd.to_numeric(df.get("adjustment_coverage_ratio"), errors="coerce").dropna().empty
+                    else 0.0,
+                },
+                {
+                    "feature": "__neutralization_full_coverage_ratio__",
+                    "non_null_rows": int(len(df)),
+                    "coverage_ratio": float(
+                        (
+                            df.get("neutralization_mode", pd.Series("", index=df.index))
+                            .astype(str)
+                            .eq("industry_size_neutralized")
+                        ).mean()
+                    )
+                    if len(df)
+                    else 0.0,
+                },
+            ]
+        )
+        coverage_report = pd.concat([coverage_report, extra_rows], ignore_index=True)
+        coverage_report.to_csv(
+            FEATURE_COVERAGE_REPORT_CSV,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        build_feature_distribution_report(df, report_cols).to_csv(
+            FEATURE_DISTRIBUTION_REPORT_CSV,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        build_feature_stability_report(df, report_cols).to_csv(
+            FEATURE_STABILITY_REPORT_CSV,
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if memory_report is not None:
+        memory_report.to_csv(
+            FEATURE_MEMORY_REPORT_CSV,
+            index=False,
+            encoding="utf-8-sig",
+        )
 
 
 def _save_feature_registry_validation(df):
@@ -243,6 +376,17 @@ def _save_feature_registry_validation(df):
     )
 
 
+def _downcast_numeric_columns(df):
+    frame = df.copy(deep=False)
+    for column in frame.columns:
+        series = frame[column]
+        if pd.api.types.is_float_dtype(series):
+            frame[column] = pd.to_numeric(series, errors="coerce", downcast="float")
+        elif pd.api.types.is_integer_dtype(series):
+            frame[column] = pd.to_numeric(series, errors="coerce", downcast="integer")
+    return frame
+
+
 def select_instruments_by_score(
     df,
     score_col,
@@ -254,6 +398,7 @@ def select_instruments_by_score(
     ascending=False,
     hot_theme_weights=None,
     hot_theme_slot_ratio=0.0,
+    min_score_percentile=0.0,
 ):
     """Select top instruments only on configured rebalance dates."""
     needed_cols = [
@@ -265,6 +410,21 @@ def select_instruments_by_score(
         "is_trading",
         "abnormal_jump",
         "formal_price_eligible",
+        "feature_price_source",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
+        "price_basis_selection_mode",
+        "neutralization_mode",
+        "strategy_params_version",
+        "strategy_params_hash",
+        "training_window_days",
+        "training_sample_count",
+        "label_purge_periods",
+        "fitted_feature_count",
+        "requested_model",
+        "runtime_model",
+        "ml_runtime_mode",
+        "ml_degradation_flag",
         "sector_parent",
         "sector_parent_heat",
         "sector_branch_heat",
@@ -288,6 +448,12 @@ def select_instruments_by_score(
             raise ValueError("Formal strategy selection requires point-in-time adjustment coverage")
         df_sel = df_sel[df_sel["formal_price_eligible"] == True]
 
+    eligible_count_by_day = {}
+    if not df_sel.empty:
+        eligible_count_by_day = (
+            df_sel.groupby("date", sort=False)["symbol"].count().to_dict()
+        )
+
     df_sel = df_sel.dropna(subset=["date", "symbol", "close", score_col])
     if df_sel.empty:
         return df_sel
@@ -298,6 +464,7 @@ def select_instruments_by_score(
         return df_sel
 
     rows = []
+    previous_symbols = set()
     for rebalance_date, one_day in df_sel.groupby("date", sort=True):
         selected = _select_one_rebalance_day(
             one_day=one_day,
@@ -306,6 +473,8 @@ def select_instruments_by_score(
             ascending=ascending,
             hot_theme_weights=hot_theme_weights,
             hot_theme_slot_ratio=hot_theme_slot_ratio,
+            min_score_percentile=min_score_percentile,
+            previous_symbols=previous_symbols,
         )
         if selected.empty:
             continue
@@ -313,7 +482,17 @@ def select_instruments_by_score(
         selected["rebalance_date"] = rebalance_date
         selected["score"] = selected[score_col]
         selected["weight"] = 1.0 / len(selected)
+        eligible_count = int(eligible_count_by_day.get(rebalance_date, len(one_day)))
+        selected["signal_candidate_count"] = eligible_count
+        selected["signal_trigger_count"] = int(len(selected))
+        selected["signal_trigger_rate"] = (
+            0.0 if eligible_count <= 0 else float(len(selected)) / float(eligible_count)
+        )
+        selected["price_basis"] = selected.get("feature_price_source", "nominal_unadjusted")
+        selected["degradation_flags"] = selected.apply(_selection_degradation_flags, axis=1)
         rows.append(selected)
+        # Track selected symbols for next rebalance date (carry-forward)
+        previous_symbols = set(selected["symbol"].tolist())
 
     if not rows:
         return df_sel.iloc[0:0].copy()
@@ -354,6 +533,8 @@ def generate_multi_strategies(
             "is_trading",
             "abnormal_jump",
             "formal_price_eligible",
+            "feature_price_source",
+            "neutralization_mode",
             "sector_parent",
             "sector_parent_heat",
             "sector_branch_heat",
@@ -380,10 +561,12 @@ def generate_multi_strategies(
             ascending=ascending,
             hot_theme_weights=hot_theme_weights,
             hot_theme_slot_ratio=hot_theme_slot_ratio,
+            min_score_percentile=STRATEGY_MIN_SCORE_PERCENTILE,
         )
 
     ml_score_tables = {}
     learning_score_tables = None
+    training_diagnostics = []
 
     for strategy_name, spec in progress_iter(
         STRATEGY_REGISTRY.items(),
@@ -391,6 +574,7 @@ def generate_multi_strategies(
         total=len(STRATEGY_REGISTRY),
     ):
         source_df = None
+        strategy_freq = STRATEGY_FREQ_OVERRIDES.get(strategy_name, freq)
         progress_step(f"strategy: {strategy_name} source={spec.source}")
 
         if spec.source == "ml":
@@ -400,6 +584,9 @@ def generate_multi_strategies(
                     model_type=spec.model_type,
                     rebalance_dates=candidate_dates,
                 )
+                training_diagnostics.extend(
+                    _frame_training_diagnostics(ml_score_tables[spec.model_type])
+                )
             source_df = ml_score_tables[spec.model_type]
         elif spec.source in {"classic_ml", "quantum_inspired"}:
             if learning_score_tables is None:
@@ -407,15 +594,38 @@ def generate_multi_strategies(
                     df,
                     rebalance_dates=candidate_dates,
                 )
+                for table in learning_score_tables.values():
+                    training_diagnostics.extend(_frame_training_diagnostics(table))
             source_df = learning_score_tables[strategy_name]
         elif spec.source == "position_management":
             strategies[strategy_name], _ = generate_position_managed_selection(
                 df,
                 top_n=top_n,
-                freq=freq,
+                freq=strategy_freq,
                 start_date=start_date,
                 end_date=end_date,
                 strategy_name=strategy_name,
+            )
+            strategies[strategy_name] = _attach_strategy_metadata(
+                strategies[strategy_name],
+                strategy_name=strategy_name,
+                strategy_source=spec.source,
+            )
+            continue
+        elif spec.source in {"technical", "research"}:
+            strategies[strategy_name], _ = generate_position_managed_selection(
+                df,
+                top_n=top_n,
+                freq=strategy_freq,
+                start_date=start_date,
+                end_date=end_date,
+                strategy_name=strategy_name,
+                signal_strategy_ids=[strategy_name],
+            )
+            strategies[strategy_name] = _attach_strategy_metadata(
+                strategies[strategy_name],
+                strategy_name=strategy_name,
+                strategy_source=spec.source,
             )
             continue
 
@@ -424,7 +634,13 @@ def generate_multi_strategies(
             ascending=spec.ascending,
             source_df=source_df,
         )
+        strategies[strategy_name] = _attach_strategy_metadata(
+            strategies[strategy_name],
+            strategy_name=strategy_name,
+            strategy_source=spec.source,
+        )
 
+    _save_model_training_diagnostics(training_diagnostics)
     return strategies
 
 
@@ -436,9 +652,11 @@ def generate_one_strategy(
     include_types=("stock", "etf_fund"),
     start_date=None,
     end_date=None,
+    progress_hook=None,
 ):
     """Generate one configured strategy selection with bounded intermediate state."""
     spec = STRATEGY_REGISTRY[strategy_name]
+    freq = STRATEGY_FREQ_OVERRIDES.get(strategy_name, freq)
     candidate_dates = _strategy_rebalance_dates(
         df=df,
         freq=freq,
@@ -447,18 +665,21 @@ def generate_one_strategy(
         end_date=end_date,
     )
     source_df = None
+    training_diagnostics = []
     if spec.source == "ml":
         source_df = compute_ml_factor(
             df,
             model_type=spec.model_type,
             rebalance_dates=candidate_dates,
         )
+        training_diagnostics.extend(_frame_training_diagnostics(source_df))
     elif spec.source in {"classic_ml", "quantum_inspired"}:
         source_df = generate_learning_strategy_scores(
             df,
             strategy_name=strategy_name,
             rebalance_dates=candidate_dates,
         )
+        training_diagnostics.extend(_frame_training_diagnostics(source_df))
     elif spec.source == "position_management":
         selection, _ = generate_position_managed_selection(
             df,
@@ -467,8 +688,21 @@ def generate_one_strategy(
             start_date=start_date,
             end_date=end_date,
             strategy_name=strategy_name,
+            progress_hook=progress_hook,
         )
-        return selection
+        return _attach_strategy_metadata(selection, strategy_name=strategy_name, strategy_source=spec.source)
+    elif spec.source in {"technical", "research"}:
+        selection, _ = generate_position_managed_selection(
+            df,
+            top_n=top_n,
+            freq=freq,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_name=strategy_name,
+            signal_strategy_ids=[strategy_name],
+            progress_hook=progress_hook,
+        )
+        return _attach_strategy_metadata(selection, strategy_name=strategy_name, strategy_source=spec.source)
 
     base_cols = _selection_source_columns(spec.score_col, df.columns)
     selection_source = df.loc[:, base_cols]
@@ -479,7 +713,7 @@ def generate_one_strategy(
             on=["date", "symbol"],
             how="left",
         )
-    return select_instruments_by_score(
+    selection = select_instruments_by_score(
         selection_source,
         spec.score_col,
         top_n=top_n,
@@ -490,7 +724,93 @@ def generate_one_strategy(
         ascending=spec.ascending,
         hot_theme_weights=HOT_THEME_WEIGHTS if ENABLE_HOT_THEME_BIAS else {},
         hot_theme_slot_ratio=HOT_THEME_SLOT_RATIO if ENABLE_HOT_THEME_BIAS else 0.0,
+        min_score_percentile=STRATEGY_MIN_SCORE_PERCENTILE,
     )
+    _save_model_training_diagnostics(training_diagnostics)
+    return _attach_strategy_metadata(selection, strategy_name=strategy_name, strategy_source=spec.source)
+
+
+def _attach_strategy_metadata(selection, *, strategy_name, strategy_source):
+    if selection is None:
+        return selection
+    result = selection.copy()
+    result["strategy_name"] = strategy_name
+    result["strategy_source"] = strategy_source
+    result["weighting_mode"] = (
+        "kelly_managed"
+        if strategy_source in {"technical", "research", "position_management"}
+        else "equal_weight"
+    )
+    result["price_basis"] = result.get("price_basis", result.get("feature_price_source", "nominal_unadjusted"))
+    result["neutralization_mode"] = result.get("neutralization_mode", "winsor_only")
+    result["ml_runtime_mode"] = result.get("ml_runtime_mode", "not_applicable")
+    if "signal_candidate_count" not in result.columns:
+        result["signal_candidate_count"] = pd.NA
+    if "signal_trigger_count" not in result.columns:
+        result["signal_trigger_count"] = pd.NA
+    if "signal_trigger_rate" not in result.columns:
+        result["signal_trigger_rate"] = pd.NA
+    if "degradation_flags" not in result.columns:
+        result["degradation_flags"] = ""
+    if "governance_variant" not in result.columns:
+        result["governance_variant"] = ""
+    return result
+
+
+def _selection_degradation_flags(row):
+    flags = []
+    if str(row.get("feature_price_source", "")) == "nominal_unadjusted":
+        flags.append("price_basis_nominal_fallback")
+        coverage_ratio = pd.to_numeric(pd.Series([row.get("adjustment_coverage_ratio")]), errors="coerce").iloc[0]
+        coverage_threshold = pd.to_numeric(pd.Series([row.get("adjustment_coverage_threshold")]), errors="coerce").iloc[0]
+        if pd.notna(coverage_ratio) and pd.notna(coverage_threshold) and coverage_ratio < coverage_threshold:
+            flags.append("adjustment_coverage_below_threshold")
+    if str(row.get("neutralization_mode", "")) != "industry_size_neutralized":
+        flags.append("neutralization_disabled_or_partial")
+    if str(row.get("ml_degradation_flag", "")):
+        flags.append(str(row.get("ml_degradation_flag")))
+    if bool(row.get("formal_price_eligible", False)) is False:
+        flags.append("formal_price_ineligible")
+    deduped = []
+    for flag in flags:
+        if flag and flag not in deduped:
+            deduped.append(flag)
+    return "|".join(deduped)
+
+
+def _frame_training_diagnostics(frame):
+    diagnostics = frame.attrs.get("training_diagnostics")
+    if diagnostics is None:
+        return []
+    if isinstance(diagnostics, pd.DataFrame):
+        if diagnostics.empty:
+            return []
+        return diagnostics.to_dict("records")
+    return list(diagnostics)
+
+
+def _save_model_training_diagnostics(rows):
+    if not rows:
+        return
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return
+    if "rebalance_date" in frame.columns:
+        frame["rebalance_date"] = pd.to_datetime(frame["rebalance_date"], errors="coerce")
+    sort_cols = [
+        col for col in [
+            "model_family",
+            "strategy_id",
+            "module_name",
+            "profile_name",
+            "rebalance_date",
+            "status",
+        ]
+        if col in frame.columns
+    ]
+    if sort_cols:
+        frame = frame.sort_values(sort_cols).reset_index(drop=True)
+    frame.to_csv(MODEL_TRAINING_DIAGNOSTICS_CSV, index=False, encoding="utf-8-sig")
 
 
 def required_feature_columns_for_strategy(strategy_name):
@@ -515,6 +835,37 @@ def required_feature_columns_for_strategy(strategy_name):
                 columns.add(f"{base_col}{suffix}")
         for horizon in LABEL_DEFAULT_HORIZONS:
             columns.add(f"future_ret_{horizon}")
+    elif spec.source in {"technical", "research", "position_management"}:
+        columns.update(
+            [
+                "code",
+                "market",
+                "amount",
+                "raw_ret",
+                "rough_limit_up",
+                "rough_limit_down",
+                "close_nominal",
+                "feature_price_source",
+                "adjustment_coverage_ratio",
+                "adjustment_coverage_threshold",
+                "price_basis_selection_mode",
+                "formal_price_eligible",
+                "ret_20",
+                "future_ret_5",
+                "future_ret_10",
+                "future_ret_20",
+                "volatility_20",
+                "market_cap_jump_flag",
+                "float_cap_jump_flag",
+                "jump_event_type",
+            ]
+        )
+        if spec.source == "position_management":
+            columns.update(["open", "high", "low", "volume"])
+            for needed_columns in PRECOMPUTED_COLUMNS_BY_SIGNAL.values():
+                columns.update(needed_columns)
+        else:
+            columns.update(PRECOMPUTED_COLUMNS_BY_SIGNAL.get(strategy_name, set()))
     return sorted(columns)
 
 
@@ -528,6 +879,20 @@ def _selection_source_columns(score_col, available_columns=None):
         "is_trading",
         "abnormal_jump",
         "formal_price_eligible",
+        "feature_price_source",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
+        "price_basis_selection_mode",
+        "neutralization_mode",
+        "strategy_params_version",
+        "strategy_params_hash",
+        "training_window_days",
+        "training_sample_count",
+        "label_purge_periods",
+        "fitted_feature_count",
+        "signal_candidate_count",
+        "signal_trigger_count",
+        "signal_trigger_rate",
         "sector_parent",
         "sector_parent_heat",
         "sector_branch_heat",
@@ -565,6 +930,8 @@ def _select_one_rebalance_day(
     ascending,
     hot_theme_weights,
     hot_theme_slot_ratio,
+    min_score_percentile=0.0,
+    previous_symbols=None,
 ):
     day = one_day.copy()
     day["selection_score"] = _build_selection_score(
@@ -574,6 +941,14 @@ def _select_one_rebalance_day(
         hot_theme_weights=hot_theme_weights,
     )
     day = day.sort_values(["selection_score", "symbol"], ascending=[False, True]).reset_index(drop=True)
+
+    # Score qualification filter: only stocks above the historical percentile threshold qualify
+    if min_score_percentile > 0 and score_col in day.columns:
+        raw_score = pd.to_numeric(day[score_col], errors="coerce")
+        score_threshold = raw_score.quantile(min_score_percentile)
+        qualified = day[raw_score >= score_threshold]
+        if not qualified.empty:
+            day = qualified.reset_index(drop=True)
 
     hot_theme_weights = hot_theme_weights or {}
     hot_slots = min(int(round(top_n * hot_theme_slot_ratio)), top_n)
@@ -599,7 +974,22 @@ def _select_one_rebalance_day(
             selected_frames.append(fallback)
 
     if not selected_frames:
-        return day.head(top_n).copy()
+        # Not enough qualified stocks: fill with previously qualified stocks if available
+        if previous_symbols and len(previous_symbols) > 0:
+            prev_available = one_day[one_day["symbol"].isin(previous_symbols)]
+            if not prev_available.empty:
+                prev_available = prev_available.copy()
+                prev_available["selection_score"] = _build_selection_score(
+                    prev_available,
+                    score_col=score_col,
+                    ascending=ascending,
+                    hot_theme_weights=hot_theme_weights or {},
+                )
+                return prev_available.sort_values(
+                    ["selection_score", "symbol"], ascending=[False, True]
+                ).head(top_n).copy()
+        # No qualified stocks and no previous positions: return empty (go to cash)
+        return day.iloc[0:0].copy()
 
     selected = pd.concat(selected_frames, ignore_index=True)
     return selected.sort_values(["selection_score", "symbol"], ascending=[False, True]).head(top_n).copy()
@@ -609,7 +999,15 @@ def _build_selection_score(day, score_col, ascending, hot_theme_weights):
     score = pd.to_numeric(day[score_col], errors="coerce")
     base_score = -score if ascending else score
     rank_component = base_score.rank(method="first", pct=True, ascending=True)
-    theme_bonus = day["sector_parent"].map(hot_theme_weights or {}).fillna(day["sector_parent_heat"]).fillna(0.0)
+    if "sector_parent" in day.columns:
+        sector_parent = day["sector_parent"]
+    else:
+        sector_parent = pd.Series("", index=day.index)
+    if "sector_parent_heat" in day.columns:
+        sector_parent_heat = pd.to_numeric(day["sector_parent_heat"], errors="coerce").fillna(0.0)
+    else:
+        sector_parent_heat = pd.Series(0.0, index=day.index)
+    theme_bonus = sector_parent.map(hot_theme_weights or {}).fillna(sector_parent_heat).fillna(0.0)
     if "sector_branch_heat" in day.columns:
         branch_bonus = pd.to_numeric(day["sector_branch_heat"], errors="coerce").fillna(0.0)
     else:

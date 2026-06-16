@@ -58,8 +58,8 @@ def _verify_preflight_and_safety(failures):
         rows.extend(
             [
                 {"date": date, "symbol": "sh510300", "instrument_type": "etf_fund", "close": 100 - index * 0.3, "amount": 100.0, "is_trading": True},
-                {"date": date, "symbol": "sh600000", "instrument_type": "stock", "close": 10.0, "amount": 20.0 if index == 24 else 100.0, "is_trading": True},
-                {"date": date, "symbol": "sz000001", "instrument_type": "stock", "close": 12.0, "amount": 20.0 if index == 24 else 100.0, "is_trading": True},
+                {"date": date, "symbol": "sh600000", "instrument_type": "stock", "close": 10.0, "amount": 20.0 if index >= 23 else 100.0, "is_trading": True},
+                {"date": date, "symbol": "sz000001", "instrument_type": "stock", "close": 12.0, "amount": 20.0 if index >= 23 else 100.0, "is_trading": True},
             ]
         )
     features = pd.DataFrame(rows)
@@ -76,7 +76,9 @@ def _verify_preflight_and_safety(failures):
 
     signals = RuleBasedSafetyAgent("sh510300").build_daily_signals(features)
     latest = signals.iloc[-1]
-    _expect(latest["risk_level"] in {"warning", "high", "crisis"}, "safety signal should react to stress", failures)
+    _expect(latest["raw_risk_level"] in {"warning", "high", "crisis"}, "raw safety signal should react to stress", failures)
+    _expect(int(latest["trigger_streak_days"]) >= 2, "confirmed safety signal should require consecutive stress days", failures)
+    _expect(latest["risk_level"] in {"warning", "high", "crisis"}, "confirmed safety signal should react after stress persists", failures)
     _expect(float(latest["exposure_cap"]) < 1.0, "safety exposure cap should fall under stress", failures)
     engine = PhaseOneDecisionCouncilEngine(features, safety_proxy_mode="strict")
     _expect(engine.manifest["benchmark_proxy_symbol"] == "sh510300", "engine should freeze selected safety proxy", failures)
@@ -186,7 +188,7 @@ def _verify_allocation_and_policy(failures):
 def _verify_reputation_shadow_and_leakage(failures):
     ledger = ReputationLedger(["alpha", "beta", "gamma"])
     for day in range(256):
-        snapshot = ledger.record_rewards(
+        ledger.record_rewards(
             {"alpha": 0.10, "beta": 0.0, "gamma": -0.10},
             as_of=pd.Timestamp("2024-01-01") + pd.offsets.BDay(day),
             trading_day_index=day,
@@ -283,6 +285,8 @@ def _verify_runner_and_advanced_policies(failures):
             "governance_account_audit_ledger",
             "governance_corporate_action_ledger",
             "governance_rollback_recommendation_ledger",
+            "governance_strategy_summary",
+            "governance_strategy_report",
             "governance_performance_risk_plot",
             "governance_model_reputation_plot",
             "governance_safety_points_plot",
@@ -294,6 +298,42 @@ def _verify_runner_and_advanced_policies(failures):
         _expect(pd.read_csv(saved["governance_execution_ledger"]).shape[0] > 0, "runner should execute synthetic orders", failures)
         account_audit = pd.read_csv(saved["governance_account_audit_ledger"])
         _expect(account_audit["reconciliation_passed"].all(), "daily account reconciliation should remain exact", failures)
+        governance_summary = pd.read_csv(saved["governance_strategy_summary"])
+        _expect(
+            {
+                "strategy_source",
+                "governance_variant",
+                "safety_proxy_mode",
+                "safety_agent_enabled",
+                "reputation_enabled",
+                "sector_cap_enabled",
+                "trading_freeze_trigger_count",
+                "trading_freeze_period_lengths",
+                "trading_freeze_min_exposure_cap",
+                "emergency_deleveraging_trigger_count",
+                "emergency_deleveraging_period_lengths",
+                "emergency_deleveraging_min_exposure_cap",
+                "turnover_budget",
+                "participation_rate",
+                "capacity_passed_ratio",
+            }.issubset(governance_summary.columns),
+            "governance strategy summary should contain reporting metadata",
+            failures,
+        )
+        freeze_triggers = int(pd.to_numeric(governance_summary.loc[0, "trading_freeze_trigger_count"], errors="coerce") or 0)
+        freeze_periods = int(pd.to_numeric(governance_summary.loc[0, "trading_freeze_total_rebalance_periods"], errors="coerce") or 0)
+        deleverage_triggers = int(pd.to_numeric(governance_summary.loc[0, "emergency_deleveraging_trigger_count"], errors="coerce") or 0)
+        deleverage_periods = int(pd.to_numeric(governance_summary.loc[0, "emergency_deleveraging_total_rebalance_periods"], errors="coerce") or 0)
+        _expect(freeze_triggers <= freeze_periods, "freeze trigger count should not exceed total freeze periods", failures)
+        _expect(
+            deleverage_triggers <= deleverage_periods,
+            "emergency deleveraging trigger count should not exceed total deleveraging periods",
+            failures,
+        )
+        report_text = saved["governance_strategy_report"].read_text(encoding="utf-8")
+        _expect("## Governance Summary" in report_text, "governance report should include governance summary section", failures)
+        _expect("### Governance Event Summary" in report_text, "governance report should include event summary section", failures)
+        _expect("Governance comparability disclaimer" in report_text, "governance report should disclose cross-class comparability limits", failures)
 
     calibration = fit_isotonic_calibration_table(
         [0.1, 0.2, 0.3, 0.4, 0.8, 0.9],

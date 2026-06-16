@@ -2,18 +2,24 @@
 r"""
 Project entry point.
 
-Click Run in Spyder without command-line arguments to execute the complete
-restartable workflow in auto_complete_after_vpn.py.  That workflow fetches
-external data, rebuilds derived artifacts, runs each strategy in a fresh
-low-memory subprocess, generates reports, and verifies the final outputs.
+`main.py` is the primary user-facing master switch.
 
-Command-line calls with arguments retain the focused pipeline and low-memory
-batch interfaces used by the orchestrator.
+Without arguments it runs the normal local pipeline directly:
+convert -> clean -> features -> strategy selection -> view -> backtest.
+
+Pipeline parameters live in `config.py`.
+Pipeline step on/off switches live in `pipeline_steps.py`.
+
+The larger restartable orchestrator remains available explicitly through
+`--auto-complete`.
 """
 
 import argparse
 import gc
+import json
 import sys
+import time
+from pathlib import Path
 
 import pandas as pd
 
@@ -25,6 +31,8 @@ from config import (
     BASELINE_VERSION,
     BACKTEST_INITIAL_CASH,
     BACKTEST_RISK_FREE_RATE,
+    BACKTEST_SKIPPED_STRATEGIES_CSV,
+    BACKTEST_SHOW_PLOT,
     CLEAN_DAILY_PARQUET,
     CORPORATE_ACTION_DATA_VERSION,
     DATA_VERSION,
@@ -51,13 +59,45 @@ from config import (
     RESEARCH_RUN_MODE,
     REPORT_DIR,
     RESULT_DIR,
+    RUNTIME_CONFIG_SNAPSHOT_JSON,
     RUNS_DIR,
     START_DATE,
+    STRATEGY_PARAMS,
+    STRATEGY_PARAMS_VERSION,
     TDX_DIR,
     FAILED_CODES_CSV,
     GOVERNANCE_OUTPUT_DIR,
+    STRATEGY_SCORE_COL,
+    STRATEGY_TOP_N,
+    STRATEGY_FREQ,
+    STRATEGY_START_DATE,
+    STRATEGY_END_DATE,
+    STRATEGY_INCLUDE_TYPES,
+    EXPORT_SELECTION_EXCEL,
+    PRINT_SELECTION_ROWS,
+    CLI_MAIN_BATCH_INDEX,
+    CLI_MAIN_BATCH_SIZE,
+    CLI_MAIN_GOVERNANCE_VARIANT,
+    CLI_MAIN_MODE,
+    MAIN_STRATEGY_BOUNDED_PARQUET_GB_THRESHOLD,
+    MAIN_STRATEGY_EXECUTION_MODE,
+    CLI_MAIN_SAFETY_PROXY_MODE,
+    CLI_GOVERNANCE_END_DATE,
+    CLI_GOVERNANCE_MAX_DAYS,
+    CLI_GOVERNANCE_START_DATE,
+    assert_valid_configuration,
+    strategy_params_hash,
+)
+from pipeline_steps import (
+    RUN_STEP_1_CONVERT_TDX,
+    RUN_STEP_2_CLEAN_DATA,
+    RUN_STEP_3_FEATURES,
+    RUN_STEP_4_STRATEGY_SELECTION,
+    RUN_STEP_5_VIEW_SELECTION,
+    RUN_STEP_6_BACKTEST,
 )
 from functions.backtest_engine import run_backtest
+from functions.date_window import window_identity
 from functions.data_sources.adjustment_factors import build_adjustment_factors_quality_report
 from functions.evaluation.experiment_tracker import (
     mark_run_completed,
@@ -68,7 +108,6 @@ from functions.clean_daily_data import clean_daily_data
 from functions.convert_tdx_daily import convert_tdx_daily, limit_file_rows_balanced
 from functions.feature_engineering import generate_daily_features_multi as generate_daily_features
 from functions.feature_engineering import (
-    generate_multi_strategies,
     generate_one_strategy,
     required_feature_columns_for_strategy,
 )
@@ -89,31 +128,95 @@ from functions.tdx_day_file_reader import collect_tdx_day_files
 from functions.view_strategy_selection import view_strategy_selection
 
 
-RUN_STEP_1_CONVERT_TDX = True
-RUN_STEP_2_CLEAN_DATA = True
-RUN_STEP_3_FEATURES = True
-RUN_STEP_4_STRATEGY_SELECTION = True
-RUN_STEP_5_VIEW_SELECTION = True
-RUN_STEP_6_BACKTEST = True
-
-STRATEGY_SCORE_COL = "score_mom_lowvol"
-STRATEGY_TOP_N = 20
-STRATEGY_FREQ = "ME"
-STRATEGY_START_DATE = "2021-01-01"
-STRATEGY_END_DATE = None
-STRATEGY_INCLUDE_TYPES = ("stock", "etf_fund")
-
-EXPORT_SELECTION_EXCEL = True
-PRINT_SELECTION_ROWS = 30
-
-BACKTEST_SHOW_PLOT = False
-
 NON_STRATEGY_PARQUETS = {
     "tdx_daily_raw.parquet",
     "tdx_daily_clean.parquet",
     "tdx_daily_features.parquet",
     "strategy_selection.parquet",
 }
+
+
+class StrategyTaskProgressWindow:
+    """Shared popup window for long-running per-strategy tasks."""
+
+    def __init__(self, title="Strategy Progress"):
+        self.enabled = False
+        self._root = None
+        self._status_var = None
+        self._detail_var = None
+        self._progress_var = None
+        self._step_var = None
+        self._started_at = time.time()
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception:
+            return
+        try:
+            root = tk.Tk()
+            root.title(title)
+            root.resizable(False, False)
+            root.attributes("-topmost", True)
+            root.protocol("WM_DELETE_WINDOW", self.close)
+
+            frame = ttk.Frame(root, padding=14)
+            frame.grid(row=0, column=0, sticky="nsew")
+
+            self._status_var = tk.StringVar(value="Waiting to start...")
+            self._detail_var = tk.StringVar(value="")
+            self._progress_var = tk.DoubleVar(value=0.0)
+            self._step_var = tk.StringVar(value="0 / 0")
+
+            ttk.Label(frame, text="Strategy Task Monitor", font=("Microsoft YaHei UI", 11, "bold")).grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Label(frame, textvariable=self._status_var, width=46).grid(row=1, column=0, sticky="w", pady=(10, 4))
+            ttk.Progressbar(frame, variable=self._progress_var, maximum=100.0, length=360).grid(
+                row=2, column=0, sticky="we", pady=(0, 6)
+            )
+            ttk.Label(frame, textvariable=self._step_var).grid(row=3, column=0, sticky="w")
+            ttk.Label(frame, textvariable=self._detail_var, width=52, justify="left", wraplength=360).grid(
+                row=4, column=0, sticky="w", pady=(6, 0)
+            )
+            self._root = root
+            self.enabled = True
+            self._pump()
+        except Exception:
+            self.close()
+
+    def update(self, *, current: int, total: int, strategy_name: str, stage: str, detail: str = ""):
+        if not self.enabled or self._root is None:
+            return
+        total = max(int(total), 1)
+        current = max(int(current), 0)
+        pct = min(max((current / total) * 100.0, 0.0), 100.0)
+        elapsed = int(time.time() - self._started_at)
+        self._status_var.set(f"{stage}: {strategy_name}")
+        self._step_var.set(f"{current} / {total} completed")
+        extra = f"Elapsed: {elapsed}s"
+        if detail:
+            extra = f"{detail} | {extra}"
+        self._detail_var.set(extra)
+        self._progress_var.set(pct)
+        self._pump()
+
+    def close(self):
+        if self._root is not None:
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+        self._root = None
+        self.enabled = False
+
+    def _pump(self):
+        if self._root is None:
+            return
+        try:
+            self._root.update_idletasks()
+            self._root.update()
+        except Exception:
+            self.close()
 
 
 def load_saved_strategies():
@@ -130,26 +233,153 @@ def expected_strategy_names():
     return list_strategy_names()
 
 
+def _main_pipeline_has_enabled_steps():
+    return any(
+        [
+            RUN_STEP_1_CONVERT_TDX,
+            RUN_STEP_2_CLEAN_DATA,
+            RUN_STEP_3_FEATURES,
+            RUN_STEP_4_STRATEGY_SELECTION,
+            RUN_STEP_5_VIEW_SELECTION,
+            RUN_STEP_6_BACKTEST,
+        ]
+    )
+
+
+def _feature_parquet_size_gb() -> float:
+    path = Path(FEATURE_DAILY_PARQUET)
+    if not path.exists():
+        return 0.0
+    return path.stat().st_size / (1024 ** 3)
+
+
+def _check_feature_completeness() -> tuple[bool, str]:
+    """Check if existing feature parquet has all columns needed by current strategies.
+
+    Returns (is_complete, reason).
+    If is_complete is True, feature generation can be skipped even if
+    strategy formulas changed, as long as the needed columns already exist.
+    """
+    if not FEATURE_DAILY_PARQUET.exists():
+        return False, "feature parquet does not exist"
+
+    try:
+        import pyarrow.parquet as pq
+        existing_columns = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
+    except Exception:
+        return False, "cannot read feature parquet schema"
+
+    strategy_names = expected_strategy_names()
+    needed_columns = set()
+    for name in strategy_names:
+        try:
+            needed_columns.update(required_feature_columns_for_strategy(name))
+        except Exception:
+            pass
+
+    missing = needed_columns - existing_columns
+    if missing:
+        return False, f"missing {len(missing)} columns: {sorted(missing)[:5]}..."
+
+    return True, f"all {len(needed_columns)} required columns present"
+
+
+def _resolve_strategy_execution_mode() -> tuple[str, str]:
+    configured = str(MAIN_STRATEGY_EXECUTION_MODE).strip().lower()
+    if configured == "bounded":
+        return "bounded", "configured"
+
+    parquet_size_gb = _feature_parquet_size_gb()
+    if parquet_size_gb >= float(MAIN_STRATEGY_BOUNDED_PARQUET_GB_THRESHOLD):
+        return "bounded", f"feature parquet {parquet_size_gb:.2f} GiB exceeds threshold"
+    return "bounded", "bounded mode is the safe default for main pipeline"
+
+
+def _save_skipped_backtest_report(rows, *, replace: bool = False):
+    if not rows:
+        return None
+    output = Path(BACKTEST_SKIPPED_STRATEGIES_CSV)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    if output.exists() and not replace:
+        existing = pd.read_csv(output)
+        frame = pd.concat([existing, frame], ignore_index=True, sort=False)
+    frame = frame.drop_duplicates(
+        subset=["strategy", "reason", "configured_start_date", "configured_end_date"],
+        keep="last",
+    )
+    frame.to_csv(output, index=False, encoding="utf-8-sig")
+    print("Saved skipped backtest report:", output)
+    return output
+
+
+def _skipped_backtest_row(strategy_name, reason):
+    identity = window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE)
+    return {
+        "strategy": strategy_name,
+        "reason": str(reason),
+        "configured_start_date": identity["start_date"],
+        "configured_end_date": identity["end_date"],
+    }
+
+
+def _classify_backtest_skip_reason(exc: Exception) -> str | None:
+    message = str(exc)
+    if "selection is empty" in message:
+        return "empty_selection"
+    if "has no selections inside configured date window" in message:
+        return "date_window_empty"
+    if "df_selection missing required columns" in message:
+        return "backtest_input_invalid"
+    return None
+
+
+def _feature_date_filters():
+    filters = []
+    if STRATEGY_START_DATE is not None:
+        filters.append(("date", ">=", pd.Timestamp(STRATEGY_START_DATE)))
+    if STRATEGY_END_DATE is not None:
+        filters.append(("date", "<=", pd.Timestamp(STRATEGY_END_DATE)))
+    return filters or None
+
+
+def _write_runtime_config_snapshot(config_snapshot, *, run_dir=None):
+    targets = [Path(RUNTIME_CONFIG_SNAPSHOT_JSON)]
+    if run_dir is not None:
+        targets.append(Path(run_dir) / "runtime_config_snapshot.json")
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(config_snapshot, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+
 def parse_args():
+    from functions.governance_variant_registry import list_governance_variant_names
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--auto-complete", action="store_true", help="Run the restartable full orchestrator in auto_complete_after_vpn.py.")
     parser.add_argument("--low-memory", action="store_true", help="Run strategy selection/backtest in small batches.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Low-memory batch size. Use 1 safest; 4 maximum recommended.")
-    parser.add_argument("--batch-index", type=int, default=0, help="Zero-based low-memory batch index.")
+    parser.add_argument("--batch-size", type=int, default=CLI_MAIN_BATCH_SIZE, help="Low-memory batch size.")
+    parser.add_argument("--batch-index", type=int, default=CLI_MAIN_BATCH_INDEX, help="Zero-based low-memory batch index.")
     parser.add_argument("--only", nargs="*", default=None, help="Run explicit strategy names only.")
     parser.add_argument("--sources", nargs="*", default=None, help="Filter strategies by source: rule ml classic_ml quantum_inspired.")
-    parser.add_argument("--mode", choices=["pipeline", "select", "backtest", "all"], default="pipeline")
+    parser.add_argument("--mode", choices=["pipeline", "select", "backtest", "all"], default=CLI_MAIN_MODE)
     parser.add_argument("--resume", action="store_true", help="Skip existing low-memory selections/backtests.")
     parser.add_argument("--skip-data-steps", action="store_true", help="In low-memory mode, skip convert/clean/features and use saved feature parquet.")
     parser.add_argument("--governance", action="store_true", help="Run the phase-one daily decision-council backtest.")
-    parser.add_argument("--governance-start-date", default=None)
-    parser.add_argument("--governance-end-date", default=None)
-    parser.add_argument("--governance-max-days", type=int, default=None)
-    parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default="strict")
+    parser.add_argument("--governance-start-date", default=CLI_GOVERNANCE_START_DATE)
+    parser.add_argument("--governance-end-date", default=CLI_GOVERNANCE_END_DATE)
+    parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS)
+    parser.add_argument("--no-live-monitor", action="store_true", help="Disable the low-memory governance metrics window.")
+    parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=CLI_MAIN_SAFETY_PROXY_MODE)
     parser.add_argument(
         "--governance-variant",
-        choices=["rules_based_president", "equal_weight_alpha_ensemble", "rules_based_president_without_sector_cap", "rules_based_president_without_safety_agent"],
-        default="rules_based_president",
+        choices=list_governance_variant_names(),
+        default=CLI_MAIN_GOVERNANCE_VARIANT,
     )
+    parser.add_argument("--registry-suite", action="store_true", help="Run the main strategy pipeline and governance main version sequentially.")
     return parser.parse_args()
 
 
@@ -293,8 +523,16 @@ def _build_backtest_signature(strategy_names):
 def metrics_to_record(strategy_name, metrics):
     metric_map = dict(zip(metrics["metric"], metrics["value"]))
     record = {"strategy": strategy_name}
+    spec = STRATEGY_REGISTRY.get(strategy_name)
+    record.update({
+        f"configured_{key}": value
+        for key, value in window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE).items()
+    })
     for key, value in metric_map.items():
         record[key] = value
+    if spec is not None:
+        record.setdefault("strategy_source", spec.source)
+        record.setdefault("weighting_mode", "kelly_managed" if spec.source in {"technical", "research", "position_management"} else "equal_weight")
 
     numeric_cols = [
         "trading_days",
@@ -305,6 +543,38 @@ def metrics_to_record(strategy_name, metrics):
         "sharpe",
         "max_drawdown",
         "win_rate",
+        "turnover_ratio",
+        "transaction_cost_ratio",
+        "blocked_order_count",
+        "failed_order_ratio",
+        "tax_impact_ratio",
+        "frozen_aum_ratio",
+        "cash_drag",
+        "top1_weight",
+        "top5_weight_sum",
+        "effective_n",
+        "degradation_count",
+        "benchmark_excess_return",
+        "crowding_top_sector_weight",
+        "crowding_hot_sector_weight",
+        "crowding_unique_sector_count",
+        "exposure_ret_20_tilt",
+        "exposure_volatility_20_tilt",
+        "exposure_close_to_ma20_tilt",
+        "exposure_amount_ratio_20_tilt",
+        "training_window_days",
+        "training_sample_count",
+        "label_purge_periods",
+        "prior_p",
+        "prior_strength",
+        "posterior_alpha",
+        "posterior_beta",
+        "posterior_sample_count",
+        "signal_candidate_count",
+        "signal_trigger_count",
+        "signal_trigger_rate",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
     ]
     for col in numeric_cols:
         record[col] = pd.to_numeric(record.get(col), errors="coerce")
@@ -313,6 +583,19 @@ def metrics_to_record(strategy_name, metrics):
 
 def build_strategy_summary(summary_df):
     summary = summary_df.copy()
+    inferred_sources = summary.get("strategy", pd.Series("", index=summary.index)).map(
+        lambda name: STRATEGY_REGISTRY[name].source if name in STRATEGY_REGISTRY else "unknown"
+    )
+    existing_sources = summary.get("strategy_source", pd.Series(pd.NA, index=summary.index)).astype("string")
+    missing_source_mask = existing_sources.isna() | existing_sources.str.strip().eq("") | existing_sources.str.lower().eq("unknown")
+    summary["strategy_source"] = existing_sources.where(~missing_source_mask, inferred_sources).fillna("unknown").astype(str)
+    inferred_weighting = summary["strategy_source"].map(
+        lambda source: "kelly_managed" if source in {"technical", "research", "position_management"} else ("dynamic_governance" if source == "governance" else "equal_weight")
+    )
+    existing_weighting = summary.get("weighting_mode", pd.Series(pd.NA, index=summary.index)).astype("string")
+    stale_equal_weight_mask = existing_weighting.str.lower().eq("equal_weight") & summary["strategy_source"].isin({"technical", "research", "position_management", "governance"})
+    missing_weighting_mask = existing_weighting.isna() | existing_weighting.str.strip().eq("") | existing_weighting.str.lower().eq("unknown") | stale_equal_weight_mask
+    summary["weighting_mode"] = existing_weighting.where(~missing_weighting_mask, inferred_weighting).fillna("equal_weight").astype(str)
     summary["return_score"] = summary["total_return"].rank(method="average", pct=True).fillna(0.0)
     summary["sharpe_score"] = summary["sharpe"].rank(method="average", pct=True).fillna(0.0)
     summary["drawdown_score"] = summary["max_drawdown"].rank(method="average", pct=True).fillna(0.0)
@@ -321,7 +604,19 @@ def build_strategy_summary(summary_df):
         + 0.35 * summary["sharpe_score"]
         + 0.25 * summary["drawdown_score"]
     )
-    return summary.sort_values("composite_score", ascending=False).reset_index(drop=True)
+    category_order = {
+        "rule": 0,
+        "technical": 1,
+        "research": 1,
+        "position_management": 1,
+        "governance": 2,
+        "ml": 3,
+        "classic_ml": 3,
+        "quantum_inspired": 3,
+        "unknown": 9,
+    }
+    summary["report_category_order"] = summary["strategy_source"].map(category_order).fillna(9)
+    return summary.sort_values(["report_category_order", "composite_score"], ascending=[True, False]).reset_index(drop=True)
 
 
 def print_strategy_rankings(summary_df):
@@ -397,67 +692,146 @@ def assert_formal_prerequisites():
 def run_low_memory(args):
     assert_formal_prerequisites()
     print_project_status()
+    progress_window = StrategyTaskProgressWindow(title="Low-memory Strategy Tasks")
 
-    if not args.skip_data_steps:
-        if RUN_STEP_1_CONVERT_TDX:
-            print("\n========== STEP 1: convert TDX daily data ==========")
-            step_signature, selected_count = _build_convert_signature()
-            step_outputs = [RAW_DAILY_PARQUET, FAILED_CODES_CSV]
-            if should_skip_step("step_1_convert_tdx", step_signature, step_outputs):
-                print(f"Skip step 1: selected {selected_count} files unchanged and raw parquet already exists.")
-            else:
-                convert_tdx_daily(limit=READ_LIMIT)
-                mark_step_completed("step_1_convert_tdx", step_signature, step_outputs)
+    try:
+        if not args.skip_data_steps:
+            if RUN_STEP_1_CONVERT_TDX:
+                print("\n========== STEP 1: convert TDX daily data ==========")
+                step_signature, selected_count = _build_convert_signature()
+                step_outputs = [RAW_DAILY_PARQUET, FAILED_CODES_CSV]
+                if should_skip_step("step_1_convert_tdx", step_signature, step_outputs):
+                    print(f"Skip step 1: selected {selected_count} files unchanged and raw parquet already exists.")
+                else:
+                    convert_tdx_daily(limit=READ_LIMIT)
+                    mark_step_completed("step_1_convert_tdx", step_signature, step_outputs)
 
-        if RUN_STEP_2_CLEAN_DATA:
-            print("\n========== STEP 2: clean daily data ==========")
-            step_signature = _build_clean_signature()
-            step_outputs = [CLEAN_DAILY_PARQUET, DATA_QUALITY_SUMMARY_CSV, ABNORMAL_RETURN_CSV]
-            if should_skip_step("step_2_clean_data", step_signature, step_outputs):
-                print("Skip step 2: raw input and cleaning parameters unchanged.")
-            else:
-                clean_daily_data()
-                mark_step_completed("step_2_clean_data", step_signature, step_outputs)
+            if RUN_STEP_2_CLEAN_DATA:
+                print("\n========== STEP 2: clean daily data ==========")
+                step_signature = _build_clean_signature()
+                step_outputs = [CLEAN_DAILY_PARQUET, DATA_QUALITY_SUMMARY_CSV, ABNORMAL_RETURN_CSV]
+                if should_skip_step("step_2_clean_data", step_signature, step_outputs):
+                    print("Skip step 2: raw input and cleaning parameters unchanged.")
+                else:
+                    clean_daily_data()
+                    mark_step_completed("step_2_clean_data", step_signature, step_outputs)
 
-        if RUN_STEP_3_FEATURES:
-            print("\n========== STEP 3: generate features ==========")
-            step_signature = _build_feature_signature()
-            step_outputs = [FEATURE_DAILY_PARQUET]
-            if should_skip_step("step_3_features", step_signature, step_outputs):
-                print("Skip step 3: clean data and feature formulas unchanged.")
-            else:
-                generate_daily_features()
-                mark_step_completed("step_3_features", step_signature, step_outputs)
+            if RUN_STEP_3_FEATURES:
+                print("\n========== STEP 3: generate features ==========")
+                step_signature = _build_feature_signature()
+                step_outputs = [FEATURE_DAILY_PARQUET]
+                if should_skip_step("step_3_features", step_signature, step_outputs):
+                    print("Skip step 3: clean data and feature formulas unchanged.")
+                else:
+                    generate_daily_features()
+                    mark_step_completed("step_3_features", step_signature, step_outputs)
 
-    selected_names = _low_memory_strategy_names(args)
-    print("\n========== Low-memory strategy batch ==========")
-    print("Selected strategies:", selected_names)
-    if not selected_names:
-        print("No strategy selected for this batch.")
-        return
+        selected_names = _low_memory_strategy_names(args)
+        print("\n========== Low-memory strategy batch ==========")
+        print("Selected strategies:", selected_names)
+        if not selected_names:
+            print("No strategy selected for this batch.")
+            return
 
-    if args.mode in {"pipeline", "select", "all"} and RUN_STEP_4_STRATEGY_SELECTION:
-        for strategy_name in progress_iter(selected_names, desc="low-memory selection", total=len(selected_names)):
-            selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
-            if args.resume and selection_path.exists():
-                print(f"Skip existing selection: {strategy_name}")
-                continue
-            _low_memory_generate_selection(strategy_name)
-            gc.collect()
+        if args.mode in {"pipeline", "select", "all"} and RUN_STEP_4_STRATEGY_SELECTION:
+            for index, strategy_name in enumerate(
+                progress_iter(selected_names, desc="low-memory selection", total=len(selected_names)),
+                start=1,
+            ):
+                progress_window.update(
+                    current=index - 1,
+                    total=len(selected_names),
+                    strategy_name=strategy_name,
+                    stage="Selection",
+                    detail="Waiting to start",
+                )
+                selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
+                if args.resume and selection_path.exists():
+                    print(f"Skip existing selection: {strategy_name}")
+                    progress_window.update(
+                        current=index,
+                        total=len(selected_names),
+                        strategy_name=strategy_name,
+                        stage="Selection",
+                        detail="Skipped existing output",
+                    )
+                    continue
+                _low_memory_generate_selection(
+                    strategy_name,
+                    progress_hook=lambda stage, detail, idx=index, name=strategy_name: progress_window.update(
+                        current=idx - 1,
+                        total=len(selected_names),
+                        strategy_name=name,
+                        stage=f"Selection/{stage}",
+                        detail=detail,
+                    ),
+                )
+                progress_window.update(
+                    current=index,
+                    total=len(selected_names),
+                    strategy_name=strategy_name,
+                    stage="Selection",
+                    detail="Completed",
+                )
+                gc.collect()
 
-    if args.mode in {"pipeline", "backtest", "all"} and RUN_STEP_6_BACKTEST:
-        records = []
-        for strategy_name in progress_iter(selected_names, desc="low-memory backtest", total=len(selected_names)):
-            metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
-            if args.resume and metrics_path.exists():
-                print(f"Skip existing backtest: {strategy_name}")
-                continue
-            records.append(_low_memory_run_backtest(strategy_name))
-            gc.collect()
-        if records:
-            _save_low_memory_summary(records)
+        if args.mode in {"pipeline", "backtest", "all"} and RUN_STEP_6_BACKTEST:
+            records = []
+            skipped_rows = []
+            for index, strategy_name in enumerate(
+                progress_iter(selected_names, desc="low-memory backtest", total=len(selected_names)),
+                start=1,
+            ):
+                progress_window.update(
+                    current=index - 1,
+                    total=len(selected_names),
+                    strategy_name=strategy_name,
+                    stage="Backtest",
+                    detail="Waiting to start",
+                )
+                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
+                if args.resume and metrics_path.exists():
+                    print(f"Skip existing backtest: {strategy_name}")
+                    progress_window.update(
+                        current=index,
+                        total=len(selected_names),
+                        strategy_name=strategy_name,
+                        stage="Backtest",
+                        detail="Skipped existing output",
+                    )
+                    continue
+                outcome = _low_memory_run_backtest(
+                    strategy_name,
+                    progress_hook=lambda stage, detail, idx=index, name=strategy_name: progress_window.update(
+                        current=idx - 1,
+                        total=len(selected_names),
+                        strategy_name=name,
+                        stage=f"Backtest/{stage}",
+                        detail=detail,
+                    ),
+                )
+                if outcome["status"] == "ok":
+                    records.append(outcome["record"])
+                    completion_detail = "Completed"
+                else:
+                    skipped_rows.append(_skipped_backtest_row(strategy_name, outcome["reason"]))
+                    completion_detail = f"Skipped: {outcome['reason']}"
+                progress_window.update(
+                    current=index,
+                    total=len(selected_names),
+                    strategy_name=strategy_name,
+                    stage="Backtest",
+                    detail=completion_detail,
+                )
+                gc.collect()
+            if records:
+                _save_low_memory_summary(records)
+            if skipped_rows:
+                _save_skipped_backtest_report(skipped_rows)
 
-    print("\nLow-memory batch completed.")
+        print("\nLow-memory batch completed.")
+    finally:
+        progress_window.close()
 
 
 def _low_memory_strategy_names(args):
@@ -476,13 +850,21 @@ def _low_memory_strategy_names(args):
     return names[start:end] if not args.only else names
 
 
-def _low_memory_generate_selection(strategy_name):
+def _low_memory_generate_selection(strategy_name, progress_hook=None):
     import pyarrow.parquet as pq
 
     schema_cols = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
     columns = [col for col in required_feature_columns_for_strategy(strategy_name) if col in schema_cols]
+    if progress_hook is not None:
+        progress_hook("load_features", f"Loading {len(columns)} feature columns")
     print(f"Load features for {strategy_name}: {len(columns)} columns")
-    features = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=columns)
+    features = pd.read_parquet(
+        FEATURE_DAILY_PARQUET,
+        columns=columns,
+        filters=_feature_date_filters(),
+    )
+    if progress_hook is not None:
+        progress_hook("generate_selection", "Computing selection rows")
     selection = generate_one_strategy(
         features,
         strategy_name=strategy_name,
@@ -491,7 +873,10 @@ def _low_memory_generate_selection(strategy_name):
         include_types=STRATEGY_INCLUDE_TYPES,
         start_date=STRATEGY_START_DATE,
         end_date=STRATEGY_END_DATE,
+        progress_hook=progress_hook,
     )
+    if progress_hook is not None:
+        progress_hook("save_selection", f"Saving {len(selection)} selection rows")
     print(f"Save selection {strategy_name}: rows={len(selection)}")
     run_strategy_selection(
         df_features=features,
@@ -504,27 +889,328 @@ def _low_memory_generate_selection(strategy_name):
         end_date=STRATEGY_END_DATE,
         strategy_name=strategy_name,
     )
+    if progress_hook is not None:
+        progress_hook("selection_done", "Selection completed")
     del features, selection
 
 
-def _low_memory_run_backtest(strategy_name):
+def _low_memory_run_backtest(strategy_name, progress_hook=None):
     selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
     if not selection_path.exists():
-        raise FileNotFoundError(f"Missing strategy selection: {selection_path}")
+        print(f"Skip backtest {strategy_name}: selection file is missing")
+        return {
+            "status": "skipped",
+            "reason": "missing_selection_file",
+        }
     print(f"\n========== Backtest strategy: {strategy_name} ==========")
+    if progress_hook is not None:
+        progress_hook("load_selection", "Loading saved selection parquet")
     selection = pd.read_parquet(selection_path)
-    _, metrics, _ = run_backtest(
-        df_selection=selection,
-        initial_cash=BACKTEST_INITIAL_CASH,
-        risk_free_rate=BACKTEST_RISK_FREE_RATE,
-        show_plot=False,
-        strategy_name=strategy_name,
-        factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
-        compute_theoretical_upper_bound=False,
-    )
+    if selection.empty:
+        print(f"Skip backtest {strategy_name}: selection is empty")
+        del selection
+        return {
+            "status": "skipped",
+            "reason": "empty_selection",
+        }
+    try:
+        if progress_hook is not None:
+            progress_hook("run_backtest", "Running backtest engine")
+        _, metrics, _ = run_backtest(
+            df_selection=selection,
+            initial_cash=BACKTEST_INITIAL_CASH,
+            risk_free_rate=BACKTEST_RISK_FREE_RATE,
+            show_plot=False,
+            strategy_name=strategy_name,
+            factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
+            compute_theoretical_upper_bound=False,
+            start_date=STRATEGY_START_DATE,
+            end_date=STRATEGY_END_DATE,
+        )
+    except ValueError as exc:
+        reason = _classify_backtest_skip_reason(exc)
+        if reason is None:
+            raise
+        print(f"Skip backtest {strategy_name}: {reason}")
+        return {
+            "status": "skipped",
+            "reason": reason,
+        }
+    if progress_hook is not None:
+        progress_hook("backtest_done", "Backtest completed")
     record = metrics_to_record(strategy_name, metrics)
-    del selection, metrics
-    return record
+    return {
+        "status": "ok",
+        "record": record,
+    }
+
+
+def _run_single_governance_variant(
+    variant_name: str,
+    *,
+    start_date: str,
+    end_date: str,
+    max_days: int | None,
+    safety_proxy_mode: str,
+    show_live_monitor: bool = True,
+):
+    from config import REGISTRY_FRAMEWORK_VERSION
+    from functions.decision_council.runner import run_governance_backtest
+    from functions.governance_variant_registry import get_governance_variant_spec
+    from functions.universe_registry import get_universe_spec
+
+    variant_spec = get_governance_variant_spec(variant_name)
+    universe_spec = get_universe_spec(variant_spec.universe_name)
+    output_dir = GOVERNANCE_OUTPUT_DIR / variant_spec.universe_name / variant_name / variant_spec.alpha_bundle
+    return run_governance_backtest(
+        start_date=start_date,
+        end_date=end_date,
+        max_days=max_days,
+        safety_proxy_mode=safety_proxy_mode,
+        governance_variant=variant_name,
+        enable_sector_cap=variant_spec.enable_sector_cap,
+        enable_safety_agent=variant_spec.enable_safety_agent,
+        enable_reputation=variant_spec.enable_reputation,
+        output_dir=output_dir,
+        universe_name=variant_spec.universe_name,
+        universe_mode=universe_spec.mode,
+        alpha_bundle=variant_spec.alpha_bundle,
+        registry_version=REGISTRY_FRAMEWORK_VERSION,
+        target_index_codes=tuple(universe_spec.target_index_codes),
+        require_constituents=universe_spec.require_constituents,
+        allow_fallback=universe_spec.allow_fallback,
+        allowed_instrument_types=tuple(universe_spec.allowed_instrument_types),
+        enable_quality_filters=universe_spec.quality_filter_enabled,
+        show_live_monitor=show_live_monitor,
+    )
+
+
+def run_registry_suite(args):
+    main()
+    _run_single_governance_variant(
+        "rules_based_president",
+        start_date=args.governance_start_date,
+        end_date=args.governance_end_date,
+        max_days=args.governance_max_days,
+        safety_proxy_mode=args.safety_proxy_mode,
+        show_live_monitor=not args.no_live_monitor,
+    )
+
+
+def run_full_registry_matrix(args):
+    from run_governance_experiments import (
+        build_experiment_comparison_report,
+        run_alpha_ablation,
+        run_universe_ablation,
+        save_experiment_comparison_report,
+    )
+
+    run_registry_suite(args)
+
+    alpha_results = run_alpha_ablation(
+        start_date=args.governance_start_date,
+        end_date=args.governance_end_date,
+        max_days=args.governance_max_days,
+    )
+    alpha_comparison = build_experiment_comparison_report(alpha_results)
+    alpha_path = save_experiment_comparison_report(alpha_comparison, "alpha_ablation")
+    print("Saved alpha ablation summary:", alpha_path)
+
+    universe_results = run_universe_ablation(
+        start_date=args.governance_start_date,
+        end_date=args.governance_end_date,
+        max_days=args.governance_max_days,
+    )
+    universe_comparison = build_experiment_comparison_report(universe_results)
+    universe_path = save_experiment_comparison_report(universe_comparison, "universe_ablation")
+    print("Saved universe ablation summary:", universe_path)
+
+
+def launch_interactive_main_menu():
+    import tkinter as tk
+    from tkinter import messagebox
+
+    selection = {}
+    root = tk.Tk()
+    root.title("Main Launcher")
+    root.resizable(False, False)
+
+    vars_map = {
+        "main_pipeline": tk.BooleanVar(value=True),
+        "governance_active": tk.BooleanVar(value=True),
+        "alpha_ablation": tk.BooleanVar(value=False),
+        "universe_ablation": tk.BooleanVar(value=False),
+    }
+
+    tk.Label(
+        root,
+        text="选择要运行的任务",
+        font=("Microsoft YaHei UI", 11, "bold"),
+        padx=16,
+        pady=12,
+    ).pack(anchor="w")
+
+    labels = [
+        ("main_pipeline", "主策略管线"),
+        ("governance_active", "治理主版本"),
+        ("alpha_ablation", "Alpha Bundle 消融"),
+        ("universe_ablation", "Universe 消融"),
+    ]
+    for key, text in labels:
+        tk.Checkbutton(
+            root,
+            text=text,
+            variable=vars_map[key],
+            anchor="w",
+            padx=18,
+            pady=2,
+            width=24,
+        ).pack(anchor="w")
+
+    tk.Label(
+        root,
+        text="“全部运行”会按顺序执行主策略、治理变体、alpha 消融、universe 消融。",
+        padx=18,
+        pady=10,
+        justify="left",
+        wraplength=360,
+    ).pack(anchor="w")
+
+    def choose_selected():
+        picked = [name for name, var in vars_map.items() if var.get()]
+        if not picked:
+            messagebox.showerror("未选择任务", "至少选择一项任务。")
+            return
+        selection["tasks"] = picked
+        root.destroy()
+
+    def choose_all():
+        selection["tasks"] = list(vars_map.keys())
+        root.destroy()
+
+    button_frame = tk.Frame(root, padx=16, pady=12)
+    button_frame.pack(fill="x")
+    tk.Button(button_frame, text="运行所选", width=12, command=choose_selected).pack(side="left")
+    tk.Button(button_frame, text="全部运行", width=12, command=choose_all).pack(side="left", padx=8)
+    tk.Button(button_frame, text="取消", width=12, command=root.destroy).pack(side="right")
+
+    root.mainloop()
+    return selection.get("tasks")
+
+
+def run_interactive_selection(tasks, args):
+    from run_governance_experiments import (
+        build_experiment_comparison_report,
+        run_alpha_ablation,
+        run_universe_ablation,
+        save_experiment_comparison_report,
+    )
+
+    if not tasks:
+        print("Interactive launcher cancelled.")
+        return
+
+    if set(tasks) == {"main_pipeline", "governance_active", "alpha_ablation", "universe_ablation"}:
+        run_full_registry_matrix(args)
+        return
+
+    if "main_pipeline" in tasks:
+        main()
+    if "governance_active" in tasks:
+        _run_single_governance_variant(
+            "rules_based_president",
+            start_date=args.governance_start_date,
+            end_date=args.governance_end_date,
+            max_days=args.governance_max_days,
+            safety_proxy_mode=args.safety_proxy_mode,
+            show_live_monitor=not args.no_live_monitor,
+        )
+    if "alpha_ablation" in tasks:
+        alpha_results = run_alpha_ablation(
+            start_date=args.governance_start_date,
+            end_date=args.governance_end_date,
+            max_days=args.governance_max_days,
+        )
+        alpha_comparison = build_experiment_comparison_report(alpha_results)
+        alpha_path = save_experiment_comparison_report(alpha_comparison, "alpha_ablation")
+        print("Saved alpha ablation summary:", alpha_path)
+    if "universe_ablation" in tasks:
+        universe_results = run_universe_ablation(
+            start_date=args.governance_start_date,
+            end_date=args.governance_end_date,
+            max_days=args.governance_max_days,
+        )
+        universe_comparison = build_experiment_comparison_report(universe_results)
+        universe_path = save_experiment_comparison_report(universe_comparison, "universe_ablation")
+        print("Saved universe ablation summary:", universe_path)
+
+
+def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
+    """Run PBO analysis on completed backtest results."""
+    from functions.pbo_cscv import compute_pbo
+
+    strategy_returns = {}
+    for name in strategy_names:
+        daily_path = RESULT_DIR / f"backtest_daily_result_{name}.parquet"
+        if not daily_path.exists():
+            daily_path = RESULT_DIR / f"backtest_daily_result_{name}.csv"
+        if not daily_path.exists():
+            continue
+        try:
+            daily = pd.read_parquet(daily_path) if str(daily_path).endswith(".parquet") else pd.read_csv(daily_path)
+            if "daily_return" in daily.columns and not daily.empty:
+                daily["daily_return"] = pd.to_numeric(daily["daily_return"], errors="coerce").fillna(0.0)
+                strategy_returns[name] = daily["daily_return"].reset_index(drop=True)
+        except Exception:
+            pass
+
+    if len(strategy_returns) < 3:
+        return None
+
+    # Align return series to same length
+    min_len = min(len(s) for s in strategy_returns.values())
+    aligned_returns = {name: s.iloc[:min_len] for name, s in strategy_returns.items()}
+
+    return compute_pbo(aligned_returns, n_blocks=16)
+
+
+def _run_leakage_audit() -> dict | None:
+    """Run data leakage audit on the feature parquet."""
+    import pyarrow.parquet as pq
+    from functions.leakage_detector import run_full_leakage_audit
+
+    if not FEATURE_DAILY_PARQUET.exists():
+        return None
+
+    # Read a sample of the feature data for auditing
+    schema = pq.read_schema(FEATURE_DAILY_PARQUET)
+    all_columns = set(schema.names)
+
+    # Collect all feature columns (excluding labels and metadata)
+    feature_columns = []
+    label_columns = [c for c in all_columns if c.startswith("future_ret_")]
+    meta_columns = {"date", "symbol", "instrument_type", "code", "market"}
+    for col in sorted(all_columns):
+        if col not in label_columns and col not in meta_columns:
+            feature_columns.append(col)
+
+    # Read sample data (first 50000 rows) for statistical checks
+    try:
+        sample = pd.read_parquet(FEATURE_DAILY_PARQUET)
+        if len(sample) > 50000:
+            sample = sample.head(50000)
+    except MemoryError:
+        # If full read fails, try with columns subset
+        sample = pd.read_parquet(
+            FEATURE_DAILY_PARQUET,
+            columns=["date", "symbol", "close"] + [c for c in feature_columns[:20] if c in all_columns],
+        )
+
+    return run_full_leakage_audit(
+        feature_df=sample,
+        feature_columns=feature_columns,
+        label_columns=label_columns,
+    )
 
 
 def _save_low_memory_summary(records):
@@ -557,7 +1243,9 @@ def _save_low_memory_summary(records):
 def main():
     assert_formal_prerequisites()
     run_dir = None
-    if ENABLE_EXPERIMENT_TRACKING:
+    progress_window = StrategyTaskProgressWindow()
+    strategy_execution_mode, strategy_execution_reason = _resolve_strategy_execution_mode()
+    if ENABLE_EXPERIMENT_TRACKING and _main_pipeline_has_enabled_steps():
         tracked_inputs = [
             RAW_DAILY_PARQUET,
             CLEAN_DAILY_PARQUET,
@@ -581,12 +1269,16 @@ def main():
             "strategy_freq": STRATEGY_FREQ,
             "strategy_start_date": STRATEGY_START_DATE,
             "strategy_end_date": STRATEGY_END_DATE,
+            "strategy_params_version": STRATEGY_PARAMS_VERSION,
+            "strategy_params_hash": strategy_params_hash(),
+            "strategy_params": STRATEGY_PARAMS,
             "enable_hot_theme_bias": ENABLE_HOT_THEME_BIAS,
             "enable_learning_strategies": ENABLE_LEARNING_STRATEGIES,
             "learning_strategy_whitelist": LEARNING_STRATEGY_WHITELIST,
             "enable_placeholder_strategies": ENABLE_PLACEHOLDER_STRATEGIES,
             "enable_quantum_inspired_strategies": ENABLE_QUANTUM_INSPIRED_STRATEGIES,
         }
+        _write_runtime_config_snapshot(config_snapshot)
         run_id, run_dir, _ = start_experiment_run(
             config_snapshot=config_snapshot,
             tracked_inputs=tracked_inputs,
@@ -594,12 +1286,20 @@ def main():
         )
         print(f"Run tracking enabled: {run_id}")
         print(f"Run metadata directory: {run_dir}")
+        _write_runtime_config_snapshot(config_snapshot, run_dir=run_dir)
 
     print_project_status()
 
     try:
         df_features = None
-        strategies = {}
+        strategy_names = expected_strategy_names()
+        available_strategy_names = []
+
+        print(
+            "Strategy execution mode:",
+            strategy_execution_mode,
+            f"({strategy_execution_reason})",
+        )
 
         if RUN_STEP_1_CONVERT_TDX:
             print("\n========== STEP 1: convert TDX daily data ==========")
@@ -632,46 +1332,68 @@ def main():
             step_outputs = [FEATURE_DAILY_PARQUET]
             if should_skip_step("step_3_features", step_signature, step_outputs):
                 print("Skip step 3: clean data and feature formulas unchanged.")
-                df_features = pd.read_parquet(FEATURE_DAILY_PARQUET)
             else:
-                df_features = generate_daily_features()
-                mark_step_completed("step_3_features", step_signature, step_outputs)
+                # Smart cache: if feature parquet already has all columns needed
+                # by current strategies, skip expensive regeneration
+                is_complete, completeness_reason = _check_feature_completeness()
+                if is_complete:
+                    print(f"Skip step 3: feature parquet already complete ({completeness_reason}).")
+                    mark_step_completed("step_3_features", step_signature, step_outputs)
+                else:
+                    print(f"Regenerating features: {completeness_reason}")
+                    df_features = generate_daily_features()
+                    mark_step_completed("step_3_features", step_signature, step_outputs)
 
         if RUN_STEP_4_STRATEGY_SELECTION:
             print("\n========== STEP 4: generate strategy selections ==========")
             step_signature, step_outputs = _build_strategy_signature()
             if should_skip_step("step_4_strategy_selection", step_signature, step_outputs):
                 print("Skip step 4: feature data and strategy formulas unchanged.")
-                strategies = load_saved_strategies()
+                available_strategy_names = [
+                    name for name in strategy_names
+                    if (PROCESSED_DIR / f"{name}.parquet").exists()
+                ]
             else:
-                if df_features is None:
-                    df_features = pd.read_parquet(FEATURE_DAILY_PARQUET)
+                if df_features is not None:
+                    del df_features
+                    df_features = None
+                    gc.collect()
 
-                strategies = generate_multi_strategies(
-                    df_features,
-                    top_n=STRATEGY_TOP_N,
-                    freq=STRATEGY_FREQ,
-                    include_types=STRATEGY_INCLUDE_TYPES,
-                    start_date=STRATEGY_START_DATE,
-                    end_date=STRATEGY_END_DATE,
-                )
-
-                for name, df_sel in progress_iter(
-                    strategies.items(),
-                    desc="save selections",
-                    total=len(strategies),
+                available_strategy_names = []
+                for index, strategy_name in enumerate(
+                    progress_iter(
+                        strategy_names,
+                        desc="generate selections",
+                        total=len(strategy_names),
+                    ),
+                    start=1,
                 ):
-                    run_strategy_selection(
-                        df_features=df_features,
-                        df_selection=df_sel,
-                        score_col=STRATEGY_SCORE_COL,
-                        top_n=STRATEGY_TOP_N,
-                        freq=STRATEGY_FREQ,
-                        include_types=STRATEGY_INCLUDE_TYPES,
-                        start_date=STRATEGY_START_DATE,
-                        end_date=STRATEGY_END_DATE,
-                        strategy_name=name,
+                    progress_window.update(
+                        current=index - 1,
+                        total=len(strategy_names),
+                        strategy_name=strategy_name,
+                        stage="Selection",
+                        detail="Waiting to start",
                     )
+                    _low_memory_generate_selection(
+                        strategy_name,
+                        progress_hook=lambda stage, detail, idx=index, name=strategy_name: progress_window.update(
+                            current=idx - 1,
+                            total=len(strategy_names),
+                            strategy_name=name,
+                            stage=f"Selection/{stage}",
+                            detail=detail,
+                        ),
+                    )
+                    available_strategy_names.append(strategy_name)
+                    progress_window.update(
+                        current=index,
+                        total=len(strategy_names),
+                        strategy_name=strategy_name,
+                        stage="Selection",
+                        detail="Completed",
+                    )
+                    gc.collect()
                 mark_step_completed("step_4_strategy_selection", step_signature, step_outputs)
 
         if RUN_STEP_5_VIEW_SELECTION:
@@ -679,49 +1401,139 @@ def main():
             view_strategy_selection(
                 export_excel=EXPORT_SELECTION_EXCEL,
                 print_rows=PRINT_SELECTION_ROWS,
-                strategy_names=list(strategies) if strategies else None,
+                strategy_names=available_strategy_names or None,
             )
 
         if RUN_STEP_6_BACKTEST:
             print("\n========== STEP 6: run backtests ==========")
-            if not strategies:
-                strategies = load_saved_strategies()
+            if not available_strategy_names:
+                available_strategy_names = [
+                    name for name in strategy_names
+                    if (PROCESSED_DIR / f"{name}.parquet").exists()
+                ]
 
-            if not strategies:
+            if not available_strategy_names:
                 raise RuntimeError("No strategy selections available for backtest")
 
-            strategy_names = sorted(strategies)
-            step_signature, step_outputs = _build_backtest_signature(strategy_names)
+            available_strategy_names = sorted(available_strategy_names)
+            step_signature, step_outputs = _build_backtest_signature(available_strategy_names)
             if should_skip_step("step_6_backtest", step_signature, step_outputs):
                 print("Skip step 6: strategy selections and backtest formulas unchanged.")
             else:
                 backtest_records = []
-                for name, df_sel in progress_iter(
-                    strategies.items(),
-                    desc="run backtests",
-                    total=len(strategies),
+                skipped_rows = []
+                for index, name in enumerate(
+                    progress_iter(
+                        available_strategy_names,
+                        desc="run backtests",
+                        total=len(available_strategy_names),
+                    ),
+                    start=1,
                 ):
-                    print(f"\n========== Backtest strategy: {name} ==========")
-                    _, metrics, _ = run_backtest(
-                        df_selection=df_sel,
-                        initial_cash=BACKTEST_INITIAL_CASH,
-                        risk_free_rate=BACKTEST_RISK_FREE_RATE,
-                        show_plot=BACKTEST_SHOW_PLOT,
+                    progress_window.update(
+                        current=index - 1,
+                        total=len(available_strategy_names),
                         strategy_name=name,
-                        factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(name),
-                        compute_theoretical_upper_bound=False,
+                        stage="Backtest",
+                        detail="Waiting to start",
                     )
-                    backtest_records.append(metrics_to_record(name, metrics))
+                    outcome = _low_memory_run_backtest(
+                        name,
+                        progress_hook=lambda stage, detail, idx=index, strategy_name=name: progress_window.update(
+                            current=idx - 1,
+                            total=len(available_strategy_names),
+                            strategy_name=strategy_name,
+                            stage=f"Backtest/{stage}",
+                            detail=detail,
+                        ),
+                    )
+                    if outcome["status"] == "ok":
+                        backtest_records.append(outcome["record"])
+                        completion_detail = "Completed"
+                    else:
+                        skipped_rows.append(_skipped_backtest_row(name, outcome["reason"]))
+                        completion_detail = f"Skipped: {outcome['reason']}"
+                    progress_window.update(
+                        current=index,
+                        total=len(available_strategy_names),
+                        strategy_name=name,
+                        stage="Backtest",
+                        detail=completion_detail,
+                    )
+                    gc.collect()
 
-                summary_df = build_strategy_summary(pd.DataFrame(backtest_records))
-                RESULT_DIR.mkdir(parents=True, exist_ok=True)
-                summary_file = RESULT_DIR / "backtest_strategy_summary.csv"
-                summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
-                report_text = build_strategy_report(summary_df)
-                report_file = save_strategy_report(report_text)
-                print_strategy_rankings(summary_df)
-                print("Saved strategy ranking summary:", summary_file)
-                print("Saved strategy diagnostic report:", report_file)
+                if backtest_records:
+                    summary_df = build_strategy_summary(pd.DataFrame(backtest_records))
+                    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+                    summary_file = RESULT_DIR / "backtest_strategy_summary.csv"
+                    summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
+                    report_text = build_strategy_report(summary_df)
+                    report_file = save_strategy_report(report_text)
+                    print_strategy_rankings(summary_df)
+                    print("Saved strategy ranking summary:", summary_file)
+                    print("Saved strategy diagnostic report:", report_file)
+
+                    # PBO (Probability of Backtest Overfitting) via CSCV
+                    try:
+                        from functions.pbo_cscv import pbo_summary_report
+                        pbo_result = _run_pbo_analysis(available_strategy_names)
+                        if pbo_result is not None:
+                            pbo_report_path = RESULT_DIR / "pbo_overfitting_report.md"
+                            pbo_report_path.write_text(
+                                pbo_summary_report(pbo_result), encoding="utf-8"
+                            )
+                            print(f"Saved PBO report: {pbo_report_path}")
+                            print(f"  PBO = {pbo_result['pbo']:.2%}, mean logit = {pbo_result['mean_logit']:.4f}")
+                    except Exception as exc:
+                        print(f"PBO analysis skipped: {exc}")
+
+                    # Data leakage audit
+                    try:
+                        from functions.leakage_detector import leakage_audit_report
+                        leakage_result = _run_leakage_audit()
+                        if leakage_result is not None:
+                            leakage_report_path = RESULT_DIR / "leakage_audit_report.md"
+                            leakage_report_path.write_text(
+                                leakage_audit_report(leakage_result), encoding="utf-8"
+                            )
+                            print(f"Saved leakage audit: {leakage_report_path}")
+                            if not leakage_result["is_clean"]:
+                                print(f"  WARNING: {leakage_result['total_violations']} leakage issue(s) detected!")
+                            else:
+                                print("  No data leakage detected.")
+                    except Exception as exc:
+                        print(f"Leakage audit skipped: {exc}")
+
+                    # Decision accuracy analysis
+                    try:
+                        from functions.decision_accuracy import (
+                            build_all_strategies_accuracy_report,
+                            plot_all_accuracy,
+                            save_accuracy_summary_csv,
+                            accuracy_report_markdown,
+                        )
+                        print("\n--- Decision Accuracy Analysis ---")
+                        accuracy_results = build_all_strategies_accuracy_report(available_strategy_names)
+                        if accuracy_results:
+                            plot_all_accuracy(accuracy_results)
+                            save_accuracy_summary_csv(accuracy_results)
+                            accuracy_md_path = RESULT_DIR / "decision_accuracy_report.md"
+                            accuracy_md_path.write_text(
+                                accuracy_report_markdown(accuracy_results), encoding="utf-8"
+                            )
+                            print(f"Saved accuracy report: {accuracy_md_path}")
+                            # Print summary
+                            for name, result in sorted(accuracy_results.items()):
+                                acc = result.get("overall_accuracy", 0.0)
+                                total = result.get("total_decisions", 0)
+                                correct = result.get("correct_decisions", 0)
+                                print(f"  {name}: {acc:.1%} ({correct}/{total})")
+                    except Exception as exc:
+                        print(f"Accuracy analysis skipped: {exc}")
+                else:
+                    print("Skip strategy ranking summary: all candidate backtests were empty.")
+                if skipped_rows:
+                    _save_skipped_backtest_report(skipped_rows, replace=True)
                 mark_step_completed("step_6_backtest", step_signature, step_outputs)
 
         print("\nSelected pipeline steps completed.")
@@ -737,37 +1549,40 @@ def main():
         if ENABLE_EXPERIMENT_TRACKING and run_dir is not None:
             mark_run_failed(run_dir, str(exc))
         raise
+    finally:
+        progress_window.close()
 
 
 if __name__ == "__main__":
+    show_runtime_disclosure = not any(arg in {"-h", "--help"} for arg in sys.argv[1:])
     try:
+        assert_valid_configuration()
         if len(sys.argv) == 1:
+            cli_args = parse_args()
+            tasks = launch_interactive_main_menu()
+            run_interactive_selection(tasks, cli_args)
+            sys.exit(0)
+        cli_args = parse_args()
+        if cli_args.auto_complete:
             from auto_complete_after_vpn import main as run_auto_completion
 
-            print("No command-line arguments detected. Running complete automatic workflow.")
+            print("Running explicit auto-complete workflow.")
             run_auto_completion()
+        elif cli_args.registry_suite:
+            run_registry_suite(cli_args)
+        elif cli_args.governance:
+            _run_single_governance_variant(
+                cli_args.governance_variant,
+                start_date=cli_args.governance_start_date,
+                end_date=cli_args.governance_end_date,
+                max_days=cli_args.governance_max_days,
+                safety_proxy_mode=cli_args.safety_proxy_mode,
+                show_live_monitor=not cli_args.no_live_monitor,
+            )
+        elif cli_args.low_memory:
+            run_low_memory(cli_args)
         else:
-            cli_args = parse_args()
-            if cli_args.governance:
-                from functions.decision_council.runner import run_governance_backtest
-
-                run_governance_backtest(
-                    start_date=cli_args.governance_start_date,
-                    end_date=cli_args.governance_end_date,
-                    max_days=cli_args.governance_max_days,
-                    safety_proxy_mode=cli_args.safety_proxy_mode,
-                    enable_sector_cap=cli_args.governance_variant != "rules_based_president_without_sector_cap",
-                    enable_safety_agent=cli_args.governance_variant != "rules_based_president_without_safety_agent",
-                    enable_reputation=cli_args.governance_variant != "equal_weight_alpha_ensemble",
-                    output_dir=(
-                        GOVERNANCE_OUTPUT_DIR
-                        if cli_args.governance_variant == "rules_based_president"
-                        else GOVERNANCE_OUTPUT_DIR / cli_args.governance_variant
-                    ),
-                )
-            elif cli_args.low_memory:
-                run_low_memory(cli_args)
-            else:
-                main()
+            main()
     finally:
-        print_runtime_disclosure()
+        if show_runtime_disclosure:
+            print_runtime_disclosure()

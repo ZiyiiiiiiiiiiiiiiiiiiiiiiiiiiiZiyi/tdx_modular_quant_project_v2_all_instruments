@@ -2,6 +2,7 @@
 import pandas as pd
 
 from config import FEATURE_DAILY_PARQUET, PROCESSED_DIR, REPORT_DIR
+from functions.date_window import assert_date_window, filter_date_window, window_identity
 
 
 def get_rebalance_dates(df, freq="ME"):
@@ -9,14 +10,16 @@ def get_rebalance_dates(df, freq="ME"):
     dates = df[["date"]].drop_duplicates().sort_values("date").copy()
     dates["date"] = pd.to_datetime(dates["date"])
 
-    if freq == "ME":
+    if freq in {"D", "DAILY"}:
+        rebalance_dates = dates["date"]
+    elif freq == "ME":
         rebalance_dates = dates.groupby(dates["date"].dt.to_period("M"))["date"].max()
     elif freq == "QE":
         rebalance_dates = dates.groupby(dates["date"].dt.to_period("Q"))["date"].max()
     elif freq.startswith("W"):
         rebalance_dates = dates.groupby(dates["date"].dt.to_period("W"))["date"].max()
     else:
-        raise ValueError("Unsupported rebalance frequency. Use 'ME', 'QE', or 'W-FRI'.")
+        raise ValueError("Unsupported rebalance frequency. Use 'D', 'ME', 'QE', or 'W-FRI'.")
 
     return rebalance_dates.reset_index(drop=True)
 
@@ -132,36 +135,37 @@ def run_strategy_selection(
         )
 
     if "rebalance_date" in selection.columns:
-        selection["rebalance_date"] = pd.to_datetime(selection["rebalance_date"])
+        selection = filter_date_window(
+            selection,
+            "rebalance_date",
+            start_date=start_date,
+            end_date=end_date,
+        )
+        assert_date_window(
+            selection,
+            "rebalance_date",
+            start_date=start_date,
+            end_date=end_date,
+            label=f"strategy selection {strategy_name}",
+        )
+    elif not selection.empty:
+        raise ValueError(f"Strategy selection {strategy_name} is missing rebalance_date")
+    identity = window_identity(start_date, end_date)
+    selection["configured_start_date"] = identity["start_date"]
+    selection["configured_end_date"] = identity["end_date"]
+    selection["date_window"] = f"{identity['start_date'] or '-'} -> {identity['end_date'] or '-'}"
     if "rank" in selection.columns and "rebalance_date" in selection.columns:
         selection = selection.sort_values(["rebalance_date", "rank"])
 
     selection.to_parquet(output_file, index=False)
 
-    if selection.empty:
-        summary = pd.DataFrame(
-            columns=[
-                "strategy_name",
-                "rebalance_date",
-                "selected_count",
-                "avg_score",
-                "min_score",
-                "max_score",
-            ]
-        )
-    else:
-        score_agg_col = "score" if "score" in selection.columns else score_col
-        summary = (
-            selection.groupby("rebalance_date")
-            .agg(
-                selected_count=("symbol", "count"),
-                avg_score=(score_agg_col, "mean"),
-                min_score=(score_agg_col, "min"),
-                max_score=(score_agg_col, "max"),
-            )
-            .reset_index()
-        )
-        summary.insert(0, "strategy_name", strategy_name)
+    summary = _build_selection_summary(
+        selection=selection,
+        strategy_name=strategy_name,
+        score_col=score_col,
+    )
+    summary["configured_start_date"] = identity["start_date"]
+    summary["configured_end_date"] = identity["end_date"]
 
     summary.to_csv(summary_file, index=False, encoding="utf-8-sig")
 
@@ -170,6 +174,79 @@ def run_strategy_selection(
     print("Selection shape:", selection.shape)
 
     return selection
+
+
+def _build_selection_summary(selection, *, strategy_name, score_col):
+    base_columns = [
+        "strategy_name",
+        "rebalance_date",
+        "selected_count",
+        "avg_score",
+        "min_score",
+        "max_score",
+        "signal_candidate_count",
+        "signal_trigger_count",
+        "signal_trigger_rate",
+        "strategy_params_version",
+        "strategy_params_hash",
+        "requested_model",
+        "runtime_model",
+        "training_window_days",
+        "training_sample_count",
+        "label_purge_periods",
+        "prior_p",
+        "prior_strength",
+        "prior_source",
+        "posterior_alpha",
+        "posterior_beta",
+        "posterior_sample_count",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
+        "price_basis_selection_mode",
+    ]
+    if selection.empty:
+        return pd.DataFrame(columns=base_columns)
+
+    score_agg_col = "score" if "score" in selection.columns else score_col
+    agg_spec = {
+        "selected_count": ("symbol", "count"),
+        "avg_score": (score_agg_col, "mean"),
+        "min_score": (score_agg_col, "min"),
+        "max_score": (score_agg_col, "max"),
+    }
+    first_value_cols = [
+        "signal_candidate_count",
+        "signal_trigger_count",
+        "signal_trigger_rate",
+        "strategy_params_version",
+        "strategy_params_hash",
+        "requested_model",
+        "runtime_model",
+        "training_window_days",
+        "training_sample_count",
+        "label_purge_periods",
+        "prior_p",
+        "prior_strength",
+        "prior_source",
+        "posterior_alpha",
+        "posterior_beta",
+        "posterior_sample_count",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
+        "price_basis_selection_mode",
+    ]
+    for column in first_value_cols:
+        if column in selection.columns:
+            agg_spec[column] = (column, "first")
+
+    summary = selection.groupby("rebalance_date").agg(**agg_spec).reset_index()
+    summary.insert(0, "strategy_name", strategy_name)
+    if "signal_trigger_rate" not in summary.columns:
+        candidate = pd.to_numeric(summary.get("signal_candidate_count"), errors="coerce")
+        trigger = pd.to_numeric(summary.get("signal_trigger_count"), errors="coerce")
+        if candidate is not None and trigger is not None:
+            summary["signal_trigger_rate"] = trigger / candidate.replace(0, pd.NA)
+    return summary
 
 
 if __name__ == "__main__":

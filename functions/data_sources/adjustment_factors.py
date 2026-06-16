@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import ADJUSTMENT_FACTORS_PARQUET, ADJUSTMENT_FACTORS_QUALITY_CSV
+from config import ADJUSTMENT_FACTORS_PARQUET, ADJUSTMENT_FACTORS_QUALITY_CSV, ADJUSTMENT_PTI_QUALITY_CSV
 from functions.data_sources.code_mapping import build_code_mapping_frame
 
 
@@ -90,8 +90,8 @@ def attach_adjustment_factors_to_daily(prices_df, factors_df):
     prices = prices_df.copy()
     prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
     if factors_df.empty:
-        prices["forward_factor"] = pd.NA
-        prices["backward_factor"] = pd.NA
+        prices["forward_factor"] = float("nan")
+        prices["backward_factor"] = float("nan")
         prices["adj_factor_available"] = False
         return prices
     factors = factors_df[factors_df["factor_source_validated"].fillna(False)].copy()
@@ -107,8 +107,8 @@ def attach_adjustment_factors_to_daily(prices_df, factors_df):
         events = factor_groups.get(symbol)
         if events is None:
             part = bars.copy()
-            part["forward_factor"] = pd.NA
-            part["backward_factor"] = pd.NA
+            part["forward_factor"] = float("nan")
+            part["backward_factor"] = float("nan")
         else:
             part = pd.merge_asof(
                 bars.sort_values("date"),
@@ -190,3 +190,84 @@ def save_adjustment_factors_quality_report(
     output_file.parent.mkdir(parents=True, exist_ok=True)
     report.to_csv(output_file, index=False, encoding="utf-8-sig")
     return output_file
+
+
+def build_adjustment_pti_coverage_report(daily_df):
+    if daily_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "rows",
+                "covered_rows",
+                "coverage_ratio",
+                "first_date",
+                "last_date",
+                "first_covered_date",
+                "last_covered_date",
+                "coverage_status",
+                "feature_price_source",
+            ]
+        )
+    data = daily_df.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    covered = data.get("adj_factor_available", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+    feature_price_source = data.get("feature_price_source", pd.Series("", index=data.index)).astype(str)
+    report = (
+        pd.DataFrame(
+            {
+                "symbol": data["symbol"].astype(str),
+                "date": data["date"],
+                "covered": covered,
+                "feature_price_source": feature_price_source,
+            }
+        )
+        .groupby("symbol", dropna=False)
+        .agg(
+            rows=("date", "count"),
+            covered_rows=("covered", "sum"),
+            first_date=("date", "min"),
+            last_date=("date", "max"),
+            first_covered_date=("date", lambda s: s[covered.loc[s.index]].min() if covered.loc[s.index].any() else pd.NaT),
+            last_covered_date=("date", lambda s: s[covered.loc[s.index]].max() if covered.loc[s.index].any() else pd.NaT),
+            feature_price_source=("feature_price_source", "last"),
+        )
+        .reset_index()
+    )
+    report["coverage_ratio"] = pd.to_numeric(report["covered_rows"], errors="coerce") / pd.to_numeric(report["rows"], errors="coerce").replace(0, pd.NA)
+    report["coverage_status"] = report["coverage_ratio"].apply(_coverage_status)
+    summary = pd.DataFrame(
+        [
+            {
+                "symbol": "__summary__",
+                "rows": int(pd.to_numeric(report["rows"], errors="coerce").fillna(0).sum()),
+                "covered_rows": int(pd.to_numeric(report["covered_rows"], errors="coerce").fillna(0).sum()),
+                "coverage_ratio": float(covered.mean()) if len(covered) else 0.0,
+                "first_date": report["first_date"].min(),
+                "last_date": report["last_date"].max(),
+                "first_covered_date": report["first_covered_date"].min(),
+                "last_covered_date": report["last_covered_date"].max(),
+                "coverage_status": _coverage_status(float(covered.mean()) if len(covered) else 0.0),
+                "feature_price_source": feature_price_source.iloc[-1] if len(feature_price_source) else "",
+            }
+        ]
+    )
+    return pd.concat([report, summary], ignore_index=True)
+
+
+def save_adjustment_pti_coverage_report(daily_df, output_path=ADJUSTMENT_PTI_QUALITY_CSV):
+    report = build_adjustment_pti_coverage_report(daily_df)
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    report.to_csv(output_file, index=False, encoding="utf-8-sig")
+    return output_file
+
+
+def _coverage_status(value):
+    if pd.isna(value):
+        return "no_coverage"
+    ratio = float(value)
+    if ratio >= 1.0:
+        return "full_coverage"
+    if ratio > 0.0:
+        return "partial_coverage"
+    return "no_coverage"

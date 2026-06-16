@@ -11,10 +11,17 @@ from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
+from scipy.stats import beta as beta_distribution
 
 from config import (
-    GOVERNANCE_MAX_POSITION_WEIGHT,
+    DATA_VERSION,
     POSITION_A500_MIN_COVERAGE_RATIO,
+    POSITION_BAYES_LOWER_CONFIDENCE,
+    POSITION_BAYES_PRIOR_P,
+    POSITION_BAYES_PRIOR_SOURCE,
+    POSITION_BAYES_PRIOR_STRENGTH,
+    POSITION_CONFLICT_BLOCK_THRESHOLD,
+    POSITION_CONFLICT_EXIT_THRESHOLD,
     POSITION_DEFAULT_RETURN_HORIZON_DAYS,
     POSITION_EMERGENCY_SINGLE_DAY_DRAWDOWN,
     POSITION_EXIT_EXPECTED_RETURN_20D,
@@ -22,15 +29,24 @@ from config import (
     POSITION_HOLD_KELLY_SCORE,
     POSITION_KELLY_SCALE,
     POSITION_MIN_P_WIN,
+    POSITION_PAYOFF_MAX,
+    POSITION_PAYOFF_MIN,
     POSITION_RISK_DISCOUNT_SMOOTH_DAYS,
     POSITION_SEVERE_EXIT_KELLY_SCORE,
+    POSITION_SINGLE_STOCK_CAP,
+    POSITION_STRATEGY_GROUP_CAP,
+    STRATEGY_PARAMS_VERSION,
+    V6_STRATEGY_GROUPS,
 )
 from functions.decision_council.contracts import SafetyDecision
 
 
 STRATEGY_SIGNAL_REQUIRED_COLUMNS = (
     "strategy_id",
+    "strategy_version",
+    "group_id",
     "symbol",
+    "event_id",
     "direction",
     "predicted_return",
     "return_horizon_days",
@@ -42,8 +58,11 @@ STRATEGY_SIGNAL_REQUIRED_COLUMNS = (
     "exit_signal_confidence",
     "signal_timestamp",
     "tradeable_timestamp",
+    "reference_date",
     "signal_source_precision",
     "source_columns",
+    "data_version",
+    "parameter_version",
 )
 
 AGGREGATED_SIGNAL_COLUMNS = (
@@ -52,6 +71,8 @@ AGGREGATED_SIGNAL_COLUMNS = (
     "expected_return",
     "return_horizon_days",
     "p_win",
+    "p_win_mean",
+    "p_win_lower",
     "p_loss",
     "avg_win",
     "avg_loss",
@@ -60,13 +81,22 @@ AGGREGATED_SIGNAL_COLUMNS = (
     "signal_conflict_score",
     "strategy_vote_count",
     "effective_sample_size",
+    "prior_p",
+    "prior_strength",
+    "prior_source",
+    "posterior_alpha",
+    "posterior_beta",
+    "posterior_sample_count",
 )
 
 
 @dataclass(frozen=True)
 class StrategySignal:
     strategy_id: str
+    strategy_version: str
+    group_id: str
     symbol: str
+    event_id: str
     direction: str
     predicted_return: float
     return_horizon_days: int
@@ -78,13 +108,19 @@ class StrategySignal:
     exit_signal_confidence: float
     signal_timestamp: pd.Timestamp
     tradeable_timestamp: pd.Timestamp
+    reference_date: pd.Timestamp
     signal_source_precision: str
     source_columns: str
+    data_version: str
+    parameter_version: str
 
     def to_record(self) -> dict:
         return {
             "strategy_id": self.strategy_id,
+            "strategy_version": self.strategy_version,
+            "group_id": self.group_id,
             "symbol": self.symbol,
+            "event_id": self.event_id,
             "direction": self.direction,
             "predicted_return": self.predicted_return,
             "return_horizon_days": self.return_horizon_days,
@@ -96,8 +132,11 @@ class StrategySignal:
             "exit_signal_confidence": self.exit_signal_confidence,
             "signal_timestamp": self.signal_timestamp,
             "tradeable_timestamp": self.tradeable_timestamp,
+            "reference_date": self.reference_date,
             "signal_source_precision": self.signal_source_precision,
             "source_columns": self.source_columns,
+            "data_version": self.data_version,
+            "parameter_version": self.parameter_version,
         }
 
 
@@ -108,6 +147,8 @@ class AggregatedSignal:
     expected_return: float
     return_horizon_days: int
     p_win: float
+    p_win_mean: float
+    p_win_lower: float
     p_loss: float
     avg_win: float
     avg_loss: float
@@ -116,6 +157,12 @@ class AggregatedSignal:
     signal_conflict_score: float
     strategy_vote_count: int
     effective_sample_size: float
+    prior_p: float
+    prior_strength: float
+    prior_source: str
+    posterior_alpha: float
+    posterior_beta: float
+    posterior_sample_count: float
 
 
 @dataclass(frozen=True)
@@ -135,6 +182,7 @@ class PositionManagementDecision:
     expected_return_20d: float
     p_win: float
     payoff_ratio: float
+    position_state: str
 
     def to_safety_decision(
         self,
@@ -187,8 +235,16 @@ def validate_strategy_signal_frame(signals: pd.DataFrame) -> pd.DataFrame:
     data["max_holding_days"] = pd.to_numeric(data["max_holding_days"], errors="coerce").astype("Int64")
     data["signal_timestamp"] = pd.to_datetime(data["signal_timestamp"], errors="coerce")
     data["tradeable_timestamp"] = pd.to_datetime(data["tradeable_timestamp"], errors="coerce")
+    data["reference_date"] = pd.to_datetime(data["reference_date"], errors="coerce")
     if data[list(STRATEGY_SIGNAL_REQUIRED_COLUMNS)].isna().any().any():
         raise ValueError("StrategySignal contains null values in required fields")
+    if (data["tradeable_timestamp"] < data["signal_timestamp"]).any():
+        raise ValueError("StrategySignal tradeable_timestamp precedes signal_timestamp")
+    if (data["reference_date"] < data["tradeable_timestamp"]).any():
+        raise ValueError("StrategySignal reference_date precedes tradeable_timestamp")
+    duplicate_events = data.duplicated(["strategy_id", "symbol", "event_id"], keep=False)
+    if duplicate_events.any():
+        raise ValueError("StrategySignal event_id must be unique within strategy and symbol")
     return data
 
 
@@ -226,6 +282,14 @@ def aggregate_strategy_signals(
         * data["confidence"].clip(0.0, 1.0)
         * data["direction_sign"].abs()
     )
+    group_totals = data.groupby(["symbol", "group_id"])["vote_weight"].transform("sum")
+    symbol_totals = data.groupby("symbol")["vote_weight"].transform("sum")
+    group_share = group_totals / symbol_totals.replace(0.0, np.nan)
+    group_scale = (
+        float(POSITION_STRATEGY_GROUP_CAP)
+        / group_share.replace(0.0, np.nan)
+    ).clip(upper=1.0).fillna(1.0)
+    data["vote_weight"] *= group_scale
 
     rows = []
     for symbol, group in data.groupby("symbol", sort=True):
@@ -235,25 +299,46 @@ def aggregate_strategy_signals(
         conflict = min(long_weight, short_weight) / total_directional if total_directional > 0 else 0.0
         signed_return = group["predicted_return"] * group["direction_sign"]
         expected_return = _weighted_average(signed_return, group["vote_weight"], fallback=0.0)
-        p_win = _beta_binomial_p_win(group)
-        p_loss = 1.0 - p_win
+        posterior = _beta_binomial_p_win(group)
+        p_win_mean = posterior["mean"]
+        p_win_lower = posterior["lower"]
         avg_win = _weighted_average(group["avg_win"].clip(lower=0.0), group["reputation_weight"], fallback=0.0)
         avg_loss = _weighted_average(group["avg_loss"].clip(upper=0.0), group["reputation_weight"], fallback=0.0)
+        sample_count = float(((group["wins"] + group["losses"]) * group["reputation_weight"].clip(lower=0.0)).sum())
+        cold_start_confidence = _weighted_average(
+            group["confidence"].clip(0.0, 1.0),
+            group["vote_weight"],
+            fallback=0.0,
+        )
+        if sample_count <= 0.0:
+            p_win_mean = 0.5
+            p_win_lower = 0.5
+            avg_win = 0.0
+            avg_loss = 0.0
+        p_loss = 1.0 - p_win_lower
         if avg_win <= 0.0 or avg_loss >= 0.0:
             payoff_ratio = 1.0
         else:
-            payoff_ratio = avg_win / abs(avg_loss)
+            payoff_ratio = float(np.clip(avg_win / abs(avg_loss), POSITION_PAYOFF_MIN, POSITION_PAYOFF_MAX))
         n_eff = _effective_sample_size(group, correlation_matrix)
         aggregate_confidence = _aggregate_confidence(group, conflict, n_eff)
         aggregate_direction = "long" if expected_return > 0 and long_weight >= short_weight else "flat"
-        horizon = int(group["return_horizon_days"].median()) if group["return_horizon_days"].notna().any() else int(default_horizon_days)
+        valid_horizons = group["return_horizon_days"].dropna()
+        if valid_horizons.empty:
+            horizon = int(default_horizon_days)
+        elif len(valid_horizons) == 1:
+            horizon = int(valid_horizons.iloc[0])
+        else:
+            horizon = int(np.nanmedian(valid_horizons.to_numpy(dtype="float64", copy=False)))
         rows.append(
             {
                 "symbol": symbol,
                 "aggregate_direction": aggregate_direction,
                 "expected_return": float(expected_return),
                 "return_horizon_days": horizon,
-                "p_win": float(np.clip(p_win, 0.0, 1.0)),
+                "p_win": float(np.clip(p_win_mean, 0.0, 1.0)),
+                "p_win_mean": float(np.clip(p_win_mean, 0.0, 1.0)),
+                "p_win_lower": float(np.clip(p_win_lower, 0.0, 1.0)),
                 "p_loss": float(np.clip(p_loss, 0.0, 1.0)),
                 "avg_win": float(avg_win),
                 "avg_loss": float(avg_loss),
@@ -262,6 +347,12 @@ def aggregate_strategy_signals(
                 "signal_conflict_score": float(np.clip(conflict, 0.0, 1.0)),
                 "strategy_vote_count": int(group["strategy_id"].nunique()),
                 "effective_sample_size": float(n_eff),
+                "prior_p": float(posterior["prior_p"]),
+                "prior_strength": float(posterior["prior_strength"]),
+                "prior_source": str(posterior["prior_source"]),
+                "posterior_alpha": float(posterior["alpha"]),
+                "posterior_beta": float(posterior["beta"]),
+                "posterior_sample_count": float(posterior["sample_count"]),
             }
         )
     return pd.DataFrame(rows, columns=AGGREGATED_SIGNAL_COLUMNS)
@@ -289,7 +380,7 @@ def calculate_target_weight(
     risk_discount: float,
     exposure_cap: float,
     kelly_scale: float = POSITION_KELLY_SCALE,
-    single_stock_cap: float = GOVERNANCE_MAX_POSITION_WEIGHT,
+    single_stock_cap: float = POSITION_SINGLE_STOCK_CAP,
 ) -> dict:
     kelly_raw = calculate_kelly_raw(p_win, payoff_ratio)
     discount = float(np.clip(risk_discount, 0.0, 1.0))
@@ -337,7 +428,7 @@ def choose_position_action(
         trimmed = current + (target - current) * float(partial_adjustment_rate)
         return "trim", "kelly_score_below_hold_threshold", max(trimmed, 0.0)
     if not in_investable_pool:
-        return "hold", "out_of_pool_but_kelly_still_valid", current
+        return "exit", "out_of_investable_pool", 0.0
     if target > current + 1e-12:
         return ("buy" if current <= 1e-12 else "add"), "kelly_target_above_current", target
     return "hold", "kelly_target_not_above_current", current
@@ -355,31 +446,82 @@ def build_position_management_decisions(
     negative_signal_days: Mapping[str, int] | None = None,
     low_p_win_days: Mapping[str, int] | None = None,
     partial_adjustment_rate: float = 0.25,
+    out_of_universe_symbols: set[str] | None = None,
+    universe_mode: str = "index_pool_strict",
 ) -> pd.DataFrame:
+    """Build position management decisions with explicit out-of-universe handling.
+
+    Parameters
+    ----------
+    out_of_universe_symbols : set[str], optional
+        Symbols that are currently held but NOT in today's universe.
+        These will get explicit exit decisions.
+    universe_mode : str
+        One of: "index_pool_strict", "quality_fallback", "blocked"
+    """
     current_weights = current_weights or {}
     investable = set(investable_symbols) if investable_symbols is not None else set(aggregated["symbol"])
     tradeable = set(tradeable_symbols) if tradeable_symbols is not None else set(aggregated["symbol"])
     negative_signal_days = negative_signal_days or {}
     low_p_win_days = low_p_win_days or {}
+    out_of_universe = out_of_universe_symbols or set()
     rows = []
+
+    # Generate explicit exit decisions for out-of-universe holdings
+    for symbol in out_of_universe:
+        current_weight = float(current_weights.get(symbol, 0.0))
+        if current_weight > 1e-12:
+            decision = PositionManagementDecision(
+                symbol=symbol,
+                current_weight=current_weight,
+                target_weight=0.0,
+                kelly_raw=0.0,
+                kelly_scale=0.0,
+                risk_discount=0.0,
+                kelly_adjusted=0.0,
+                kelly_score=0.0,
+                position_action="exit",
+                action_reason="out_of_investable_pool",
+                exposure_cap=float(exposure_cap),
+                risk_level=str(risk_level),
+                expected_return_20d=0.0,
+                p_win=0.0,
+                payoff_ratio=1.0,
+                position_state="exit",
+            )
+            record = decision.__dict__.copy()
+            record["out_of_universe"] = True
+            record["universe_mode"] = universe_mode
+            rows.append(record)
+
+    # Generate decisions for in-universe stocks
     for row in aggregated.to_dict("records"):
         symbol = str(row["symbol"])
+        current_weight = float(current_weights.get(symbol, 0.0))
+        conflict = float(row.get("signal_conflict_score", 0.0))
+        sizing_p_win = float(row.get("p_win_lower", row["p_win"]))
         sizing = calculate_target_weight(
-            p_win=float(row["p_win"]),
+            p_win=sizing_p_win,
             payoff_ratio=float(row["payoff_ratio"]),
             risk_discount=float(row.get("aggregate_confidence", 1.0)) * float(risk_discount),
             exposure_cap=exposure_cap,
         )
+        if conflict > POSITION_CONFLICT_BLOCK_THRESHOLD and current_weight <= 1e-12:
+            sizing["target_weight"] = 0.0
+            sizing["kelly_score"] = 0.0
+        elif conflict > POSITION_CONFLICT_EXIT_THRESHOLD and float(row["expected_return"]) < 0.0:
+            sizing["target_weight"] = min(sizing["target_weight"], current_weight * 0.5)
+            sizing["kelly_score"] = sizing["target_weight"]
         expected_20d = _to_20d_return(
             float(row["expected_return"]),
             int(row.get("return_horizon_days", POSITION_DEFAULT_RETURN_HORIZON_DAYS)),
         )
         action, reason, final_target = choose_position_action(
-            current_weight=float(current_weights.get(symbol, 0.0)),
+            current_weight=current_weight,
             target_weight=sizing["target_weight"],
             kelly_score=sizing["kelly_score"],
             expected_return_20d=expected_20d,
-            p_win=float(row["p_win"]),
+            p_win=sizing_p_win,
             in_investable_pool=symbol in investable,
             is_tradeable=symbol in tradeable,
             negative_signal_days=int(negative_signal_days.get(symbol, 0)),
@@ -388,7 +530,7 @@ def build_position_management_decisions(
         )
         decision = PositionManagementDecision(
             symbol=symbol,
-            current_weight=float(current_weights.get(symbol, 0.0)),
+            current_weight=current_weight,
             target_weight=float(final_target),
             kelly_raw=sizing["kelly_raw"],
             kelly_scale=sizing["kelly_scale"],
@@ -400,10 +542,28 @@ def build_position_management_decisions(
             exposure_cap=float(exposure_cap),
             risk_level=str(risk_level),
             expected_return_20d=expected_20d,
-            p_win=float(row["p_win"]),
+            p_win=sizing_p_win,
             payoff_ratio=float(row["payoff_ratio"]),
+            position_state=_position_state(
+                action,
+                in_investable_pool=symbol in investable,
+                is_tradeable=symbol in tradeable,
+            ),
         )
-        rows.append(decision.__dict__)
+        record = decision.__dict__.copy()
+        record["out_of_universe"] = False
+        record["universe_mode"] = universe_mode
+        for extra_col in [
+            "prior_p",
+            "prior_strength",
+            "prior_source",
+            "posterior_alpha",
+            "posterior_beta",
+            "posterior_sample_count",
+        ]:
+            if extra_col in row:
+                record[extra_col] = row[extra_col]
+        rows.append(record)
     return pd.DataFrame(rows)
 
 
@@ -482,11 +642,38 @@ def _normalize_strategy_stats(strategy_stats: pd.DataFrame | None) -> pd.DataFra
     return data[columns]
 
 
-def _beta_binomial_p_win(group: pd.DataFrame) -> float:
+def _beta_binomial_p_win(group: pd.DataFrame) -> dict:
     weights = group["reputation_weight"].clip(lower=0.0)
     weighted_wins = float((group["wins"] * weights).sum())
     weighted_losses = float((group["losses"] * weights).sum())
-    return (1.0 + weighted_wins) / (2.0 + weighted_wins + weighted_losses)
+    if weighted_wins + weighted_losses <= 0.0:
+        alpha = POSITION_BAYES_PRIOR_STRENGTH * POSITION_BAYES_PRIOR_P
+        beta = POSITION_BAYES_PRIOR_STRENGTH * (1.0 - POSITION_BAYES_PRIOR_P)
+        return {
+            "mean": 0.5,
+            "lower": 0.5,
+            "alpha": float(alpha),
+            "beta": float(beta),
+            "sample_count": 0.0,
+            "prior_p": float(POSITION_BAYES_PRIOR_P),
+            "prior_strength": float(POSITION_BAYES_PRIOR_STRENGTH),
+            "prior_source": str(POSITION_BAYES_PRIOR_SOURCE),
+        }
+    alpha = weighted_wins + POSITION_BAYES_PRIOR_STRENGTH * POSITION_BAYES_PRIOR_P
+    beta = weighted_losses + POSITION_BAYES_PRIOR_STRENGTH * (1.0 - POSITION_BAYES_PRIOR_P)
+    mean = alpha / max(alpha + beta, 1e-12)
+    lower_tail = 1.0 - POSITION_BAYES_LOWER_CONFIDENCE
+    lower = float(beta_distribution.ppf(lower_tail, alpha, beta))
+    return {
+        "mean": float(mean),
+        "lower": lower,
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "sample_count": float(weighted_wins + weighted_losses),
+        "prior_p": float(POSITION_BAYES_PRIOR_P),
+        "prior_strength": float(POSITION_BAYES_PRIOR_STRENGTH),
+        "prior_source": str(POSITION_BAYES_PRIOR_SOURCE),
+    }
 
 
 def _aggregate_confidence(group: pd.DataFrame, conflict: float, n_eff: float) -> float:
@@ -525,3 +712,22 @@ def _weighted_average(values, weights, *, fallback: float) -> float:
 def _to_20d_return(expected_return: float, horizon_days: int) -> float:
     horizon = max(int(horizon_days), 1)
     return float(expected_return) * (20.0 / horizon)
+
+
+def _position_state(
+    action: str,
+    *,
+    in_investable_pool: bool,
+    is_tradeable: bool,
+) -> str:
+    if not is_tradeable:
+        return "FROZEN_UNTRADEABLE"
+    if action == "exit":
+        return "EXIT_PENDING"
+    if action == "trim":
+        return "REDUCE_LIGHT"
+    if action == "buy":
+        return "NEW"
+    if not in_investable_pool:
+        return "HOLD_OUT_OF_POOL"
+    return "ACTIVE"

@@ -25,6 +25,15 @@ from config import (
     RAW_EXTERNAL_DIR,
     REPORT_DIR,
     START_DATE,
+    EXTERNAL_DATA_END_DATE,
+    EXTERNAL_DATA_SYMBOL_LIMIT,
+    MARKET_CAP_BATCH_DELAY_SECONDS,
+    MARKET_CAP_BATCH_SIZE,
+    MARKET_CAP_DEFAULT_SOURCE,
+    MARKET_CAP_MAX_REPORT_FILES,
+    MARKET_CAP_REPORT_START_DATE,
+    MARKET_CAP_REQUEST_DELAY_SECONDS,
+    assert_valid_configuration,
 )
 from functions.data_sources.market_cap_data import (
     detect_market_cap_jump_flags,
@@ -50,22 +59,24 @@ def eligible_stock_symbols(limit=None):
 
 
 def main():
+    assert_valid_configuration()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["akshare", "file", "tdx_finance"], default="tdx_finance")
+    parser.add_argument("--source", choices=["akshare", "file", "tdx_finance"], default=MARKET_CAP_DEFAULT_SOURCE)
     parser.add_argument("--input-file", default=None, help="CSV/XLSX/Parquet with date, code/symbol, total_cap, float_cap.")
     parser.add_argument("--source-name", default=None)
     parser.add_argument("--start-date", default=START_DATE)
-    parser.add_argument("--end-date", default=pd.Timestamp.today().date().isoformat())
-    parser.add_argument("--limit", type=int, default=None, help="Validation subset only; omit for full universe.")
-    parser.add_argument("--report-start-date", default="2017-01-01")
-    parser.add_argument("--max-report-files", type=int, default=None)
+    parser.add_argument("--end-date", default=EXTERNAL_DATA_END_DATE)
+    parser.add_argument("--limit", type=int, default=EXTERNAL_DATA_SYMBOL_LIMIT, help="Validation subset only.")
+    parser.add_argument("--report-start-date", default=MARKET_CAP_REPORT_START_DATE)
+    parser.add_argument("--max-report-files", type=int, default=MARKET_CAP_MAX_REPORT_FILES)
     parser.add_argument("--use-existing-reports-only", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=50)
-    parser.add_argument("--request-delay-seconds", type=float, default=0.35)
-    parser.add_argument("--batch-delay-seconds", type=float, default=2.0)
+    parser.add_argument("--batch-size", type=int, default=MARKET_CAP_BATCH_SIZE)
+    parser.add_argument("--request-delay-seconds", type=float, default=MARKET_CAP_REQUEST_DELAY_SECONDS)
+    parser.add_argument("--batch-delay-seconds", type=float, default=MARKET_CAP_BATCH_DELAY_SECONDS)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
+    args.end_date = args.end_date or pd.Timestamp.today().date().isoformat()
 
     if args.source == "file":
         if not args.input_file:

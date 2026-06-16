@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 
-from functions.feature_engineering import build_feature_frame
+from functions.feature_engineering import build_feature_frame, finalize_feature_frame_for_storage
 
 
 def verify_feature_pipeline_integration():
@@ -39,6 +39,9 @@ def verify_feature_pipeline_integration():
         "below_target_penalized_return",
         "close_nominal",
         "feature_price_source",
+        "adjustment_coverage_ratio",
+        "adjustment_coverage_threshold",
+        "price_basis_selection_mode",
         "feature_timestamp",
         "ret_20_z",
         "ret_20_robust",
@@ -82,6 +85,41 @@ def verify_feature_pipeline_integration():
         print("[FAIL] adjusted feature price source was not selected")
     else:
         print("[PASS] adjusted feature price source selected when factors exist")
+
+    partial_adjusted_sample = sample.copy()
+    partial_adjusted_sample["backward_factor"] = 1.0
+    partial_adjusted_sample.loc[partial_adjusted_sample["symbol"] == "sz000001", "backward_factor"] = pd.NA
+    partial_adjusted_result = build_feature_frame(partial_adjusted_sample)
+    partial_price_sources = set(partial_adjusted_result["feature_price_source"].dropna())
+    if partial_price_sources != {"nominal_unadjusted"}:
+        failures.append("partial adjustment coverage should force a nominal_unadjusted feature basis")
+        print("[FAIL] partial adjustment coverage did not force nominal_unadjusted pricing")
+    else:
+        print("[PASS] partial adjustment coverage falls back to a uniform nominal price basis")
+    partial_coverage = pd.to_numeric(partial_adjusted_result["adjustment_coverage_ratio"], errors="coerce").dropna()
+    if partial_coverage.empty or not (0.0 < partial_coverage.iloc[0] < 1.0):
+        failures.append("partial adjustment coverage ratio should be recorded between 0 and 1")
+        print("[FAIL] partial adjustment coverage ratio not recorded correctly")
+    else:
+        print("[PASS] partial adjustment coverage ratio recorded explicitly")
+
+    stored_result, memory_report = finalize_feature_frame_for_storage(result)
+    if "macd_dif" in stored_result.columns or "kdj_rsv" in stored_result.columns:
+        failures.append("transient feature columns should be pruned from the stored feature frame")
+        print("[FAIL] transient feature columns were not pruned from storage")
+    else:
+        print("[PASS] transient feature columns pruned from stored feature frame")
+    if "score_macd_cross" not in stored_result.columns or "atr_20" not in stored_result.columns:
+        failures.append("stored feature frame should retain precomputed strategy columns")
+        print("[FAIL] stored feature frame lost required precomputed strategy columns")
+    else:
+        print("[PASS] stored feature frame retains required strategy columns")
+    saved_ratio = pd.to_numeric(memory_report["memory_saved_ratio"], errors="coerce").dropna()
+    if saved_ratio.empty:
+        failures.append("feature memory report should record memory_saved_ratio")
+        print("[FAIL] feature memory report did not record memory_saved_ratio")
+    else:
+        print("[PASS] feature memory report recorded memory savings")
 
     print()
     if failures:

@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-from pathlib import Path
-
-from config import RUNS_DIR
+from config import RUNS_DIR, RUNTIME_CONFIG_SNAPSHOT_JSON
 from functions.evaluation.experiment_tracker import read_run_metadata
 
 
@@ -88,6 +86,34 @@ def verify_experiment_tracking():
             print("[FAIL] failed run missing error_message")
         elif status == "failed":
             print("[PASS] failed run has error_message")
+
+        config_snapshot = metadata.get("config_snapshot", {})
+        required_config_keys = {
+            "strategy_params_version",
+            "strategy_params_hash",
+            "strategy_params",
+            "strategy_start_date",
+            "strategy_end_date",
+        }
+        missing_config_keys = sorted(required_config_keys - set(config_snapshot))
+        if missing_config_keys:
+            failures.append(f"config_snapshot missing keys: {missing_config_keys}")
+            print(f"[FAIL] config_snapshot missing keys: {missing_config_keys}")
+        else:
+            print("[PASS] config_snapshot carries strategy parameter metadata")
+
+        latest_runtime_snapshot = latest_run / "runtime_config_snapshot.json"
+        if not latest_runtime_snapshot.exists():
+            failures.append(f"latest run missing runtime config snapshot: {latest_runtime_snapshot}")
+            print(f"[FAIL] latest run missing runtime config snapshot: {latest_runtime_snapshot}")
+        else:
+            print(f"[PASS] latest run runtime config snapshot exists: {latest_runtime_snapshot}")
+
+    if not RUNTIME_CONFIG_SNAPSHOT_JSON.exists():
+        failures.append(f"shared runtime config snapshot missing: {RUNTIME_CONFIG_SNAPSHOT_JSON}")
+        print(f"[FAIL] shared runtime config snapshot missing: {RUNTIME_CONFIG_SNAPSHOT_JSON}")
+    else:
+        print(f"[PASS] shared runtime config snapshot exists: {RUNTIME_CONFIG_SNAPSHOT_JSON}")
 
     print()
     if failures:

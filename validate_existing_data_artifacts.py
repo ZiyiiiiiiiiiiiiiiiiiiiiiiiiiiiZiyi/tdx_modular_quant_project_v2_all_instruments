@@ -16,6 +16,10 @@ from config import (
     MARKET_CAP_PARQUET,
     RAW_DAILY_PARQUET,
     REPORT_DIR,
+    ARTIFACT_VALIDATION_ROW_GROUP_SAMPLE_SIZE,
+    ARTIFACT_VALIDATION_ROWS_PER_GROUP,
+    ARTIFACT_VALIDATION_SYMBOL_SAMPLE_SIZE,
+    assert_valid_configuration,
 )
 from functions.data_sources.adjustment_factors import REQUIRED_ADJUSTMENT_FACTOR_COLUMNS
 from functions.data_sources.corporate_actions import REQUIRED_CORPORATE_ACTION_COLUMNS
@@ -25,13 +29,14 @@ from functions.data_sources.market_cap_data import REQUIRED_MARKET_CAP_COLUMNS
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["tdx-daily", "baostock", "market-cap", "features"], required=True)
-    parser.add_argument("--symbol-sample-size", type=int, default=24)
-    parser.add_argument("--row-group-sample-size", type=int, default=12)
-    parser.add_argument("--rows-per-group", type=int, default=200)
+    parser.add_argument("--symbol-sample-size", type=int, default=ARTIFACT_VALIDATION_SYMBOL_SAMPLE_SIZE)
+    parser.add_argument("--row-group-sample-size", type=int, default=ARTIFACT_VALIDATION_ROW_GROUP_SAMPLE_SIZE)
+    parser.add_argument("--rows-per-group", type=int, default=ARTIFACT_VALIDATION_ROWS_PER_GROUP)
     return parser.parse_args()
 
 
 def main():
+    assert_valid_configuration()
     args = parse_args()
     if args.dataset == "tdx-daily":
         checks = validate_tdx_daily_artifacts(

@@ -34,7 +34,7 @@ def classify_prototype_sector(symbol: str, instrument_type: str | None = None) -
 class PortfolioConstructionCommittee:
     """Translate ranked proposals and risk caps into auditable candidate weights."""
 
-    def __init__(self, *, enable_sector_cap: bool = True):
+    def __init__(self, *, enable_sector_cap: bool = False):
         self.enable_sector_cap = bool(enable_sector_cap)
 
     def construct(self, candidates: pd.DataFrame, *, exposure_cap: float):
@@ -70,7 +70,18 @@ def allocate_constrained_inverse_vol(
             classify_prototype_sector(symbol, instrument_type)
             for symbol, instrument_type in zip(data["symbol"], types)
         ]
-    raw = 1.0 / data["volatility_20"]
+    if "target_weight" in data.columns and pd.to_numeric(
+        data["target_weight"], errors="coerce"
+    ).fillna(0.0).gt(0.0).any():
+        requested = pd.to_numeric(data["target_weight"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        raw = requested / requested.sum()
+        max_position_weight = min(
+            float(max_position_weight),
+            float(requested.max()),
+        )
+        exposure_cap = min(float(exposure_cap), float(requested.sum()))
+    else:
+        raw = 1.0 / data["volatility_20"]
     raw = raw / raw.sum()
     data["raw_inverse_vol_weight"] = raw * float(exposure_cap)
     data["target_weight"] = 0.0

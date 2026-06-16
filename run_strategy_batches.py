@@ -11,11 +11,24 @@ import pyarrow.parquet as pq
 from config import (
     BACKTEST_INITIAL_CASH,
     BACKTEST_RISK_FREE_RATE,
+    BACKTEST_SKIPPED_STRATEGIES_CSV,
     FEATURE_DAILY_PARQUET,
     PROCESSED_DIR,
     RESULT_DIR,
+    STRATEGY_FREQ,
+    STRATEGY_INCLUDE_TYPES,
+    STRATEGY_SCORE_COL,
+    STRATEGY_START_DATE,
+    STRATEGY_END_DATE,
+    STRATEGY_TOP_N,
+    STRATEGY_BATCH_SIZE_DEFAULT,
+    CLI_STRATEGY_BATCH_INDEX,
+    CLI_STRATEGY_BATCH_MODE,
+    CLI_STRATEGY_BATCH_OFFSET,
+    assert_valid_configuration,
 )
 from functions.backtest_engine import run_backtest
+from functions.date_window import window_identity
 from functions.governance import print_runtime_disclosure
 from functions.feature_engineering import (
     generate_one_strategy,
@@ -26,20 +39,13 @@ from functions.strategy_registry import STRATEGY_FACTOR_DESCRIPTIONS, STRATEGY_R
 from functions.strategy_selection import run_strategy_selection
 
 
-STRATEGY_TOP_N = 20
-STRATEGY_FREQ = "ME"
-STRATEGY_START_DATE = "2021-01-01"
-STRATEGY_END_DATE = None
-STRATEGY_INCLUDE_TYPES = ("stock", "etf_fund")
-STRATEGY_SCORE_COL = "score_mom_lowvol"
-
-
 def main():
+    assert_valid_configuration()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["select", "backtest", "all"], default="all")
-    parser.add_argument("--batch-size", type=int, default=1, help="Use 1 for low memory; 4 is the practical upper bound.")
-    parser.add_argument("--offset", type=int, default=0, help="Zero-based batch offset.")
-    parser.add_argument("--batch-index", type=int, default=None, help="Alternative to --offset: offset=batch_index*batch_size.")
+    parser.add_argument("--mode", choices=["select", "backtest", "all"], default=CLI_STRATEGY_BATCH_MODE)
+    parser.add_argument("--batch-size", type=int, default=STRATEGY_BATCH_SIZE_DEFAULT, help="Use 1 for low memory; 4 is the practical upper bound.")
+    parser.add_argument("--offset", type=int, default=CLI_STRATEGY_BATCH_OFFSET, help="Zero-based batch offset.")
+    parser.add_argument("--batch-index", type=int, default=CLI_STRATEGY_BATCH_INDEX, help="Alternative to --offset.")
     parser.add_argument("--only", nargs="*", default=None, help="Explicit strategy names.")
     parser.add_argument("--sources", nargs="*", default=None, help="Filter source types: rule ml classic_ml quantum_inspired.")
     parser.add_argument("--resume", action="store_true", help="Skip existing outputs for the selected mode.")
@@ -49,7 +55,7 @@ def main():
     strategy_names = _resolve_strategy_names(args.only, args.sources)
     if args.smoke:
         strategy_names = strategy_names[:1]
-    else:
+    elif _should_apply_batch_slice(args):
         start = max(args.offset, 0)
         if args.batch_index is not None:
             start = max(args.batch_index, 0) * max(args.batch_size, 1)
@@ -71,16 +77,22 @@ def main():
 
     if args.mode in {"backtest", "all"}:
         records = []
+        skipped_rows = []
         for strategy_name in strategy_names:
             metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
             if args.resume and metrics_path.exists():
                 print(f"Skip existing backtest: {strategy_name}")
                 continue
-            record = _run_one_backtest(strategy_name)
-            records.append(record)
+            result = _run_one_backtest(strategy_name)
+            if result["status"] == "ok":
+                records.append(result["record"])
+            else:
+                skipped_rows.append(_skipped_backtest_row(strategy_name, result["reason"]))
             gc.collect()
         if records:
             _append_batch_summary(records)
+        if skipped_rows:
+            _save_skipped_backtest_report(skipped_rows)
 
 
 def _resolve_strategy_names(only, sources):
@@ -97,10 +109,16 @@ def _resolve_strategy_names(only, sources):
     return names
 
 
+def _should_apply_batch_slice(args) -> bool:
+    if not args.only:
+        return True
+    return args.batch_index is not None or int(args.offset) > 0
+
+
 def _generate_and_save_selection(strategy_name):
     columns = _existing_columns(required_feature_columns_for_strategy(strategy_name))
     print(f"Load features for {strategy_name}: {len(columns)} columns")
-    features = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=columns)
+    features = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=columns, filters=_feature_date_filters())
     selection = generate_one_strategy(
         features,
         strategy_name=strategy_name,
@@ -128,21 +146,85 @@ def _generate_and_save_selection(strategy_name):
 def _run_one_backtest(strategy_name):
     selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
     if not selection_path.exists():
-        raise FileNotFoundError(f"Missing selection file: {selection_path}")
+        print(f"Skip backtest {strategy_name}: selection file is missing")
+        return {
+            "status": "skipped",
+            "reason": "missing_selection_file",
+        }
     print(f"Backtest {strategy_name}")
     selection = pd.read_parquet(selection_path)
-    _, metrics, _ = run_backtest(
-        df_selection=selection,
-        initial_cash=BACKTEST_INITIAL_CASH,
-        risk_free_rate=BACKTEST_RISK_FREE_RATE,
-        show_plot=False,
-        strategy_name=strategy_name,
-        factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
-        compute_theoretical_upper_bound=False,
-    )
+    if selection.empty:
+        print(f"Skip backtest {strategy_name}: selection is empty")
+        del selection
+        return {
+            "status": "skipped",
+            "reason": "empty_selection",
+        }
+    try:
+        _, metrics, _ = run_backtest(
+            df_selection=selection,
+            initial_cash=BACKTEST_INITIAL_CASH,
+            risk_free_rate=BACKTEST_RISK_FREE_RATE,
+            show_plot=False,
+            strategy_name=strategy_name,
+            factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
+            compute_theoretical_upper_bound=False,
+            start_date=STRATEGY_START_DATE,
+            end_date=STRATEGY_END_DATE,
+        )
+    except ValueError as exc:
+        reason = _classify_backtest_skip_reason(exc)
+        if reason is None:
+            raise
+        print(f"Skip backtest {strategy_name}: {reason}")
+        return {
+            "status": "skipped",
+            "reason": reason,
+        }
     record = metrics_to_record(strategy_name, metrics)
-    del selection, metrics
-    return record
+    return {
+        "status": "ok",
+        "record": record,
+    }
+
+
+def _save_skipped_backtest_report(rows):
+    if not rows:
+        return None
+    output = BACKTEST_SKIPPED_STRATEGIES_CSV
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    if output.exists():
+        existing = pd.read_csv(output)
+        frame = pd.concat([existing, frame], ignore_index=True, sort=False)
+    frame = frame.drop_duplicates(
+        subset=["strategy", "reason", "configured_start_date", "configured_end_date"],
+        keep="last",
+    )
+    frame.to_csv(output, index=False, encoding="utf-8-sig")
+    print(f"Saved skipped backtest report: {output}")
+    return output
+
+
+def _skipped_backtest_row(strategy_name, reason):
+    identity = window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE)
+    return {
+        "strategy": strategy_name,
+        "reason": str(reason),
+        "configured_start_date": identity["start_date"],
+        "configured_end_date": identity["end_date"],
+    }
+
+
+def _classify_backtest_skip_reason(exc: Exception) -> str | None:
+    message = str(exc)
+    if "selection is empty" in message:
+        return "empty_selection"
+    if "has no selections inside configured date window" in message:
+        return "date_window_empty"
+    if "df_selection missing required columns" in message:
+        return "backtest_input_invalid"
+    return None
 
 
 def _append_batch_summary(records):
@@ -184,6 +266,10 @@ def build_strategy_summary(summary_df):
 def metrics_to_record(strategy_name, metrics):
     metric_map = dict(zip(metrics["metric"], metrics["value"]))
     record = {"strategy": strategy_name}
+    record.update({
+        f"configured_{key}": value
+        for key, value in window_identity(STRATEGY_START_DATE, STRATEGY_END_DATE).items()
+    })
     for key, value in metric_map.items():
         record[key] = value
     for col in [
@@ -203,6 +289,15 @@ def metrics_to_record(strategy_name, metrics):
 def _existing_columns(columns):
     schema_cols = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
     return [col for col in columns if col in schema_cols]
+
+
+def _feature_date_filters():
+    filters = []
+    if STRATEGY_START_DATE is not None:
+        filters.append(("date", ">=", pd.Timestamp(STRATEGY_START_DATE)))
+    if STRATEGY_END_DATE is not None:
+        filters.append(("date", "<=", pd.Timestamp(STRATEGY_END_DATE)))
+    return filters or None
 
 
 if __name__ == "__main__":

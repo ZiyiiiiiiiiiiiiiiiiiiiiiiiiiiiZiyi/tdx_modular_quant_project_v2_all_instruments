@@ -6,10 +6,16 @@ import argparse
 import importlib.util
 import socket
 
+from config import (
+    EXTERNAL_DIAGNOSIS_DEPENDENCIES,
+    EXTERNAL_DIAGNOSIS_HOSTS,
+    EXTERNAL_DIAGNOSIS_SOCKET_TIMEOUT_SECONDS,
+    EXTERNAL_DIAGNOSIS_TCP_ENDPOINTS,
+)
 
-DEPENDENCIES = ("baostock", "mootdx")
-HOSTS = ("public-api.baostock.com", "down.tdx.com.cn")
-TCP_ENDPOINTS = (("public-api.baostock.com", 10030),)
+DEPENDENCIES = EXTERNAL_DIAGNOSIS_DEPENDENCIES
+HOSTS = EXTERNAL_DIAGNOSIS_HOSTS
+TCP_ENDPOINTS = EXTERNAL_DIAGNOSIS_TCP_ENDPOINTS
 
 
 def diagnose():
@@ -29,7 +35,10 @@ def diagnose():
             failures.append(f"NETWORK_OR_VPN_DNS:{host}")
     for host, port in TCP_ENDPOINTS:
         try:
-            with socket.create_connection((host, port), timeout=5):
+            with socket.create_connection(
+                (host, port),
+                timeout=EXTERNAL_DIAGNOSIS_SOCKET_TIMEOUT_SECONDS,
+            ):
                 print(f"{host}:{port}: TCP_OK")
         except OSError as exc:
             print(f"{host}:{port}: TCP_FAILED {type(exc).__name__}: {exc}")

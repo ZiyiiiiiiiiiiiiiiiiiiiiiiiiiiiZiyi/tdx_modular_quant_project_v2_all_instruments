@@ -24,9 +24,12 @@ from functions.execution.valuation import (
     build_blocked_order_valuation_ledger,
     valuation_discount_by_date,
 )
+from functions.benchmark import build_benchmark_return_frame
 from functions.governance import research_status_dict
+from functions.event_and_hedge import estimate_static_alpha_beta
 from functions.metrics import calc_backtest_metrics
 from functions.performance_charts import save_performance_diagnostics
+from functions.date_window import assert_date_window, filter_date_window, normalize_date_window
 
 try:
     import matplotlib.pyplot as plt
@@ -45,6 +48,14 @@ LEARNING_METADATA_COLUMNS = [
 ]
 
 _FEATURE_DATA_CACHE = None
+RISK_MONITOR_FEATURE_COLUMNS = [
+    "sector_parent",
+    "is_hot_sector",
+    "ret_20",
+    "volatility_20",
+    "close_to_ma20",
+    "amount_ratio_20",
+]
 
 
 def prepare_daily_returns(feature_data):
@@ -67,6 +78,8 @@ def run_backtest(
     strategy_name="strategy",
     factor_description=None,
     compute_theoretical_upper_bound=True,
+    start_date=None,
+    end_date=None,
 ):
     """
     Backtest one strategy by expanding rebalance selections into daily holdings.
@@ -86,15 +99,45 @@ def run_backtest(
     if df_sel.empty:
         raise ValueError(f"Strategy {strategy_name} selection is empty")
 
-    df_sel["rebalance_date"] = pd.to_datetime(df_sel["rebalance_date"])
+    backtest_start_date, backtest_end_date = normalize_date_window(start_date, end_date)
+    df_sel = filter_date_window(
+        df_sel,
+        "rebalance_date",
+        start_date=backtest_start_date,
+        end_date=backtest_end_date,
+    )
+    if df_sel.empty:
+        raise ValueError(
+            f"Strategy {strategy_name} has no selections inside configured date window "
+            f"{backtest_start_date.date() if backtest_start_date is not None else '-'} -> "
+            f"{backtest_end_date.date() if backtest_end_date is not None else '-'}"
+        )
+    assert_date_window(
+        df_sel,
+        "rebalance_date",
+        start_date=backtest_start_date,
+        end_date=backtest_end_date,
+        label=f"backtest selection {strategy_name}",
+    )
     returns["date"] = pd.to_datetime(returns["date"])
     feature_data["date"] = pd.to_datetime(feature_data["date"])
     df_sel = df_sel.sort_values(["rebalance_date", "symbol"]).copy()
+    selection_meta = _build_selection_metadata(df_sel, strategy_name=strategy_name)
 
     df_sel = _apply_weight_constraints(df_sel, max_weight=max_weight)
 
     rebalance_dates = pd.Series(df_sel["rebalance_date"].drop_duplicates().sort_values()).reset_index(drop=True)
     all_trade_dates = pd.Series(returns["date"].drop_duplicates().sort_values()).reset_index(drop=True)
+    if backtest_start_date is not None:
+        all_trade_dates = all_trade_dates[all_trade_dates >= backtest_start_date].reset_index(drop=True)
+        rebalance_dates = rebalance_dates[rebalance_dates >= backtest_start_date].reset_index(drop=True)
+    if backtest_end_date is not None:
+        all_trade_dates = all_trade_dates[all_trade_dates <= backtest_end_date].reset_index(drop=True)
+        rebalance_dates = rebalance_dates[rebalance_dates <= backtest_end_date].reset_index(drop=True)
+        if rebalance_dates.empty:
+            raise ValueError(f"Strategy {strategy_name} has no rebalance dates on or before {backtest_end_date.date() if backtest_end_date is not None else '-'}")
+        if all_trade_dates.empty:
+            raise ValueError(f"Strategy {strategy_name} has no trade dates on or before {backtest_end_date.date() if backtest_end_date is not None else '-'}")
 
     period_frames = []
     oracle_period_frames = []
@@ -108,6 +151,8 @@ def run_backtest(
             if idx + 1 < len(rebalance_dates)
             else all_trade_dates.max()
         )
+        if backtest_end_date is not None:
+            next_rebalance = min(pd.Timestamp(next_rebalance), backtest_end_date)
         period_dates = all_trade_dates[
             (all_trade_dates > rebalance_date) & (all_trade_dates <= next_rebalance)
         ]
@@ -286,6 +331,36 @@ def run_backtest(
     for key, value in research_status_dict().items():
         daily_result[key] = value
 
+    benchmark_frame, benchmark_meta = build_benchmark_return_frame(feature_data)
+    benchmark_frame = benchmark_frame.copy()
+    if not benchmark_frame.empty:
+        daily_result = daily_result.merge(benchmark_frame, on="date", how="left")
+        daily_result["benchmark_return"] = pd.to_numeric(
+            daily_result["benchmark_return"], errors="coerce"
+        ).fillna(0.0)
+        daily_result["benchmark_nav"] = pd.to_numeric(
+            daily_result["benchmark_nav"], errors="coerce"
+        ).ffill()
+        if daily_result["benchmark_nav"].dropna().empty:
+            daily_result["benchmark_nav"] = (1.0 + daily_result["benchmark_return"]).cumprod() * initial_cash
+        else:
+            daily_result["benchmark_nav"] = daily_result["benchmark_nav"].fillna(
+                (1.0 + daily_result["benchmark_return"]).cumprod()
+            ) * initial_cash
+        daily_result["excess_daily_return"] = daily_result["daily_return"] - daily_result["benchmark_return"]
+        benchmark_stats = estimate_static_alpha_beta(
+            daily_result[["date", "daily_return"]],
+            daily_result[["date", "benchmark_return"]],
+        )
+        benchmark_excess_return = benchmark_stats["excess_return"]
+        benchmark_status = benchmark_meta["benchmark_status"]
+    else:
+        daily_result["benchmark_return"] = np.nan
+        daily_result["benchmark_nav"] = np.nan
+        daily_result["excess_daily_return"] = np.nan
+        benchmark_excess_return = np.nan
+        benchmark_status = f"blocked: {benchmark_meta['benchmark_status']}"
+
     theoretical_summary = None
     if oracle_period_frames:
         theoretical_daily = _build_daily_result(
@@ -303,6 +378,21 @@ def run_backtest(
     metrics, drawdown = calc_backtest_metrics(
         daily_result=daily_result,
         risk_free_rate=risk_free_rate,
+    )
+    metrics = pd.concat(
+        [
+            metrics,
+            pd.DataFrame(
+                {
+                    "metric": ["configured_start_date", "configured_end_date"],
+                    "value": [
+                        backtest_start_date.date().isoformat() if backtest_start_date is not None else None,
+                        backtest_end_date.date().isoformat() if backtest_end_date is not None else None,
+                    ],
+                }
+            ),
+        ],
+        ignore_index=True,
     )
     gross_nav = (1 + daily_result["gross_daily_return"]).cumprod() * initial_cash
     order_ledger = pd.concat(order_ledger_parts, ignore_index=True) if order_ledger_parts else pd.DataFrame()
@@ -342,6 +432,14 @@ def run_backtest(
     base_cost_ratio = float(daily_result["transaction_cost"].sum())
     gross_total_return = gross_nav.iloc[-1] / float(initial_cash) - 1 if len(gross_nav) else np.nan
     status = research_status_dict()
+    risk_monitor_summary, risk_monitor_detail = _build_risk_monitoring_outputs(df_sel, feature_data)
+    final_degradation_parts = [
+        flag for flag in str(selection_meta.get("degradation_flags", "")).split("|")
+        if str(flag).strip()
+    ]
+    if benchmark_frame.empty and "benchmark_unavailable" not in final_degradation_parts:
+        final_degradation_parts.append("benchmark_unavailable")
+
     execution_metrics = pd.DataFrame(
         {
             "metric": [
@@ -357,9 +455,47 @@ def run_backtest(
                 "liquidatable_total_return",
                 "economic_total_return",
                 "benchmark_excess_return",
+                "benchmark_status",
+                "crowding_top_sector_weight",
+                "crowding_hot_sector_weight",
+                "crowding_unique_sector_count",
+                "exposure_ret_20_tilt",
+                "exposure_volatility_20_tilt",
+                "exposure_close_to_ma20_tilt",
+                "exposure_amount_ratio_20_tilt",
                 "cost_sensitivity_low_return",
                 "cost_sensitivity_base_return",
                 "cost_sensitivity_high_return",
+                "strategy_source",
+                "weighting_mode",
+                "price_basis",
+                "neutralization_mode",
+                "ml_runtime_mode",
+                "requested_model",
+                "runtime_model",
+                "date_window",
+                "strategy_params_version",
+                "strategy_params_hash",
+                "training_window_days",
+                "training_sample_count",
+                "label_purge_periods",
+                "prior_p",
+                "prior_strength",
+                "prior_source",
+                "posterior_alpha",
+                "posterior_beta",
+                "posterior_sample_count",
+                "signal_candidate_count",
+                "signal_trigger_count",
+                "signal_trigger_rate",
+                "adjustment_coverage_ratio",
+                "adjustment_coverage_threshold",
+                "price_basis_selection_mode",
+                "degradation_flags",
+                "degradation_count",
+                "top1_weight",
+                "top5_weight_sum",
+                "effective_n",
                 "research_mode",
                 "formal_status",
                 "formal_eligible",
@@ -378,10 +514,48 @@ def run_backtest(
                 final_cash_drag,
                 daily_result["liquidatable_nav"].iloc[-1] / float(initial_cash) - 1,
                 daily_result["economic_nav"].iloc[-1] / float(initial_cash) - 1,
-                np.nan,
+                benchmark_excess_return,
+                benchmark_status,
+                risk_monitor_summary.get("crowding_top_sector_weight", np.nan),
+                risk_monitor_summary.get("crowding_hot_sector_weight", np.nan),
+                risk_monitor_summary.get("crowding_unique_sector_count", np.nan),
+                risk_monitor_summary.get("exposure_ret_20_tilt", np.nan),
+                risk_monitor_summary.get("exposure_volatility_20_tilt", np.nan),
+                risk_monitor_summary.get("exposure_close_to_ma20_tilt", np.nan),
+                risk_monitor_summary.get("exposure_amount_ratio_20_tilt", np.nan),
                 gross_total_return - 0.5 * base_cost_ratio,
                 gross_total_return - base_cost_ratio,
                 gross_total_return - 2.0 * base_cost_ratio,
+                selection_meta["strategy_source"],
+                selection_meta["weighting_mode"],
+                selection_meta["price_basis"],
+                selection_meta["neutralization_mode"],
+                selection_meta["ml_runtime_mode"],
+                selection_meta["requested_model"],
+                selection_meta["runtime_model"],
+                selection_meta["date_window"],
+                selection_meta["strategy_params_version"],
+                selection_meta["strategy_params_hash"],
+                selection_meta["training_window_days"],
+                selection_meta["training_sample_count"],
+                selection_meta["label_purge_periods"],
+                selection_meta["prior_p"],
+                selection_meta["prior_strength"],
+                selection_meta["prior_source"],
+                selection_meta["posterior_alpha"],
+                selection_meta["posterior_beta"],
+                selection_meta["posterior_sample_count"],
+                selection_meta["signal_candidate_count"],
+                selection_meta["signal_trigger_count"],
+                selection_meta["signal_trigger_rate"],
+                selection_meta["adjustment_coverage_ratio"],
+                selection_meta["adjustment_coverage_threshold"],
+                selection_meta["price_basis_selection_mode"],
+                "|".join(final_degradation_parts),
+                len(final_degradation_parts),
+                selection_meta["top1_weight"],
+                selection_meta["top5_weight_sum"],
+                selection_meta["effective_n"],
                 status["research_mode"],
                 status["formal_status"],
                 status["formal_eligible"],
@@ -391,7 +565,30 @@ def run_backtest(
         }
     )
     metrics = pd.concat([metrics, execution_metrics], ignore_index=True)
-    daily_result["drawdown"] = drawdown.values
+    daily_result["drawdown"] = drawdown.reindex(daily_result.index).fillna(0.0).values
+    for key in [
+        "strategy_source",
+        "weighting_mode",
+        "price_basis",
+        "neutralization_mode",
+        "ml_runtime_mode",
+        "requested_model",
+        "runtime_model",
+        "date_window",
+        "strategy_params_version",
+        "strategy_params_hash",
+        "price_basis_selection_mode",
+        "prior_source",
+        "degradation_flags",
+    ]:
+        if key == "degradation_flags":
+            daily_result[key] = "|".join(final_degradation_parts)
+        else:
+            daily_result[key] = selection_meta[key]
+    daily_result["benchmark_status"] = benchmark_status
+    daily_result["benchmark_excess_return"] = benchmark_excess_return
+    daily_result["benchmark_id"] = benchmark_meta.get("benchmark_id", "")
+    daily_result["benchmark_symbol"] = benchmark_meta.get("benchmark_symbol", "")
     holdings_record = daily_result[["date", "holding_count"]].copy()
     liquidity_report = build_liquidity_lock_report(
         pd.concat(delayed_orders, ignore_index=True) if delayed_orders else pd.DataFrame()
@@ -408,6 +605,7 @@ def run_backtest(
     tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}.csv"
     cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}.csv"
     valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}.csv"
+    risk_monitor_csv = RESULT_DIR / f"risk_monitoring_{strategy_name}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)
@@ -419,6 +617,7 @@ def run_backtest(
         ["date", "initial_cash", "net_value", "liquidatable_nav", "economic_nav", "valuation_discount_amount"]
     ].to_csv(cash_ledger_csv, index=False, encoding="utf-8-sig")
     valuation_ledger.to_csv(valuation_ledger_csv, index=False, encoding="utf-8-sig")
+    risk_monitor_detail.to_csv(risk_monitor_csv, index=False, encoding="utf-8-sig")
     _save_learning_metadata(df_sel, learning_meta_csv)
     if not liquidity_report.empty:
         save_liquidity_lock_report(
@@ -441,6 +640,7 @@ def run_backtest(
         strategy_name=strategy_name,
         output_dir=RESULT_DIR,
         selection=df_sel,
+        feature_data=feature_data,
     )
 
     print("\n========== Backtest Result ==========")
@@ -475,6 +675,7 @@ def run_backtest(
     print("Saved tax ledger:", tax_ledger_csv)
     print("Saved cash ledger:", cash_ledger_csv)
     print("Saved valuation ledger:", valuation_ledger_csv)
+    print("Saved risk monitoring:", risk_monitor_csv)
     if learning_meta_csv.exists():
         print("Saved learning metadata:", learning_meta_csv)
     if not liquidity_report.empty:
@@ -484,6 +685,93 @@ def run_backtest(
         print(f"Saved {label}:", path)
 
     return daily_result, metrics, holdings_record
+
+
+def _build_selection_metadata(df_selection, *, strategy_name: str) -> dict:
+    def _first_non_empty(column_name, default):
+        if column_name not in df_selection.columns:
+            return default
+        series = df_selection[column_name].dropna().astype(str)
+        series = series[series.str.len() > 0]
+        return series.iloc[0] if not series.empty else default
+
+    def _grouped_numeric_average(column_name, default=np.nan):
+        if column_name not in df_selection.columns:
+            return default
+        values = []
+        if "rebalance_date" in df_selection.columns and not df_selection.empty:
+            for _, group in df_selection.groupby("rebalance_date", sort=False):
+                series = pd.to_numeric(group[column_name], errors="coerce").dropna()
+                if not series.empty:
+                    values.append(float(series.iloc[0]))
+        else:
+            series = pd.to_numeric(df_selection[column_name], errors="coerce").dropna()
+            if not series.empty:
+                values.extend(series.astype(float).tolist())
+        return float(np.mean(values)) if values else default
+
+    weights = pd.to_numeric(df_selection.get("weight", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+    grouped_weights = []
+    if "rebalance_date" in df_selection.columns and not df_selection.empty:
+        for _, group in df_selection.groupby("rebalance_date", sort=False):
+            group_weights = pd.to_numeric(group.get("weight", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
+            if group_weights.empty:
+                continue
+            sorted_weights = group_weights.sort_values(ascending=False).reset_index(drop=True)
+            top1 = float(sorted_weights.iloc[0]) if len(sorted_weights) else 0.0
+            top5 = float(sorted_weights.head(5).sum())
+            effective_n = float(1.0 / np.square(sorted_weights).sum()) if np.square(sorted_weights).sum() > 0 else 0.0
+            grouped_weights.append((top1, top5, effective_n))
+    if grouped_weights:
+        top1_weight = float(np.mean([item[0] for item in grouped_weights]))
+        top5_weight_sum = float(np.mean([item[1] for item in grouped_weights]))
+        effective_n = float(np.mean([item[2] for item in grouped_weights]))
+    else:
+        top1_weight = float(weights.max()) if not weights.empty else 0.0
+        top5_weight_sum = float(weights.sort_values(ascending=False).head(5).sum()) if not weights.empty else 0.0
+        effective_n = float(1.0 / np.square(weights).sum()) if np.square(weights).sum() > 0 else 0.0
+
+    degradation_parts = []
+    if "degradation_flags" in df_selection.columns:
+        for value in df_selection["degradation_flags"].fillna("").astype(str):
+            for flag in value.split("|"):
+                flag = flag.strip()
+                if flag and flag not in degradation_parts:
+                    degradation_parts.append(flag)
+
+    return {
+        "strategy": strategy_name,
+        "strategy_source": _first_non_empty("strategy_source", "unknown"),
+        "weighting_mode": _first_non_empty("weighting_mode", "equal_weight"),
+        "price_basis": _first_non_empty("price_basis", _first_non_empty("feature_price_source", "nominal_unadjusted")),
+        "neutralization_mode": _first_non_empty("neutralization_mode", "winsor_only"),
+        "ml_runtime_mode": _first_non_empty("ml_runtime_mode", "not_applicable"),
+        "requested_model": _first_non_empty("requested_model", ""),
+        "runtime_model": _first_non_empty("runtime_model", ""),
+        "date_window": _first_non_empty("date_window", ""),
+        "strategy_params_version": _first_non_empty("strategy_params_version", ""),
+        "strategy_params_hash": _first_non_empty("strategy_params_hash", ""),
+        "training_window_days": _grouped_numeric_average("training_window_days"),
+        "training_sample_count": _grouped_numeric_average("training_sample_count"),
+        "label_purge_periods": _grouped_numeric_average("label_purge_periods"),
+        "prior_p": _grouped_numeric_average("prior_p"),
+        "prior_strength": _grouped_numeric_average("prior_strength"),
+        "prior_source": _first_non_empty("prior_source", ""),
+        "posterior_alpha": _grouped_numeric_average("posterior_alpha"),
+        "posterior_beta": _grouped_numeric_average("posterior_beta"),
+        "posterior_sample_count": _grouped_numeric_average("posterior_sample_count"),
+        "signal_candidate_count": _grouped_numeric_average("signal_candidate_count"),
+        "signal_trigger_count": _grouped_numeric_average("signal_trigger_count"),
+        "signal_trigger_rate": _grouped_numeric_average("signal_trigger_rate"),
+        "adjustment_coverage_ratio": _grouped_numeric_average("adjustment_coverage_ratio"),
+        "adjustment_coverage_threshold": _grouped_numeric_average("adjustment_coverage_threshold"),
+        "price_basis_selection_mode": _first_non_empty("price_basis_selection_mode", ""),
+        "degradation_flags": "|".join(degradation_parts),
+        "degradation_count": len(degradation_parts),
+        "top1_weight": top1_weight,
+        "top5_weight_sum": top5_weight_sum,
+        "effective_n": effective_n,
+    }
 
 
 def _plot_equity_curve(
@@ -709,10 +997,151 @@ def _load_feature_data():
             "rough_limit_up",
             "rough_limit_down",
         ]
+        wanted_columns.extend(RISK_MONITOR_FEATURE_COLUMNS)
         available_columns = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
+        wanted_columns.extend(
+            sorted(
+                col
+                for col in available_columns
+                if str(col).startswith("future_ret_")
+            )
+        )
         columns = [col for col in wanted_columns if col in available_columns]
         _FEATURE_DATA_CACHE = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=columns)
     return _FEATURE_DATA_CACHE.copy()
+
+
+def _build_risk_monitoring_outputs(df_selection, feature_data):
+    columns = [
+        "rebalance_date",
+        "symbol",
+        "weight",
+        "sector_parent",
+        "is_hot_sector",
+        "ret_20",
+        "volatility_20",
+        "close_to_ma20",
+        "amount_ratio_20",
+        "universe_ret_20_mean",
+        "universe_volatility_20_mean",
+        "universe_close_to_ma20_mean",
+        "universe_amount_ratio_20_mean",
+        "top_sector_weight",
+        "hot_sector_weight",
+        "unique_sector_count",
+        "exposure_ret_20_tilt",
+        "exposure_volatility_20_tilt",
+        "exposure_close_to_ma20_tilt",
+        "exposure_amount_ratio_20_tilt",
+    ]
+    if df_selection is None or df_selection.empty or "rebalance_date" not in df_selection.columns:
+        return {key: np.nan for key in columns if key != "rebalance_date" and key != "symbol"}, pd.DataFrame(columns=columns)
+
+    selection = df_selection.copy()
+    selection["rebalance_date"] = pd.to_datetime(selection["rebalance_date"], errors="coerce")
+    selection["symbol"] = selection["symbol"].astype(str)
+    selection["weight"] = pd.to_numeric(selection.get("weight"), errors="coerce").fillna(0.0)
+
+    feature_cols = ["date", "symbol", *[col for col in RISK_MONITOR_FEATURE_COLUMNS if col in feature_data.columns]]
+    snapshot = feature_data.loc[:, feature_cols].copy()
+    snapshot["date"] = pd.to_datetime(snapshot["date"], errors="coerce")
+    snapshot["symbol"] = snapshot["symbol"].astype(str)
+
+    merged = selection.merge(
+        snapshot,
+        left_on=["rebalance_date", "symbol"],
+        right_on=["date", "symbol"],
+        how="left",
+    )
+    universe = snapshot[snapshot["date"].isin(merged["rebalance_date"].dropna().unique())].copy()
+
+    exposure_rows = []
+    for rebalance_date, group in merged.groupby("rebalance_date", sort=True):
+        weights = pd.to_numeric(group["weight"], errors="coerce").fillna(0.0)
+        if float(weights.sum()) > 0:
+            weights = weights / float(weights.sum())
+        day_universe = universe[universe["date"] == rebalance_date]
+        sector_column = _monitor_column_name(group, "sector_parent")
+        hot_column = _monitor_column_name(group, "is_hot_sector")
+        sector_series = (
+            group.get(sector_column, pd.Series("", index=group.index))
+            .fillna("")
+            .astype(str)
+            .replace("", pd.NA)
+        )
+        if sector_series.dropna().empty:
+            top_sector_weight = np.nan
+            unique_sector_count = np.nan
+        else:
+            sector_weight = group.assign(weight=weights).groupby(sector_series)["weight"].sum()
+            top_sector_weight = float(sector_weight.max()) if not sector_weight.empty else np.nan
+            unique_sector_count = float(sector_series.dropna().nunique())
+
+        hot_series = group.get(hot_column, pd.Series(pd.NA, index=group.index))
+        hot_numeric = pd.Series(hot_series).astype("boolean")
+        hot_sector_weight = (
+            float(weights[hot_numeric.fillna(False).astype(bool)].sum())
+            if hot_numeric.notna().any()
+            else np.nan
+        )
+
+        row = {
+            "rebalance_date": rebalance_date,
+            "symbol": "",
+            "weight": float(weights.sum()),
+            "sector_parent": "",
+            "is_hot_sector": pd.NA,
+            "ret_20": pd.NA,
+            "volatility_20": pd.NA,
+            "close_to_ma20": pd.NA,
+            "amount_ratio_20": pd.NA,
+            "top_sector_weight": top_sector_weight,
+            "hot_sector_weight": hot_sector_weight,
+            "unique_sector_count": unique_sector_count,
+        }
+        for col in ["ret_20", "volatility_20", "close_to_ma20", "amount_ratio_20"]:
+            selected_mean = _weighted_average(group.get(_monitor_column_name(group, col)), weights)
+            universe_mean = pd.to_numeric(day_universe.get(col), errors="coerce").dropna().mean() if col in day_universe.columns else np.nan
+            row[f"universe_{col}_mean"] = universe_mean
+            row[f"exposure_{col}_tilt"] = selected_mean - universe_mean if pd.notna(selected_mean) and pd.notna(universe_mean) else np.nan
+        exposure_rows.append(row)
+
+    detail = pd.DataFrame(exposure_rows, columns=columns)
+    summary = {
+        "crowding_top_sector_weight": float(pd.to_numeric(detail.get("top_sector_weight"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "crowding_hot_sector_weight": float(pd.to_numeric(detail.get("hot_sector_weight"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "crowding_unique_sector_count": float(pd.to_numeric(detail.get("unique_sector_count"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "exposure_ret_20_tilt": float(pd.to_numeric(detail.get("exposure_ret_20_tilt"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "exposure_volatility_20_tilt": float(pd.to_numeric(detail.get("exposure_volatility_20_tilt"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "exposure_close_to_ma20_tilt": float(pd.to_numeric(detail.get("exposure_close_to_ma20_tilt"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+        "exposure_amount_ratio_20_tilt": float(pd.to_numeric(detail.get("exposure_amount_ratio_20_tilt"), errors="coerce").dropna().mean()) if not detail.empty else np.nan,
+    }
+    return summary, detail
+
+
+def _weighted_average(values, weights):
+    if values is None:
+        return np.nan
+    series = pd.to_numeric(pd.Series(values), errors="coerce")
+    weight_series = pd.to_numeric(pd.Series(weights), errors="coerce")
+    valid = series.notna() & weight_series.notna()
+    if not valid.any():
+        return np.nan
+    clean_weights = weight_series[valid].fillna(0.0)
+    denom = float(clean_weights.sum())
+    if denom <= 0:
+        return np.nan
+    return float((series[valid] * clean_weights).sum() / denom)
+
+
+def _monitor_column_name(frame: pd.DataFrame, base_name: str) -> str:
+    if base_name in frame.columns:
+        return base_name
+    for suffix in ("_y", "_x"):
+        candidate = f"{base_name}{suffix}"
+        if candidate in frame.columns:
+            return candidate
+    return base_name
 
 
 def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_date, initial_cash):

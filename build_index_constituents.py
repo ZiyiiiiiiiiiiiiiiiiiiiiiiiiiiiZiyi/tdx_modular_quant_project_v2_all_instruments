@@ -11,6 +11,12 @@ import argparse
 
 import pandas as pd
 
+from config import (
+    INDEX_CONSTITUENT_COVERAGE_END_DATE,
+    INDEX_CONSTITUENT_COVERAGE_START_DATE,
+    INDEX_CONSTITUENT_DEFAULT_SOURCE,
+    assert_valid_configuration,
+)
 from functions.data_sources.index_constituents_provider import (
     fetch_current_csindex_constituents_with_akshare,
     merge_constituent_snapshot,
@@ -29,17 +35,18 @@ from functions.investable_universe import (
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["akshare", "file"], default="akshare")
+    parser.add_argument("--source", choices=["akshare", "file"], default=INDEX_CONSTITUENT_DEFAULT_SOURCE)
     parser.add_argument("--input", default=None, help="CSV/XLSX file for --source file.")
     parser.add_argument("--output", default=str(INDEX_CONSTITUENTS_PARQUET))
     parser.add_argument("--append", action="store_true", help="Append current snapshot and close disappeared names.")
     parser.add_argument("--asof-date", default=None)
-    parser.add_argument("--start-date", default="2024-09-23", help="Coverage report start date.")
-    parser.add_argument("--end-date", default=None, help="Coverage report end date. Defaults to asof/today.")
+    parser.add_argument("--start-date", default=INDEX_CONSTITUENT_COVERAGE_START_DATE, help="Coverage report start date.")
+    parser.add_argument("--end-date", default=INDEX_CONSTITUENT_COVERAGE_END_DATE, help="Coverage report end date.")
     return parser.parse_args()
 
 
 def main():
+    assert_valid_configuration()
     args = parse_args()
     asof = pd.Timestamp(args.asof_date or pd.Timestamp.today().normalize())
     if args.source == "file":

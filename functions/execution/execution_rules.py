@@ -19,10 +19,42 @@ REQUIRED_ORDER_COLUMNS = [
 ]
 
 
+def normalize_a_share_symbol(symbol) -> str:
+    return str(symbol).strip().lower()
+
+
+def infer_a_share_board(symbol) -> str:
+    normalized = normalize_a_share_symbol(symbol)
+    code = normalized[2:]
+    market = normalized[:2]
+    if market == "bj":
+        return "bse"
+    if code.startswith(("688", "689")):
+        return "star"
+    if code.startswith(("300", "301")):
+        return "chinext"
+    return "main_board"
+
+
+def infer_st_flag(*, is_st=None, name=None) -> bool:
+    if pd.notna(is_st):
+        if isinstance(is_st, str):
+            normalized = is_st.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "st"}:
+                return True
+            if normalized in {"0", "false", "no", "n", ""}:
+                return False
+        return bool(is_st)
+    if pd.isna(name):
+        return False
+    normalized_name = str(name).strip().upper().replace(" ", "")
+    return normalized_name.startswith("ST") or normalized_name.startswith("*ST")
+
+
 def a_share_price_limit_ratio(symbol, *, is_st=False):
     """Return configured daily price-limit ratio for common A-share boards."""
-    code = str(symbol).strip().lower()[2:]
-    market = str(symbol).strip().lower()[:2]
+    code = normalize_a_share_symbol(symbol)[2:]
+    market = normalize_a_share_symbol(symbol)[:2]
     if is_st:
         return 0.05
     if market == "bj":
@@ -30,6 +62,16 @@ def a_share_price_limit_ratio(symbol, *, is_st=False):
     if code.startswith(("300", "301", "688", "689")):
         return 0.20
     return 0.10
+
+
+def build_price_limit_metadata(symbol, *, is_st=None, name=None) -> dict:
+    st_flag = infer_st_flag(is_st=is_st, name=name)
+    board = infer_a_share_board(symbol)
+    return {
+        "board_type": board,
+        "is_st": bool(st_flag),
+        "price_limit_ratio": float(a_share_price_limit_ratio(symbol, is_st=st_flag)),
+    }
 
 
 def rounded_price_limit(previous_close, ratio, direction):

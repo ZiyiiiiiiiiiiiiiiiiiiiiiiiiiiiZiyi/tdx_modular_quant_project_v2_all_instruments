@@ -33,7 +33,7 @@ ORDER_COLUMNS = [
 class RulesBasedPresidentPolicy:
     """Convert ranked candidates and hard constraints into one daily plan."""
 
-    def __init__(self, *, enable_sector_cap: bool = True, enable_safety_agent: bool = True):
+    def __init__(self, *, enable_sector_cap: bool = False, enable_safety_agent: bool = True):
         self.enable_sector_cap = bool(enable_sector_cap)
         self.enable_safety_agent = bool(enable_safety_agent)
         self.portfolio_constructor = PortfolioConstructionCommittee(enable_sector_cap=enable_sector_cap)
@@ -70,13 +70,13 @@ class RulesBasedPresidentPolicy:
                 held_symbols.append(symbol)
         ranked_symbols = eligible.loc[
             eligible["candidate_rank"] <= int(context.entry_rank_limit)
-        ].sort_values(["alpha_score", "symbol"], ascending=[False, True])["symbol"].tolist()
+        ].sort_values(["primary_score", "symbol"], ascending=[False, True])["symbol"].tolist()
         selected_symbols = list(dict.fromkeys(held_symbols))
         for symbol in ranked_symbols:
             if symbol not in selected_symbols and len(selected_symbols) < int(context.top_n):
                 selected_symbols.append(symbol)
         selected = eligible[eligible["symbol"].isin(selected_symbols)].copy()
-        selected = selected.sort_values(["alpha_score", "symbol"], ascending=[False, True])
+        selected = selected.sort_values(["primary_score", "symbol"], ascending=[False, True])
         allocated, allocation_diagnostics = self.portfolio_constructor.construct(
             selected,
             exposure_cap=allocatable_cap,
@@ -172,7 +172,7 @@ class RulesBasedPresidentPolicy:
         safety_ranked = sorted(
             (
                 (
-                    float(candidate_index.at[symbol, "alpha_score"]) if symbol in candidate_index.index else float("-inf"),
+                    float(candidate_index.at[symbol, "primary_score"]) if symbol in candidate_index.index else float("-inf"),
                     symbol,
                     weight,
                 )
@@ -260,8 +260,10 @@ def _prepare_candidates(candidates):
     data["alpha_collapse_exit"] = data.get("alpha_collapse_exit", False)
     data["expected_return_5d"] = data.get("expected_return_5d", pd.NA)
     data["aggregate_confidence"] = data.get("aggregate_confidence", pd.NA)
+    data["primary_score"] = data.get("primary_score", data["alpha_score"])
+    data["score_authority"] = data.get("score_authority", "exploratory_alpha_fallback")
     if "candidate_rank" not in data.columns:
-        ordered = data.sort_values(["alpha_score", "symbol"], ascending=[False, True]).index
+        ordered = data.sort_values(["primary_score", "symbol"], ascending=[False, True]).index
         data.loc[ordered, "candidate_rank"] = range(1, len(data) + 1)
     return data
 

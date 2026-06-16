@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 
+from functions.quality_checks import add_quality_flags
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.execution_rules import (
     REQUIRED_ORDER_COLUMNS,
     apply_a_share_constraints,
     a_share_price_limit_ratio,
+    build_price_limit_metadata,
     classify_daily_limit_feasibility,
+    infer_a_share_board,
+    infer_st_flag,
     normalize_order_frame,
     rounded_price_limit,
 )
@@ -125,6 +129,49 @@ def verify_execution_rules():
         failures.append("daily limit feasibility classification mismatch")
     else:
         print("[PASS] one-price board and high-uncertainty classification correct")
+
+    if infer_a_share_board("sz300001") != "chinext":
+        failures.append("board classifier should detect ChiNext")
+    if infer_a_share_board("sh688001") != "star":
+        failures.append("board classifier should detect STAR")
+    if infer_a_share_board("bj430001") != "bse":
+        failures.append("board classifier should detect BSE")
+    if infer_st_flag(name="*ST测试") is not True:
+        failures.append("name-based ST inference should detect *ST prefixes")
+    limit_meta = build_price_limit_metadata("sz300001", is_st=False)
+    if limit_meta["board_type"] != "chinext" or float(limit_meta["price_limit_ratio"]) != 0.20:
+        failures.append("price-limit metadata should expose board type and ratio together")
+    if not any("board classifier" in item or "ST inference" in item or "metadata should" in item for item in failures):
+        print("[PASS] board/ST metadata helpers correct")
+
+    price_sample = pd.DataFrame(
+        [
+            {"date": "2024-01-02", "symbol": "sh600000", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-03", "symbol": "sh600000", "open": 11.0, "high": 11.0, "low": 10.8, "close": 11.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-02", "symbol": "sz300001", "open": 20.0, "high": 20.2, "low": 19.8, "close": 20.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-03", "symbol": "sz300001", "open": 24.0, "high": 24.0, "low": 23.5, "close": 24.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-02", "symbol": "bj430001", "open": 30.0, "high": 30.1, "low": 29.9, "close": 30.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-03", "symbol": "bj430001", "open": 39.0, "high": 39.0, "low": 38.8, "close": 39.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-02", "symbol": "sh600001", "name": "*ST样本", "open": 10.0, "high": 10.1, "low": 9.9, "close": 10.0, "amount": 1000.0, "volume": 100.0},
+            {"date": "2024-01-03", "symbol": "sh600001", "name": "*ST样本", "open": 10.5, "high": 10.5, "low": 10.2, "close": 10.5, "amount": 1000.0, "volume": 100.0},
+        ]
+    )
+    quality = add_quality_flags(price_sample)
+    expected_limit_hits = {
+        "sh600000": ("main_board", 0.10, True),
+        "sz300001": ("chinext", 0.20, True),
+        "bj430001": ("bse", 0.30, True),
+        "sh600001": ("main_board", 0.05, True),
+    }
+    latest_rows = quality.sort_values("date").groupby("symbol").tail(1).set_index("symbol")
+    for symbol, (board_type, ratio, limit_hit) in expected_limit_hits.items():
+        row = latest_rows.loc[symbol]
+        if str(row["board_type"]) != board_type or abs(float(row["price_limit_ratio"]) - ratio) > 1e-9:
+            failures.append(f"quality flags should store board/ratio for {symbol}")
+        if bool(row["rough_limit_up"]) != limit_hit:
+            failures.append(f"quality limit-up detection mismatch for {symbol}")
+    if not any("quality flags should store board/ratio" in item or "quality limit-up detection mismatch" in item for item in failures):
+        print("[PASS] quality flags use board-aware rounded price limits")
 
     print()
     if failures:

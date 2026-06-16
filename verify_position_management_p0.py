@@ -17,6 +17,7 @@ from functions.decision_council.position_management import (
 
 
 def main():
+    _verify_position_managed_required_columns()
     _verify_strategy_signal_contract()
     _verify_aggregation_and_conflict()
     _verify_kelly_field_semantics()
@@ -24,6 +25,15 @@ def main():
     _verify_a500_coverage_rule()
     _verify_emergency_risk_discount_bypass()
     print("Position management P0 verification passed.")
+
+
+def _verify_position_managed_required_columns():
+    from functions.feature_engineering import required_feature_columns_for_strategy
+
+    required = set(required_feature_columns_for_strategy("position_managed_kelly"))
+    missing = {"open", "high", "low", "close", "volume"} - required
+    assert not missing, f"position-managed low-memory contract misses OHLCV: {sorted(missing)}"
+    print("[PASS] position-managed low-memory contract includes OHLCV")
 
 
 def _verify_strategy_signal_contract():
@@ -77,14 +87,14 @@ def _verify_kelly_field_semantics():
         payoff_ratio=2.0,
         risk_discount=0.5,
         exposure_cap=1.0,
-        kelly_scale=0.25,
+        kelly_scale=0.50,
         single_stock_cap=0.20,
     )
     assert abs(sizing["kelly_raw"] - 0.4) < 1e-12
-    assert sizing["kelly_scale"] == 0.25
+    assert sizing["kelly_scale"] == 0.50
     assert sizing["risk_discount"] == 0.5
-    assert abs(sizing["kelly_adjusted"] - 0.05) < 1e-12
-    assert abs(sizing["target_weight"] - 0.05) < 1e-12
+    assert abs(sizing["kelly_adjusted"] - 0.10) < 1e-12
+    assert abs(sizing["target_weight"] - 0.10) < 1e-12
     assert sizing["kelly_score"] == sizing["target_weight"]
     print("[PASS] Kelly field semantics are fixed and formula precedence is correct")
 
@@ -191,7 +201,7 @@ def _verify_emergency_risk_discount_bypass():
 
 
 def _signals():
-    return pd.DataFrame(
+    data = pd.DataFrame(
         [
             {
                 "strategy_id": "macd",
@@ -246,6 +256,20 @@ def _signals():
             },
         ]
     )
+    data["strategy_version"] = "test_v1"
+    data["group_id"] = data["strategy_id"].map(
+        {"macd": "trend", "rsi": "reversal", "turtle": "trend"}
+    )
+    data["event_id"] = [
+        f"{strategy_id}:{symbol}:{index}"
+        for index, (strategy_id, symbol) in enumerate(
+            zip(data["strategy_id"], data["symbol"]), start=1
+        )
+    ]
+    data["reference_date"] = pd.to_datetime(data["tradeable_timestamp"]) + pd.offsets.BDay(20)
+    data["data_version"] = "test_data_v1"
+    data["parameter_version"] = "test_params_v1"
+    return data
 
 
 if __name__ == "__main__":

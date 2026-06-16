@@ -92,7 +92,10 @@ def convert_tdx_daily(limit=None):
     data = data.sort_values(["symbol", "date"])
     data.to_parquet(RAW_DAILY_PARQUET, index=False)
 
-    pd.DataFrame(failed).to_csv(FAILED_CODES_CSV, index=False, encoding="utf-8-sig")
+    if failed:
+        pd.DataFrame(failed).to_csv(FAILED_CODES_CSV, index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame(columns=["market", "code", "symbol", "instrument_type", "file_path", "error"]).to_csv(FAILED_CODES_CSV, index=False, encoding="utf-8-sig")
 
     print("Saved raw daily data:", RAW_DAILY_PARQUET)
     print("Shape:", data.shape)

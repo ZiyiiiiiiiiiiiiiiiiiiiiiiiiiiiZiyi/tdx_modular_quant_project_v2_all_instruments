@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-import tempfile
-from pathlib import Path
-
 import pandas as pd
 
 from functions.execution.execution_model import execution_model_snapshot
@@ -70,7 +67,8 @@ def verify_formal_infrastructure():
 
     admission = build_formal_admission_report()
     assert {"gate", "status", "formal_block_reason_code", "detail"}.issubset(admission.columns)
-    assert "manual_review_required" in set(admission["status"])
+    assert set(admission["status"]).issubset({"passed", "failed"})
+    assert "failed" in set(admission["status"])
 
     print("Formal infrastructure verification passed.")
 

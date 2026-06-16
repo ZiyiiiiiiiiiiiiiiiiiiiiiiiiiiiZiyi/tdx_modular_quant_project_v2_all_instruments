@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from config import GOVERNANCE_STREAM_BATCH_SIZE
+from config import GOVERNANCE_STREAM_BATCH_SIZE, assert_valid_configuration
 from functions.decision_council.industrial_pipeline import run_industrial_governance_build
 
 
@@ -15,6 +15,7 @@ def parse_args():
 
 
 def main():
+    assert_valid_configuration()
     args = parse_args()
     print("========== Serial Governance Industrial Build P2-P7 ==========")
     print("Arrow batch size:", args.batch_size)

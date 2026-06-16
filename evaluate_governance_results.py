@@ -14,9 +14,6 @@ from functions.decision_council.evaluation import evaluate_phase_two_admission
 BASELINES = {
     "mom_lowvol": RESULT_DIR / "backtest_daily_result_mom_lowvol.csv",
     "ml_elasticnet": RESULT_DIR / "backtest_daily_result_ml_elasticnet.csv",
-    "equal_weight_alpha_ensemble": GOVERNANCE_OUTPUT_DIR / "equal_weight_alpha_ensemble" / "governance_daily_result.csv",
-    "rules_based_president_without_sector_cap": GOVERNANCE_OUTPUT_DIR / "rules_based_president_without_sector_cap" / "governance_daily_result.csv",
-    "rules_based_president_without_safety_agent": GOVERNANCE_OUTPUT_DIR / "rules_based_president_without_safety_agent" / "governance_daily_result.csv",
 }
 
 

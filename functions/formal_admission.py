@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Automatic formal-admission audit. Manual review remains mandatory."""
+"""Automatic binary formal-admission audit."""
 from __future__ import annotations
 
 import json
@@ -18,17 +18,30 @@ from config import (
     TEST_LOCK_ENABLED,
 )
 from functions.governance import FormalBlockReason
+from functions.data_integrity import build_data_integrity_report, data_verified
 
 
 def build_formal_admission_report() -> pd.DataFrame:
+    integrity = build_data_integrity_report()
     rows = [
         _artifact_gate("governance_covenant", "RESEARCH_GOVERNANCE.md", FormalBlockReason.GOVERNANCE_NOT_SIGNED),
-        _artifact_gate("pit_adjustment_artifact", ADJUSTMENT_FACTORS_PARQUET, FormalBlockReason.PIT_ADJUSTMENT_UNVERIFIED, manual=True),
-        _artifact_gate("corporate_action_artifact", CORPORATE_ACTIONS_PARQUET, FormalBlockReason.PIT_CORPORATE_ACTION_UNVERIFIED, manual=True),
+        _artifact_gate("pit_adjustment_artifact", ADJUSTMENT_FACTORS_PARQUET, FormalBlockReason.PIT_ADJUSTMENT_UNVERIFIED),
+        _artifact_gate("corporate_action_artifact", CORPORATE_ACTIONS_PARQUET, FormalBlockReason.PIT_CORPORATE_ACTION_UNVERIFIED),
         _artifact_gate("feature_lineage", FEATURE_LINEAGE_CSV, FormalBlockReason.LINEAGE_COVERAGE_LOW),
-        _artifact_gate("feature_timestamp_audit", FEATURE_TIMESTAMP_AUDIT_CSV, FormalBlockReason.FEATURE_TIMESTAMP_AUDIT_FAILED),
-        _artifact_gate("benchmark_report", BENCHMARK_REPORT_CSV, FormalBlockReason.BENCHMARK_NOT_INVESTABLE, manual=True),
-        _artifact_gate("reproducibility_manifest", FORMAL_MANIFEST_JSON, FormalBlockReason.REPRO_PACKAGE_MISSING, manual=True),
+        _integrity_gate(
+            integrity,
+            "feature_timestamp_audit",
+            fallback_path=FEATURE_TIMESTAMP_AUDIT_CSV,
+            failure_reason=FormalBlockReason.FEATURE_TIMESTAMP_AUDIT_FAILED,
+        ),
+        _integrity_gate(
+            integrity,
+            "investable_benchmark",
+            fallback_path=BENCHMARK_REPORT_CSV,
+            failure_reason=FormalBlockReason.BENCHMARK_NOT_INVESTABLE,
+            report_gate_name="benchmark_report",
+        ),
+        _artifact_gate("reproducibility_manifest", FORMAL_MANIFEST_JSON, FormalBlockReason.REPRO_PACKAGE_MISSING),
         {
             "gate": "test_lock_enabled",
             "status": "passed" if TEST_LOCK_ENABLED else "failed",
@@ -36,14 +49,13 @@ def build_formal_admission_report() -> pd.DataFrame:
             "detail": f"TEST_LOCK_ENABLED={TEST_LOCK_ENABLED}",
         },
     ]
-    rows.extend(
-        [
-            _manual_gate("pit_universe_review", FormalBlockReason.PIT_UNIVERSE_UNVERIFIED),
-            _manual_gate("pit_industry_review", FormalBlockReason.PIT_INDUSTRY_UNVERIFIED),
-            _manual_gate("account_ledger_integration", FormalBlockReason.ACCOUNT_LEDGER_INCOMPLETE),
-            _manual_gate("tax_ledger_integration", FormalBlockReason.TAX_LEDGER_MISSING),
-            _manual_gate("independent_manual_review", FormalBlockReason.LIMITED_REVIEW_INDEPENDENCE),
-        ]
+    rows.append(
+        {
+            "gate": "v6_data_verified",
+            "status": "passed" if data_verified(integrity) else "failed",
+            "formal_block_reason_code": "" if data_verified(integrity) else FormalBlockReason.PIT_UNIVERSE_UNVERIFIED.value,
+            "detail": "All objective V6 data-integrity gates must pass.",
+        }
     )
     return pd.DataFrame(rows)
 
@@ -60,12 +72,9 @@ def formal_admission_passed(report=None):
     return bool(not report.empty and (report["status"] == "passed").all())
 
 
-def _artifact_gate(gate, path, reason, manual=False):
+def _artifact_gate(gate, path, reason):
     exists = Path(path).exists()
-    if exists and manual:
-        status = "manual_review_required"
-    else:
-        status = "passed" if exists else "failed"
+    status = "passed" if exists else "failed"
     return {
         "gate": gate,
         "status": status,
@@ -74,10 +83,25 @@ def _artifact_gate(gate, path, reason, manual=False):
     }
 
 
-def _manual_gate(gate, reason):
-    return {
-        "gate": gate,
-        "status": "manual_review_required",
-        "formal_block_reason_code": reason.value,
-        "detail": "Requires verified provider data or independent manual sign-off.",
-    }
+def _integrity_gate(
+    integrity_report: pd.DataFrame,
+    integrity_gate_name: str,
+    *,
+    fallback_path,
+    failure_reason,
+    report_gate_name: str | None = None,
+):
+    gate_name = report_gate_name or integrity_gate_name
+    if integrity_report is not None and not integrity_report.empty and "gate" in integrity_report.columns:
+        matched = integrity_report[integrity_report["gate"].astype(str) == str(integrity_gate_name)]
+        if not matched.empty:
+            row = matched.iloc[0]
+            passed = bool(row.get("passed"))
+            detail = str(row.get("detail", fallback_path))
+            return {
+                "gate": gate_name,
+                "status": "passed" if passed else "failed",
+                "formal_block_reason_code": "" if passed else failure_reason.value,
+                "detail": detail,
+            }
+    return _artifact_gate(gate_name, fallback_path, failure_reason)

@@ -221,6 +221,7 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
     target_col = _target_column(module_name, reward_method)
     target_horizon = _target_horizon(module_name, reward_method)
     rows = []
+    diagnostics = []
 
     ordered_dates = pd.to_datetime(pd.Series(rebalance_dates)).sort_values()
     for rebalance_date in progress_iter(
@@ -236,11 +237,41 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
         train_data = data.loc[train_mask].copy()
         predict_data = data.loc[predict_mask].copy()
         if train_data.empty or predict_data.empty:
+            diagnostics.append(
+                _learning_diagnostic_row(
+                    strategy_id=f"{module_name}_{reward_method}_{profile_name}",
+                    module_name=module_name,
+                    reward_method=reward_method,
+                    profile_name=profile_name,
+                    rebalance_date=rebalance_date,
+                    lookback_days=profile["lookback_days"],
+                    required_min_train_rows=profile["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="empty_train_or_predict",
+                )
+            )
             continue
 
         train_data[target_col] = train_data[target_col].replace([np.inf, -np.inf], np.nan)
         train_data = train_data.dropna(subset=[target_col, "symbol"])
         if len(train_data) < profile["min_train_rows"]:
+            diagnostics.append(
+                _learning_diagnostic_row(
+                    strategy_id=f"{module_name}_{reward_method}_{profile_name}",
+                    module_name=module_name,
+                    reward_method=reward_method,
+                    profile_name=profile_name,
+                    rebalance_date=rebalance_date,
+                    lookback_days=profile["lookback_days"],
+                    required_min_train_rows=profile["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="insufficient_train_rows",
+                )
+            )
             continue
 
         feature_cols = _select_feature_columns(
@@ -249,6 +280,21 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
             max_features=profile["max_features"],
         )
         if not feature_cols:
+            diagnostics.append(
+                _learning_diagnostic_row(
+                    strategy_id=f"{module_name}_{reward_method}_{profile_name}",
+                    module_name=module_name,
+                    reward_method=reward_method,
+                    profile_name=profile_name,
+                    rebalance_date=rebalance_date,
+                    lookback_days=profile["lookback_days"],
+                    required_min_train_rows=profile["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="no_feature_columns",
+                )
+            )
             continue
 
         if module_name == "classic_ml":
@@ -282,10 +328,27 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
         scored["qubit_count"] = profile["qubit_count"] if module_name == "quantum_inspired" else 0
         scored["fitted_feature_count"] = len(feature_cols)
         scored["feature_list"] = ",".join(feature_cols)
+        scored["training_sample_count"] = len(train_data)
         rows.append(scored)
+        diagnostics.append(
+            _learning_diagnostic_row(
+                strategy_id=f"{module_name}_{reward_method}_{profile_name}",
+                module_name=module_name,
+                reward_method=reward_method,
+                profile_name=profile_name,
+                rebalance_date=rebalance_date,
+                lookback_days=profile["lookback_days"],
+                required_min_train_rows=profile["min_train_rows"],
+                actual_train_rows=len(train_data),
+                predict_rows=len(predict_data),
+                status="scored",
+                skip_reason="",
+                fitted_feature_count=len(feature_cols),
+            )
+        )
 
     if not rows:
-        return pd.DataFrame(
+        empty = pd.DataFrame(
             columns=[
                 "date",
                 "symbol",
@@ -299,10 +362,47 @@ def _score_one_strategy(data, rebalance_dates, module_name, reward_method, profi
                 "qubit_count",
                 "fitted_feature_count",
                 "feature_list",
+                "training_sample_count",
             ]
         )
+        empty.attrs["training_diagnostics"] = pd.DataFrame(diagnostics)
+        return empty
 
-    return pd.concat(rows, ignore_index=True)
+    result = pd.concat(rows, ignore_index=True)
+    result.attrs["training_diagnostics"] = pd.DataFrame(diagnostics)
+    return result
+
+
+def _learning_diagnostic_row(
+    *,
+    strategy_id,
+    module_name,
+    reward_method,
+    profile_name,
+    rebalance_date,
+    lookback_days,
+    required_min_train_rows,
+    actual_train_rows,
+    predict_rows,
+    status,
+    skip_reason,
+    fitted_feature_count=0,
+):
+    return {
+        "model_family": "learning_strategy",
+        "strategy_id": str(strategy_id),
+        "module_name": str(module_name),
+        "reward_method": str(reward_method),
+        "profile_name": str(profile_name),
+        "rebalance_date": pd.Timestamp(rebalance_date),
+        "lookback_days": int(lookback_days),
+        "required_min_train_rows": int(required_min_train_rows),
+        "actual_train_rows": int(actual_train_rows),
+        "predict_rows": int(predict_rows),
+        "status": str(status),
+        "skip_reason": str(skip_reason),
+        "fitted_feature_count": int(fitted_feature_count),
+    }
 
 
 def _select_feature_columns(train_data, target_col, max_features):

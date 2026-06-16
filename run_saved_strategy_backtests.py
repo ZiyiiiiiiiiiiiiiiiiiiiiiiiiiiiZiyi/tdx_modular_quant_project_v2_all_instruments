@@ -8,7 +8,14 @@ from __future__ import annotations
 
 import pandas as pd
 
-from config import BACKTEST_INITIAL_CASH, BACKTEST_RISK_FREE_RATE, PROCESSED_DIR, RESULT_DIR
+from config import (
+    BACKTEST_INITIAL_CASH,
+    BACKTEST_RISK_FREE_RATE,
+    PROCESSED_DIR,
+    RESULT_DIR,
+    STRATEGY_END_DATE,
+    STRATEGY_START_DATE,
+)
 from functions.backtest_engine import run_backtest
 from main import build_strategy_summary, metrics_to_record
 from functions.report_builder import build_strategy_report, save_strategy_report
@@ -38,6 +45,8 @@ def main():
             strategy_name=strategy_name,
             factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
             compute_theoretical_upper_bound=False,
+            start_date=STRATEGY_START_DATE,
+            end_date=STRATEGY_END_DATE,
         )
         records.append(metrics_to_record(strategy_name, metrics))
 

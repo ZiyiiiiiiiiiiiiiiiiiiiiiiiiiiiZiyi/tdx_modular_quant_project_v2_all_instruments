@@ -8,6 +8,7 @@ from pathlib import Path
 
 from config import (
     ADJUSTMENT_FACTORS_PARQUET,
+    BENCHMARK_REPORT_CSV,
     CORPORATE_ACTIONS_PARQUET,
     FORMAL_MODE_NAME,
     MARKET_CAP_PARQUET,
@@ -74,6 +75,7 @@ class ResearchStatus:
 
 
 def default_fallback_disclosures() -> list[FallbackDisclosure]:
+    benchmark_disclosure = _benchmark_fallback_disclosure()
     return [
         FallbackDisclosure(
             "PIT adjustment factors",
@@ -111,12 +113,7 @@ def default_fallback_disclosures() -> list[FallbackDisclosure]:
             "The live backtest does not yet maintain a complete tax ledger or holding-period dividend-tax model.",
             FormalBlockReason.TAX_LEDGER_MISSING.value,
         ),
-        FallbackDisclosure(
-            "Investable benchmark",
-            "Print strategy metrics without asserting a formal ranking.",
-            "Investable benchmark artifacts are not attached.",
-            FormalBlockReason.BENCHMARK_NOT_INVESTABLE.value,
-        ),
+        benchmark_disclosure,
         FallbackDisclosure(
             "Independent review",
             "Keep results exploratory and require a future reviewer timestamp or signature before formal release.",
@@ -155,7 +152,7 @@ def build_research_status() -> ResearchStatus:
         formal_block_reason_detail="; ".join(item.reason for item in disclosures),
         data_manifest_id="runtime_manifest_pending",
         execution_model_version=EXECUTION_MODEL_VERSION,
-        benchmark_id="investable_benchmark_pending",
+        benchmark_id=_resolved_benchmark_id(),
         review_status="independent_review_pending",
     )
 
@@ -201,3 +198,40 @@ def print_runtime_disclosure() -> None:
     else:
         print("No substitute content was used.")
     print("===============================================")
+
+
+def _benchmark_fallback_disclosure() -> FallbackDisclosure:
+    report_path = Path(BENCHMARK_REPORT_CSV)
+    if report_path.exists():
+        try:
+            import pandas as pd
+
+            report = pd.read_csv(report_path)
+        except Exception:
+            report = None
+        if report is not None and not report.empty and {"benchmark_id", "symbol", "status"}.issubset(report.columns):
+            available = report[report["status"].astype(str).str.lower() == "available"].copy()
+            if not available.empty:
+                row = available.iloc[0]
+                benchmark_id = str(row.get("benchmark_id", ""))
+                symbol = str(row.get("symbol", ""))
+                return FallbackDisclosure(
+                    "Investable benchmark",
+                    "Use the attached tradable ETF benchmark for exploratory excess-return comparison, but keep formal ranking blocked pending audited benchmark governance.",
+                    f"Exploratory benchmark comparison is available via {benchmark_id}:{symbol}, but formal benchmark admission and review sign-off are not complete.",
+                    FormalBlockReason.BENCHMARK_NOT_INVESTABLE.value,
+                )
+    return FallbackDisclosure(
+        "Investable benchmark",
+        "Print strategy metrics without asserting a formal ranking.",
+        "Investable benchmark artifacts are not attached.",
+        FormalBlockReason.BENCHMARK_NOT_INVESTABLE.value,
+    )
+
+
+def _resolved_benchmark_id() -> str:
+    disclosure = _benchmark_fallback_disclosure()
+    text = disclosure.reason
+    if "via " in text:
+        return text.split("via ", 1)[1].split(",", 1)[0].strip()
+    return "investable_benchmark_pending"

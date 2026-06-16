@@ -5,11 +5,14 @@ import pandas as pd
 
 from config import (
     SAFETY_CRISIS_DRAWDOWN,
+    SAFETY_CRISIS_CONFIRM_DAYS,
     SAFETY_CRISIS_LIQUIDITY_STRESS,
     SAFETY_HIGH_DRAWDOWN,
+    SAFETY_HIGH_CONFIRM_DAYS,
     SAFETY_HIGH_LIQUIDITY_STRESS,
     SAFETY_PROXY_MAX_LAG_DAYS,
     SAFETY_WARNING_DRAWDOWN,
+    SAFETY_WARNING_CONFIRM_DAYS,
     SAFETY_WARNING_LIQUIDITY_STRESS,
 )
 from functions.decision_council.contracts import SafetyDecision
@@ -53,7 +56,9 @@ class RuleBasedSafetyAgent:
             lag_days = _lag_days(result["benchmark_drawdown_5d"])
             result["benchmark_drawdown_5d"] = result["benchmark_drawdown_5d"].ffill(limit=SAFETY_PROXY_MAX_LAG_DAYS)
             result["risk_level_lag_days"] = lag_days
-        result["risk_level"] = result.apply(self._risk_level, axis=1)
+        result["raw_risk_level"] = result.apply(self._risk_level, axis=1)
+        result["trigger_source"] = result.apply(self._trigger_source, axis=1)
+        result["risk_level"], result["trigger_streak_days"] = _confirmed_risk_levels(result["raw_risk_level"])
         result["exposure_cap"] = result["risk_level"].map(
             {"normal": 1.0, "warning": 0.7, "high": 0.3, "crisis": 0.0}
         )
@@ -73,6 +78,9 @@ class RuleBasedSafetyAgent:
             proxy_mode=self.proxy_mode,
             risk_level_lag_days=int(row.get("risk_level_lag_days", 0)),
             degraded=bool(row.get("degraded", False)),
+            raw_risk_level=str(row.get("raw_risk_level", row["risk_level"])),
+            trigger_source=str(row.get("trigger_source", "normal")),
+            trigger_streak_days=int(row.get("trigger_streak_days", 0)),
         )
 
     @staticmethod
@@ -90,6 +98,31 @@ class RuleBasedSafetyAgent:
             return "warning"
         return "normal"
 
+    def _trigger_source(self, row) -> str:
+        drawdown = _optional_float(row.get("benchmark_drawdown_5d"))
+        stress = float(row["market_liquidity_stress_ratio"])
+        level = self._risk_level(row)
+        if level == "normal":
+            return "normal"
+        drawdown_hit = False
+        liquidity_hit = False
+        if level == "warning":
+            drawdown_hit = drawdown is not None and drawdown >= SAFETY_WARNING_DRAWDOWN
+            liquidity_hit = stress >= SAFETY_WARNING_LIQUIDITY_STRESS
+        elif level == "high":
+            drawdown_hit = drawdown is not None and drawdown >= SAFETY_HIGH_DRAWDOWN
+            liquidity_hit = stress >= SAFETY_HIGH_LIQUIDITY_STRESS
+        elif level == "crisis":
+            drawdown_hit = drawdown is not None and drawdown >= SAFETY_CRISIS_DRAWDOWN
+            liquidity_hit = stress >= SAFETY_CRISIS_LIQUIDITY_STRESS
+        if drawdown_hit and liquidity_hit:
+            return "both"
+        if drawdown_hit:
+            return "drawdown_only"
+        if liquidity_hit:
+            return "liquidity_only"
+        return "normal"
+
 
 def _optional_float(value) -> float | None:
     return None if pd.isna(value) else float(value)
@@ -102,3 +135,30 @@ def _lag_days(series: pd.Series) -> pd.Series:
         current = current + 1 if pd.isna(value) else 0
         lag.append(current)
     return pd.Series(lag, index=series.index, dtype=int)
+
+
+def _confirmed_risk_levels(raw_levels: pd.Series) -> tuple[pd.Series, pd.Series]:
+    order = {"normal": 0, "warning": 1, "high": 2, "crisis": 3}
+    reverse = {value: key for key, value in order.items()}
+    confirms = {
+        1: int(SAFETY_WARNING_CONFIRM_DAYS),
+        2: int(SAFETY_HIGH_CONFIRM_DAYS),
+        3: int(SAFETY_CRISIS_CONFIRM_DAYS),
+    }
+    confirmed = []
+    streaks = []
+    consecutive = {1: 0, 2: 0, 3: 0}
+    for raw_level in raw_levels.fillna("normal").astype(str):
+        score = order.get(raw_level, 0)
+        for threshold in (1, 2, 3):
+            consecutive[threshold] = consecutive[threshold] + 1 if score >= threshold else 0
+        confirmed_score = 0
+        confirmed_streak = 0
+        for threshold in (3, 2, 1):
+            if consecutive[threshold] >= confirms[threshold]:
+                confirmed_score = threshold
+                confirmed_streak = consecutive[threshold]
+                break
+        confirmed.append(reverse[confirmed_score])
+        streaks.append(confirmed_streak)
+    return pd.Series(confirmed, index=raw_levels.index), pd.Series(streaks, index=raw_levels.index, dtype=int)

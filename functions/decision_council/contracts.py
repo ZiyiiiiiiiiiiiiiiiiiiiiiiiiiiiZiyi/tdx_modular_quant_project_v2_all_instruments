@@ -18,6 +18,9 @@ class SafetyDecision:
     proxy_mode: str
     risk_level_lag_days: int = 0
     degraded: bool = False
+    raw_risk_level: str = "normal"
+    trigger_source: str = "normal"
+    trigger_streak_days: int = 0
 
 
 @dataclass(frozen=True)

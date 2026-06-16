@@ -16,6 +16,9 @@ from functions.investable_universe import (
 from functions.metrics import calc_backtest_metrics
 from functions.performance_charts import save_performance_diagnostics
 from functions.position_managed_selection import generate_position_managed_selection
+from functions.strategy_registry import STRATEGY_REGISTRY
+from functions.strategy_signal_generators import build_technical_strategy_features
+from config import GOVERNANCE_ALPHA_MODEL_FEATURES
 
 
 def main():
@@ -24,6 +27,7 @@ def main():
     _verify_universe(features, constituents)
     selection, ledger = _verify_position_managed_selection(features, constituents)
     _verify_events_and_hedge(constituents)
+    _verify_expanded_technical_strategies(features)
     _verify_metrics_and_charts(selection)
     print("Full upgrade requirement verification passed.")
 
@@ -86,6 +90,27 @@ def _verify_events_and_hedge(constituents):
     assert hedge.get_available_notional("2024-01-01") == 0.0
     assert hedge.get_hedge_cost("2024-01-01").tracking_error_rate == 0.0
     print("[PASS] event-driven timestamps and alpha-hedge research stub")
+
+
+def _verify_expanded_technical_strategies(features):
+    expanded = build_technical_strategy_features(features)
+    strategy_columns = {
+        "eod_close_strength": "score_eod_close_strength",
+        "limit_up_follow": "score_limit_up_follow",
+        "macd_cross": "score_macd_cross",
+        "ma_cross": "score_ma_cross",
+        "price_volume_breakout": "score_price_volume_breakout",
+        "consecutive_decline_rebound": "score_consecutive_decline_rebound",
+        "holiday_effect": "score_holiday_effect",
+        "kdj_oversold_cross": "score_kdj_oversold_cross",
+        "low_volume_pullback": "score_low_volume_pullback",
+    }
+    assert {"ema_20", "kdj_k", "kdj_d", "kdj_j"}.issubset(expanded.columns)
+    for strategy_name, score_col in strategy_columns.items():
+        assert strategy_name in STRATEGY_REGISTRY
+        assert score_col in expanded.columns
+        assert GOVERNANCE_ALPHA_MODEL_FEATURES[strategy_name] == score_col
+    print("[PASS] expanded technical indicators and Kelly/governance strategy registration")
 
 
 def _verify_metrics_and_charts(selection):

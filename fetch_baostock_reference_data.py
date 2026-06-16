@@ -15,6 +15,17 @@ from config import (
     RAW_EXTERNAL_DIR,
     REPORT_DIR,
     START_DATE,
+    EXTERNAL_DATA_BATCH_DELAY_SECONDS,
+    EXTERNAL_DATA_BATCH_SIZE,
+    EXTERNAL_DATA_DIVIDEND_BATCH_SIZE,
+    EXTERNAL_DATA_END_DATE,
+    EXTERNAL_DATA_FACTOR_HISTORY_START,
+    EXTERNAL_DATA_LOGIN_RETRIES,
+    EXTERNAL_DATA_LOGIN_RETRY_DELAY_SECONDS,
+    EXTERNAL_DATA_REQUEST_DELAY_SECONDS,
+    EXTERNAL_DATA_SOCKET_TIMEOUT_SECONDS,
+    EXTERNAL_DATA_SYMBOL_LIMIT,
+    assert_valid_configuration,
 )
 from functions.data_sources.adjustment_factors import (
     save_adjustment_factors,
@@ -37,42 +48,44 @@ def eligible_stock_symbols(limit=None):
 
 
 def main():
+    assert_valid_configuration()
     parser = argparse.ArgumentParser()
     parser.add_argument("--start-date", default=START_DATE)
-    parser.add_argument("--factor-history-start", default="1990-01-01")
-    parser.add_argument("--end-date", default=pd.Timestamp.today().date().isoformat())
-    parser.add_argument("--limit", type=int, default=None, help="Validation subset only; omit for formal fetch.")
+    parser.add_argument("--factor-history-start", default=EXTERNAL_DATA_FACTOR_HISTORY_START)
+    parser.add_argument("--end-date", default=EXTERNAL_DATA_END_DATE)
+    parser.add_argument("--limit", type=int, default=EXTERNAL_DATA_SYMBOL_LIMIT, help="Validation subset only.")
     parser.add_argument("--skip-dividends", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=EXTERNAL_DATA_BATCH_SIZE)
     parser.add_argument(
         "--dividend-batch-size",
         type=int,
-        default=5,
+        default=EXTERNAL_DATA_DIVIDEND_BATCH_SIZE,
         help="Dividend symbols staged per checkpoint. Keep this small because each symbol queries multiple years.",
     )
     parser.add_argument(
         "--request-delay-seconds",
         type=float,
-        default=0.35,
+        default=EXTERNAL_DATA_REQUEST_DELAY_SECONDS,
         help="Pause between BaoStock symbol requests. BaoStock is sensitive to fast loops.",
     )
     parser.add_argument(
         "--batch-delay-seconds",
         type=float,
-        default=2.0,
+        default=EXTERNAL_DATA_BATCH_DELAY_SECONDS,
         help="Pause after each staged batch is written.",
     )
-    parser.add_argument("--login-retries", type=int, default=3)
-    parser.add_argument("--login-retry-delay-seconds", type=float, default=5.0)
+    parser.add_argument("--login-retries", type=int, default=EXTERNAL_DATA_LOGIN_RETRIES)
+    parser.add_argument("--login-retry-delay-seconds", type=float, default=EXTERNAL_DATA_LOGIN_RETRY_DELAY_SECONDS)
     parser.add_argument(
         "--socket-timeout-seconds",
         type=float,
-        default=30.0,
+        default=EXTERNAL_DATA_SOCKET_TIMEOUT_SECONDS,
         help="Abort a stalled BaoStock socket request so a later run can resume from staged data.",
     )
     parser.add_argument("--publish", action="store_true", help="Publish completed full-universe results.")
     parser.add_argument("--resume", action="store_true", help="Resume a staged fetch.")
     args = parser.parse_args()
+    args.end_date = args.end_date or pd.Timestamp.today().date().isoformat()
     if args.publish and args.limit is not None:
         raise ValueError("A limited validation fetch cannot be published as production data")
     symbols = eligible_stock_symbols(limit=args.limit)

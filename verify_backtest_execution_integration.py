@@ -50,7 +50,6 @@ def verify_backtest_execution_integration():
         feature_path = temp / "tdx_daily_features.parquet"
         feature_df.to_parquet(feature_path, index=False)
 
-        from config import FEATURE_DAILY_PARQUET as original_feature_path
         import functions.backtest_engine as backtest_engine_module
 
         old_feature_path = backtest_engine_module.FEATURE_DAILY_PARQUET

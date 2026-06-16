@@ -66,6 +66,16 @@ MODEL_CONFIGS = {
 }
 
 
+def runtime_model_name(model_type: str) -> str:
+    if model_type == "elasticnet":
+        return "elasticnet_linear_shrinkage"
+    if model_type == "xgboost":
+        return "xgboost_regressor" if USE_EXTERNAL_TREE_MODELS and xgb is not None else "linear_shrinkage_xgb_proxy"
+    if model_type == "lightgbm":
+        return "lightgbm_regressor" if USE_EXTERNAL_TREE_MODELS and lgb is not None else "linear_shrinkage_lgb_proxy"
+    raise ValueError("model_type must be 'elasticnet', 'xgboost', or 'lightgbm'")
+
+
 def list_ml_baseline_models():
     return tuple(MODEL_CONFIGS.keys())
 
@@ -101,6 +111,7 @@ def compute_factor(
     config = MODEL_CONFIGS[model_type]
     rebalance_index = _normalize_rebalance_dates(data=data, rebalance_dates=rebalance_dates)
     rows = []
+    diagnostics = []
 
     progress_step(f"ML factor {model_type}: rebalance dates={len(rebalance_index)}")
     for rebalance_date in progress_iter(
@@ -116,6 +127,19 @@ def compute_factor(
         train_data = data.loc[train_mask].copy()
         predict_data = data.loc[predict_mask].copy()
         if train_data.empty or predict_data.empty:
+            diagnostics.append(
+                _diagnostic_row(
+                    model_family="ml_baseline",
+                    strategy_id=model_type,
+                    rebalance_date=rebalance_date,
+                    lookback_days=lookback_days,
+                    required_min_train_rows=config["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="empty_train_or_predict",
+                )
+            )
             continue
 
         train_data[DEFAULT_TARGET_COL] = train_data[DEFAULT_TARGET_COL].replace(
@@ -124,6 +148,19 @@ def compute_factor(
         )
         train_data = train_data.dropna(subset=[DEFAULT_TARGET_COL, "symbol"])
         if len(train_data) < config["min_train_rows"]:
+            diagnostics.append(
+                _diagnostic_row(
+                    model_family="ml_baseline",
+                    strategy_id=model_type,
+                    rebalance_date=rebalance_date,
+                    lookback_days=lookback_days,
+                    required_min_train_rows=config["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="insufficient_train_rows",
+                )
+            )
             continue
 
         feature_cols = _select_feature_columns(
@@ -131,6 +168,19 @@ def compute_factor(
             max_features=config["max_features"],
         )
         if not feature_cols:
+            diagnostics.append(
+                _diagnostic_row(
+                    model_family="ml_baseline",
+                    strategy_id=model_type,
+                    rebalance_date=rebalance_date,
+                    lookback_days=lookback_days,
+                    required_min_train_rows=config["min_train_rows"],
+                    actual_train_rows=len(train_data),
+                    predict_rows=len(predict_data),
+                    status="skipped",
+                    skip_reason="no_feature_columns",
+                )
+            )
             continue
 
         scores = _fit_predict_model(
@@ -145,27 +195,92 @@ def compute_factor(
         scored = predict_data[["date", "symbol"]].copy()
         scored["score_ml"] = scores
         scored["ml_model"] = model_type
+        scored["requested_model"] = model_type
+        scored["runtime_model"] = runtime_model_name(model_type)
+        scored["ml_runtime_mode"] = "tree_model" if scored["runtime_model"].iloc[0].endswith("_regressor") else "proxy_model"
+        scored["ml_degradation_flag"] = (
+            "ml_tree_model_proxy_used"
+            if scored["ml_runtime_mode"].iloc[0] == "proxy_model" and model_type in {"xgboost", "lightgbm"}
+            else ""
+        )
         scored["training_window_days"] = lookback_days
         scored["label_purge_periods"] = DEFAULT_LABEL_HORIZON
         scored["fitted_feature_count"] = len(feature_cols)
         scored["feature_list"] = ",".join(feature_cols)
+        scored["training_sample_count"] = len(train_data)
         rows.append(scored)
+        diagnostics.append(
+            _diagnostic_row(
+                model_family="ml_baseline",
+                strategy_id=model_type,
+                rebalance_date=rebalance_date,
+                lookback_days=lookback_days,
+                required_min_train_rows=config["min_train_rows"],
+                actual_train_rows=len(train_data),
+                predict_rows=len(predict_data),
+                status="scored",
+                skip_reason="",
+                runtime_model=scored["runtime_model"].iloc[0],
+                requested_model=model_type,
+                fitted_feature_count=len(feature_cols),
+            )
+        )
 
     if not rows:
-        return pd.DataFrame(
+        empty = pd.DataFrame(
             columns=[
                 "date",
                 "symbol",
                 "score_ml",
                 "ml_model",
+                "requested_model",
+                "runtime_model",
+                "ml_runtime_mode",
+                "ml_degradation_flag",
                 "training_window_days",
                 "label_purge_periods",
                 "fitted_feature_count",
                 "feature_list",
+                "training_sample_count",
             ]
         )
+        empty.attrs["training_diagnostics"] = pd.DataFrame(diagnostics)
+        return empty
 
-    return pd.concat(rows, ignore_index=True)
+    result = pd.concat(rows, ignore_index=True)
+    result.attrs["training_diagnostics"] = pd.DataFrame(diagnostics)
+    return result
+
+
+def _diagnostic_row(
+    *,
+    model_family,
+    strategy_id,
+    rebalance_date,
+    lookback_days,
+    required_min_train_rows,
+    actual_train_rows,
+    predict_rows,
+    status,
+    skip_reason,
+    runtime_model="",
+    requested_model="",
+    fitted_feature_count=0,
+):
+    return {
+        "model_family": model_family,
+        "strategy_id": str(strategy_id),
+        "rebalance_date": pd.Timestamp(rebalance_date),
+        "lookback_days": int(lookback_days),
+        "required_min_train_rows": int(required_min_train_rows),
+        "actual_train_rows": int(actual_train_rows),
+        "predict_rows": int(predict_rows),
+        "status": str(status),
+        "skip_reason": str(skip_reason),
+        "requested_model": str(requested_model or strategy_id),
+        "runtime_model": str(runtime_model),
+        "fitted_feature_count": int(fitted_feature_count),
+    }
 
 
 def _prepare_ml_frame(df_factors, target_col):
