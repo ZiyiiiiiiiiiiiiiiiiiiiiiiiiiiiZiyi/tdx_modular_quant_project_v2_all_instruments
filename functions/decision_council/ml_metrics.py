@@ -5,14 +5,15 @@ Computes comprehensive metrics including:
 - Return, Sharpe, Calmar, Sortino
 - Max Drawdown
 - Win Rate
-- Buy/Sell Accuracy
-- PBO (Probability of Backtest Overfitting)
+- Buy/Sell counts
+- Negative block rate for single-run stability diagnostics
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
 
 def compute_comprehensive_metrics(daily_csv_path: str | Path) -> dict:
@@ -41,16 +42,20 @@ def compute_comprehensive_metrics(daily_csv_path: str | Path) -> dict:
         return {}
     
     nav = nav / float(nav.iloc[0])
-    daily_ret = nav.pct_change().fillna(0.0)
+    daily_ret = nav.pct_change(fill_method=None).fillna(0.0)
     n_days = len(nav)
     
     # Basic metrics
     total_return = float(nav.iloc[-1] - 1)
     annual_return = (1 + total_return) ** (252 / max(n_days, 1)) - 1
     annual_vol = float(daily_ret.std() * np.sqrt(252))
-    
-    # Sharpe
-    sharpe = annual_return / annual_vol if annual_vol > 0 else 0.0
+
+    daily_rf = 0.0
+    excess_daily_ret = daily_ret - daily_rf
+
+    # Standard daily excess-return Sharpe.
+    excess_mean_annual = float(excess_daily_ret.mean() * 252)
+    sharpe = excess_mean_annual / annual_vol if annual_vol > 0 else 0.0
     
     # Max Drawdown
     drawdown = nav / nav.cummax() - 1
@@ -60,9 +65,9 @@ def compute_comprehensive_metrics(daily_csv_path: str | Path) -> dict:
     calmar = annual_return / abs(max_dd) if max_dd != 0 else 0.0
     
     # Sortino
-    downside = daily_ret[daily_ret < 0]
+    downside = excess_daily_ret[excess_daily_ret < 0]
     downside_vol = float(downside.std() * np.sqrt(252)) if len(downside) > 0 else 0.0
-    sortino = annual_return / downside_vol if downside_vol > 0 else 0.0
+    sortino = excess_mean_annual / downside_vol if downside_vol > 0 else 0.0
     
     # Win Rate
     win_rate = float((daily_ret > 0).mean())
@@ -129,26 +134,107 @@ def compute_execution_accuracy(exec_csv_path: str | Path) -> dict:
     }
 
 
-def compute_pbo_simple(daily_csv_path: str | Path, n_blocks: int = 16) -> dict:
+def compute_concentration_metrics(holdings_csv_path: str | Path) -> dict:
+    """Recompute concentration metrics from daily holdings market values."""
+    holdings_csv_path = Path(holdings_csv_path)
+    if not holdings_csv_path.exists():
+        return {
+            "top1_weight": np.nan,
+            "top5_weight_sum": np.nan,
+            "effective_n": np.nan,
+            "holding_count_avg": np.nan,
+            "concentration_method": "missing_holdings_ledger_recompute_required",
+        }
+
+    holdings = pd.read_csv(holdings_csv_path)
+    if holdings.empty:
+        return {
+            "top1_weight": np.nan,
+            "top5_weight_sum": np.nan,
+            "effective_n": np.nan,
+            "holding_count_avg": np.nan,
+            "concentration_method": "empty_holdings_ledger_recompute_required",
+        }
+
+    required_cols = {"date", "symbol", "market_value"}
+    if not required_cols.issubset(set(holdings.columns)):
+        return {
+            "top1_weight": np.nan,
+            "top5_weight_sum": np.nan,
+            "effective_n": np.nan,
+            "holding_count_avg": np.nan,
+            "concentration_method": "invalid_holdings_ledger_recompute_required",
+        }
+
+    holdings["date"] = pd.to_datetime(holdings["date"], errors="coerce")
+    holdings["market_value"] = pd.to_numeric(holdings["market_value"], errors="coerce")
+    holdings = holdings.dropna(subset=["date", "symbol", "market_value"])
+    if holdings.empty:
+        return {
+            "top1_weight": np.nan,
+            "top5_weight_sum": np.nan,
+            "effective_n": np.nan,
+            "holding_count_avg": np.nan,
+            "concentration_method": "empty_holdings_ledger_recompute_required",
+        }
+
+    grouped = []
+    for _, frame in holdings.groupby("date", sort=True):
+        values = frame["market_value"].clip(lower=0.0)
+        invested = float(values.sum())
+        if invested <= 0:
+            continue
+        weights = (values / invested).sort_values(ascending=False).reset_index(drop=True)
+        weight_square_sum = float(weights.pow(2).sum())
+        grouped.append(
+            {
+                "top1_weight": float(weights.iloc[0]) if len(weights) else 0.0,
+                "top5_weight_sum": float(weights.head(5).sum()) if len(weights) else 0.0,
+                "effective_n": float(1.0 / weight_square_sum) if weight_square_sum > 0 else 0.0,
+                "holding_count": int(len(weights)),
+            }
+        )
+
+    if not grouped:
+        return {
+            "top1_weight": np.nan,
+            "top5_weight_sum": np.nan,
+            "effective_n": np.nan,
+            "holding_count_avg": np.nan,
+            "concentration_method": "empty_holdings_ledger_recompute_required",
+        }
+
+    result = pd.DataFrame(grouped)
+    return {
+        "top1_weight": float(result["top1_weight"].mean()),
+        "top5_weight_sum": float(result["top5_weight_sum"].mean()),
+        "effective_n": float(result["effective_n"].mean()),
+        "holding_count_avg": float(result["holding_count"].mean()),
+        "concentration_method": "holdings_ledger_market_value_recomputed",
+    }
+
+
+def compute_negative_block_rate(daily_csv_path: str | Path, n_blocks: int = 16) -> dict:
     """
-    Simple PBO calculation.
-    
-    Returns dict with:
-    - pbo (Probability of Backtest Overfitting)
+    Compute a single-run block stability diagnostic.
+
+    This is not CSCV/PBO because a single strategy run has no model-selection
+    competition set. We expose it separately as the fraction of negative
+    contiguous return blocks.
     """
     daily_csv_path = Path(daily_csv_path)
     if not daily_csv_path.exists():
-        return {"pbo": np.nan}
+        return {"negative_block_rate": np.nan}
     
     data = pd.read_csv(daily_csv_path)
     if data.empty or len(data) < n_blocks:
-        return {"pbo": np.nan}
+        return {"negative_block_rate": np.nan}
     
     data["date"] = pd.to_datetime(data["date"])
     nav = pd.to_numeric(data["nominal_nav"], errors="coerce").dropna()
     
     if len(nav) < n_blocks:
-        return {"pbo": np.nan}
+        return {"negative_block_rate": np.nan}
     
     # Split into blocks
     nav_normalized = nav / float(nav.iloc[0])
@@ -163,13 +249,10 @@ def compute_pbo_simple(daily_csv_path: str | Path, n_blocks: int = 16) -> dict:
             blocks.append(block_return)
     
     if len(blocks) < 2:
-        return {"pbo": np.nan}
+        return {"negative_block_rate": np.nan}
     
-    # Simple PBO: ratio of negative blocks
     negative_blocks = sum(1 for b in blocks if b < 0)
-    pbo = negative_blocks / len(blocks)
-    
-    return {"pbo": pbo}
+    return {"negative_block_rate": negative_blocks / len(blocks)}
 
 
 def compute_all_metrics(
@@ -186,21 +269,26 @@ def compute_all_metrics(
     
     daily_path = output_dir / "governance_daily_result.csv"
     exec_path = output_dir / "governance_execution_ledger.csv"
+    holdings_path = output_dir / "governance_holdings_ledger.csv"
     
     # Basic metrics
     metrics = compute_comprehensive_metrics(daily_path)
     
     # Execution accuracy
     accuracy = compute_execution_accuracy(exec_path)
+
+    concentration = compute_concentration_metrics(holdings_path)
     
-    # PBO
-    pbo = compute_pbo_simple(daily_path)
+    stability = compute_negative_block_rate(daily_path)
     
     # Combine all
     result = {
         **metrics,
         **accuracy,
-        **pbo,
+        **concentration,
+        **stability,
+        "pbo": np.nan,
+        "pbo_method": "not_applicable_single_strategy_run",
         "output_dir": str(output_dir),
     }
     
@@ -237,6 +325,8 @@ def format_metrics_report(metrics: dict, model_name: str = "") -> str:
         lines.append(f"Max Drawdown:     {metrics['max_drawdown']:.2%}")
     if "win_rate" in metrics:
         lines.append(f"Win Rate:         {metrics['win_rate']:.1%}")
+    if "negative_block_rate" in metrics and not np.isnan(metrics.get("negative_block_rate", np.nan)):
+        lines.append(f"Negative Block Rate: {metrics['negative_block_rate']:.1%}")
     if "pbo" in metrics and not np.isnan(metrics.get("pbo", np.nan)):
         lines.append(f"PBO:              {metrics['pbo']:.1%}")
     if "total_buys" in metrics:

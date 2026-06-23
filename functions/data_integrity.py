@@ -23,7 +23,9 @@ from config import (
     START_DATE,
     STRATEGY_END_DATE,
     V6_RESEARCH_WATERMARK,
+    DEFAULT_UNIVERSE_NAME,
 )
+from functions.universe_registry import get_universe_spec
 
 
 @dataclass(frozen=True)
@@ -151,7 +153,14 @@ def _index_gate(path: Path) -> DataGate:
         return DataGate("pit_index_constituents", True, False, "required columns missing", str(path))
     date_columns = {"effective_date", "first_trade_date"} & set(frame.columns)
     codes = set(frame["index_code"].astype(str).str.replace(".SH", "", regex=False))
-    expected = {"000300", "000905", "000510"}
+    try:
+        expected = {
+            str(code).zfill(6)
+            for code in get_universe_spec(DEFAULT_UNIVERSE_NAME).target_index_codes
+            if str(code).strip()
+        }
+    except Exception:
+        expected = {"000300", "000905", "000510"}
     start_column = "effective_date" if "effective_date" in frame.columns else "first_trade_date"
     frame[start_column] = pd.to_datetime(frame[start_column], errors="coerce")
     frame["out_date"] = pd.to_datetime(

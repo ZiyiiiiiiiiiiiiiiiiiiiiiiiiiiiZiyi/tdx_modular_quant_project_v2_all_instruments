@@ -1,0 +1,973 @@
+"""Research diagnostics for high-exposure governance upgrades.
+
+These reports are intentionally post-trade diagnostics. They do not decide
+orders directly; they audit whether probabilities, entry filters, risk budgets,
+and capacity assumptions are strong enough to justify higher exposure.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+
+from functions.decision_council.analytics import build_top_strength_benchmark_series, factor_module
+
+
+PREDICTION_BUCKETS = [0.0, 0.45, 0.50, 0.55, 0.60, 0.65, 1.0]
+PREDICTION_LABELS = ["<45%", "45-50%", "50-55%", "55-60%", "60-65%", "65%+"]
+
+
+def build_governance_quality_reports(
+    *,
+    ideal_portfolio_plan: pd.DataFrame,
+    executable_order_plan: pd.DataFrame,
+    execution_ledger: pd.DataFrame,
+    alpha_proposals: pd.DataFrame,
+    feature_data: pd.DataFrame,
+    benchmark_symbol: str | None,
+    daily_result: pd.DataFrame | None = None,
+    attribution_ledger: pd.DataFrame | None = None,
+    return_pivot: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
+    close_pivot = _close_pivot(feature_data)
+    benchmark_returns = _top_strength_benchmark_forward_returns(feature_data)
+    if all(series.empty for series in benchmark_returns.values()):
+        benchmark_returns = _benchmark_forward_returns(close_pivot, benchmark_symbol)
+    reports = {
+        "governance_entry_payoff_report": build_entry_payoff_report(
+            execution_ledger=execution_ledger,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_entry_calibration_report": build_entry_calibration_report(
+            ideal_portfolio_plan=ideal_portfolio_plan,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_selection_funnel_attribution": build_selection_funnel_attribution(
+            ideal_portfolio_plan=ideal_portfolio_plan,
+            execution_ledger=execution_ledger,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_entry_payoff_by_regime": build_entry_payoff_by_regime(
+            execution_ledger=execution_ledger,
+            daily_result=daily_result,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_entry_decision_audit": build_entry_decision_audit(
+            ideal_portfolio_plan=ideal_portfolio_plan,
+            execution_ledger=execution_ledger,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_position_lifecycle_report": build_position_lifecycle_report(
+            execution_ledger=execution_ledger,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_returns,
+        ),
+        "governance_capacity_stress_report": build_capacity_stress_report(
+            executable_order_plan=executable_order_plan,
+            execution_ledger=execution_ledger,
+        ),
+        "governance_risk_contribution_ledger": build_risk_contribution_ledger(
+            ideal_portfolio_plan=ideal_portfolio_plan,
+            return_pivot=return_pivot,
+        ),
+        "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals),
+        "governance_factor_role_report": build_factor_role_report(alpha_proposals),
+        "governance_rolling_beat_report": build_rolling_beat_report(attribution_ledger),
+    }
+    reports["governance_rebound_entry_diagnostics"] = build_rebound_entry_diagnostics(
+        reports.get("governance_entry_payoff_by_regime", pd.DataFrame()),
+        daily_result=daily_result,
+    )
+    reports["governance_strategy_validation_matrix"] = build_strategy_validation_matrix(reports)
+    return reports
+
+
+def build_rebound_entry_diagnostics(payoff_by_regime: pd.DataFrame, *, daily_result: pd.DataFrame | None) -> pd.DataFrame:
+    rows = []
+    if payoff_by_regime is not None and not payoff_by_regime.empty:
+        data = payoff_by_regime.copy()
+        data["horizon_days"] = pd.to_numeric(data.get("horizon_days"), errors="coerce")
+        data["sample_count"] = pd.to_numeric(data.get("sample_count"), errors="coerce").fillna(0)
+        for horizon in (5, 10, 20):
+            group = data[
+                data["horizon_days"].eq(int(horizon))
+                & data.get("side", pd.Series(dtype=object)).astype(str).eq("buy")
+                & data.get("regime_name", pd.Series(dtype=object)).astype(str).eq("rebound")
+            ].copy()
+            rows.append(
+                {
+                    "diagnostic": f"rebound_buy_{horizon}d",
+                    "horizon_days": int(horizon),
+                    "sample_count": int(group["sample_count"].sum()) if not group.empty else 0,
+                    "hit_rate": _weighted_metric(group, "hit_rate"),
+                    "expectancy": _weighted_metric(group, "expectancy"),
+                    "avg_directional_excess_return": _weighted_metric(group, "avg_directional_excess_return"),
+                    "passed": bool(_weighted_metric(group, "expectancy") > 0.0 and _weighted_metric(group, "avg_directional_excess_return") > 0.0),
+                    "interpretation": "rebound entries have positive absolute and excess expectancy" if _weighted_metric(group, "expectancy") > 0.0 else "rebound entries are not yet reliable",
+                }
+            )
+    if daily_result is not None and not daily_result.empty:
+        daily = daily_result.copy()
+        regime_col = "structural_regime_level" if "structural_regime_level" in daily.columns else "regime_name" if "regime_name" in daily.columns else None
+        if regime_col:
+            regime = daily[regime_col].fillna("unknown").astype(str)
+            rows.append(
+                {
+                    "diagnostic": "rebound_day_share",
+                    "horizon_days": 0,
+                    "sample_count": int(regime.eq("rebound").sum()),
+                    "hit_rate": np.nan,
+                    "expectancy": np.nan,
+                    "avg_directional_excess_return": np.nan,
+                    "passed": bool(regime.eq("rebound").mean() <= 0.35),
+                    "interpretation": "rebound label is not dominating the sample" if regime.eq("rebound").mean() <= 0.35 else "rebound label may be too broad",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_strategy_validation_matrix(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Summarize whether high-exposure deployment evidence is internally consistent."""
+    calibration = reports.get("governance_entry_calibration_report", pd.DataFrame())
+    payoff = reports.get("governance_entry_payoff_report", pd.DataFrame())
+    risk = reports.get("governance_risk_contribution_ledger", pd.DataFrame())
+    rolling = reports.get("governance_rolling_beat_report", pd.DataFrame())
+    lifecycle = reports.get("governance_position_lifecycle_report", pd.DataFrame())
+    rebound = reports.get("governance_rebound_entry_diagnostics", pd.DataFrame())
+
+    rows = []
+    cal10 = calibration[pd.to_numeric(calibration.get("horizon_days"), errors="coerce").eq(10)] if not calibration.empty else pd.DataFrame()
+    if not cal10.empty:
+        weighted_ece = float(pd.to_numeric(cal10.get("ece_weighted"), errors="coerce").fillna(0.0).sum())
+        best_lower = float(pd.to_numeric(cal10.get("wilson_lower_95"), errors="coerce").max())
+        rows.append(_gate_row("entry_probability_calibration", weighted_ece <= 0.06 and best_lower >= 0.48, weighted_ece, "<=0.06 ECE and best Wilson lower >=0.48"))
+        rows.append(_gate_row("entry_probability_lower_bound", best_lower >= 0.50, best_lower, ">=0.50 for full-exposure authorization"))
+    else:
+        rows.append(_gate_row("entry_probability_calibration", False, np.nan, "missing calibration report"))
+
+    buy10 = payoff[
+        pd.to_numeric(payoff.get("horizon_days"), errors="coerce").eq(10)
+        & payoff.get("side", pd.Series(dtype=object)).astype(str).eq("buy")
+    ] if not payoff.empty else pd.DataFrame()
+    if not buy10.empty:
+        buy_expectancy = float(pd.to_numeric(buy10.get("expectancy"), errors="coerce").mean())
+        buy_excess = float(pd.to_numeric(buy10.get("avg_directional_excess_return"), errors="coerce").mean())
+        rows.append(_gate_row("buy_10d_expectancy", buy_expectancy > 0.0, buy_expectancy, ">0 after costs/proxy benchmark"))
+        rows.append(_gate_row("buy_10d_excess_expectancy", buy_excess > 0.0, buy_excess, ">0 vs top-strength benchmark"))
+    else:
+        rows.append(_gate_row("buy_10d_expectancy", False, np.nan, "missing executed buy payoff"))
+
+    sell10 = payoff[
+        pd.to_numeric(payoff.get("horizon_days"), errors="coerce").eq(10)
+        & payoff.get("side", pd.Series(dtype=object)).astype(str).eq("sell")
+    ] if not payoff.empty else pd.DataFrame()
+    if not sell10.empty:
+        sell_expectancy = float(pd.to_numeric(sell10.get("expectancy"), errors="coerce").mean())
+        rows.append(_gate_row("sell_10d_directional_expectancy", sell_expectancy > 0.0, sell_expectancy, ">0 means sells avoid forward losses"))
+
+    if not risk.empty and "risk_contribution_share" in risk.columns:
+        eligible = risk[
+            risk.get("risk_gate_eligible", pd.Series(True, index=risk.index))
+            .fillna(False)
+            .astype(bool)
+        ]
+        source = eligible if not eligible.empty else risk
+        metric_col = (
+            "positive_risk_contribution_share"
+            if "positive_risk_contribution_share" in source.columns
+            else "risk_contribution_share"
+        )
+        max_rc = float(pd.to_numeric(source[metric_col], errors="coerce").max())
+        rows.append(_gate_row("max_single_name_risk_contribution", max_rc <= 0.35, max_rc, "<=0.35 research, <=0.25 deployment"))
+    else:
+        rows.append(_gate_row("max_single_name_risk_contribution", False, np.nan, "missing covariance risk contribution report"))
+
+    roll60 = rolling[
+        pd.to_numeric(rolling.get("window_days"), errors="coerce").eq(60)
+        & rolling.get("segment", pd.Series("full", index=rolling.index)).astype(str).eq("full")
+    ] if not rolling.empty else pd.DataFrame()
+    if not roll60.empty:
+        beat = float(pd.to_numeric(roll60.get("account_beat_ratio"), errors="coerce").iloc[0])
+        if np.isfinite(beat):
+            rows.append(_gate_row("rolling_60d_top_strength_beat", beat >= 0.50, beat, ">=0.50 vs top-strength benchmark"))
+
+    if not lifecycle.empty:
+        giveback_ratio = float(pd.to_numeric(lifecycle.get("paper_profit_giveback_flag"), errors="coerce").fillna(0.0).mean())
+        failure_ratio = float(pd.to_numeric(lifecycle.get("post_entry_failure_flag"), errors="coerce").fillna(0.0).mean())
+        rows.append(_gate_row("profit_giveback_unhandled_ratio", giveback_ratio <= 0.25, giveback_ratio, "<=0.25 or sell lifecycle too slow"))
+        rows.append(_gate_row("post_entry_failure_ratio", failure_ratio <= 0.25, failure_ratio, "<=0.25 or entry/early-exit loop is weak"))
+
+    if rebound is not None and not rebound.empty:
+        r10 = rebound[rebound.get("diagnostic", pd.Series(dtype=object)).astype(str).eq("rebound_buy_10d")]
+        if not r10.empty:
+            sample_count = float(pd.to_numeric(r10.get("sample_count"), errors="coerce").fillna(0.0).iloc[-1])
+            if sample_count > 0:
+                value = float(pd.to_numeric(r10.get("expectancy"), errors="coerce").iloc[-1])
+                rows.append(_gate_row("rebound_buy_10d_expectancy", value > 0.0, value, ">0 or rebound entries should be blocked/tightened"))
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["gate_status"] = np.where(result["passed"].astype(bool), "pass", "fail")
+    result["research_interpretation"] = np.where(
+        result["passed"].astype(bool),
+        "evidence supports current module",
+        "do not rely on this module for high exposure until investigated",
+    )
+    return result
+
+
+def _gate_row(name: str, passed: bool, observed_value, threshold: str) -> dict:
+    return {
+        "gate_name": str(name),
+        "passed": bool(passed),
+        "observed_value": observed_value,
+        "threshold": str(threshold),
+    }
+
+
+def build_rolling_beat_report(attribution_ledger: pd.DataFrame | None, windows=(5, 20, 60, 120, 252)) -> pd.DataFrame:
+    if attribution_ledger is None or attribution_ledger.empty:
+        return pd.DataFrame()
+    required = {"date", "account_net_value", "benchmark_net_value"}
+    if not required.issubset(attribution_ledger.columns):
+        return pd.DataFrame()
+    data = attribution_ledger.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data = data.dropna(subset=["date"]).sort_values("date")
+    for column in ["account_net_value", "holding_portfolio_net_value", "benchmark_net_value", "excess_net_value"]:
+        if column in data.columns:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+    rows = []
+    for window in windows:
+        account_return = data["account_net_value"] / data["account_net_value"].shift(int(window)) - 1.0
+        benchmark_return = data["benchmark_net_value"] / data["benchmark_net_value"].shift(int(window)) - 1.0
+        holding_return = (
+            data["holding_portfolio_net_value"] / data["holding_portfolio_net_value"].shift(int(window)) - 1.0
+            if "holding_portfolio_net_value" in data.columns
+            else pd.Series(np.nan, index=data.index)
+        )
+        valid = account_return.notna() & benchmark_return.notna()
+        valid_holding = holding_return.notna() & benchmark_return.notna()
+        rows.append(
+            {
+                "window_days": int(window),
+                "window_count": int(valid.sum()),
+                "account_beat_ratio": float((account_return[valid] > benchmark_return[valid]).mean()) if valid.any() else np.nan,
+                "account_avg_rolling_excess": float((account_return[valid] - benchmark_return[valid]).mean()) if valid.any() else np.nan,
+                "holding_beat_ratio": float((holding_return[valid_holding] > benchmark_return[valid_holding]).mean()) if valid_holding.any() else np.nan,
+                "holding_avg_rolling_excess": float((holding_return[valid_holding] - benchmark_return[valid_holding]).mean()) if valid_holding.any() else np.nan,
+            }
+        )
+    for year, group in data.groupby(data["date"].dt.year):
+        account_return = group["account_net_value"] / group["account_net_value"].shift(60) - 1.0
+        benchmark_return = group["benchmark_net_value"] / group["benchmark_net_value"].shift(60) - 1.0
+        valid = account_return.notna() & benchmark_return.notna()
+        rows.append(
+            {
+                "window_days": 60,
+                "segment": f"year_{int(year)}",
+                "window_count": int(valid.sum()),
+                "account_beat_ratio": float((account_return[valid] > benchmark_return[valid]).mean()) if valid.any() else np.nan,
+                "account_avg_rolling_excess": float((account_return[valid] - benchmark_return[valid]).mean()) if valid.any() else np.nan,
+                "holding_beat_ratio": np.nan,
+                "holding_avg_rolling_excess": np.nan,
+            }
+        )
+    result = pd.DataFrame(rows)
+    if "segment" not in result.columns:
+        result["segment"] = "full"
+    result["segment"] = result["segment"].fillna("full")
+    return result
+
+
+def build_entry_calibration_report(
+    *,
+    ideal_portfolio_plan: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizons=(5, 10, 20),
+) -> pd.DataFrame:
+    if ideal_portfolio_plan is None or ideal_portfolio_plan.empty:
+        return pd.DataFrame()
+    data = ideal_portfolio_plan.copy()
+    data["decision_date"] = pd.to_datetime(data.get("decision_date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
+    rows = []
+    for horizon in horizons:
+        pred_col = f"p_win_{horizon}d_calibrated"
+        if pred_col not in data.columns and horizon == 20:
+            pred_col = "p_win_10d_calibrated"
+        if pred_col not in data.columns:
+            continue
+        outcomes = _attach_forward_outcomes(
+            data,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_forward_returns,
+            horizon=horizon,
+            price_column=None,
+        )
+        if outcomes.empty:
+            continue
+        outcomes["predicted_p"] = pd.to_numeric(outcomes[pred_col], errors="coerce")
+        outcomes = outcomes.dropna(subset=["predicted_p", "forward_return"])
+        if outcomes.empty:
+            continue
+        outcomes["prediction_bucket"] = pd.cut(
+            outcomes["predicted_p"].clip(0.0, 1.0),
+            bins=PREDICTION_BUCKETS,
+            labels=PREDICTION_LABELS,
+            include_lowest=True,
+        ).astype(str)
+        for bucket, group in outcomes.groupby("prediction_bucket", dropna=False):
+            if group.empty:
+                continue
+            wins = group["forward_return"] > 0.0
+            realized = float(wins.mean())
+            pred = float(group["predicted_p"].mean())
+            rows.append(
+                {
+                    "horizon_days": int(horizon),
+                    "prediction_bucket": str(bucket),
+                    "sample_count": int(len(group)),
+                    "predicted_p_mean": pred,
+                    "realized_win_rate": realized,
+                    "wilson_lower_95": _wilson_lower(int(wins.sum()), int(len(group))),
+                    "brier_score": float(np.mean(np.square(group["predicted_p"].to_numpy(dtype=float) - wins.astype(float).to_numpy()))),
+                    "ece_component": float(abs(realized - pred) * len(group)),
+                    "avg_forward_return": float(group["forward_return"].mean()),
+                    "avg_forward_excess_return": float(group["forward_excess_return"].mean()),
+                    "avg_win": _mean_positive(group["forward_return"]),
+                    "avg_loss": _mean_loss_abs(group["forward_return"]),
+                    "payoff_ratio": _payoff_ratio(group["forward_return"]),
+                    "expectancy": _expectancy(group["forward_return"]),
+                }
+            )
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    total_by_horizon = result.groupby("horizon_days")["sample_count"].transform("sum").replace(0, np.nan)
+    result["ece_weighted"] = result["ece_component"] / total_by_horizon
+    return result.drop(columns=["ece_component"]).sort_values(["horizon_days", "prediction_bucket"]).reset_index(drop=True)
+
+
+def build_entry_payoff_report(
+    *,
+    execution_ledger: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizons=(5, 10, 20),
+) -> pd.DataFrame:
+    if execution_ledger is None or execution_ledger.empty:
+        return pd.DataFrame()
+    data = execution_ledger.copy()
+    data["decision_date"] = pd.to_datetime(data.get("trade_date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
+    data["side"] = data.get("side", pd.Series(dtype=object)).astype(str)
+    rows = []
+    for horizon in horizons:
+        outcomes = _attach_forward_outcomes(
+            data,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_forward_returns,
+            horizon=horizon,
+            price_column="price",
+        )
+        if outcomes.empty:
+            continue
+        outcomes["correct"] = np.where(
+            outcomes["side"].eq("buy"),
+            outcomes["forward_return"] > 0.0,
+            outcomes["forward_return"] < 0.0,
+        )
+        for keys, group in outcomes.groupby(["side", "reason"], dropna=False):
+            side, reason = keys
+            rows.append(_payoff_row(group, horizon=horizon, layer="executed", side=side, reason=reason))
+    return pd.DataFrame(rows).sort_values(["horizon_days", "side", "sample_count"], ascending=[True, True, False]).reset_index(drop=True)
+
+
+def build_selection_funnel_attribution(
+    *,
+    ideal_portfolio_plan: pd.DataFrame,
+    execution_ledger: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizons=(5, 10, 20),
+) -> pd.DataFrame:
+    frames = []
+    if ideal_portfolio_plan is not None and not ideal_portfolio_plan.empty:
+        ideal = ideal_portfolio_plan.copy()
+        ideal["decision_date"] = pd.to_datetime(ideal.get("decision_date"), errors="coerce")
+        ideal["symbol"] = ideal.get("symbol", pd.Series(dtype=object)).astype(str)
+        ideal["layer"] = "ideal_selected"
+        frames.append(ideal)
+    if execution_ledger is not None and not execution_ledger.empty:
+        executed = execution_ledger[execution_ledger.get("side", "").astype(str).eq("buy")].copy()
+        executed["decision_date"] = pd.to_datetime(executed.get("trade_date"), errors="coerce")
+        executed["symbol"] = executed.get("symbol", pd.Series(dtype=object)).astype(str)
+        executed["layer"] = "executed_buy"
+        frames.append(executed)
+    if not frames:
+        return pd.DataFrame()
+    rows = []
+    data = pd.concat(frames, ignore_index=True, sort=False)
+    for horizon in horizons:
+        outcomes = _attach_forward_outcomes(
+            data,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_forward_returns,
+            horizon=horizon,
+            price_column="price" if "price" in data.columns else None,
+        )
+        if outcomes.empty:
+            continue
+        for layer, group in outcomes.groupby("layer", dropna=False):
+            rows.append(_payoff_row(group, horizon=horizon, layer=layer, side="", reason=""))
+    return pd.DataFrame(rows).sort_values(["horizon_days", "layer"]).reset_index(drop=True)
+
+
+def build_entry_payoff_by_regime(
+    *,
+    execution_ledger: pd.DataFrame,
+    daily_result: pd.DataFrame | None,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizons=(5, 10, 20),
+) -> pd.DataFrame:
+    if execution_ledger is None or execution_ledger.empty:
+        return pd.DataFrame()
+    data = execution_ledger.copy()
+    data["decision_date"] = pd.to_datetime(data.get("trade_date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
+    data["side"] = data.get("side", pd.Series(dtype=object)).astype(str)
+    regime_map = _regime_map(daily_result)
+    data["regime_name"] = data["decision_date"].dt.normalize().map(regime_map).fillna("unknown")
+    rows = []
+    for horizon in horizons:
+        outcomes = _attach_forward_outcomes(
+            data,
+            close_pivot=close_pivot,
+            benchmark_forward_returns=benchmark_forward_returns,
+            horizon=horizon,
+            price_column="price",
+        )
+        if outcomes.empty:
+            continue
+        outcomes["correct"] = np.where(
+            outcomes["side"].eq("buy"),
+            outcomes["forward_return"] > 0.0,
+            outcomes["forward_return"] < 0.0,
+        )
+        for keys, group in outcomes.groupby(["regime_name", "side"], dropna=False):
+            regime_name, side = keys
+            row = _payoff_row(group, horizon=horizon, layer="executed_regime", side=side, reason=str(regime_name))
+            row["regime_name"] = str(regime_name)
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["horizon_days", "regime_name", "side"]).reset_index(drop=True)
+
+
+def build_entry_decision_audit(
+    *,
+    ideal_portfolio_plan: pd.DataFrame,
+    execution_ledger: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizon: int = 10,
+) -> pd.DataFrame:
+    if ideal_portfolio_plan is None or ideal_portfolio_plan.empty:
+        return pd.DataFrame()
+    data = ideal_portfolio_plan.copy()
+    data["decision_date"] = pd.to_datetime(data.get("decision_date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
+    data = _attach_forward_outcomes(
+        data,
+        close_pivot=close_pivot,
+        benchmark_forward_returns=benchmark_forward_returns,
+        horizon=int(horizon),
+        price_column=None,
+    )
+    if data.empty:
+        return pd.DataFrame()
+    executed_keys = set()
+    if execution_ledger is not None and not execution_ledger.empty:
+        trades = execution_ledger.copy()
+        trades["trade_date"] = pd.to_datetime(trades.get("trade_date"), errors="coerce")
+        trades = trades[trades.get("side", pd.Series(dtype=object)).astype(str).eq("buy")]
+        if "decision_id" in trades.columns and "decision_id" in data.columns:
+            executed_keys = {(str(row["decision_id"]), str(row["symbol"])) for _, row in trades.iterrows()}
+            data["executed_buy"] = [
+                (str(row.get("decision_id", "")), str(row["symbol"])) in executed_keys
+                for _, row in data.iterrows()
+            ]
+        else:
+            executed_keys = {
+                (pd.Timestamp(row["trade_date"]).normalize(), str(row["symbol"]))
+                for _, row in trades.dropna(subset=["trade_date"]).iterrows()
+            }
+            data["executed_buy"] = [
+                (pd.Timestamp(row["decision_date"]).normalize(), str(row["symbol"])) in executed_keys
+                for _, row in data.iterrows()
+            ]
+    if "executed_buy" not in data.columns:
+        data["executed_buy"] = False
+    keep = [
+        "decision_id",
+        "decision_date",
+        "symbol",
+        "ideal_weight",
+        "executed_buy",
+        "alpha_percentile",
+        "p_win_10d_calibrated",
+        "p_win_10d_wilson_lower",
+        "expected_edge_10d",
+        "conservative_expected_edge_10d",
+        "edge_to_risk_10d",
+        "conservative_edge_to_risk_10d",
+        "entry_evidence_grade",
+        "entry_confirmed",
+        "entry_block_reason",
+        "forward_return",
+        "forward_excess_return",
+        "forward_benchmark_return",
+    ]
+    for column in keep:
+        if column not in data.columns:
+            data[column] = pd.NA
+    return data[keep].sort_values(["decision_date", "ideal_weight"], ascending=[True, False]).reset_index(drop=True)
+
+
+def build_position_lifecycle_report(
+    *,
+    execution_ledger: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    max_horizon_days: int = 90,
+) -> pd.DataFrame:
+    if execution_ledger is None or execution_ledger.empty or close_pivot.empty:
+        return pd.DataFrame()
+    trades = execution_ledger.copy()
+    trades["trade_date"] = pd.to_datetime(trades.get("trade_date"), errors="coerce")
+    trades["symbol"] = trades.get("symbol", pd.Series(dtype=object)).astype(str)
+    trades["side"] = trades.get("side", pd.Series(dtype=object)).astype(str)
+    trades["price"] = pd.to_numeric(trades.get("price"), errors="coerce")
+    trades = trades.dropna(subset=["trade_date", "symbol", "price"])
+    if trades.empty:
+        return pd.DataFrame()
+    sells = trades[trades["side"].eq("sell")].sort_values(["symbol", "trade_date"])
+    rows = []
+    for _, buy in trades[trades["side"].eq("buy")].sort_values(["trade_date", "symbol"]).iterrows():
+        symbol = str(buy["symbol"])
+        entry_date = pd.Timestamp(buy["trade_date"])
+        entry_price = float(buy["price"])
+        if entry_price <= 0.0 or symbol not in close_pivot.columns:
+            continue
+        future_sells = sells[(sells["symbol"].eq(symbol)) & (sells["trade_date"] > entry_date)]
+        exit_date = pd.Timestamp(future_sells.iloc[0]["trade_date"]) if not future_sells.empty else None
+        path = close_pivot.loc[close_pivot.index >= entry_date, symbol].dropna().head(int(max_horizon_days) + 1)
+        if exit_date is not None:
+            path = path[path.index <= exit_date]
+        if path.empty:
+            continue
+        rel = path.astype(float) / entry_price - 1.0
+        mfe = float(rel.max())
+        mae = float(rel.min())
+        end_return = float(rel.iloc[-1])
+        giveback = float((mfe - end_return) / max(mfe, 1e-12)) if mfe > 0.0 else 0.0
+        benchmark_10d = benchmark_forward_returns.get(10, pd.Series(dtype=float))
+        rows.append(
+            {
+                "entry_date": entry_date,
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "entry_reason": buy.get("reason", ""),
+                "observed_days": int(len(path)),
+                "exit_date": exit_date if exit_date is not None else pd.NaT,
+                "exit_reason": str(future_sells.iloc[0].get("reason", "")) if not future_sells.empty else "",
+                "end_return": end_return,
+                "mfe": mfe,
+                "mae": mae,
+                "giveback_from_peak": giveback,
+                "benchmark_forward_10d": float(benchmark_10d.get(entry_date.normalize(), 0.0)) if not benchmark_10d.empty else 0.0,
+                "paper_profit_giveback_flag": bool(mfe >= 0.08 and giveback >= 0.45),
+                "post_entry_failure_flag": bool(len(path) >= 8 and mfe < 0.015 and end_return < -0.035),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["entry_date", "symbol"]).reset_index(drop=True)
+
+
+def build_capacity_stress_report(
+    *,
+    executable_order_plan: pd.DataFrame,
+    execution_ledger: pd.DataFrame,
+    capital_multipliers=(1, 5, 10, 20),
+    participation_limit: float = 0.05,
+    min_order_notional: float = 3000.0,
+) -> pd.DataFrame:
+    source = execution_ledger if execution_ledger is not None and not execution_ledger.empty else executable_order_plan
+    if source is None or source.empty:
+        return pd.DataFrame()
+    data = source.copy()
+    notional = pd.to_numeric(data.get("trade_notional", pd.Series(dtype=float)), errors="coerce").abs()
+    if notional.empty:
+        notional = pd.to_numeric(data.get("delta_weight", pd.Series(dtype=float)), errors="coerce").abs() * 1_000_000.0
+    market_amount = pd.to_numeric(data.get("market_amount", pd.Series(np.nan, index=data.index)), errors="coerce")
+    rows = []
+    for multiplier in capital_multipliers:
+        scaled_notional = notional.fillna(0.0) * float(multiplier)
+        participation = scaled_notional / market_amount.replace(0.0, np.nan)
+        rows.append(
+            {
+                "capital_multiplier": float(multiplier),
+                "order_count": int(len(data)),
+                "avg_order_notional": float(scaled_notional.mean()) if len(scaled_notional) else 0.0,
+                "median_order_notional": float(scaled_notional.median()) if len(scaled_notional) else 0.0,
+                "small_order_ratio": float((scaled_notional < float(min_order_notional)).mean()) if len(scaled_notional) else 0.0,
+                "avg_participation_rate": float(participation.replace([np.inf, -np.inf], np.nan).mean()),
+                "p95_participation_rate": float(participation.replace([np.inf, -np.inf], np.nan).quantile(0.95)),
+                "participation_breach_ratio": float((participation > float(participation_limit)).mean()),
+                "capacity_passed": bool((participation.fillna(0.0) <= float(participation_limit)).mean() >= 0.95),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_risk_contribution_ledger(
+    *,
+    ideal_portfolio_plan: pd.DataFrame,
+    return_pivot: pd.DataFrame | None,
+    lookback_days: int = 60,
+    min_gate_weight: float = 0.002,
+) -> pd.DataFrame:
+    if ideal_portfolio_plan is None or ideal_portfolio_plan.empty or return_pivot is None or return_pivot.empty:
+        return pd.DataFrame()
+    data = ideal_portfolio_plan.copy()
+    data["decision_date"] = pd.to_datetime(data.get("decision_date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
+    data["ideal_weight"] = pd.to_numeric(data.get("ideal_weight"), errors="coerce").fillna(0.0)
+    rows = []
+    for date, group in data.groupby("decision_date", sort=True):
+        symbols = [s for s in group["symbol"].astype(str).tolist() if s in return_pivot.columns]
+        if len(symbols) < 2:
+            continue
+        returns = return_pivot.loc[return_pivot.index < pd.Timestamp(date), symbols].tail(int(lookback_days))
+        returns = returns.dropna(axis=1, thresh=max(10, int(lookback_days * 0.5))).dropna(how="all")
+        if returns.shape[1] < 2:
+            continue
+        cov = returns.cov().astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        valid = [s for s in group["symbol"].astype(str).tolist() if s in cov.index]
+        if len(valid) < 2:
+            continue
+        weights = group.set_index("symbol").loc[valid, "ideal_weight"].to_numpy(dtype=float)
+        sigma = cov.loc[valid, valid].to_numpy(dtype=float)
+        rc = _risk_contribution(weights, sigma)
+        marginal = sigma @ weights if weights.size else np.array([])
+        for symbol, weight, marginal_risk, rc_share in zip(valid, weights, marginal, rc):
+            positive_share = float(max(rc_share, 0.0))
+            rows.append(
+                {
+                    "date": pd.Timestamp(date),
+                    "symbol": symbol,
+                    "target_weight": float(weight),
+                    "marginal_risk": float(marginal_risk),
+                    "risk_contribution_share": float(rc_share),
+                    "positive_risk_contribution_share": positive_share,
+                    "risk_gate_eligible": bool(float(weight) >= float(min_gate_weight)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int = 200_000) -> pd.DataFrame:
+    if alpha_proposals is None or alpha_proposals.empty:
+        return pd.DataFrame()
+    required = {"decision_date", "symbol", "model_name", "predicted_return_5d"}
+    if not required.issubset(alpha_proposals.columns):
+        return pd.DataFrame()
+    data = alpha_proposals[list(required)].copy()
+    if len(data) > int(max_rows):
+        data = data.sample(n=int(max_rows), random_state=7)
+    data["row_key"] = pd.to_datetime(data["decision_date"], errors="coerce").astype(str) + "|" + data["symbol"].astype(str)
+    data["predicted_return_5d"] = pd.to_numeric(data["predicted_return_5d"], errors="coerce")
+    pivot = data.pivot_table(index="row_key", columns="model_name", values="predicted_return_5d", aggfunc="mean")
+    corr = pivot.corr(method="spearman", min_periods=30)
+    rows = []
+    for model in corr.columns:
+        peers = corr[model].drop(labels=[model], errors="ignore").dropna()
+        rows.append(
+            {
+                "model_name": model,
+                "sample_rows": int(pivot[model].notna().sum()),
+                "avg_abs_rank_corr_to_others": float(peers.abs().mean()) if not peers.empty else 0.0,
+                "max_abs_rank_corr_to_other": float(peers.abs().max()) if not peers.empty else 0.0,
+                "most_redundant_peer": str(peers.abs().idxmax()) if not peers.empty else "",
+                "redundancy_flag": bool((peers.abs().max() if not peers.empty else 0.0) >= 0.85),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("max_abs_rank_corr_to_other", ascending=False).reset_index(drop=True)
+
+
+def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
+    if alpha_proposals is None or alpha_proposals.empty or "model_name" not in alpha_proposals.columns:
+        return pd.DataFrame()
+    models = sorted(str(name) for name in alpha_proposals["model_name"].dropna().astype(str).unique())
+    rows = []
+    for model in models:
+        module = factor_module(model)
+        role = _factor_role(model, module)
+        rows.append(
+            {
+                "model_name": model,
+                "factor_module": module,
+                "primary_role": role["primary_role"],
+                "buy_use_allowed": role["buy_use_allowed"],
+                "hold_validation_allowed": role["hold_validation_allowed"],
+                "sell_trigger_allowed": role["sell_trigger_allowed"],
+                "risk_override_allowed": role["risk_override_allowed"],
+                "role_rationale": role["role_rationale"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _attach_forward_outcomes(
+    data: pd.DataFrame,
+    *,
+    close_pivot: pd.DataFrame,
+    benchmark_forward_returns: dict[int, pd.Series],
+    horizon: int,
+    price_column: str | None,
+) -> pd.DataFrame:
+    if close_pivot.empty or data.empty:
+        return pd.DataFrame()
+    out = data.copy()
+    dates = pd.to_datetime(out["decision_date"], errors="coerce")
+    symbols = out["symbol"].astype(str)
+    entry_prices = []
+    exit_prices = []
+    for date, symbol in zip(dates, symbols):
+        if pd.isna(date) or symbol not in close_pivot.columns:
+            entry_prices.append(np.nan)
+            exit_prices.append(np.nan)
+            continue
+        path = close_pivot.loc[close_pivot.index >= pd.Timestamp(date), symbol].dropna()
+        if len(path) <= int(horizon):
+            entry_prices.append(np.nan)
+            exit_prices.append(np.nan)
+            continue
+        entry_prices.append(float(path.iloc[0]))
+        exit_prices.append(float(path.iloc[int(horizon)]))
+    if price_column and price_column in out.columns:
+        supplied = pd.to_numeric(out[price_column], errors="coerce")
+        out["_entry_price"] = supplied.where(supplied > 0.0, pd.Series(entry_prices, index=out.index))
+    else:
+        out["_entry_price"] = entry_prices
+    out["_exit_price"] = exit_prices
+    out = out.dropna(subset=["_entry_price", "_exit_price"])
+    out = out[out["_entry_price"] > 0.0].copy()
+    if out.empty:
+        return out
+    out["forward_return"] = out["_exit_price"] / out["_entry_price"] - 1.0
+    benchmark = benchmark_forward_returns.get(int(horizon), pd.Series(dtype=float))
+    out["forward_benchmark_return"] = dates.map(benchmark).reindex(out.index)
+    out["forward_benchmark_return"] = pd.to_numeric(out["forward_benchmark_return"], errors="coerce").fillna(0.0)
+    out["forward_excess_return"] = out["forward_return"] - out["forward_benchmark_return"]
+    return out
+
+
+def _close_pivot(feature_data: pd.DataFrame) -> pd.DataFrame:
+    if feature_data is None or feature_data.empty:
+        return pd.DataFrame()
+    close_col = "close_nominal" if "close_nominal" in feature_data.columns else "close"
+    if close_col not in feature_data.columns:
+        return pd.DataFrame()
+    data = feature_data[["date", "symbol", close_col]].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["symbol"] = data["symbol"].astype(str)
+    data[close_col] = pd.to_numeric(data[close_col], errors="coerce")
+    data = data.dropna(subset=["date", "symbol", close_col])
+    if data.empty:
+        return pd.DataFrame()
+    return data.pivot_table(index="date", columns="symbol", values=close_col, aggfunc="last").sort_index()
+
+
+def _benchmark_forward_returns(close_pivot: pd.DataFrame, benchmark_symbol: str | None, horizons=(5, 10, 20)) -> dict[int, pd.Series]:
+    if close_pivot.empty or not benchmark_symbol or str(benchmark_symbol) not in close_pivot.columns:
+        return {int(h): pd.Series(dtype=float) for h in horizons}
+    close = close_pivot[str(benchmark_symbol)].dropna()
+    return {int(h): close.shift(-int(h)) / close - 1.0 for h in horizons}
+
+
+def _top_strength_benchmark_forward_returns(feature_data: pd.DataFrame, horizons=(5, 10, 20)) -> dict[int, pd.Series]:
+    benchmark = build_top_strength_benchmark_series(feature_data)
+    if benchmark.empty:
+        return {int(h): pd.Series(dtype=float) for h in horizons}
+    data = benchmark.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["benchmark_net_value"] = pd.to_numeric(data["benchmark_net_value"], errors="coerce")
+    data = data.dropna(subset=["date", "benchmark_net_value"]).sort_values("date").drop_duplicates("date")
+    if data.empty:
+        return {int(h): pd.Series(dtype=float) for h in horizons}
+    nav = data.set_index("date")["benchmark_net_value"]
+    return {int(h): nav.shift(-int(h)) / nav - 1.0 for h in horizons}
+
+
+def _regime_map(daily_result: pd.DataFrame | None) -> dict:
+    if daily_result is None or daily_result.empty or "date" not in daily_result.columns:
+        return {}
+    data = daily_result.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    regime_col = "regime_name" if "regime_name" in data.columns else (
+        "structural_regime_level" if "structural_regime_level" in data.columns else None
+    )
+    if regime_col is None:
+        return {}
+    data[regime_col] = data[regime_col].fillna("unknown").astype(str)
+    return data.dropna(subset=["date"]).drop_duplicates("date", keep="last").set_index("date")[regime_col].to_dict()
+
+
+def _factor_role(model_name: str, module: str) -> dict:
+    name = str(model_name).lower()
+    module = str(module).lower()
+    role = {
+        "primary_role": "entry_alpha",
+        "buy_use_allowed": True,
+        "hold_validation_allowed": True,
+        "sell_trigger_allowed": False,
+        "risk_override_allowed": False,
+        "role_rationale": "default alpha signal; cannot force exits without separate sell validation",
+    }
+    if module in {"trend", "flow_close"}:
+        role.update(
+            {
+                "primary_role": "entry_and_hold_validation",
+                "hold_validation_allowed": True,
+                "sell_trigger_allowed": True,
+                "role_rationale": "trend/flow can validate continuation and warn on deterioration, but needs MFE/MAE confirmation",
+            }
+        )
+    if module in {"reversal_pullback", "range_grid"}:
+        role.update(
+            {
+                "primary_role": "entry_alpha",
+                "sell_trigger_allowed": False,
+                "role_rationale": "reversal/range signals are entry-timing tools; using them as hard sell triggers is not validated",
+            }
+        )
+    if module in {"event_limit"} or "limit" in name or "event" in name:
+        role.update(
+            {
+                "primary_role": "event_entry_or_risk_watch",
+                "hold_validation_allowed": False,
+                "sell_trigger_allowed": True,
+                "risk_override_allowed": True,
+                "role_rationale": "event/limit signals can decay quickly; allow risk-watch exits but not blanket buy/hold confidence",
+            }
+        )
+    if module in {"defensive"} or "lowvol" in name:
+        role.update(
+            {
+                "primary_role": "risk_sizer",
+                "buy_use_allowed": False,
+                "hold_validation_allowed": True,
+                "sell_trigger_allowed": False,
+                "risk_override_allowed": True,
+                "role_rationale": "defensive/low-vol is mainly a sizing and risk-control signal, not standalone alpha",
+            }
+        )
+    return role
+
+
+def _payoff_row(group: pd.DataFrame, *, horizon: int, layer: str, side: str, reason: str) -> dict:
+    returns = pd.to_numeric(group["forward_return"], errors="coerce").dropna()
+    excess = pd.to_numeric(group.get("forward_excess_return"), errors="coerce").dropna()
+    if str(side).lower() == "sell":
+        directional = -returns
+        directional_excess = -excess
+    else:
+        directional = returns
+        directional_excess = excess
+    if "correct" in group.columns:
+        correct = pd.to_numeric(group["correct"], errors="coerce").dropna()
+        hit_rate = float(correct.mean()) if not correct.empty else float((directional > 0.0).mean())
+    else:
+        hit_rate = float((directional > 0.0).mean()) if not directional.empty else 0.0
+    return {
+        "horizon_days": int(horizon),
+        "layer": str(layer),
+        "side": str(side),
+        "reason": str(reason),
+        "sample_count": int(len(returns)),
+        "hit_rate": hit_rate,
+        "avg_forward_return": float(returns.mean()) if not returns.empty else 0.0,
+        "avg_forward_excess_return": float(excess.mean()) if not excess.empty else 0.0,
+        "avg_directional_return": float(directional.mean()) if not directional.empty else 0.0,
+        "avg_directional_excess_return": float(directional_excess.mean()) if not directional_excess.empty else 0.0,
+        "avg_win": _mean_positive(directional),
+        "avg_loss": _mean_loss_abs(directional),
+        "payoff_ratio": _payoff_ratio(directional),
+        "expectancy": _expectancy(directional),
+    }
+
+
+def _weighted_metric(group: pd.DataFrame, metric: str) -> float:
+    if group is None or group.empty or metric not in group.columns:
+        return np.nan
+    values = pd.to_numeric(group.get(metric), errors="coerce")
+    weights = pd.to_numeric(group.get("sample_count", pd.Series(1.0, index=group.index)), errors="coerce").fillna(1.0)
+    valid = values.notna() & weights.gt(0)
+    if not valid.any():
+        return np.nan
+    return float((values[valid] * weights[valid]).sum() / max(float(weights[valid].sum()), 1e-12))
+
+
+def _mean_positive(values) -> float:
+    data = pd.to_numeric(values, errors="coerce").dropna()
+    wins = data[data > 0.0]
+    return float(wins.mean()) if not wins.empty else 0.0
+
+
+def _mean_loss_abs(values) -> float:
+    data = pd.to_numeric(values, errors="coerce").dropna()
+    losses = data[data <= 0.0]
+    return abs(float(losses.mean())) if not losses.empty else 0.0
+
+
+def _payoff_ratio(values) -> float:
+    loss = _mean_loss_abs(values)
+    return _mean_positive(values) / loss if loss > 1e-12 else 0.0
+
+
+def _expectancy(values) -> float:
+    data = pd.to_numeric(values, errors="coerce").dropna()
+    if data.empty:
+        return 0.0
+    win_rate = float((data > 0.0).mean())
+    return win_rate * _mean_positive(data) - (1.0 - win_rate) * _mean_loss_abs(data)
+
+
+def _wilson_lower(wins: int, n: int, z: float = 1.96) -> float:
+    if n <= 0:
+        return 0.0
+    phat = float(wins) / float(n)
+    denom = 1.0 + z * z / n
+    centre = phat + z * z / (2.0 * n)
+    margin = z * math.sqrt((phat * (1.0 - phat) + z * z / (4.0 * n)) / n)
+    return max(0.0, float((centre - margin) / denom))
+
+
+def _risk_contribution(weights: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    variance = float(weights @ sigma @ weights)
+    if variance <= 1e-18:
+        return np.zeros_like(weights)
+    marginal = sigma @ weights
+    return (weights * marginal) / variance

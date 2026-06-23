@@ -21,6 +21,14 @@ class SafetyDecision:
     raw_risk_level: str = "normal"
     trigger_source: str = "normal"
     trigger_streak_days: int = 0
+    benchmark_drawdown_20d: float | None = None
+    benchmark_return_5d: float | None = None
+    benchmark_return_20d: float | None = None
+    benchmark_underwater_from_peak: float | None = None
+    structural_regime_level: str = "bull"
+    regime_exposure_budget: float = 1.0
+    safety_exposure_cap: float = 1.0
+    hard_freeze_active: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,5 +47,8 @@ class DecisionContext:
     hold_rank_limit: int = 100
     allow_normal_rebalance: bool = True
     partial_adjustment_rate: float = 0.25
+    catchup_buy_budget: float = 0.0
+    catchup_allowed: bool = False
     transition_only: bool = False
     hard_qualification_symbols: frozenset[str] = frozenset()
+    covariance_matrix: pd.DataFrame | None = None

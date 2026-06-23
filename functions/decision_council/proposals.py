@@ -242,7 +242,8 @@ def build_rule_alpha_proposals(
             continue
         score = pd.to_numeric(data[feature_col], errors="coerce")
         volatility = pd.to_numeric(data.get("volatility_20"), errors="coerce").fillna(0.0)
-        scale = score.abs().median()
+        non_null_abs_score = score.abs().dropna()
+        scale = non_null_abs_score.median() if not non_null_abs_score.empty else 1.0
         scale = float(scale) if pd.notna(scale) and scale > 1e-12 else 1.0
         predicted = (score / scale).clip(-5.0, 5.0) * 0.01
         part = pd.DataFrame(
@@ -329,6 +330,7 @@ def build_daily_candidates(
         "volatility_20",
         "ret_5",
         "ret_20",
+        "close_to_ma20",
         "close",
         "close_nominal",
         "amount",
@@ -341,6 +343,11 @@ def build_daily_candidates(
         "payoff_ratio",
         "index_pool_codes",
         "in_target_index_pool",
+        "score_orderflow_amount_shock",
+        "score_orderflow_close_drive",
+        "score_orderflow_accumulation",
+        "score_orderflow_efficiency",
+        "score_eod_close_strength",
     ]
     source = source[[column for column in keep if column in source.columns]].copy()
     candidates = source.merge(combined, on="symbol", how="inner")
@@ -418,9 +425,15 @@ def _empty_candidates() -> pd.DataFrame:
             "amount_ma20",
             "is_trading",
             "abnormal_jump",
+            "ret_20",
+            "close_to_ma20",
             "alpha_score",
             "alpha_percentile",
             "expected_return_5d",
+            "aggregate_confidence",
+            "entry_confirmed",
+            "entry_quality_score",
+            "entry_block_reason",
             "alpha_collapse_exit",
             "liquidity_eligible",
             "candidate_rank",

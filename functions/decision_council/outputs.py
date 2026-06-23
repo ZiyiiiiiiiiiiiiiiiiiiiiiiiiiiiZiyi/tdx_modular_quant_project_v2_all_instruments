@@ -39,7 +39,10 @@ class GovernanceLedgerBundle:
 
     def frame(self, ledger_name: str) -> pd.DataFrame:
         parts = self.frames[ledger_name]
-        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        if not parts:
+            return pd.DataFrame()
+        cleaned = [part.dropna(axis=1, how="all") for part in parts if part is not None and not part.empty]
+        return pd.concat(cleaned, ignore_index=True) if cleaned else pd.DataFrame()
 
     def save(self, output_dir=GOVERNANCE_OUTPUT_DIR) -> dict[str, Path]:
         output = Path(output_dir)

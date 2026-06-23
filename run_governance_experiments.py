@@ -63,6 +63,7 @@ from functions.decision_council.runner import (
     GovernanceBacktestRunner,
     _governance_feature_columns,
     _prepare_features,
+    archive_existing_governance_output,
 )
 from functions.decision_council.policy import RulesBasedPresidentPolicy
 from functions.pipeline_cache import file_fingerprint
@@ -107,6 +108,40 @@ def build_output_path(variant_name: str, alpha_bundle: str, universe_name: str) 
     return RESULT_DIR / "governance" / universe_name / variant_name / alpha_bundle
 
 
+def _read_feature_schema_columns() -> set[str]:
+    try:
+        import pyarrow.parquet as pq
+
+        return set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
+    except Exception:
+        return set()
+
+
+def _ensure_governance_feature_columns(required_columns: set[str]) -> set[str]:
+    """Rebuild the feature parquet once if newly-required governance columns are absent."""
+    available_columns = _read_feature_schema_columns()
+    missing = sorted(required_columns - available_columns)
+    if not missing:
+        return available_columns
+
+    print("Governance feature parquet is missing required columns.")
+    print(f"Missing columns: {missing}")
+    print("Rebuilding feature parquet to include the latest governance factors...")
+
+    from functions.feature_engineering import generate_daily_features_multi
+
+    generate_daily_features_multi()
+    available_columns = _read_feature_schema_columns()
+    missing = sorted(required_columns - available_columns)
+    if missing:
+        raise ValueError(
+            "Governance feature parquet is still missing required columns after rebuild: "
+            f"{missing}"
+        )
+    print("Feature rebuild completed. Governance-required columns are now available.")
+    return available_columns
+
+
 def _load_governance_features(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
@@ -122,12 +157,6 @@ def _load_governance_features(
     if allowed_instrument_types:
         load_instrument_types = tuple(dict.fromkeys((*allowed_instrument_types, "etf_fund")))
         filters.append(("instrument_type", "in", list(load_instrument_types)))
-    try:
-        import pyarrow.parquet as pq
-
-        available_columns = set(pq.read_schema(FEATURE_DAILY_PARQUET).names)
-    except Exception:
-        available_columns = set(_governance_feature_columns())
     alpha_feature_columns = set(GOVERNANCE_ALPHA_MODEL_FEATURES.values())
     required_columns = [
         column for column in _governance_feature_columns()
@@ -145,9 +174,7 @@ def _load_governance_features(
         "volatility_20",
     }
     mandatory_columns.update(GOVERNANCE_ALPHA_MODEL_FEATURES[name] for name in alpha_models)
-    missing = sorted(mandatory_columns - available_columns)
-    if missing:
-        raise ValueError(f"Governance feature parquet is missing required columns: {missing}")
+    available_columns = _ensure_governance_feature_columns(mandatory_columns)
     required_columns = [column for column in required_columns if column in available_columns]
     data = pd.read_parquet(
         FEATURE_DAILY_PARQUET,
@@ -170,6 +197,10 @@ def run_single_experiment(
     max_days: int | None = None,
     safety_proxy_mode: str = SAFETY_PROXY_MODE,
     low_memory: bool = True,
+    enable_shadow_portfolios: bool = True,
+    show_live_monitor: bool = False,
+    live_monitor=None,
+    output_dir_suffix: str | None = None,
 ) -> dict[str, Path]:
     """运行单个治理实验"""
     variant_spec = get_governance_variant_spec(variant_name)
@@ -177,6 +208,11 @@ def run_single_experiment(
     universe_spec = get_universe_spec(universe_name)
 
     output_dir = build_output_path(variant_name, alpha_bundle, universe_name)
+    if output_dir_suffix:
+        safe_suffix = str(output_dir_suffix).strip().replace("\\", "_").replace("/", "_")
+        if safe_suffix:
+            output_dir = output_dir / safe_suffix
+    archived_path = archive_existing_governance_output(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'=' * 60}")
@@ -185,6 +221,8 @@ def run_single_experiment(
     print(f"  Alpha Bundle: {alpha_bundle}")
     print(f"  Universe: {universe_name}")
     print(f"  Output: {output_dir}")
+    if archived_path is not None:
+        print(f"  Archived Previous Output: {archived_path}")
     print("=" * 60)
 
     alpha_models = ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(alpha_bundle)
@@ -205,6 +243,7 @@ def run_single_experiment(
     policy = RulesBasedPresidentPolicy(
         enable_sector_cap=variant_spec.enable_sector_cap,
         enable_safety_agent=variant_spec.enable_safety_agent,
+        exit_mode=variant_spec.extra.get("exit_mode", "full"),
     )
 
     # Run backtest
@@ -215,10 +254,12 @@ def run_single_experiment(
         output_dir=output_dir,
         alpha_models=alpha_models,
         prepared_features=low_memory,
+        enable_shadow_portfolios=enable_shadow_portfolios,
         enable_reputation=variant_spec.enable_reputation,
         enable_sector_cap=variant_spec.enable_sector_cap,
         enable_safety_agent=variant_spec.enable_safety_agent,
         enable_market_regime_policy=variant_spec.enable_market_regime_policy,
+        entry_confirmation_mode=variant_spec.extra.get("entry_confirmation_mode", "full"),
         governance_variant=variant_name,
         universe_mode=universe_spec.mode,
         data_fingerprints={"feature_daily_parquet": file_fingerprint(FEATURE_DAILY_PARQUET)},
@@ -232,7 +273,13 @@ def run_single_experiment(
         alpha_bundle=alpha_bundle,
     )
 
-    saved = runner.run(start_date=effective_start, end_date=effective_end, max_days=max_days)
+    saved = runner.run(
+        start_date=effective_start,
+        end_date=effective_end,
+        max_days=max_days,
+        show_live_monitor=show_live_monitor,
+        live_monitor=live_monitor,
+    )
 
     # Save experiment metadata
     metadata = {
@@ -242,11 +289,15 @@ def run_single_experiment(
         "start_date": str(effective_start),
         "end_date": str(effective_end),
         "output_dir": str(output_dir),
+        "output_dir_suffix": str(output_dir_suffix or ""),
         "alpha_models": list(alpha_models),
         "enable_reputation": variant_spec.enable_reputation,
         "enable_sector_cap": variant_spec.enable_sector_cap,
         "enable_safety_agent": variant_spec.enable_safety_agent,
         "enable_market_regime_policy": variant_spec.enable_market_regime_policy,
+        "entry_confirmation_mode": variant_spec.extra.get("entry_confirmation_mode", "full"),
+        "exit_mode": variant_spec.extra.get("exit_mode", "full"),
+        "layer_added": variant_spec.extra.get("layer_added", ""),
         "universe_mode": universe_spec.mode,
         "require_constituents": universe_spec.require_constituents,
         "low_memory": low_memory,
@@ -536,7 +587,7 @@ def main():
     print("  python run_governance_experiments.py --list-variants")
     print("  python run_governance_experiments.py --list-bundles")
     print("  python run_governance_experiments.py --list-universes")
-    print("  python run_governance_experiments.py --variant rules_based_president --alpha-bundle president_core_bundle --universe hs300_csi500_a500_strict")
+    print("  python run_governance_experiments.py --variant rules_based_president --alpha-bundle president_core_bundle --universe hs300_csi300_a500_strict")
 
 
 if __name__ == "__main__":

@@ -167,6 +167,58 @@ class AlphaRegistry:
             source="rule",
         ))
 
+        self.register(AlphaSpec(
+            alpha_name="orderflow_amount_shock",
+            module_path="functions.feature_engineering",
+            score_column="score_orderflow_amount_shock",
+            input_columns=["amount", "amount_ma20"],
+            category="research_alpha",
+            horizon_days=5,
+            supports_governance=True,
+            supports_strategy_selection=True,
+            description="Daily amount-shock proxy for suspected aggressive flow participation.",
+            source="research",
+        ))
+
+        self.register(AlphaSpec(
+            alpha_name="orderflow_close_drive",
+            module_path="functions.feature_engineering",
+            score_column="score_orderflow_close_drive",
+            input_columns=["open", "high", "low", "close", "amount", "amount_ma20"],
+            category="research_alpha",
+            horizon_days=5,
+            supports_governance=True,
+            supports_strategy_selection=True,
+            description="Daily close-drive proxy under elevated turnover.",
+            source="research",
+        ))
+
+        self.register(AlphaSpec(
+            alpha_name="orderflow_accumulation",
+            module_path="functions.feature_engineering",
+            score_column="score_orderflow_accumulation",
+            input_columns=["open", "high", "low", "close", "amount", "amount_ma20"],
+            category="research_alpha",
+            horizon_days=5,
+            supports_governance=True,
+            supports_strategy_selection=True,
+            description="Daily accumulation/distribution proxy combining body, intraday direction, and flow intensity.",
+            source="research",
+        ))
+
+        self.register(AlphaSpec(
+            alpha_name="orderflow_efficiency",
+            module_path="functions.feature_engineering",
+            score_column="score_orderflow_efficiency",
+            input_columns=["ret_1", "volatility_20", "amount", "amount_ma20"],
+            category="research_alpha",
+            horizon_days=5,
+            supports_governance=True,
+            supports_strategy_selection=True,
+            description="Daily price-impact efficiency proxy under abnormal turnover.",
+            source="research",
+        ))
+
         # ========== Technical Alpha ==========
         self.register(AlphaSpec(
             alpha_name="macd_trend",

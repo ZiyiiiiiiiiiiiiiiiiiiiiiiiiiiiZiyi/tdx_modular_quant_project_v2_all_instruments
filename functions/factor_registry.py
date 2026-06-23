@@ -59,6 +59,19 @@ def default_factor_registry():
             category="liquidity",
             status="stable",
         ),
+        "daily_orderflow_proxy_core": FactorSpec(
+            factor_name="daily_orderflow_proxy_core",
+            module_path="functions.feature_engineering",
+            output_columns=(
+                "score_orderflow_amount_shock",
+                "score_orderflow_close_drive",
+                "score_orderflow_accumulation",
+                "score_orderflow_efficiency",
+            ),
+            input_columns=("open", "high", "low", "close", "amount", "volume"),
+            category="orderflow_proxy",
+            status="experimental",
+        ),
         "ml_factor_score": FactorSpec(
             factor_name="ml_factor_score",
             module_path="functions.factors.factor_ml",

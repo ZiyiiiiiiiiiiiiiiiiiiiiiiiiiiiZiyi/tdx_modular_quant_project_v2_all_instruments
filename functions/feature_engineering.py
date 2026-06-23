@@ -65,6 +65,10 @@ NORMALIZED_FEATURE_COLUMNS = [
     "close_to_ma60",
     "amount_ratio_20",
     "score_mom_lowvol",
+    "score_orderflow_amount_shock",
+    "score_orderflow_close_drive",
+    "score_orderflow_accumulation",
+    "score_orderflow_efficiency",
 ]
 
 TRANSIENT_FEATURE_COLUMNS = {
@@ -231,7 +235,30 @@ def build_feature_frame(df):
     df["amount_ma20"] = grouped["amount"].transform(lambda x: x.rolling(20, min_periods=20).mean())
     df["amount_ratio_20"] = df["amount"] / df["amount_ma20"] - 1
 
+    amount_safe = pd.to_numeric(df["amount"], errors="coerce").clip(lower=0.0).fillna(0.0)
+    df["_tmp_log_amount"] = np.log1p(amount_safe)
+    log_amount_ma20 = grouped["_tmp_log_amount"].transform(lambda x: x.rolling(20, min_periods=20).mean())
+    amount_multiple_20 = amount_safe / df["amount_ma20"].replace(0, np.nan)
+    flow_intensity = np.log1p(amount_multiple_20.clip(lower=0.0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    intraday_direction = (
+        ((df[close_col] - df[low_col]) - (df[high_col] - df[close_col]))
+        / (df[high_col] - df[low_col]).replace(0, np.nan)
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    normalized_ret_1 = (
+        pd.to_numeric(df["ret_1"], errors="coerce").fillna(0.0)
+        / (pd.to_numeric(df["volatility_20"], errors="coerce").abs().fillna(0.0) + 0.01)
+    )
+    df["score_orderflow_amount_shock"] = (df["_tmp_log_amount"] - log_amount_ma20).replace([np.inf, -np.inf], np.nan)
+    df["score_orderflow_close_drive"] = intraday_direction * flow_intensity
+    df["score_orderflow_accumulation"] = (
+        pd.to_numeric(df["intraday_ret"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(df["body_ratio"], errors="coerce").fillna(0.0)
+        * flow_intensity
+    )
+    df["score_orderflow_efficiency"] = normalized_ret_1 * flow_intensity
+
     df["score_mom_lowvol"] = df["ret_20"] - df["volatility_20"]
+    df = df.drop(columns=["_tmp_log_amount"])
 
     progress_step("feature frame: apply labels")
     df = apply_default_labels(df, price_col=close_col)

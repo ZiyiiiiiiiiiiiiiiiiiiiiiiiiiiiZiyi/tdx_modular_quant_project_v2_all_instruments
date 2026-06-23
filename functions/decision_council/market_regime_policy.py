@@ -50,6 +50,7 @@ class RegimeParams:
     
     # Rebalancing
     rebalance_interval_days: int
+    regime_name: str = "unknown"
 
 
 # Bull market parameters: More aggressive, faster trading
@@ -80,6 +81,64 @@ BULL_PARAMS = RegimeParams(
     
     # Rebalancing: Weekly
     rebalance_interval_days=5,
+    regime_name="bull",
+)
+
+REBOUND_PARAMS = RegimeParams(
+    safety_warning_drawdown=0.020,
+    safety_high_drawdown=0.040,
+    safety_crisis_drawdown=0.065,
+    safety_warning_confirm_days=3,
+    safety_high_confirm_days=3,
+    safety_crisis_confirm_days=3,
+    min_score_percentile=0.76,
+    kelly_scale=0.42,
+    min_p_win=0.51,
+    severe_exit_kelly_score=0.018,
+    default_turnover_budget=0.055,
+    max_positions=25,
+    max_position_weight=0.08,
+    max_sector_weight=0.30,
+    rebalance_interval_days=5,
+    regime_name="rebound",
+)
+
+NEUTRAL_PARAMS = RegimeParams(
+    safety_warning_drawdown=0.020,
+    safety_high_drawdown=0.038,
+    safety_crisis_drawdown=0.060,
+    safety_warning_confirm_days=2,
+    safety_high_confirm_days=2,
+    safety_crisis_confirm_days=2,
+    min_score_percentile=0.80,
+    kelly_scale=0.38,
+    min_p_win=0.52,
+    severe_exit_kelly_score=0.017,
+    default_turnover_budget=0.035,
+    max_positions=20,
+    max_position_weight=0.09,
+    max_sector_weight=0.28,
+    rebalance_interval_days=5,
+    regime_name="neutral",
+)
+
+WEAK_PARAMS = RegimeParams(
+    safety_warning_drawdown=0.016,
+    safety_high_drawdown=0.032,
+    safety_crisis_drawdown=0.052,
+    safety_warning_confirm_days=2,
+    safety_high_confirm_days=2,
+    safety_crisis_confirm_days=2,
+    min_score_percentile=0.85,
+    kelly_scale=0.34,
+    min_p_win=0.54,
+    severe_exit_kelly_score=0.016,
+    default_turnover_budget=0.025,
+    max_positions=16,
+    max_position_weight=0.10,
+    max_sector_weight=0.25,
+    rebalance_interval_days=10,
+    regime_name="weak",
 )
 
 # Bear market parameters: More conservative, slower trading
@@ -110,6 +169,26 @@ BEAR_PARAMS = RegimeParams(
     
     # Rebalancing: Monthly
     rebalance_interval_days=21,
+    regime_name="bear",
+)
+
+CRISIS_PARAMS = RegimeParams(
+    safety_warning_drawdown=0.012,
+    safety_high_drawdown=0.025,
+    safety_crisis_drawdown=0.045,
+    safety_warning_confirm_days=1,
+    safety_high_confirm_days=1,
+    safety_crisis_confirm_days=1,
+    min_score_percentile=0.90,
+    kelly_scale=0.20,
+    min_p_win=0.58,
+    severe_exit_kelly_score=0.010,
+    default_turnover_budget=0.010,
+    max_positions=8,
+    max_position_weight=0.08,
+    max_sector_weight=0.20,
+    rebalance_interval_days=21,
+    regime_name="crisis",
 )
 
 
@@ -119,13 +198,7 @@ class MarketRegimeDetector:
     
     Uses sh510300 (CSI 300 ETF) as the primary benchmark.
     
-    Detection Logic:
-    1. Price vs MA20: Bull if price > MA20
-    2. 20-day return: Bull if return > 0
-    3. MA slope: Bull if MA20 is rising (current MA > MA 5 days ago)
-    4. Volatility: Bear if volatility exceeds threshold
-    
-    All conditions must be met for bull regime.
+    Detection uses benchmark trend, drawdown, volatility, and universe breadth.
     """
     
     def __init__(
@@ -140,7 +213,8 @@ class MarketRegimeDetector:
         self.volatility_threshold = volatility_threshold
         self.min_history_days = min_history_days
         self._regime_cache: dict[str, str] = {}
-    
+        self._precomputed_history: dict[str, pd.Series] = {}
+
     def detect(
         self,
         features_df: pd.DataFrame,
@@ -166,10 +240,78 @@ class MarketRegimeDetector:
         cache_key = f"{benchmark_symbol}_{date.strftime('%Y%m%d')}"
         if cache_key in self._regime_cache:
             return self._regime_cache[cache_key]
+
+        prepared = self._precomputed_history.get(str(benchmark_symbol))
+        if prepared is not None and not prepared.empty:
+            try:
+                regime = prepared.asof(pd.Timestamp(date))
+            except Exception:
+                regime = None
+            if isinstance(regime, str) and regime:
+                self._regime_cache[cache_key] = regime
+                return regime
         
         regime = self._detect_internal(features_df, date, benchmark_symbol)
         self._regime_cache[cache_key] = regime
         return regime
+
+    def prepare_history(
+        self,
+        features_df: pd.DataFrame,
+        benchmark_symbol: str = "sh510300",
+    ) -> pd.Series:
+        """Precompute regime labels for the full benchmark history once."""
+        benchmark_symbol = str(benchmark_symbol)
+        if benchmark_symbol in self._precomputed_history:
+            return self._precomputed_history[benchmark_symbol]
+
+        benchmark = features_df.loc[
+            features_df["symbol"].astype(str) == benchmark_symbol,
+            ["date", "close", "close_nominal"],
+        ].copy()
+        if benchmark.empty:
+            prepared = pd.Series(dtype="object")
+            self._precomputed_history[benchmark_symbol] = prepared
+            return prepared
+
+        benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
+        benchmark.sort_values("date", inplace=True)
+        if "close_nominal" in benchmark.columns:
+            close = pd.to_numeric(benchmark["close_nominal"], errors="coerce")
+        else:
+            close = pd.to_numeric(benchmark["close"], errors="coerce")
+        prepared = pd.DataFrame(
+            {
+                "date": benchmark["date"].to_numpy(),
+                "close": close.to_numpy(),
+            }
+        ).dropna(subset=["date", "close"])
+        if prepared.empty:
+            series = pd.Series(dtype="object")
+            self._precomputed_history[benchmark_symbol] = series
+            return series
+
+        prepared["ma20"] = prepared["close"].rolling(window=20, min_periods=20).mean()
+        prepared["ma60"] = prepared["close"].rolling(window=60, min_periods=40).mean()
+        prepared["ma120"] = prepared["close"].rolling(window=120, min_periods=80).mean()
+        prepared["ret_20d"] = prepared["close"] / prepared["close"].shift(self.ma_period - 1) - 1.0
+        prepared["ret_60d"] = prepared["close"] / prepared["close"].shift(60) - 1.0
+        prepared["ma_prev"] = prepared["ma20"].shift(self.ma_slope_lookback - 1)
+        prepared["recent_volatility"] = prepared["close"].pct_change().rolling(window=20, min_periods=1).std()
+        prepared["underwater"] = prepared["close"] / prepared["close"].cummax() - 1.0
+        prepared["history_count"] = np.arange(1, len(prepared) + 1, dtype=float)
+        prepared["regime"] = [
+            self._classify_market_row(row, breadth_score=np.nan)
+            for _, row in prepared.iterrows()
+        ]
+        prepared["regime"] = _apply_hysteresis(prepared["regime"], confirm_days=3)
+        series = pd.Series(
+            prepared["regime"].to_numpy(),
+            index=pd.DatetimeIndex(prepared["date"]),
+            dtype="object",
+        )
+        self._precomputed_history[benchmark_symbol] = series
+        return series
     
     def _detect_internal(
         self,
@@ -201,44 +343,69 @@ class MarketRegimeDetector:
         if len(close) < self.min_history_days:
             return "bear"  # Default to bear if insufficient history
         
-        # Calculate indicators
         current_price = float(close.iloc[-1])
-        
-        # 1. MA20
-        ma20 = close.rolling(window=self.ma_period, min_periods=self.ma_period).mean()
+        ma20 = close.rolling(window=20, min_periods=20).mean()
+        ma60 = close.rolling(window=60, min_periods=40).mean()
+        ma120 = close.rolling(window=120, min_periods=80).mean()
         current_ma = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else current_price
-        
-        # 2. 20-day return
-        if len(close) >= self.ma_period:
-            price_20d_ago = float(close.iloc[-self.ma_period])
-            ret_20d = (current_price - price_20d_ago) / price_20d_ago if price_20d_ago > 0 else 0.0
-        else:
-            ret_20d = 0.0
-        
-        # 3. MA slope (rising or falling)
+        current_ma60 = float(ma60.iloc[-1]) if not pd.isna(ma60.iloc[-1]) else current_price
+        current_ma120 = float(ma120.iloc[-1]) if not pd.isna(ma120.iloc[-1]) else current_price
+        ret_20d = current_price / float(close.iloc[-20]) - 1.0 if len(close) >= 20 and float(close.iloc[-20]) > 0 else 0.0
+        ret_60d = current_price / float(close.iloc[-60]) - 1.0 if len(close) >= 60 and float(close.iloc[-60]) > 0 else 0.0
+        ret_5d = current_price / float(close.iloc[-5]) - 1.0 if len(close) >= 5 and float(close.iloc[-5]) > 0 else 0.0
         if len(ma20) >= self.ma_slope_lookback:
             ma_5d_ago = float(ma20.iloc[-self.ma_slope_lookback])
-            ma_rising = current_ma > ma_5d_ago
         else:
-            ma_rising = True
-        
-        # 4. Recent volatility
+            ma_5d_ago = current_ma
         recent_returns = close.pct_change().dropna().tail(20)
         recent_volatility = float(recent_returns.std()) if len(recent_returns) > 0 else 0.0
-        
-        # Bull conditions (ALL must be true):
-        # 1. Price above MA20
-        # 2. 20-day return positive
-        # 3. MA20 is rising
-        # 4. Volatility below threshold
-        is_bull = (
-            current_price > current_ma
-            and ret_20d > 0
-            and ma_rising
-            and recent_volatility < self.volatility_threshold
+        underwater = current_price / float(close.cummax().iloc[-1]) - 1.0 if float(close.cummax().iloc[-1]) > 0 else 0.0
+        daily = features_df.loc[features_df["date"].eq(pd.Timestamp(date))]
+        breadth_score = _breadth_score(daily)
+        row = pd.Series(
+            {
+                "close": current_price,
+                "ma20": current_ma,
+                "ma60": current_ma60,
+                "ma120": current_ma120,
+                "ma_prev": ma_5d_ago,
+                "ret_20d": ret_20d,
+                "ret_60d": ret_60d,
+                "ret_5d": ret_5d,
+                "recent_volatility": recent_volatility,
+                "underwater": underwater,
+                "history_count": len(close),
+            }
         )
-        
-        return "bull" if is_bull else "bear"
+        return self._classify_market_row(row, breadth_score=breadth_score)
+
+    def _classify_market_row(self, row: pd.Series, *, breadth_score: float) -> str:
+        if float(row.get("history_count", 0.0)) < float(self.min_history_days):
+            return "bear"
+        price = float(row.get("close", 0.0))
+        ma20 = float(row.get("ma20", price))
+        ma60 = float(row.get("ma60", price))
+        ma120 = float(row.get("ma120", price))
+        ret20 = float(row.get("ret_20d", 0.0) or 0.0)
+        ret60 = float(row.get("ret_60d", 0.0) or 0.0)
+        ret5 = float(row.get("ret_5d", 0.0) or 0.0)
+        ma_rising = ma20 > float(row.get("ma_prev", ma20))
+        vol = float(row.get("recent_volatility", 0.0) or 0.0)
+        underwater = float(row.get("underwater", 0.0) or 0.0)
+        breadth = 0.5 if pd.isna(breadth_score) else float(breadth_score)
+        if underwater <= -0.25 or vol >= self.volatility_threshold * 1.8:
+            return "crisis"
+        if price > ma20 > ma60 and ret20 > 0.02 and ret60 > 0.0 and ma_rising and breadth >= 0.55:
+            return "bull"
+        # Rebound needs short-term follow-through and healthier breadth. A loose
+        # rebound label encouraged buys in failed bounces.
+        if price > ma20 and ret20 > 0.03 and ret5 > -0.005 and ma_rising and underwater > -0.20 and breadth >= 0.52 and ret60 > -0.12:
+            return "rebound"
+        if price > ma20 and ret20 > 0.0 and breadth >= 0.45:
+            return "neutral"
+        if price > ma120 and ret20 > -0.03 and breadth >= 0.35:
+            return "weak"
+        return "bear"
     
     def clear_cache(self):
         """Clear the regime detection cache."""
@@ -261,6 +428,10 @@ class MarketRegimePolicy:
     ):
         self.bull_params = bull_params or BULL_PARAMS
         self.bear_params = bear_params or BEAR_PARAMS
+        self.rebound_params = REBOUND_PARAMS
+        self.neutral_params = NEUTRAL_PARAMS
+        self.weak_params = WEAK_PARAMS
+        self.crisis_params = CRISIS_PARAMS
         self.detector = detector or MarketRegimeDetector()
         self._regime_history: list[tuple[pd.Timestamp, str]] = []
     
@@ -291,8 +462,15 @@ class MarketRegimePolicy:
         
         if regime == "bull":
             return self.bull_params
-        else:
-            return self.bear_params
+        if regime == "rebound":
+            return self.rebound_params
+        if regime == "neutral":
+            return self.neutral_params
+        if regime == "weak":
+            return self.weak_params
+        if regime == "crisis":
+            return self.crisis_params
+        return self.bear_params
     
     def get_current_regime(self) -> str:
         """Get the most recently detected regime."""
@@ -336,3 +514,40 @@ class MarketRegimePolicy:
             "max_sector_weight": params.max_sector_weight,
             "rebalance_interval_days": params.rebalance_interval_days,
         }
+
+
+def _breadth_score(daily: pd.DataFrame) -> float:
+    if daily is None or daily.empty:
+        return float("nan")
+    scores = []
+    if "ret_20" in daily.columns:
+        ret20 = pd.to_numeric(daily["ret_20"], errors="coerce").dropna()
+        if not ret20.empty:
+            scores.append(float((ret20 > 0.0).mean()))
+    if "close_to_ma20" in daily.columns:
+        close_to_ma20 = pd.to_numeric(daily["close_to_ma20"], errors="coerce").dropna()
+        if not close_to_ma20.empty:
+            scores.append(float((close_to_ma20 > 0.0).mean()))
+    if not scores:
+        return float("nan")
+    return float(np.mean(scores))
+
+
+def _apply_hysteresis(regimes: pd.Series | list[str], *, confirm_days: int = 3) -> list[str]:
+    values = list(regimes)
+    if not values:
+        return []
+    confirmed = values[0]
+    streak_value = values[0]
+    streak = 0
+    output = []
+    for value in values:
+        if value == streak_value:
+            streak += 1
+        else:
+            streak_value = value
+            streak = 1
+        if streak >= int(confirm_days):
+            confirmed = streak_value
+        output.append(confirmed)
+    return output

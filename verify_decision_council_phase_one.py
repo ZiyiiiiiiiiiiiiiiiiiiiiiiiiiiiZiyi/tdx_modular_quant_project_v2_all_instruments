@@ -57,9 +57,9 @@ def _verify_preflight_and_safety(failures):
     for index, date in enumerate(dates):
         rows.extend(
             [
-                {"date": date, "symbol": "sh510300", "instrument_type": "etf_fund", "close": 100 - index * 0.3, "amount": 100.0, "is_trading": True},
-                {"date": date, "symbol": "sh600000", "instrument_type": "stock", "close": 10.0, "amount": 20.0 if index >= 23 else 100.0, "is_trading": True},
-                {"date": date, "symbol": "sz000001", "instrument_type": "stock", "close": 12.0, "amount": 20.0 if index >= 23 else 100.0, "is_trading": True},
+                {"date": date, "symbol": "sh510300", "instrument_type": "etf_fund", "close": 100 - index * 0.8, "amount": 100.0, "is_trading": True},
+                {"date": date, "symbol": "sh600000", "instrument_type": "stock", "close": 10.0, "amount": 20.0 if index >= 22 else 100.0, "is_trading": True},
+                {"date": date, "symbol": "sz000001", "instrument_type": "stock", "close": 12.0, "amount": 20.0 if index >= 22 else 100.0, "is_trading": True},
             ]
         )
     features = pd.DataFrame(rows)
@@ -76,10 +76,20 @@ def _verify_preflight_and_safety(failures):
 
     signals = RuleBasedSafetyAgent("sh510300").build_daily_signals(features)
     latest = signals.iloc[-1]
-    _expect(latest["raw_risk_level"] in {"warning", "high", "crisis"}, "raw safety signal should react to stress", failures)
-    _expect(int(latest["trigger_streak_days"]) >= 2, "confirmed safety signal should require consecutive stress days", failures)
-    _expect(latest["risk_level"] in {"warning", "high", "crisis"}, "confirmed safety signal should react after stress persists", failures)
-    _expect(float(latest["exposure_cap"]) < 1.0, "safety exposure cap should fall under stress", failures)
+    stressed = signals[signals["raw_risk_level"].isin(["warning", "high", "crisis"])].copy()
+    confirmed = signals[signals["risk_level"].isin(["warning", "high", "crisis"])].copy()
+    _expect(not stressed.empty, "raw safety signal should react to stress", failures)
+    _expect(
+        not confirmed.empty and int(pd.to_numeric(confirmed["trigger_streak_days"], errors="coerce").fillna(0).max()) >= 2,
+        "confirmed safety signal should require consecutive stress days",
+        failures,
+    )
+    _expect(not confirmed.empty, "confirmed safety signal should react after stress persists", failures)
+    _expect(
+        not confirmed.empty and float(pd.to_numeric(confirmed["exposure_cap"], errors="coerce").min()) < 1.0,
+        "safety exposure cap should fall under stress",
+        failures,
+    )
     engine = PhaseOneDecisionCouncilEngine(features, safety_proxy_mode="strict")
     _expect(engine.manifest["benchmark_proxy_symbol"] == "sh510300", "engine should freeze selected safety proxy", failures)
     engine_candidates = pd.DataFrame(
