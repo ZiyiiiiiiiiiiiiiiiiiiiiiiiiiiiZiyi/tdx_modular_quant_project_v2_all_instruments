@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import pandas as pd
 
@@ -76,6 +77,10 @@ class PhaseOneDecisionCouncilEngine:
         allow_normal_rebalance: bool = True,
         transition_only: bool = False,
         hard_qualification_symbols=(),
+        catchup_buy_budget: float = 0.0,
+        catchup_allowed: bool = False,
+        target_exposure_cap: float | None = None,
+        covariance_matrix: pd.DataFrame | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         decision_date = pd.Timestamp(decision_date)
         if decision_date not in self.safety_signals.index:
@@ -84,6 +89,10 @@ class PhaseOneDecisionCouncilEngine:
         if isinstance(safety_row, pd.DataFrame):
             safety_row = safety_row.iloc[-1]
         safety = self.safety_agent.decide({"date": decision_date, **safety_row.to_dict()})
+        raw_safety_exposure_cap = float(safety.exposure_cap)
+        if target_exposure_cap is not None:
+            effective_cap = min(raw_safety_exposure_cap, max(float(target_exposure_cap), 0.0))
+            safety = replace(safety, exposure_cap=effective_cap)
         context = DecisionContext(
             decision_id=str(decision_id),
             decision_date=decision_date,
@@ -99,10 +108,15 @@ class PhaseOneDecisionCouncilEngine:
             hold_rank_limit=GOVERNANCE_HOLD_RANK_LIMIT,
             allow_normal_rebalance=bool(allow_normal_rebalance),
             partial_adjustment_rate=GOVERNANCE_PARTIAL_ADJUSTMENT_RATE,
+            catchup_buy_budget=float(catchup_buy_budget),
+            catchup_allowed=bool(catchup_allowed),
             transition_only=bool(transition_only),
             hard_qualification_symbols=frozenset(str(symbol) for symbol in hard_qualification_symbols),
+            covariance_matrix=covariance_matrix,
         )
         ideal, orders, diagnostics = self.policy.decide(context)
+        diagnostics["raw_safety_exposure_cap"] = raw_safety_exposure_cap
+        diagnostics["effective_target_exposure_cap"] = float(safety.exposure_cap)
         self.ledgers.append("ideal_portfolio_plan", ideal)
         self.ledgers.append("executable_order_plan", orders)
         self.ledgers.append("safety_decision_ledger", {**safety.__dict__, **diagnostics})

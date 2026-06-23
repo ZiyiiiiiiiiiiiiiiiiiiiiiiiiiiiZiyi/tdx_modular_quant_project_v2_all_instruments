@@ -67,6 +67,145 @@ class GovernanceVariantRegistry:
                 governance_variant_tag="president",
             )
         )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_layer_validation",
+                base_policy="rules_based_president",
+                enable_reputation=False,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=False,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="validation_core_bundle",
+                position_sizing_mode="fixed_weight",
+                description=(
+                    "Diagnostic validation line with a compact equal-weight alpha bundle, "
+                    "static market parameters, reputation disabled, and safety kept on. "
+                    "Use this to isolate whether the base signal has positive expectancy "
+                    "before adding adaptive reputation or regime overlays."
+                ),
+                status="active",
+                governance_variant_tag="layer_validation",
+                extra={
+                    "purpose": "causal_layer_validation",
+                    "recommended_shadow_portfolios": False,
+                },
+            )
+        )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_core_base",
+                base_policy="rules_based_president",
+                enable_reputation=False,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=False,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="validation_core_bundle",
+                position_sizing_mode="fixed_weight",
+                description="Ablation base: compact factors, fixed-percentile entry, simple exits, no regime overlay.",
+                status="active",
+                governance_variant_tag="core_base",
+                extra={
+                    "purpose": "layer_ablation_suite",
+                    "entry_confirmation_mode": "fixed_percentile_only",
+                    "exit_mode": "simple",
+                    "layer_added": "none",
+                },
+            )
+        )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_core_plus_regime",
+                base_policy="rules_based_president",
+                enable_reputation=False,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=True,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="validation_core_bundle",
+                position_sizing_mode="fixed_weight",
+                description="Ablation: core base plus market-regime parameter overlay.",
+                status="active",
+                governance_variant_tag="core_plus_regime",
+                extra={
+                    "purpose": "layer_ablation_suite",
+                    "entry_confirmation_mode": "fixed_percentile_only",
+                    "exit_mode": "simple",
+                    "layer_added": "market_regime",
+                },
+            )
+        )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_core_plus_probability",
+                base_policy="rules_based_president",
+                enable_reputation=False,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=False,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="validation_core_bundle",
+                position_sizing_mode="fixed_weight",
+                description="Ablation: core base plus probability calibration and expected-edge entry.",
+                status="active",
+                governance_variant_tag="core_plus_probability",
+                extra={
+                    "purpose": "layer_ablation_suite",
+                    "entry_confirmation_mode": "full",
+                    "exit_mode": "simple",
+                    "layer_added": "probability_calibration",
+                },
+            )
+        )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_core_plus_complex_exit",
+                base_policy="rules_based_president",
+                enable_reputation=False,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=False,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="validation_core_bundle",
+                position_sizing_mode="fixed_weight",
+                description="Ablation: core probability entry plus complex lifecycle/replacement/trend exits.",
+                status="active",
+                governance_variant_tag="core_plus_complex_exit",
+                extra={
+                    "purpose": "layer_ablation_suite",
+                    "entry_confirmation_mode": "full",
+                    "exit_mode": "full",
+                    "layer_added": "complex_exit",
+                },
+            )
+        )
+        self.register(
+            GovernanceVariantSpec(
+                variant_name="governance_full_mainline_control",
+                base_policy="rules_based_president",
+                enable_reputation=True,
+                enable_sector_cap=False,
+                enable_safety_agent=True,
+                enable_market_regime_policy=True,
+                universe_name="hs300_csi500_a500_strict",
+                alpha_bundle="president_core_bundle",
+                position_sizing_mode="kelly_managed",
+                description=(
+                    "Full-mainline control for the layer ablation suite. This mirrors "
+                    "rules_based_president but writes to a separate output directory so "
+                    "diagnostic suites do not overwrite the mainline result folder."
+                ),
+                status="active",
+                governance_variant_tag="full_mainline_control",
+                extra={
+                    "purpose": "layer_ablation_suite",
+                    "entry_confirmation_mode": "full",
+                    "exit_mode": "full",
+                    "layer_added": "full_mainline_control",
+                },
+            )
+        )
 
 
     def register(self, spec: GovernanceVariantSpec) -> None:

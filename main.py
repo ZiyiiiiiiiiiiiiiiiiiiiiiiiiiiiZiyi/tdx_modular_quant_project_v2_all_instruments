@@ -17,7 +17,10 @@ The larger restartable orchestrator remains available explicitly through
 import argparse
 import gc
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -137,86 +140,38 @@ NON_STRATEGY_PARQUETS = {
 
 
 class StrategyTaskProgressWindow:
-    """Shared popup window for long-running per-strategy tasks."""
+    """Console-only progress reporter for long-running per-strategy tasks.
+
+    The project UI now uses browser dashboards. This class intentionally avoids
+    Tk so Spyder cannot block the kernel on a native window event loop.
+    """
 
     def __init__(self, title="Strategy Progress"):
-        self.enabled = False
-        self._root = None
-        self._status_var = None
-        self._detail_var = None
-        self._progress_var = None
-        self._step_var = None
+        self.enabled = True
+        self.title = str(title)
         self._started_at = time.time()
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-        except Exception:
-            return
-        try:
-            root = tk.Tk()
-            root.title(title)
-            root.resizable(False, False)
-            root.attributes("-topmost", True)
-            root.protocol("WM_DELETE_WINDOW", self.close)
-
-            frame = ttk.Frame(root, padding=14)
-            frame.grid(row=0, column=0, sticky="nsew")
-
-            self._status_var = tk.StringVar(value="Waiting to start...")
-            self._detail_var = tk.StringVar(value="")
-            self._progress_var = tk.DoubleVar(value=0.0)
-            self._step_var = tk.StringVar(value="0 / 0")
-
-            ttk.Label(frame, text="Strategy Task Monitor", font=("Microsoft YaHei UI", 11, "bold")).grid(
-                row=0, column=0, sticky="w"
-            )
-            ttk.Label(frame, textvariable=self._status_var, width=46).grid(row=1, column=0, sticky="w", pady=(10, 4))
-            ttk.Progressbar(frame, variable=self._progress_var, maximum=100.0, length=360).grid(
-                row=2, column=0, sticky="we", pady=(0, 6)
-            )
-            ttk.Label(frame, textvariable=self._step_var).grid(row=3, column=0, sticky="w")
-            ttk.Label(frame, textvariable=self._detail_var, width=52, justify="left", wraplength=360).grid(
-                row=4, column=0, sticky="w", pady=(6, 0)
-            )
-            self._root = root
-            self.enabled = True
-            self._pump()
-        except Exception:
-            self.close()
+        self._last_printed = 0.0
+        print(f"{self.title}: waiting to start...")
 
     def update(self, *, current: int, total: int, strategy_name: str, stage: str, detail: str = ""):
-        if not self.enabled or self._root is None:
+        if not self.enabled:
             return
         total = max(int(total), 1)
         current = max(int(current), 0)
         pct = min(max((current / total) * 100.0, 0.0), 100.0)
         elapsed = int(time.time() - self._started_at)
-        self._status_var.set(f"{stage}: {strategy_name}")
-        self._step_var.set(f"{current} / {total} completed")
-        extra = f"Elapsed: {elapsed}s"
-        if detail:
-            extra = f"{detail} | {extra}"
-        self._detail_var.set(extra)
-        self._progress_var.set(pct)
-        self._pump()
+        now = time.time()
+        if now - self._last_printed < 2.0 and current < total:
+            return
+        self._last_printed = now
+        detail_text = f" | {detail}" if detail else ""
+        print(
+            f"{self.title}: {pct:5.1f}% ({current}/{total}) | "
+            f"{stage}: {strategy_name}{detail_text} | elapsed={elapsed}s"
+        )
 
     def close(self):
-        if self._root is not None:
-            try:
-                self._root.destroy()
-            except Exception:
-                pass
-        self._root = None
         self.enabled = False
-
-    def _pump(self):
-        if self._root is None:
-            return
-        try:
-            self._root.update_idletasks()
-            self._root.update()
-        except Exception:
-            self.close()
 
 
 def load_saved_strategies():
@@ -357,6 +312,7 @@ def _write_runtime_config_snapshot(config_snapshot, *, run_dir=None):
 
 def parse_args():
     from functions.governance_variant_registry import list_governance_variant_names
+    from functions.universe_registry import list_universe_names
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--auto-complete", action="store_true", help="Run the restartable full orchestrator in auto_complete_after_vpn.py.")
@@ -372,6 +328,27 @@ def parse_args():
     parser.add_argument("--governance-start-date", default=CLI_GOVERNANCE_START_DATE)
     parser.add_argument("--governance-end-date", default=CLI_GOVERNANCE_END_DATE)
     parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS)
+    parser.add_argument(
+        "--governance-universe",
+        dest="governance_universes",
+        action="append",
+        choices=list_universe_names(),
+        default=None,
+        help="Governance stock pool to run. Repeat this option to run multiple review universes.",
+    )
+    parser.add_argument(
+        "--governance-shadow-portfolios",
+        dest="governance_shadow_portfolios",
+        action="store_true",
+        default=None,
+        help="Enable expensive per-alpha shadow backtests for governance reputation updates.",
+    )
+    parser.add_argument(
+        "--no-governance-shadow-portfolios",
+        dest="governance_shadow_portfolios",
+        action="store_false",
+        help="Disable per-alpha shadow backtests and keep reputation weights static for a faster governance run.",
+    )
     parser.add_argument("--no-live-monitor", action="store_true", help="Disable the low-memory governance metrics window.")
     parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=CLI_MAIN_SAFETY_PROXY_MODE)
     parser.add_argument(
@@ -952,6 +929,8 @@ def _run_single_governance_variant(
     end_date: str,
     max_days: int | None,
     safety_proxy_mode: str,
+    universe_name: str | None = None,
+    enable_shadow_portfolios: bool = True,
     show_live_monitor: bool = True,
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
@@ -960,8 +939,9 @@ def _run_single_governance_variant(
     from functions.universe_registry import get_universe_spec
 
     variant_spec = get_governance_variant_spec(variant_name)
-    universe_spec = get_universe_spec(variant_spec.universe_name)
-    output_dir = GOVERNANCE_OUTPUT_DIR / variant_spec.universe_name / variant_name / variant_spec.alpha_bundle
+    selected_universe_name = universe_name or variant_spec.universe_name
+    universe_spec = get_universe_spec(selected_universe_name)
+    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / variant_spec.alpha_bundle
     return run_governance_backtest(
         start_date=start_date,
         end_date=end_date,
@@ -971,8 +951,10 @@ def _run_single_governance_variant(
         enable_sector_cap=variant_spec.enable_sector_cap,
         enable_safety_agent=variant_spec.enable_safety_agent,
         enable_reputation=variant_spec.enable_reputation,
+        entry_confirmation_mode=variant_spec.extra.get("entry_confirmation_mode", "full"),
+        policy_exit_mode=variant_spec.extra.get("exit_mode", "full"),
         output_dir=output_dir,
-        universe_name=variant_spec.universe_name,
+        universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
         alpha_bundle=variant_spec.alpha_bundle,
         registry_version=REGISTRY_FRAMEWORK_VERSION,
@@ -981,11 +963,13 @@ def _run_single_governance_variant(
         allow_fallback=universe_spec.allow_fallback,
         allowed_instrument_types=tuple(universe_spec.allowed_instrument_types),
         enable_quality_filters=universe_spec.quality_filter_enabled,
+        enable_shadow_portfolios=enable_shadow_portfolios,
         show_live_monitor=show_live_monitor,
     )
 
 
 def run_registry_suite(args):
+    selected_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
     main()
     _run_single_governance_variant(
         "rules_based_president",
@@ -993,6 +977,8 @@ def run_registry_suite(args):
         end_date=args.governance_end_date,
         max_days=args.governance_max_days,
         safety_proxy_mode=args.safety_proxy_mode,
+        universe_name=selected_universes[0],
+        enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
         show_live_monitor=not args.no_live_monitor,
     )
 
@@ -1026,123 +1012,368 @@ def run_full_registry_matrix(args):
     print("Saved universe ablation summary:", universe_path)
 
 
-def launch_interactive_main_menu():
-    import tkinter as tk
-    from tkinter import messagebox
+DEFAULT_GOVERNANCE_REVIEW_UNIVERSES = ("hs300_csi500_a500_strict", "hs300_strict")
 
-    selection = {}
-    root = tk.Tk()
-    root.title("Main Launcher")
-    root.resizable(False, False)
 
-    vars_map = {
-        "main_pipeline": tk.BooleanVar(value=True),
-        "governance_active": tk.BooleanVar(value=True),
-        "alpha_ablation": tk.BooleanVar(value=False),
-        "universe_ablation": tk.BooleanVar(value=False),
+def _normalize_governance_universes(raw_universes) -> tuple[str, ...]:
+    from functions.universe_registry import list_universe_names
+
+    if not raw_universes:
+        return DEFAULT_GOVERNANCE_REVIEW_UNIVERSES
+    if isinstance(raw_universes, str):
+        raw_items = raw_universes.split(",")
+    else:
+        raw_items = []
+        for item in raw_universes:
+            if isinstance(item, str):
+                raw_items.extend(item.split(","))
+    available = set(list_universe_names())
+    cleaned: list[str] = []
+    for item in raw_items:
+        name = str(item).strip()
+        if not name or name in cleaned:
+            continue
+        if name not in available:
+            raise ValueError(f"Unknown governance universe '{name}'. Available: {sorted(available)}")
+        cleaned.append(name)
+    return tuple(cleaned) if cleaned else DEFAULT_GOVERNANCE_REVIEW_UNIVERSES
+
+
+def _month_to_date(value: str | None, *, end_of_month: bool) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) == 7:
+        period = pd.Period(text, freq="M")
+        ts = period.to_timestamp(how="end" if end_of_month else "start")
+    else:
+        ts = pd.Timestamp(text)
+    return ts.strftime("%Y-%m-%d")
+
+
+def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]):
+    runtime_args = argparse.Namespace(**vars(args))
+    governance_tasks = {
+        "governance_active",
+        "governance_mainline_review",
+        "governance_layer_validation",
+        "governance_layer_ablation_suite",
     }
+    if not any(task in governance_tasks for task in tasks):
+        return runtime_args
 
-    tk.Label(
-        root,
-        text="选择要运行的任务",
-        font=("Microsoft YaHei UI", 11, "bold"),
-        padx=16,
-        pady=12,
-    ).pack(anchor="w")
+    governance = selection.get("governance", {}) if isinstance(selection, dict) else {}
+    if not isinstance(governance, dict):
+        governance = {}
 
-    labels = [
-        ("main_pipeline", "主策略管线"),
-        ("governance_active", "治理主版本"),
-        ("alpha_ablation", "Alpha Bundle 消融"),
-        ("universe_ablation", "Universe 消融"),
-    ]
-    for key, text in labels:
-        tk.Checkbutton(
-            root,
-            text=text,
-            variable=vars_map[key],
-            anchor="w",
-            padx=18,
-            pady=2,
-            width=24,
-        ).pack(anchor="w")
-
-    tk.Label(
-        root,
-        text="“全部运行”会按顺序执行主策略、治理变体、alpha 消融、universe 消融。",
-        padx=18,
-        pady=10,
-        justify="left",
-        wraplength=360,
-    ).pack(anchor="w")
-
-    def choose_selected():
-        picked = [name for name, var in vars_map.items() if var.get()]
-        if not picked:
-            messagebox.showerror("未选择任务", "至少选择一项任务。")
-            return
-        selection["tasks"] = picked
-        root.destroy()
-
-    def choose_all():
-        selection["tasks"] = list(vars_map.keys())
-        root.destroy()
-
-    button_frame = tk.Frame(root, padx=16, pady=12)
-    button_frame.pack(fill="x")
-    tk.Button(button_frame, text="运行所选", width=12, command=choose_selected).pack(side="left")
-    tk.Button(button_frame, text="全部运行", width=12, command=choose_all).pack(side="left", padx=8)
-    tk.Button(button_frame, text="取消", width=12, command=root.destroy).pack(side="right")
-
-    root.mainloop()
-    return selection.get("tasks")
-
-
-def run_interactive_selection(tasks, args):
-    from run_governance_experiments import (
-        build_experiment_comparison_report,
-        run_alpha_ablation,
-        run_universe_ablation,
-        save_experiment_comparison_report,
+    runtime_args.governance_universes = _normalize_governance_universes(
+        governance.get("universes") or getattr(runtime_args, "governance_universes", None)
     )
 
+    start_date = _month_to_date(governance.get("start_month"), end_of_month=False)
+    end_date = _month_to_date(governance.get("end_month"), end_of_month=True)
+    if start_date:
+        runtime_args.governance_start_date = start_date
+    if end_date:
+        runtime_args.governance_end_date = end_date
+    if pd.Timestamp(runtime_args.governance_start_date) > pd.Timestamp(runtime_args.governance_end_date):
+        raise ValueError(
+            f"Governance start date is after end date: "
+            f"{runtime_args.governance_start_date} > {runtime_args.governance_end_date}"
+        )
+
+    max_days = governance.get("max_days")
+    if max_days is not None and str(max_days).strip():
+        max_days_int = int(str(max_days).strip())
+        if max_days_int <= 0:
+            raise ValueError("Governance max trading days must be positive.")
+        runtime_args.governance_max_days = max_days_int
+    if "shadow_portfolios" in governance:
+        runtime_args.governance_shadow_portfolios = bool(governance.get("shadow_portfolios"))
+    return runtime_args
+
+
+def run_governance_mainline_review_from_main(args):
+    """Run the two-universe governance review flow from the main launcher."""
+    from build_governance_mainline_report import build_report
+    from functions.decision_council.live_monitor import GovernanceLiveMonitor
+    from run_governance_experiments import run_single_experiment
+
+    review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    variant_name = "rules_based_president"
+    alpha_bundle = "president_core_bundle"
+    shared_live_monitor = None
+    if not args.no_live_monitor:
+        shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
+
+    for universe_name in review_universes:
+        print("=" * 72)
+        print(f"Running mainline review universe: {universe_name}")
+        print("=" * 72)
+        run_single_experiment(
+            variant_name=variant_name,
+            alpha_bundle=alpha_bundle,
+            universe_name=universe_name,
+            start_date=args.governance_start_date,
+            end_date=args.governance_end_date,
+            max_days=args.governance_max_days,
+            enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
+            show_live_monitor=not args.no_live_monitor,
+            live_monitor=shared_live_monitor,
+        )
+    report_path, comparison_path = build_report()
+    print(f"Saved review report: {report_path}")
+    print(f"Saved comparison csv: {comparison_path}")
+
+
+def run_governance_layer_validation_from_main(args):
+    """Run a compact governance line that isolates base signal quality."""
+    from functions.decision_council.live_monitor import GovernanceLiveMonitor
+    from run_governance_experiments import run_single_experiment
+
+    review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    variant_name = "governance_layer_validation"
+    alpha_bundle = "validation_core_bundle"
+    shared_live_monitor = None
+    if not args.no_live_monitor:
+        shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
+
+    for universe_name in review_universes:
+        print("=" * 72)
+        print(f"Running layer validation universe: {universe_name}")
+        print("=" * 72)
+        run_single_experiment(
+            variant_name=variant_name,
+            alpha_bundle=alpha_bundle,
+            universe_name=universe_name,
+            start_date=args.governance_start_date,
+            end_date=args.governance_end_date,
+            max_days=args.governance_max_days,
+            enable_shadow_portfolios=False,
+            show_live_monitor=not args.no_live_monitor,
+            live_monitor=shared_live_monitor,
+        )
+
+
+LAYER_ABLATION_SUITE = (
+    ("governance_core_base", "validation_core_bundle", "01_core_base"),
+    ("governance_core_plus_regime", "validation_core_bundle", "02_core_plus_regime"),
+    ("governance_core_plus_probability", "validation_core_bundle", "03_core_plus_probability"),
+    ("governance_core_plus_complex_exit", "validation_core_bundle", "04_core_plus_complex_exit"),
+    ("governance_full_mainline_control", "president_core_bundle", "05_full_mainline_control"),
+)
+
+
+def run_governance_layer_ablation_suite_from_main(args):
+    """Run all layer-ablation lines for the selected universes and window."""
+    from functions.decision_council.live_monitor import GovernanceLiveMonitor
+    from functions.decision_council.layer_ablation_diagnostics import build_layer_ablation_diagnostics
+    from run_governance_experiments import build_output_path, run_single_experiment
+
+    review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    suite_id = pd.Timestamp.now().strftime("suite_%Y%m%d_%H%M%S")
+    shared_live_monitor = None
+    if not args.no_live_monitor:
+        shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
+    comparison_rows = []
+    for universe_name in review_universes:
+        for variant_name, alpha_bundle, suite_step in LAYER_ABLATION_SUITE:
+            print("=" * 72)
+            print(f"Running layer ablation step: {suite_step}")
+            print(f"  Universe: {universe_name}")
+            print(f"  Variant: {variant_name}")
+            print(f"  Alpha Bundle: {alpha_bundle}")
+            print("=" * 72)
+            saved = run_single_experiment(
+                variant_name=variant_name,
+                alpha_bundle=alpha_bundle,
+                universe_name=universe_name,
+                start_date=args.governance_start_date,
+                end_date=args.governance_end_date,
+                max_days=args.governance_max_days,
+                enable_shadow_portfolios=False,
+                show_live_monitor=not args.no_live_monitor,
+                live_monitor=shared_live_monitor,
+                output_dir_suffix=suite_id,
+            )
+            summary_path = saved.get("governance_strategy_summary")
+            if summary_path is None:
+                summary_path = build_output_path(variant_name, alpha_bundle, universe_name) / suite_id / "governance_strategy_summary.csv"
+            try:
+                summary = pd.read_csv(summary_path)
+            except Exception:
+                summary = pd.DataFrame()
+            if summary.empty:
+                comparison_rows.append(
+                    {
+                        "suite_step": suite_step,
+                        "universe_name": universe_name,
+                        "variant_name": variant_name,
+                        "alpha_bundle": alpha_bundle,
+                        "suite_id": suite_id,
+                        "summary_status": "missing_or_empty",
+                    }
+                )
+                continue
+            row = summary.iloc[0].to_dict()
+            row.update(
+                {
+                    "suite_step": suite_step,
+                    "universe_name": universe_name,
+                    "variant_name": variant_name,
+                    "alpha_bundle": alpha_bundle,
+                    "suite_id": suite_id,
+                    "summary_status": "ok",
+                }
+            )
+            comparison_rows.append(row)
+
+    comparison = pd.DataFrame(comparison_rows)
+    output_path = RESULT_DIR / "governance" / f"layer_ablation_suite_comparison_{suite_id}.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    comparison.to_csv(output_path, index=False, encoding="utf-8-sig")
+    print(f"Saved layer ablation suite comparison: {output_path}")
+    diagnostic_paths = build_layer_ablation_diagnostics(
+        suite_id=suite_id,
+        universe_names=review_universes,
+        suite_steps=LAYER_ABLATION_SUITE,
+        result_dir=RESULT_DIR,
+    )
+    for name, path in diagnostic_paths.items():
+        print(f"Saved layer diagnostic {name}: {path}")
+
+
+def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
+    runtime_args = argparse.Namespace(**vars(args))
+    profile = str(profile_name or "full").strip().lower()
+    governance_tasks = {
+        "governance_active",
+        "governance_mainline_review",
+        "governance_layer_validation",
+        "governance_layer_ablation_suite",
+    }
+    touches_governance = any(task in governance_tasks for task in tasks)
+
+    if profile != "fast" or not touches_governance:
+        if touches_governance and runtime_args.governance_shadow_portfolios is None:
+            runtime_args.governance_shadow_portfolios = False
+        shadow_state = "on" if runtime_args.governance_shadow_portfolios else "off"
+        return runtime_args, "full", f"Full historical review window, shadow_portfolios={shadow_state}."
+
+    configured_end = pd.Timestamp(runtime_args.governance_end_date or CLI_GOVERNANCE_END_DATE)
+    configured_start = pd.Timestamp(runtime_args.governance_start_date or CLI_GOVERNANCE_START_DATE)
+    fast_start = max(configured_start, configured_end - pd.Timedelta(days=365))
+    runtime_args.governance_start_date = fast_start.strftime("%Y-%m-%d")
+    runtime_args.governance_end_date = configured_end.strftime("%Y-%m-%d")
+    runtime_args.governance_max_days = min(int(runtime_args.governance_max_days), 180) if runtime_args.governance_max_days is not None else 180
+    if runtime_args.governance_shadow_portfolios is None:
+        runtime_args.governance_shadow_portfolios = False
+    return (
+        runtime_args,
+        "fast",
+        (
+            f"Fast review window: {runtime_args.governance_start_date} -> {runtime_args.governance_end_date}, "
+            f"max_days={runtime_args.governance_max_days}, shadow_portfolios=off."
+        ),
+    )
+
+
+def launch_interactive_main_menu():
+    state_dir = Path(tempfile.gettempdir()) / "tdx_main_launcher"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / f"selection_{os.getpid()}.json"
+    if state_path.exists():
+        try:
+            state_path.unlink()
+        except Exception:
+            pass
+
+    launcher_script = Path(__file__).with_name("main_launcher_web.py")
+    if not launcher_script.exists():
+        print("Browser launcher script is missing.")
+        return {}
+
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(launcher_script), str(state_path)],
+        cwd=str(Path(__file__).resolve().parent),
+    )
+    print(f"Main Launcher started in external browser mode (pid={proc.pid}).")
+
+    selection = {}
+    last_wait_notice = time.time()
+    while proc.poll() is None:
+        if state_path.exists():
+            try:
+                selection = json.loads(state_path.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                pass
+        if time.time() - last_wait_notice >= 15:
+            print("Waiting for launcher selection...")
+            last_wait_notice = time.time()
+        time.sleep(0.2)
+
+    if not selection and state_path.exists():
+        try:
+            selection = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            selection = {}
+
+    try:
+        state_path.unlink()
+    except Exception:
+        pass
+    return selection
+
+
+def run_interactive_selection(selection, args):
+    tasks = [] if not selection else selection.get("tasks", [])
+    profile = "full" if not selection else selection.get("profile", "full")
     if not tasks:
         print("Interactive launcher cancelled.")
         return
-
-    if set(tasks) == {"main_pipeline", "governance_active", "alpha_ablation", "universe_ablation"}:
-        run_full_registry_matrix(args)
-        return
+    runtime_args = _apply_interactive_governance_params(args, selection, tasks)
+    runtime_args, profile_name, profile_note = _apply_runtime_profile(runtime_args, profile, tasks)
+    print(f"Launcher runtime profile: {profile_name}")
+    print(profile_note)
+    if (
+        "governance_active" in tasks
+        or "governance_mainline_review" in tasks
+        or "governance_layer_validation" in tasks
+        or "governance_layer_ablation_suite" in tasks
+    ):
+        selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
+        runtime_args.governance_universes = selected_universes
+        print(
+            "Governance selection: "
+            f"universes={list(selected_universes)}, "
+            f"start={runtime_args.governance_start_date}, "
+            f"end={runtime_args.governance_end_date}, "
+            f"max_days={runtime_args.governance_max_days}"
+        )
 
     if "main_pipeline" in tasks:
         main()
     if "governance_active" in tasks:
+        selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         _run_single_governance_variant(
             "rules_based_president",
-            start_date=args.governance_start_date,
-            end_date=args.governance_end_date,
-            max_days=args.governance_max_days,
-            safety_proxy_mode=args.safety_proxy_mode,
-            show_live_monitor=not args.no_live_monitor,
+            start_date=runtime_args.governance_start_date,
+            end_date=runtime_args.governance_end_date,
+            max_days=runtime_args.governance_max_days,
+            safety_proxy_mode=runtime_args.safety_proxy_mode,
+            universe_name=selected_universes[0],
+            enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
+            show_live_monitor=not runtime_args.no_live_monitor,
         )
-    if "alpha_ablation" in tasks:
-        alpha_results = run_alpha_ablation(
-            start_date=args.governance_start_date,
-            end_date=args.governance_end_date,
-            max_days=args.governance_max_days,
-        )
-        alpha_comparison = build_experiment_comparison_report(alpha_results)
-        alpha_path = save_experiment_comparison_report(alpha_comparison, "alpha_ablation")
-        print("Saved alpha ablation summary:", alpha_path)
-    if "universe_ablation" in tasks:
-        universe_results = run_universe_ablation(
-            start_date=args.governance_start_date,
-            end_date=args.governance_end_date,
-            max_days=args.governance_max_days,
-        )
-        universe_comparison = build_experiment_comparison_report(universe_results)
-        universe_path = save_experiment_comparison_report(universe_comparison, "universe_ablation")
-        print("Saved universe ablation summary:", universe_path)
+    if "governance_mainline_review" in tasks:
+        run_governance_mainline_review_from_main(runtime_args)
+    if "governance_layer_validation" in tasks:
+        run_governance_layer_validation_from_main(runtime_args)
+    if "governance_layer_ablation_suite" in tasks:
+        run_governance_layer_ablation_suite_from_main(runtime_args)
 
 
 def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
@@ -1559,6 +1790,7 @@ if __name__ == "__main__":
         assert_valid_configuration()
         if len(sys.argv) == 1:
             cli_args = parse_args()
+            print("Opening Main Launcher in the browser.")
             tasks = launch_interactive_main_menu()
             run_interactive_selection(tasks, cli_args)
             sys.exit(0)
@@ -1571,12 +1803,15 @@ if __name__ == "__main__":
         elif cli_args.registry_suite:
             run_registry_suite(cli_args)
         elif cli_args.governance:
+            selected_universes = _normalize_governance_universes(getattr(cli_args, "governance_universes", None))
             _run_single_governance_variant(
                 cli_args.governance_variant,
                 start_date=cli_args.governance_start_date,
                 end_date=cli_args.governance_end_date,
                 max_days=cli_args.governance_max_days,
                 safety_proxy_mode=cli_args.safety_proxy_mode,
+                universe_name=selected_universes[0],
+                enable_shadow_portfolios=bool(cli_args.governance_shadow_portfolios) if cli_args.governance_shadow_portfolios is not None else True,
                 show_live_monitor=not cli_args.no_live_monitor,
             )
         elif cli_args.low_memory:

@@ -86,6 +86,22 @@ class UniverseRegistry:
             status="active",
         ))
 
+        # 1b. HS300 + CSI300 + A500 严格模式
+        # HS300 and CSI300 both map to index code 000300 in the current pipeline,
+        # so the implementation keeps a de-duplicated code set while preserving
+        # the requested universe name for reporting and experiment tracking.
+        self.register(UniverseSpec(
+            name="hs300_csi300_a500_strict",
+            mode="index_pool_strict",
+            require_constituents=True,
+            allow_fallback=False,
+            target_index_codes=["000300", "000510"],
+            quality_filter_enabled=True,
+            description="沪深300+CSI300+中证A500严格股票池；CSI300与HS300同码后按去重指数集合执行",
+            status="active",
+            extra={"requested_index_aliases": ["hs300", "csi300", "csi_a500"]},
+        ))
+
         # 2. HS300 严格模式
         self.register(UniverseSpec(
             name="hs300_strict",

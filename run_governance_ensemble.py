@@ -247,11 +247,11 @@ def run_backtest(gui):
             sortino = metrics.get("sortino", 0)
             max_dd = metrics.get("max_drawdown", 0)
             win_rate = metrics.get("win_rate", 0)
-            pbo = metrics.get("pbo", np.nan)
-            
-            pbo_str = f"{pbo:.1%}" if not np.isnan(pbo) else "N/A"
+            negative_block_rate = metrics.get("negative_block_rate", np.nan)
+
+            negative_block_str = f"{negative_block_rate:.1%}" if not np.isnan(negative_block_rate) else "N/A"
             msg = f"Return: {ret:.2%} | Sharpe: {sharpe:.3f} | Calmar: {calmar:.3f} | MaxDD: {max_dd:.2%}"
-            details = f"Sortino: {sortino:.3f} | Win Rate: {win_rate:.1%} | PBO: {pbo_str} | Saved to: {output_dir}"
+            details = f"Sortino: {sortino:.3f} | Win Rate: {win_rate:.1%} | Negative Block Rate: {negative_block_str} | Saved to: {output_dir}"
             gui.root.after(0, lambda: gui.update_progress(total_days, total_days, msg, details))
             
             while not gui.cancelled:

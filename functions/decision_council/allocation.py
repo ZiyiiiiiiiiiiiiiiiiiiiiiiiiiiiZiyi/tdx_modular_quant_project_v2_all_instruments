@@ -37,11 +37,12 @@ class PortfolioConstructionCommittee:
     def __init__(self, *, enable_sector_cap: bool = False):
         self.enable_sector_cap = bool(enable_sector_cap)
 
-    def construct(self, candidates: pd.DataFrame, *, exposure_cap: float):
+    def construct(self, candidates: pd.DataFrame, *, exposure_cap: float, covariance_matrix: pd.DataFrame | None = None):
         return allocate_constrained_inverse_vol(
             candidates,
             exposure_cap=float(exposure_cap),
             max_sector_weight=GOVERNANCE_MAX_PROTOTYPE_SECTOR_WEIGHT if self.enable_sector_cap else 1.0,
+            covariance_matrix=covariance_matrix,
         )
 
 
@@ -54,6 +55,9 @@ def allocate_constrained_inverse_vol(
     max_iterations: int = GOVERNANCE_REALLOCATION_ITERATIONS,
     min_residual: float = GOVERNANCE_REALLOCATION_MIN_WEIGHT,
     volatility_cap_multiplier: float = GOVERNANCE_VOLATILITY_CAP_MULTIPLIER,
+    covariance_matrix: pd.DataFrame | None = None,
+    covariance_shrinkage: float = 0.35,
+    max_risk_contribution: float = 0.25,
 ) -> tuple[pd.DataFrame, dict]:
     data = candidates.copy()
     if data.empty or exposure_cap <= 0:
@@ -81,7 +85,14 @@ def allocate_constrained_inverse_vol(
         )
         exposure_cap = min(float(exposure_cap), float(requested.sum()))
     else:
-        raw = 1.0 / data["volatility_20"]
+        edge = pd.to_numeric(
+            data.get("edge_to_risk_10d", pd.Series(0.0, index=data.index)),
+            errors="coerce",
+        ).fillna(0.0).clip(lower=0.0)
+        if edge.gt(0.0).any():
+            raw = (1.0 / data["volatility_20"]) * (1.0 + edge.clip(upper=2.0))
+        else:
+            raw = 1.0 / data["volatility_20"]
     raw = raw / raw.sum()
     data["raw_inverse_vol_weight"] = raw * float(exposure_cap)
     data["target_weight"] = 0.0
@@ -120,6 +131,12 @@ def allocate_constrained_inverse_vol(
     volatility_cap = volatility_cap_multiplier * uncapped_vol
     scale = min(1.0, volatility_cap / constrained_vol) if constrained_vol > 0 else 1.0
     data["target_weight"] *= scale
+    covariance_diagnostics = _apply_covariance_risk_budget(
+        data,
+        covariance_matrix=covariance_matrix,
+        shrinkage=covariance_shrinkage,
+        max_risk_contribution=max_risk_contribution,
+    )
     reserve = max(float(exposure_cap) - float(data["target_weight"].sum()), 0.0)
     diagnostics = {
         "exposure_cap": float(exposure_cap),
@@ -130,12 +147,126 @@ def allocate_constrained_inverse_vol(
         "constraint_cash_reserve": reserve,
         "max_position_weight": float(data["target_weight"].max()),
         "max_prototype_sector_weight": float(data.groupby("prototype_sector")["target_weight"].sum().max()),
+        **covariance_diagnostics,
     }
     return data, diagnostics
 
 
 def _diagonal_portfolio_volatility(weights: pd.Series, volatilities: pd.Series) -> float:
     return float(np.sqrt(np.square(weights.to_numpy(dtype=float) * volatilities.to_numpy(dtype=float)).sum()))
+
+
+def _apply_covariance_risk_budget(
+    data: pd.DataFrame,
+    *,
+    covariance_matrix: pd.DataFrame | None,
+    shrinkage: float,
+    max_risk_contribution: float,
+) -> dict:
+    if covariance_matrix is None or covariance_matrix.empty or data.empty:
+        return {
+            "covariance_risk_model_used": False,
+            "portfolio_covariance_volatility": 0.0,
+            "max_risk_contribution": 0.0,
+            "avg_pairwise_correlation": 0.0,
+            "covariance_condition_number": 0.0,
+        }
+    symbols = data["symbol"].astype(str).tolist()
+    cov = covariance_matrix.copy()
+    cov.index = cov.index.astype(str)
+    cov.columns = cov.columns.astype(str)
+    available = [symbol for symbol in symbols if symbol in cov.index and symbol in cov.columns]
+    if len(available) < 2:
+        return {
+            "covariance_risk_model_used": False,
+            "portfolio_covariance_volatility": 0.0,
+            "max_risk_contribution": 0.0,
+            "avg_pairwise_correlation": 0.0,
+            "covariance_condition_number": 0.0,
+        }
+    cov = cov.loc[available, available].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    raw_sigma = cov.to_numpy(dtype=float)
+    diagonal = np.diag(np.diag(raw_sigma))
+    raw_condition = _condition_number(_nearest_positive_semidefinite(raw_sigma))
+    lam = min(max(float(shrinkage), 0.0), 1.0)
+    if raw_condition > 5000:
+        lam = max(lam, 0.80)
+    elif raw_condition > 1000:
+        lam = max(lam, 0.65)
+    elif raw_condition > 300:
+        lam = max(lam, 0.50)
+    sigma = lam * diagonal + (1.0 - lam) * raw_sigma
+    sigma = _nearest_positive_semidefinite(sigma)
+    indexer = data["symbol"].astype(str).isin(available)
+    weights = data.loc[indexer, "target_weight"].to_numpy(dtype=float)
+    if weights.sum() <= 0:
+        return {
+            "covariance_risk_model_used": True,
+            "portfolio_covariance_volatility": 0.0,
+            "max_risk_contribution": 0.0,
+            "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
+            "covariance_condition_number": _condition_number(sigma),
+        }
+    for _ in range(80):
+        rc = _risk_contribution(weights, sigma)
+        if rc.size == 0 or float(np.nanmax(rc)) <= float(max_risk_contribution):
+            break
+        offender = int(np.nanargmax(rc))
+        scale = min(0.85 * float(max_risk_contribution) / max(float(rc[offender]), 1e-12), 0.75)
+        scale = max(scale, 0.05)
+        weights[offender] *= scale
+    data.loc[indexer, "target_weight"] = weights
+    variance = float(weights @ sigma @ weights)
+    return {
+        "covariance_risk_model_used": True,
+        "portfolio_covariance_volatility": float(np.sqrt(max(variance, 0.0))),
+        "max_risk_contribution": float(np.nanmax(_risk_contribution(weights, sigma))) if weights.sum() > 0 else 0.0,
+        "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
+        "covariance_condition_number": _condition_number(sigma),
+        "covariance_shrinkage_used": float(lam),
+        "raw_covariance_condition_number": float(raw_condition),
+    }
+
+
+def _risk_contribution(weights: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+    variance = float(weights @ sigma @ weights)
+    if variance <= 1e-18:
+        return np.zeros_like(weights)
+    marginal = sigma @ weights
+    return (weights * marginal) / variance
+
+
+def _nearest_positive_semidefinite(sigma: np.ndarray) -> np.ndarray:
+    sigma = np.asarray(sigma, dtype=float)
+    sigma = 0.5 * (sigma + sigma.T)
+    min_diag = max(float(np.nanmedian(np.diag(sigma))) * 0.01, 1e-8)
+    diag = np.diag(sigma).copy()
+    diag[diag <= 0.0] = min_diag
+    np.fill_diagonal(sigma, diag)
+    try:
+        values, vectors = np.linalg.eigh(sigma)
+        floor = max(float(np.nanmedian(values[values > 0])) * 0.001 if np.any(values > 0) else 1e-8, 1e-10)
+        values = np.clip(values, floor, None)
+        stabilized = (vectors * values) @ vectors.T
+        return 0.5 * (stabilized + stabilized.T)
+    except Exception:
+        return sigma
+
+
+def _avg_pairwise_correlation(sigma: np.ndarray) -> float:
+    diag = np.sqrt(np.clip(np.diag(sigma), 1e-12, None))
+    corr = sigma / np.outer(diag, diag)
+    if corr.shape[0] < 2:
+        return 0.0
+    mask = ~np.eye(corr.shape[0], dtype=bool)
+    return float(np.nanmean(corr[mask]))
+
+
+def _condition_number(sigma: np.ndarray) -> float:
+    try:
+        return float(np.linalg.cond(sigma))
+    except Exception:
+        return 0.0
 
 
 def _empty_diagnostics(exposure_cap: float) -> dict:
@@ -148,4 +279,9 @@ def _empty_diagnostics(exposure_cap: float) -> dict:
         "constraint_cash_reserve": exposure_cap,
         "max_position_weight": 0.0,
         "max_prototype_sector_weight": 0.0,
+        "covariance_risk_model_used": False,
+        "portfolio_covariance_volatility": 0.0,
+        "max_risk_contribution": 0.0,
+        "avg_pairwise_correlation": 0.0,
+        "covariance_condition_number": 0.0,
     }

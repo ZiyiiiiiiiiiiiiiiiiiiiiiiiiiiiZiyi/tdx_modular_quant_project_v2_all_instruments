@@ -10,13 +10,17 @@ import pandas as pd
 def save_governance_diagnostic_plots(
     *,
     daily_result: pd.DataFrame,
+    holdings_ledger: pd.DataFrame,
     reputation_ledger: pd.DataFrame,
     safety_ledger: pd.DataFrame,
     execution_ledger: pd.DataFrame,
+    attribution_ledger: pd.DataFrame | None = None,
+    bucket_attribution: pd.DataFrame | None = None,
+    factor_weight_ledger: pd.DataFrame | None = None,
     feature_data: pd.DataFrame,
     output_dir,
 ) -> dict[str, Path]:
-    """Save three governance charts without making plotting a runtime dependency."""
+    """Save governance diagnostics without making plotting a runtime dependency."""
     try:
         import matplotlib
 
@@ -33,6 +37,21 @@ def save_governance_diagnostic_plots(
         path = output / "governance_performance_risk.png"
         _plot_performance_risk(plt, daily_result, path)
         saved["governance_performance_risk_plot"] = path
+        path = output / "governance_capital_allocation.png"
+        _plot_capital_allocation(plt, daily_result, path)
+        saved["governance_capital_allocation_plot"] = path
+    if attribution_ledger is not None and not attribution_ledger.empty:
+        path = output / "governance_benchmark_exposure_attribution.png"
+        if _plot_benchmark_exposure_attribution(plt, attribution_ledger, path):
+            saved["governance_benchmark_exposure_attribution_plot"] = path
+    if bucket_attribution is not None and not bucket_attribution.empty:
+        path = output / "governance_bucket_attribution.png"
+        if _plot_bucket_attribution(plt, bucket_attribution, path):
+            saved["governance_bucket_attribution_plot"] = path
+    if factor_weight_ledger is not None and not factor_weight_ledger.empty:
+        path = output / "governance_factor_module_weights.png"
+        if _plot_factor_module_weights(plt, factor_weight_ledger, path):
+            saved["governance_factor_module_weight_plot"] = path
     if not reputation_ledger.empty:
         path = output / "governance_model_reputation_scores.png"
         _plot_model_scores(plt, reputation_ledger, path)
@@ -45,6 +64,16 @@ def save_governance_diagnostic_plots(
         path = output / "governance_decision_accuracy.png"
         if _plot_decision_accuracy(plt, execution_ledger, feature_data, path):
             saved["governance_decision_accuracy_plot"] = path
+    if not holdings_ledger.empty:
+        path = output / "governance_top_holdings_latest.png"
+        if _plot_top_holdings_latest(plt, holdings_ledger, path):
+            saved["governance_top_holdings_latest_plot"] = path
+        animation_path = output / "governance_selected_holdings_90d.gif"
+        static_path = output / "governance_selected_holdings_90d.png"
+        saved_path = _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, animation_path, static_path)
+        if saved_path is not None:
+            key = "governance_selected_holdings_90d_animation" if saved_path.suffix.lower() == ".gif" else "governance_selected_holdings_90d_plot"
+            saved[key] = saved_path
     return saved
 
 
@@ -117,6 +146,38 @@ def _plot_performance_risk(plt, daily_result, output_path):
     axes[2].set_ylabel("Daily return")
     sharpe_axis.set_ylabel("20D rolling Sharpe")
     axes[2].grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_capital_allocation(plt, daily_result, output_path):
+    data = daily_result.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["cash"] = pd.to_numeric(data.get("cash", pd.Series(dtype=float)), errors="coerce")
+    data["invested_value"] = pd.to_numeric(data.get("invested_value", pd.Series(dtype=float)), errors="coerce")
+    data["nominal_nav"] = pd.to_numeric(data.get("nominal_nav", pd.Series(dtype=float)), errors="coerce")
+    data = data.dropna(subset=["date", "nominal_nav"]).sort_values("date")
+    if data.empty:
+        return
+
+    data["cash_ratio"] = data["cash"] / data["nominal_nav"].replace(0.0, np.nan)
+    data["invested_ratio"] = data["invested_value"] / data["nominal_nav"].replace(0.0, np.nan)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
+    axes[0].plot(data["date"], data["cash"], color="#c47f17", linewidth=1.2, label="Cash")
+    axes[0].plot(data["date"], data["invested_value"], color="#1f77b4", linewidth=1.2, label="Invested")
+    axes[0].set_ylabel("Value")
+    axes[0].set_title("Governance capital allocation")
+    axes[0].legend(loc="best")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].fill_between(data["date"], data["cash_ratio"].fillna(0.0), color="#f2c66d", alpha=0.6, label="Cash ratio")
+    axes[1].fill_between(data["date"], 0.0, data["invested_ratio"].fillna(0.0), color="#7fb3e6", alpha=0.6, label="Invested ratio")
+    axes[1].set_ylabel("Ratio")
+    axes[1].set_ylim(0.0, 1.05)
+    axes[1].legend(loc="best")
+    axes[1].grid(alpha=0.25)
     fig.tight_layout()
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
@@ -265,3 +326,251 @@ def _plot_decision_accuracy(plt, execution_ledger, feature_data, output_path) ->
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
+
+
+def _plot_top_holdings_latest(plt, holdings_ledger, output_path) -> bool:
+    data = holdings_ledger.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["market_value"] = pd.to_numeric(data["market_value"], errors="coerce")
+    data["weight"] = pd.to_numeric(data.get("weight", pd.Series(dtype=float)), errors="coerce")
+    data = data.dropna(subset=["date", "symbol", "market_value"]).sort_values(["date", "market_value"], ascending=[True, False])
+    if data.empty:
+        return False
+
+    latest_date = data["date"].max()
+    latest = data[data["date"] == latest_date].copy().sort_values("market_value", ascending=False).head(12)
+    if latest.empty:
+        return False
+
+    labels = [str(symbol) for symbol in latest["symbol"]]
+    values = latest["market_value"].to_numpy(dtype=float)
+    weights = latest["weight"].fillna(0.0).to_numpy(dtype=float)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    axes[0].barh(labels[::-1], values[::-1], color="#1f77b4")
+    axes[0].set_title(f"Top holdings by market value ({latest_date.date()})")
+    axes[0].set_xlabel("Market value")
+    axes[0].grid(alpha=0.25, axis="x")
+
+    axes[1].barh(labels[::-1], weights[::-1], color="#2ca02c")
+    axes[1].set_title("Holding weights")
+    axes[1].set_xlabel("Weight")
+    axes[1].set_xlim(0.0, max(float(weights.max()) * 1.15, 0.05))
+    axes[1].grid(alpha=0.25, axis="x")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_benchmark_exposure_attribution(plt, attribution_ledger, output_path) -> bool:
+    data = attribution_ledger.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    required = [
+        "account_net_value",
+        "invested_capital_net_value",
+        "valid_invested_capital_net_value",
+        "holding_portfolio_net_value",
+        "benchmark_net_value",
+        "excess_net_value",
+        "actual_exposure",
+        "account_drawdown",
+        "invested_capital_drawdown",
+    ]
+    for column in required:
+        data[column] = pd.to_numeric(data.get(column, pd.Series(dtype=float)), errors="coerce")
+    data = data.dropna(subset=["date"]).sort_values("date")
+    if data.empty:
+        return False
+
+    fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True, gridspec_kw={"height_ratios": [2.0, 1.0, 1.0]})
+    axes[0].plot(data["date"], data["account_net_value"], label="Account NAV (cash included)", color="#147a54", linewidth=1.4)
+    axes[0].plot(data["date"], data["invested_capital_net_value"], label="Raw invested-capital NAV", color="#9b59b6", linewidth=1.0, alpha=0.55)
+    axes[0].plot(data["date"], data["valid_invested_capital_net_value"], label="Valid invested NAV (exposure>=5%)", color="#2c7fb8", linewidth=1.3)
+    axes[0].plot(data["date"], data["holding_portfolio_net_value"], label="Holding portfolio NAV approx", color="#0f766e", linewidth=1.1)
+    axes[0].plot(data["date"], data["benchmark_net_value"], label="Benchmark NAV", color="#666666", linewidth=1.1)
+    axes[0].plot(data["date"], data["excess_net_value"], label="Account excess NAV", color="#d4a84f", linewidth=1.1)
+    axes[0].axhline(1.0, color="#999999", linestyle="--", linewidth=0.8)
+    axes[0].set_title("Account vs invested capital vs benchmark")
+    axes[0].set_ylabel("Net value")
+    axes[0].legend(loc="best")
+    axes[0].grid(alpha=0.25)
+
+    axes[1].plot(data["date"], data["account_drawdown"], label="Account drawdown", color="#b3403a", linewidth=1.1)
+    axes[1].plot(data["date"], data["invested_capital_drawdown"], label="Invested-capital drawdown", color="#7f1d1d", linewidth=1.1)
+    axes[1].fill_between(data["date"], data["account_drawdown"].fillna(0.0), 0.0, color="#d9827b", alpha=0.22)
+    axes[1].set_ylabel("Drawdown")
+    axes[1].legend(loc="best")
+    axes[1].grid(alpha=0.25)
+
+    axes[2].fill_between(data["date"], 0.0, data["actual_exposure"].fillna(0.0), color="#2c7fb8", alpha=0.45)
+    axes[2].set_ylim(0.0, max(1.0, float(data["actual_exposure"].max(skipna=True) or 0.0) * 1.1))
+    axes[2].set_ylabel("Actual exposure")
+    axes[2].set_xlabel("Date")
+    axes[2].grid(alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_bucket_attribution(plt, bucket_attribution, output_path) -> bool:
+    data = bucket_attribution.copy()
+    preferred_metric = "valid_invested_excess_total_return" if "valid_invested_excess_total_return" in data.columns else "invested_excess_total_return"
+    data[preferred_metric] = pd.to_numeric(data.get(preferred_metric), errors="coerce")
+    data["avg_actual_exposure"] = pd.to_numeric(data.get("avg_actual_exposure"), errors="coerce")
+    data = data.dropna(subset=["dimension", "bucket"])
+    if data.empty:
+        return False
+
+    dimensions = [
+        "holding_count_bucket",
+        "exposure_bucket",
+        "factor_entropy_bucket",
+        "dominant_factor_module",
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.ravel()
+    for axis, dimension in zip(axes, dimensions):
+        subset = data[data["dimension"].astype(str).eq(dimension)].copy()
+        subset = subset.sort_values(preferred_metric, ascending=False).head(10)
+        if subset.empty:
+            axis.set_title(f"{dimension}: no data")
+            axis.axis("off")
+            continue
+        colors = np.where(subset[preferred_metric].fillna(0.0) >= 0, "#147a54", "#b3403a")
+        axis.barh(subset["bucket"].astype(str)[::-1], subset[preferred_metric].fillna(0.0)[::-1], color=colors[::-1])
+        axis.axvline(0.0, color="#666666", linewidth=0.8)
+        axis.set_title(f"{dimension} | {preferred_metric}")
+        axis.grid(alpha=0.25, axis="x")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_factor_module_weights(plt, factor_weight_ledger, output_path) -> bool:
+    data = factor_weight_ledger.copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["weight_share"] = pd.to_numeric(data.get("weight_share"), errors="coerce").clip(lower=0.0)
+    data["factor_module"] = data.get("factor_module", pd.Series("unknown", index=data.index)).fillna("unknown").astype(str)
+    data = data.dropna(subset=["date", "weight_share"])
+    if data.empty:
+        return False
+    pivot = (
+        data.groupby(["date", "factor_module"], as_index=False)["weight_share"]
+        .sum()
+        .pivot(index="date", columns="factor_module", values="weight_share")
+        .fillna(0.0)
+        .sort_index()
+    )
+    if pivot.empty:
+        return False
+    fig, axes = plt.subplots(2, 1, figsize=(15, 10), sharex=True, gridspec_kw={"height_ratios": [1.7, 1.0]})
+    pivot.plot.area(ax=axes[0], linewidth=0.0, alpha=0.72)
+    axes[0].set_title("Alpha factor module weight share")
+    axes[0].set_ylabel("Share")
+    axes[0].set_ylim(0.0, max(1.0, float(pivot.sum(axis=1).max()) * 1.05))
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(loc="upper left", ncol=3, fontsize=8)
+
+    top_factor = (
+        data.sort_values(["date", "weight_share"], ascending=[True, False])
+        .groupby("date", as_index=False)
+        .head(1)
+        .sort_values("date")
+    )
+    axes[1].plot(top_factor["date"], top_factor["weight_share"], color="#b3403a", linewidth=1.2, label="Top factor share")
+    axes[1].set_ylabel("Top share")
+    axes[1].set_xlabel("Date")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(loc="best")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, gif_path, png_path) -> Path | None:
+    latest = holdings_ledger.copy()
+    latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
+    latest["market_value"] = pd.to_numeric(latest.get("market_value"), errors="coerce")
+    latest = latest.dropna(subset=["date", "symbol", "market_value"])
+    if latest.empty or feature_data is None or feature_data.empty:
+        return None
+    latest_date = latest["date"].max()
+    symbols = (
+        latest[latest["date"].eq(latest_date)]
+        .sort_values("market_value", ascending=False)["symbol"]
+        .astype(str)
+        .head(6)
+        .tolist()
+    )
+    if not symbols:
+        return None
+
+    prices = feature_data.copy()
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+    close_col = "close_nominal" if "close_nominal" in prices.columns else "close"
+    prices[close_col] = pd.to_numeric(prices[close_col], errors="coerce")
+    start_date = latest_date - pd.Timedelta(days=120)
+    prices = prices[
+        prices["symbol"].astype(str).isin(symbols)
+        & prices["date"].between(start_date, latest_date)
+    ].dropna(subset=["date", "symbol", close_col]).sort_values(["symbol", "date"])
+    if prices.empty:
+        return None
+
+    pivot = prices.pivot_table(index="date", columns="symbol", values=close_col, aggfunc="last").sort_index().ffill()
+    pivot = pivot.tail(90)
+    if len(pivot) < 2:
+        return None
+    normalized = pivot / pivot.iloc[0].replace(0.0, np.nan)
+
+    fig, axis = plt.subplots(figsize=(14, 7))
+    palette = ["#147a54", "#b3403a", "#2c7fb8", "#d4a84f", "#8a5a44", "#465a7a"]
+    for idx, column in enumerate(normalized.columns):
+        axis.plot(normalized.index, normalized[column], linewidth=1.4, color=palette[idx % len(palette)], label=str(column))
+    axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
+    axis.set_title(f"Latest holdings 90 trading-day normalized price paths ({latest_date.date()})")
+    axis.set_ylabel("Normalized close")
+    axis.legend(loc="best", ncol=3)
+    axis.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=220, bbox_inches="tight")
+
+    try:
+        from matplotlib.animation import FuncAnimation, PillowWriter
+
+        axis.clear()
+        axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
+        axis.set_title(f"Latest holdings 90 trading-day normalized price paths ({latest_date.date()})")
+        axis.set_ylabel("Normalized close")
+        axis.grid(alpha=0.25)
+        lines = []
+        for idx, column in enumerate(normalized.columns):
+            (line,) = axis.plot([], [], linewidth=1.5, color=palette[idx % len(palette)], label=str(column))
+            lines.append((column, line))
+        y_min = float(np.nanmin(normalized.to_numpy(dtype=float)))
+        y_max = float(np.nanmax(normalized.to_numpy(dtype=float)))
+        pad = max((y_max - y_min) * 0.08, 0.02)
+        axis.set_ylim(y_min - pad, y_max + pad)
+        axis.set_xlim(normalized.index.min(), normalized.index.max())
+        axis.legend(loc="best", ncol=3)
+
+        def update(frame):
+            frame_data = normalized.iloc[: frame + 1]
+            for column, line in lines:
+                line.set_data(frame_data.index, frame_data[column])
+            return [line for _, line in lines]
+
+        anim = FuncAnimation(fig, update, frames=len(normalized), interval=160, blit=False)
+        anim.save(gif_path, writer=PillowWriter(fps=7))
+        plt.close(fig)
+        return gif_path
+    except Exception:
+        plt.close(fig)
+        return png_path

@@ -133,6 +133,10 @@ class AlphaBundleRegistry:
                 "momentum",
                 "mom_lowvol",
                 "ma_break",
+                "orderflow_amount_shock",
+                "orderflow_close_drive",
+                "orderflow_accumulation",
+                "orderflow_efficiency",
                 "macd_trend",
                 "mean_reversion",
                 "rsi_reversal",
@@ -163,6 +167,10 @@ class AlphaBundleRegistry:
                 "momentum",
                 "mom_lowvol",
                 "ma_break",
+                "orderflow_amount_shock",
+                "orderflow_close_drive",
+                "orderflow_accumulation",
+                "orderflow_efficiency",
                 "macd_trend",
                 "mean_reversion",
                 "rsi_reversal",
@@ -197,6 +205,10 @@ class AlphaBundleRegistry:
                 "alpha_hedge",
                 "event_driven",
                 "holiday_effect",
+                "orderflow_amount_shock",
+                "orderflow_close_drive",
+                "orderflow_accumulation",
+                "orderflow_efficiency",
             ],
             weighting_scheme="equal",
             blend_mode="equal_weight",
@@ -232,6 +244,33 @@ class AlphaBundleRegistry:
             blend_mode="rank_ensemble",
             description="高选择性组合：V6正式候选策略因子",
             status="experimental",
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="validation_core_bundle",
+            alpha_names=[
+                "momentum",
+                "mom_lowvol",
+                "orderflow_amount_shock",
+                "orderflow_efficiency",
+                "price_volume_breakout",
+                "turtle_breakout",
+                "mean_reversion",
+                "kdj_oversold_cross",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description=(
+                "Layer-validation core bundle: compact equal-weight set for isolating "
+                "whether the base entry signal has positive expectancy before reputation, "
+                "shadow weighting, or regime-specific overlays are added."
+            ),
+            status="active",
+            extra={
+                "purpose": "causal_layer_validation",
+                "modules": "momentum,low_vol,orderflow,breakout,reversal",
+                "expected_use": "short-to-medium diagnostic runs",
+            },
         ))
 
     def register(self, spec: AlphaBundleSpec) -> None:

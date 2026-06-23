@@ -1,0 +1,267 @@
+# -*- coding: utf-8 -*-
+"""Build a focused governance mainline review report."""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pandas as pd
+
+from config import DEFAULT_ALPHA_BUNDLE, DEFAULT_GOVERNANCE_VARIANT, REPORT_DIR
+from functions.data_integrity import build_data_integrity_report
+from functions.decision_council.ml_metrics import compute_all_metrics
+from functions.formal_admission import build_formal_admission_report
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = REPORT_DIR
+REVIEW_UNIVERSES = ("hs300_csi500_a500_strict", "hs300_strict")
+
+
+def _summary_path(universe_name: str) -> Path:
+    return (
+        PROJECT_DIR
+        / "results"
+        / "governance"
+        / universe_name
+        / DEFAULT_GOVERNANCE_VARIANT
+        / DEFAULT_ALPHA_BUNDLE
+        / "governance_strategy_summary.csv"
+    )
+
+
+def _daily_path(universe_name: str) -> Path:
+    return (
+        PROJECT_DIR
+        / "results"
+        / "governance"
+        / universe_name
+        / DEFAULT_GOVERNANCE_VARIANT
+        / DEFAULT_ALPHA_BUNDLE
+        / "governance_daily_result.csv"
+    )
+
+
+def _output_dir(universe_name: str) -> Path:
+    return (
+        PROJECT_DIR
+        / "results"
+        / "governance"
+        / universe_name
+        / DEFAULT_GOVERNANCE_VARIANT
+        / DEFAULT_ALPHA_BUNDLE
+    )
+
+
+def _load_universe_rows() -> pd.DataFrame:
+    rows = []
+    for universe_name in REVIEW_UNIVERSES:
+        summary_path = _summary_path(universe_name)
+        if not summary_path.exists():
+            rows.append({"universe_name": universe_name, "status": "missing_results"})
+            continue
+        summary = pd.read_csv(summary_path)
+        if summary.empty:
+            rows.append({"universe_name": universe_name, "status": "empty_summary"})
+            continue
+        row = summary.iloc[0].to_dict()
+        row["universe_name"] = universe_name
+        row["status"] = "completed"
+        row.update(compute_all_metrics(_output_dir(universe_name)))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _load_safety_failure_messages() -> list[str]:
+    verify_path = PROJECT_DIR / "verify_decision_council_phase_one.py"
+    text = verify_path.read_text(encoding="utf-8")
+    patterns = [
+        "confirmed safety signal should require consecutive stress days",
+        "confirmed safety signal should react after stress persists",
+        "safety exposure cap should fall under stress",
+    ]
+    found = []
+    for pattern in patterns:
+        if pattern in text:
+            found.append(pattern)
+    return found
+
+
+def _format_blocker_table(frame: pd.DataFrame) -> list[str]:
+    if frame.empty:
+        return ["No blocker data available."]
+    cols = [column for column in ["gate", "status", "formal_block_reason_code", "detail"] if column in frame.columns]
+    return [frame.loc[:, cols].to_markdown(index=False)]
+
+
+def _recommendation_lines(blocked: pd.DataFrame) -> list[str]:
+    lines = []
+    blocker_map = {
+        "pit_adjustment_artifact": "Freeze one authoritative PIT adjustment artifact, add source/version checks, and bind it into the formal manifest.",
+        "corporate_action_artifact": "Promote corporate action history from exploratory artifact to audited PIT ledger with ex-date / pay-date reconciliation.",
+        "benchmark_report": "Define an investable benchmark series and publish excess-return validation instead of the current safety-only proxy status.",
+        "v6_data_verified": "Close the remaining V6 objective gates before any formal admission attempt.",
+        "feature_timestamp_audit": "Move timestamp audit from artifact existence to explicit pass/fail evidence in every formal run.",
+        "reproducibility_manifest": "Package code snapshot, config snapshot, input fingerprints, and run command into one reproducible release artifact.",
+        "test_lock_enabled": "Keep test lock enabled so post-test contamination cannot invalidate the admission package.",
+    }
+    for gate in blocked.get("gate", pd.Series(dtype=str)).astype(str).tolist():
+        recommendation = blocker_map.get(gate)
+        if recommendation and recommendation not in lines:
+            lines.append(f"- `{gate}`: {recommendation}")
+    return lines
+
+
+def build_report() -> tuple[Path, Path]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    universe_rows = _load_universe_rows()
+    comparison_path = OUTPUT_DIR / "governance_mainline_review_summary.csv"
+    universe_rows.to_csv(comparison_path, index=False, encoding="utf-8-sig")
+    history_dir = OUTPUT_DIR / "governance_mainline_history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_tag = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_comparison_path = history_dir / f"governance_mainline_review_summary_{snapshot_tag}.csv"
+    universe_rows.to_csv(snapshot_comparison_path, index=False, encoding="utf-8-sig")
+
+    formal = build_formal_admission_report()
+    integrity = build_data_integrity_report()
+    safety_failures = _load_safety_failure_messages()
+
+    completed = universe_rows[universe_rows.get("status", "").astype(str) == "completed"].copy()
+    completed = completed.sort_values("total_return", ascending=False) if not completed.empty and "total_return" in completed.columns else completed
+
+    lines = [
+        "# Governance Mainline Phase 1.5 Review",
+        "",
+        "## Mainline Decision",
+        f"- Variant: `{DEFAULT_GOVERNANCE_VARIANT}`",
+        f"- Alpha bundle: `{DEFAULT_ALPHA_BUNDLE}`",
+        "- Review scope: `hs300_csi500_a500_strict` and `hs300_strict` only",
+        "- Universe note: `CSI500` remains the intended second-layer pool because it adds a distinct mid-cap constituent set instead of duplicating the `HS300/CSI300` large-cap exposure.",
+        "",
+        "## Result Comparison",
+    ]
+    if completed.empty:
+        lines.append("No completed governance outputs were found for the requested review scope.")
+    else:
+        cols = [
+            column
+            for column in [
+                "universe_name",
+                "date_window",
+                "total_return",
+                "annual_return",
+                "sharpe",
+                "calmar",
+                "sortino",
+                "max_drawdown",
+                "win_rate",
+                "negative_block_rate",
+                "top1_weight",
+                "top5_weight_sum",
+                "effective_n",
+                "concentration_method",
+                "trading_freeze_trigger_count",
+                "emergency_deleveraging_trigger_count",
+                "portfolio_exposure_cap",
+            ]
+            if column in completed.columns
+        ]
+        lines.append(completed.loc[:, cols].to_markdown(index=False))
+        best = completed.iloc[0]
+        date_windows = completed["date_window"].dropna().astype(str).unique().tolist() if "date_window" in completed.columns else []
+        lines.extend(
+            [
+                "",
+                "### Review Readout",
+                f"- Preferred review universe: `{best['universe_name']}` based on current total return / Sharpe leadership inside the narrowed scope.",
+                "- Keep `hs300_strict` as the tighter-control benchmark line, not as the primary deployment target.",
+                "- Treat emergency deleveraging counts as provisional until the safety-chain verification is green.",
+            ]
+        )
+        concentration_methods = completed.get("concentration_method", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+        if concentration_methods and any("recompute_required" in item for item in concentration_methods):
+            lines.append("- At least one reviewed universe is using legacy artifacts without a holdings ledger; concentration metrics for that run require a fresh replay to become trustworthy.")
+        if len(date_windows) > 1:
+            lines.append("- Current review windows are not aligned across universes yet; treat this report as a staging review until both universes finish on the same date range.")
+
+    lines.extend(
+        [
+            "",
+            "## Institutional Blockers",
+            "- These are the blockers that keep reports at `Formal eligible=False`.",
+            "",
+            "### Formal Admission Gates",
+        ]
+    )
+    lines.extend(_format_blocker_table(formal))
+    lines.extend(["", "### Data Integrity Gates"])
+    lines.extend(_format_blocker_table(integrity.assign(formal_block_reason_code="")))
+
+    failed_formal = formal[formal.get("status", "").astype(str) != "passed"].copy()
+    lines.extend(["", "### Recommended Closure Path"])
+    lines.extend(_recommendation_lines(failed_formal) or ["- No formal blockers detected."])
+
+    lines.extend(
+        [
+            "",
+            "## Behavioral Blockers",
+            "- The main issue is not simply low return. The safety confirmation chain is not yet trustworthy enough for deployment-grade drawdown interpretation.",
+            "- The problematic chain is: `raw_risk_level -> trigger_streak_days -> risk_level -> exposure_cap`.",
+            "",
+            "### Current Safety Verification Focus",
+        ]
+    )
+    for item in safety_failures:
+        lines.append(f"- `{item}`")
+    lines.extend(
+        [
+            "",
+            "### Why This Matters",
+            "- If consecutive-stress confirmation is wrong, the model may de-risk too early or too late.",
+            "- If confirmed `risk_level` is wrong, the report's emergency deleveraging counts are not reliable evidence of correct policy behavior.",
+            "- If `exposure_cap` does not fall when confirmed stress is present, backtest drawdown control is overstated.",
+            "",
+            "### Safety Remediation Plan",
+            "1. Build a day-by-day audit table for stress episodes showing benchmark drawdown, liquidity stress, raw level, streak, confirmed level, and final exposure cap.",
+            "2. Reconcile the synthetic verification scenario in `verify_decision_council_phase_one.py` with the exact threshold logic in `functions/decision_council/safety.py`.",
+            "3. Confirm whether the mismatch is in signal construction, confirmation counting, or cap mapping before any alpha conclusion is trusted.",
+            "4. Re-run the two review universes after the safety chain is green and compare trigger counts again before changing alpha conclusions.",
+            "",
+            "## Mainline Review Workstream",
+            "- Revenue source review: inspect which alpha contributors dominate selected names in `hs300_csi500_a500_strict` versus `hs300_strict`.",
+            "- Drawdown source review: align the largest NAV drawdown windows with the safety ledger and execution ledger.",
+            "- Risk trigger review: isolate every freeze / deleverage episode and classify it as justified, delayed, or false-positive.",
+            "",
+            "## Benchmark and Formalization Workstream",
+            "- Define one investable benchmark for governance results and publish excess-return calculations beside the safety proxy.",
+            "- Promote PIT adjustment, corporate action, and universe evidence from 'artifact exists' to 'audited pass/fail with coverage proof'.",
+            "- Produce a formal run package containing config snapshot, code snapshot, input fingerprints, output fingerprints, and admission verdict.",
+            "",
+            "## Go-Live Acceptance Template",
+            "- Verification: `verify_decision_council_phase_one.py` must pass with no manual waivers.",
+            "- Formal gates: no failed item in the formal admission report for PIT, benchmark, reproducibility, or timestamp evidence.",
+            "- Mainline performance: `hs300_csi500_a500_strict` must remain better than or comparable to `hs300_strict` on return-adjusted-risk metrics, not just raw return.",
+            "- Safety credibility: every emergency deleveraging episode in the narrowed review scope must be explainable from the safety ledger.",
+            "- Reporting package: keep performance, drawdown, rolling Sharpe, capital allocation, holdings, and explicit overfitting diagnostics in the final delivery bundle.",
+            "",
+            f"Generated comparison CSV: `{comparison_path}`",
+        ]
+    )
+
+    report_path = OUTPUT_DIR / "governance_mainline_phase15_review.md"
+    report_text = "\n".join(lines) + "\n"
+    report_path.write_text(report_text, encoding="utf-8")
+    snapshot_report_path = history_dir / f"governance_mainline_phase15_review_{snapshot_tag}.md"
+    snapshot_report_path.write_text(report_text, encoding="utf-8")
+    return report_path, comparison_path
+
+
+def main() -> None:
+    report_path, comparison_path = build_report()
+    print(f"Saved report: {report_path}")
+    print(f"Saved comparison: {comparison_path}")
+
+
+if __name__ == "__main__":
+    main()
