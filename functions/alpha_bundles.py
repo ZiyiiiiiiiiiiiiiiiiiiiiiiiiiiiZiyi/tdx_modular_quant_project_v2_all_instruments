@@ -273,6 +273,138 @@ class AlphaBundleRegistry:
             },
         ))
 
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_trend_bundle",
+            alpha_names=[
+                "momentum",
+                "mom_lowvol",
+                "ma_break",
+                "macd_trend",
+                "turtle_breakout",
+                "macd_cross",
+                "ma_cross",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: trend and momentum factors only.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module": "trend"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_reversal_bundle",
+            alpha_names=[
+                "mean_reversion",
+                "rsi_reversal",
+                "kdj_oversold_cross",
+                "consecutive_decline_rebound",
+                "low_volume_pullback",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: reversal and pullback factors only.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module": "reversal_pullback"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_orderflow_bundle",
+            alpha_names=[
+                "orderflow_amount_shock",
+                "orderflow_close_drive",
+                "orderflow_accumulation",
+                "orderflow_efficiency",
+                "eod_close_strength",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: order-flow and close-strength factors only.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module": "orderflow"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_breakout_bundle",
+            alpha_names=[
+                "price_volume_breakout",
+                "turtle_breakout",
+                "limit_up_follow",
+                "ma_break",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: breakout and limit-up follow factors only.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module": "breakout"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_core_minus_trend_bundle",
+            alpha_names=[
+                "orderflow_amount_shock",
+                "orderflow_efficiency",
+                "price_volume_breakout",
+                "mean_reversion",
+                "kdj_oversold_cross",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: validation core without trend factors.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module_removed": "trend"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_core_minus_reversal_bundle",
+            alpha_names=[
+                "momentum",
+                "mom_lowvol",
+                "orderflow_amount_shock",
+                "orderflow_efficiency",
+                "price_volume_breakout",
+                "turtle_breakout",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: validation core without reversal factors.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module_removed": "reversal_pullback"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_core_minus_orderflow_bundle",
+            alpha_names=[
+                "momentum",
+                "mom_lowvol",
+                "price_volume_breakout",
+                "turtle_breakout",
+                "mean_reversion",
+                "kdj_oversold_cross",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: validation core without order-flow factors.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module_removed": "orderflow"},
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diagnostic_core_minus_breakout_bundle",
+            alpha_names=[
+                "momentum",
+                "mom_lowvol",
+                "orderflow_amount_shock",
+                "orderflow_efficiency",
+                "mean_reversion",
+                "kdj_oversold_cross",
+            ],
+            weighting_scheme="equal",
+            blend_mode="equal_weight",
+            description="Enhanced diagnostic bundle: validation core without breakout factors.",
+            status="active",
+            extra={"purpose": "enhanced_module_diagnostics", "module_removed": "breakout"},
+        ))
+
     def register(self, spec: AlphaBundleSpec) -> None:
         """注册一个alpha组合"""
         if spec.bundle_name in self._specs:

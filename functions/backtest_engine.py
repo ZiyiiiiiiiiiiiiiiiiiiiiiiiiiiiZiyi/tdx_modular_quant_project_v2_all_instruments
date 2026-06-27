@@ -4,14 +4,19 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from config import (
+    DEFAULT_BACKTEST_CAPITAL_PROFILE,
     FEATURE_DAILY_PARQUET,
     LIQUIDITY_LOCK_REPORT_CSV,
     MIN_LOT_SIZE,
+    OPEN_POSITION_LEDGER_PREFIX,
     ORDER_LEDGER_PREFIX,
     RESULT_DIR,
+    TRADE_PAIR_LEDGER_PREFIX,
     CASH_LEDGER_PREFIX,
     TAX_LEDGER_PREFIX,
     VALUATION_LEDGER_PREFIX,
+    backtest_profile_suffix,
+    get_backtest_capital_profile,
 )
 from functions.execution.liquidity_lock_handler import (
     build_liquidity_lock_report,
@@ -20,6 +25,7 @@ from functions.execution.liquidity_lock_handler import (
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.order_simulator import build_delayed_order_queue, simulate_order_book
 from functions.execution.tax_ledger import build_trade_tax_ledger, tax_ledger_total
+from functions.execution.trade_pairing import build_trade_pairing_ledgers
 from functions.execution.valuation import (
     build_blocked_order_valuation_ledger,
     valuation_discount_by_date,
@@ -80,6 +86,8 @@ def run_backtest(
     compute_theoretical_upper_bound=True,
     start_date=None,
     end_date=None,
+    capital_profile_name=DEFAULT_BACKTEST_CAPITAL_PROFILE,
+    capital_profile=None,
 ):
     """
     Backtest one strategy by expanding rebalance selections into daily holdings.
@@ -90,6 +98,7 @@ def run_backtest(
     """
     feature_data = _load_feature_data()
     returns = prepare_daily_returns(feature_data)
+    capital_profile = capital_profile or get_backtest_capital_profile(capital_profile_name)
 
     df_sel = df_selection.copy()
     required_cols = ["symbol", "rebalance_date"]
@@ -138,10 +147,20 @@ def run_backtest(
             raise ValueError(f"Strategy {strategy_name} has no rebalance dates on or before {backtest_end_date.date() if backtest_end_date is not None else '-'}")
         if all_trade_dates.empty:
             raise ValueError(f"Strategy {strategy_name} has no trade dates on or before {backtest_end_date.date() if backtest_end_date is not None else '-'}")
+    df_sel = _apply_capital_profile_selection_constraints(
+        df_sel,
+        capital_profile=capital_profile,
+        feature_data=feature_data,
+        all_trade_dates=all_trade_dates,
+    )
+    if df_sel.empty:
+        raise ValueError(f"Strategy {strategy_name} has no affordable selections for capital profile {capital_profile['name']}")
+    rebalance_dates = pd.Series(df_sel["rebalance_date"].drop_duplicates().sort_values()).reset_index(drop=True)
 
     period_frames = []
     oracle_period_frames = []
     actual_weights = {}
+    actual_shares = {}
     delayed_orders = []
     rebalance_cost_records = []
     order_ledger_parts = []
@@ -166,12 +185,19 @@ def run_backtest(
         rebalance_orders = _build_rebalance_orders(
             one_holdings=one_holdings,
             previous_weights=actual_weights,
+            previous_shares=actual_shares,
             feature_data=feature_data,
             trade_date=execution_date,
             initial_cash=initial_cash,
         )
         simulated_orders = simulate_order_book(rebalance_orders)
-        simulated_orders = _enforce_cash_weight_budget(actual_weights, simulated_orders)
+        simulated_orders = _enforce_cash_weight_budget(
+            actual_weights,
+            simulated_orders,
+            min_cash_buffer_ratio=(
+                capital_profile["min_cash_buffer"] / max(float(initial_cash), 1e-12)
+            ),
+        )
         simulated_orders["rebalance_date"] = rebalance_date
         order_ledger_parts.append(simulated_orders)
         delayed_orders.append(build_delayed_order_queue(simulated_orders))
@@ -186,6 +212,13 @@ def run_backtest(
             }
         )
         actual_weights = _apply_filled_orders_to_weights(actual_weights, simulated_orders)
+        actual_shares = _apply_filled_orders_to_shares(actual_shares, simulated_orders)
+        actual_weights = _weights_from_shares(
+            actual_shares,
+            feature_data=feature_data,
+            trade_date=execution_date,
+            initial_cash=initial_cash,
+        )
         executed_holdings = pd.DataFrame(
             {"symbol": list(actual_weights.keys()), "weight": list(actual_weights.values())}
         )
@@ -396,6 +429,11 @@ def run_backtest(
     )
     gross_nav = (1 + daily_result["gross_daily_return"]).cumprod() * initial_cash
     order_ledger = pd.concat(order_ledger_parts, ignore_index=True) if order_ledger_parts else pd.DataFrame()
+    trade_pairs, open_positions, trade_summary = build_trade_pairing_ledgers(
+        order_ledger,
+        returns[["date", "symbol", "trade_close"]],
+        capital_profile=capital_profile["name"],
+    )
     tax_ledger = build_trade_tax_ledger(order_ledger)
     valuation_ledger = build_blocked_order_valuation_ledger(order_ledger)
     valuation_discount = valuation_discount_by_date(valuation_ledger)
@@ -456,6 +494,18 @@ def run_backtest(
                 "economic_total_return",
                 "benchmark_excess_return",
                 "benchmark_status",
+                "capital_profile",
+                "capital_initial_cash",
+                "capital_min_cash_buffer",
+                "capital_max_positions",
+                "trade_win_rate",
+                "realized_trade_count",
+                "winning_trade_count",
+                "losing_trade_count",
+                "realized_pnl_amount",
+                "unrealized_pnl_amount",
+                "open_position_count",
+                "inventory_underflow_count",
                 "crowding_top_sector_weight",
                 "crowding_hot_sector_weight",
                 "crowding_unique_sector_count",
@@ -516,6 +566,18 @@ def run_backtest(
                 daily_result["economic_nav"].iloc[-1] / float(initial_cash) - 1,
                 benchmark_excess_return,
                 benchmark_status,
+                capital_profile["name"],
+                capital_profile["initial_cash"],
+                capital_profile["min_cash_buffer"],
+                capital_profile["max_positions"] if capital_profile["max_positions"] is not None else np.nan,
+                trade_summary["trade_win_rate"],
+                trade_summary["realized_trade_count"],
+                trade_summary["winning_trade_count"],
+                trade_summary["losing_trade_count"],
+                trade_summary["realized_pnl_amount"],
+                trade_summary["unrealized_pnl_amount"],
+                trade_summary["open_position_count"],
+                trade_summary["inventory_underflow_count"],
                 risk_monitor_summary.get("crowding_top_sector_weight", np.nan),
                 risk_monitor_summary.get("crowding_hot_sector_weight", np.nan),
                 risk_monitor_summary.get("crowding_unique_sector_count", np.nan),
@@ -590,28 +652,40 @@ def run_backtest(
     daily_result["benchmark_id"] = benchmark_meta.get("benchmark_id", "")
     daily_result["benchmark_symbol"] = benchmark_meta.get("benchmark_symbol", "")
     holdings_record = daily_result[["date", "holding_count"]].copy()
+    suffix = backtest_profile_suffix(capital_profile["name"])
+    liquidity_report_csv = (
+        LIQUIDITY_LOCK_REPORT_CSV.with_name(
+            f"{LIQUIDITY_LOCK_REPORT_CSV.stem}{suffix}{LIQUIDITY_LOCK_REPORT_CSV.suffix}"
+        )
+        if suffix
+        else LIQUIDITY_LOCK_REPORT_CSV
+    )
     liquidity_report = build_liquidity_lock_report(
         pd.concat(delayed_orders, ignore_index=True) if delayed_orders else pd.DataFrame()
     )
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    daily_csv = RESULT_DIR / f"backtest_daily_result_{strategy_name}.csv"
-    daily_parquet = RESULT_DIR / f"backtest_daily_result_{strategy_name}.parquet"
-    metrics_csv = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
-    holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}.csv"
-    plot_file = RESULT_DIR / f"equity_curve_{strategy_name}.png"
-    learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}.csv"
-    order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}.csv"
-    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}.csv"
-    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}.csv"
-    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}.csv"
-    risk_monitor_csv = RESULT_DIR / f"risk_monitoring_{strategy_name}.csv"
+    daily_csv = RESULT_DIR / f"backtest_daily_result_{strategy_name}{suffix}.csv"
+    daily_parquet = RESULT_DIR / f"backtest_daily_result_{strategy_name}{suffix}.parquet"
+    metrics_csv = RESULT_DIR / f"backtest_metrics_{strategy_name}{suffix}.csv"
+    holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}{suffix}.csv"
+    plot_file = RESULT_DIR / f"equity_curve_{strategy_name}{suffix}.png"
+    learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}{suffix}.csv"
+    order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    trade_pair_csv = RESULT_DIR / f"{TRADE_PAIR_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    open_position_csv = RESULT_DIR / f"{OPEN_POSITION_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
+    risk_monitor_csv = RESULT_DIR / f"risk_monitoring_{strategy_name}{suffix}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)
     metrics.to_csv(metrics_csv, index=False, encoding="utf-8-sig")
     holdings_record.to_csv(holdings_csv, index=False, encoding="utf-8-sig")
     order_ledger.to_csv(order_ledger_csv, index=False, encoding="utf-8-sig")
+    trade_pairs.to_csv(trade_pair_csv, index=False, encoding="utf-8-sig")
+    open_positions.to_csv(open_position_csv, index=False, encoding="utf-8-sig")
     tax_ledger.to_csv(tax_ledger_csv, index=False, encoding="utf-8-sig")
     daily_result[
         ["date", "initial_cash", "net_value", "liquidatable_nav", "economic_nav", "valuation_discount_amount"]
@@ -622,7 +696,7 @@ def run_backtest(
     if not liquidity_report.empty:
         save_liquidity_lock_report(
             liquidity_report,
-            output_path=LIQUIDITY_LOCK_REPORT_CSV,
+            output_path=liquidity_report_csv,
         )
 
     _plot_equity_curve(
@@ -637,7 +711,7 @@ def run_backtest(
     )
     diagnostic_outputs = save_performance_diagnostics(
         daily_result=daily_result,
-        strategy_name=strategy_name,
+        strategy_name=f"{strategy_name}{suffix}",
         output_dir=RESULT_DIR,
         selection=df_sel,
         feature_data=feature_data,
@@ -672,6 +746,8 @@ def run_backtest(
     print("Saved metrics:", metrics_csv)
     print("Saved holdings:", holdings_csv)
     print("Saved order ledger:", order_ledger_csv)
+    print("Saved trade pairs:", trade_pair_csv)
+    print("Saved open positions:", open_position_csv)
     print("Saved tax ledger:", tax_ledger_csv)
     print("Saved cash ledger:", cash_ledger_csv)
     print("Saved valuation ledger:", valuation_ledger_csv)
@@ -679,7 +755,7 @@ def run_backtest(
     if learning_meta_csv.exists():
         print("Saved learning metadata:", learning_meta_csv)
     if not liquidity_report.empty:
-        print("Saved liquidity lock report:", LIQUIDITY_LOCK_REPORT_CSV)
+        print("Saved liquidity lock report:", liquidity_report_csv)
     print("Saved equity curve:", plot_file)
     for label, path in diagnostic_outputs.items():
         print(f"Saved {label}:", path)
@@ -1144,9 +1220,9 @@ def _monitor_column_name(frame: pd.DataFrame, base_name: str) -> str:
     return base_name
 
 
-def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_date, initial_cash):
+def _build_rebalance_orders(one_holdings, previous_weights, previous_shares, feature_data, trade_date, initial_cash):
     current_weights = dict(zip(one_holdings["symbol"], one_holdings["weight"]))
-    symbols = sorted(set(previous_weights) | set(current_weights))
+    symbols = sorted(set(previous_weights) | set(current_weights) | set(previous_shares))
     if not symbols:
         return pd.DataFrame(columns=["symbol", "trade_date", "side", "target_shares", "price"])
 
@@ -1169,18 +1245,23 @@ def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_
     for symbol in symbols:
         prev_weight = float(previous_weights.get(symbol, 0.0))
         new_weight = float(current_weights.get(symbol, 0.0))
-        delta_weight = new_weight - prev_weight
-        if abs(delta_weight) < 1e-12:
-            continue
         price = float(price_map.get(symbol, 0.0) or 0.0)
         if price <= 0:
             continue
-        notional = abs(delta_weight) * float(initial_cash)
-        raw_shares = notional / price
-        target_shares = int(raw_shares // MIN_LOT_SIZE) * MIN_LOT_SIZE
-        if target_shares <= 0:
+        previous_position_shares = float(previous_shares.get(symbol, 0.0) or 0.0)
+        target_position_shares = int((max(new_weight, 0.0) * float(initial_cash)) // price // MIN_LOT_SIZE) * MIN_LOT_SIZE
+        delta_shares = float(target_position_shares - previous_position_shares)
+        if abs(delta_shares) < 1e-12:
             continue
-        side = "buy" if delta_weight > 0 else "sell"
+        trade_shares = abs(delta_shares)
+        if trade_shares <= 0:
+            continue
+        side = "buy" if delta_shares > 0 else "sell"
+        if side == "sell":
+            trade_shares = min(trade_shares, previous_position_shares)
+            if trade_shares <= 0:
+                continue
+        delta_weight = new_weight - prev_weight
         trading_state = state_map.get(symbol, {})
         suspension_blocked = (
             "is_trading" in trading_state
@@ -1195,11 +1276,13 @@ def _build_rebalance_orders(one_holdings, previous_weights, feature_data, trade_
                 "symbol": symbol,
                 "trade_date": trade_date,
                 "side": side,
-                "target_shares": target_shares,
+                "target_shares": trade_shares,
                 "price": price,
                 "previous_weight": prev_weight,
                 "target_weight": new_weight,
                 "delta_weight": delta_weight,
+                "previous_position_shares": previous_position_shares,
+                "target_position_shares": float(target_position_shares),
                 "same_day_sell_blocked": False,
                 "price_limit_blocked_flag": price_limit_blocked,
                 "suspension_blocked_flag": suspension_blocked,
@@ -1224,7 +1307,53 @@ def _apply_filled_orders_to_weights(previous_weights, simulated_orders):
     return weights
 
 
-def _enforce_cash_weight_budget(previous_weights, simulated_orders):
+def _apply_filled_orders_to_shares(previous_shares, simulated_orders):
+    shares = {
+        str(symbol): float(value)
+        for symbol, value in dict(previous_shares).items()
+        if float(value) > 1e-12
+    }
+    if simulated_orders.empty:
+        return shares
+    for _, order in simulated_orders.iterrows():
+        if order["execution_status"] != "filled":
+            continue
+        symbol = str(order["symbol"])
+        executed = float(order.get("executed_shares", 0.0) or 0.0)
+        if executed <= 0.0:
+            continue
+        if str(order["side"]).lower() == "buy":
+            shares[symbol] = shares.get(symbol, 0.0) + executed
+        else:
+            shares[symbol] = max(shares.get(symbol, 0.0) - executed, 0.0)
+            if shares[symbol] <= 1e-12:
+                shares.pop(symbol, None)
+    return shares
+
+
+def _weights_from_shares(position_shares, *, feature_data, trade_date, initial_cash):
+    if not position_shares:
+        return {}
+    price_col = next(
+        (col for col in ["open_nominal", "open", "close_nominal", "close"] if col in feature_data.columns),
+        None,
+    )
+    if price_col is None:
+        return {}
+    price_frame = feature_data[feature_data["date"] == trade_date][["symbol", price_col]].drop_duplicates("symbol")
+    price_map = dict(zip(price_frame["symbol"], pd.to_numeric(price_frame[price_col], errors="coerce").fillna(0.0)))
+    weights = {}
+    for symbol, shares in position_shares.items():
+        price = float(price_map.get(symbol, 0.0) or 0.0)
+        if price <= 0.0:
+            continue
+        weight = float(shares) * price / max(float(initial_cash), 1e-12)
+        if weight > 1e-12:
+            weights[str(symbol)] = weight
+    return weights
+
+
+def _enforce_cash_weight_budget(previous_weights, simulated_orders, *, min_cash_buffer_ratio=0.0):
     """Reject buys requiring proceeds from a blocked sell."""
     if simulated_orders.empty:
         return simulated_orders
@@ -1235,7 +1364,7 @@ def _enforce_cash_weight_budget(previous_weights, simulated_orders):
     ]
     for _, order in filled_sells.iterrows():
         weights[order["symbol"]] = float(order["target_weight"])
-    available_weight = max(1.0 - sum(weights.values()), 0.0)
+    available_weight = max(1.0 - sum(weights.values()) - float(min_cash_buffer_ratio), 0.0)
     buy_rows = orders[
         (orders["execution_status"] == "filled") & (orders["side"] == "buy")
     ].index
@@ -1264,6 +1393,71 @@ def _apply_weight_constraints(df_selection, max_weight):
     group_total = group_total.where(group_total > 0, 1.0)
     data["weight"] = (data["weight"] / group_total).clip(lower=0.0, upper=max_weight)
     return data
+
+
+def _apply_capital_profile_selection_constraints(df_selection, *, capital_profile, feature_data=None, all_trade_dates=None):
+    data = df_selection.copy()
+    max_positions = capital_profile.get("max_positions")
+    if bool(capital_profile.get("affordability_first", False)) and feature_data is not None and all_trade_dates is not None:
+        data = _filter_affordable_profile_candidates(
+            data,
+            capital_profile=capital_profile,
+            feature_data=feature_data,
+            all_trade_dates=all_trade_dates,
+        )
+        if data.empty:
+            return data
+    if max_positions is not None and max_positions > 0:
+        weight_col = pd.to_numeric(data.get("weight"), errors="coerce").fillna(0.0)
+        data = (
+            data.assign(_weight_rank=weight_col, _selection_order=np.arange(len(data)))
+            .sort_values(["rebalance_date", "_weight_rank", "_selection_order"], ascending=[True, False, True])
+            .groupby("rebalance_date", group_keys=False)
+            .head(int(max_positions))
+            .drop(columns=["_weight_rank", "_selection_order"])
+        )
+        totals = data.groupby("rebalance_date")["weight"].transform("sum").replace(0.0, 1.0)
+        data["weight"] = pd.to_numeric(data["weight"], errors="coerce").fillna(0.0) / totals
+    return data
+
+
+def _filter_affordable_profile_candidates(df_selection, *, capital_profile, feature_data, all_trade_dates):
+    price_col = next(
+        (col for col in ["open_nominal", "open", "close_nominal", "close"] if col in feature_data.columns),
+        None,
+    )
+    if price_col is None:
+        return df_selection
+    max_positions = capital_profile.get("max_positions")
+    if max_positions is None or max_positions <= 0:
+        max_positions = int(df_selection.groupby("rebalance_date")["symbol"].transform("count").max() or 1)
+    budget = max(float(capital_profile["initial_cash"]) - float(capital_profile.get("min_cash_buffer", 0.0) or 0.0), 0.0)
+    per_position_budget = budget / max(int(max_positions), 1)
+    if per_position_budget <= 0.0:
+        return df_selection.iloc[0:0].copy()
+
+    trade_dates = pd.to_datetime(pd.Series(all_trade_dates).dropna().sort_values()).reset_index(drop=True)
+    price_data = feature_data[["date", "symbol", price_col]].copy()
+    price_data["date"] = pd.to_datetime(price_data["date"], errors="coerce")
+    price_data[price_col] = pd.to_numeric(price_data[price_col], errors="coerce")
+    price_lookup = price_data.dropna(subset=["date", "symbol", price_col]).set_index(["date", "symbol"])[price_col]
+
+    kept_indexes = []
+    for rebalance_date, group in df_selection.groupby("rebalance_date", sort=True):
+        future_dates = trade_dates[trade_dates > pd.Timestamp(rebalance_date)]
+        if future_dates.empty:
+            kept_indexes.extend(group.index.tolist())
+            continue
+        execution_date = pd.Timestamp(future_dates.iloc[0])
+        for row_index, row in group.iterrows():
+            price = price_lookup.get((execution_date, row["symbol"]), np.nan)
+            if pd.isna(price) or float(price) <= 0.0:
+                if not bool(capital_profile.get("skip_unaffordable_symbols", False)):
+                    kept_indexes.append(row_index)
+                continue
+            if float(price) * float(MIN_LOT_SIZE) <= per_position_budget + 1e-12:
+                kept_indexes.append(row_index)
+    return df_selection.loc[kept_indexes].copy()
 
 
 def _expand_rebalance_costs(rebalance_cost_records, available_dates, initial_cash):

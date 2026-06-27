@@ -18,6 +18,13 @@ from config import (
     GOVERNANCE_ALLOWED_INSTRUMENT_TYPES,
     GOVERNANCE_DEFAULT_TOP_N,
     GOVERNANCE_DEFAULT_TURNOVER_BUDGET,
+    GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_ACTUAL_TARGET_RATIO,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_TRADES,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_WIN_RATE,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_PROFIT_FACTOR,
+    GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL,
     GOVERNANCE_INITIAL_TRANSITION_DAYS,
     GOVERNANCE_INITIAL_CASH,
     GOVERNANCE_END_DATE,
@@ -56,6 +63,7 @@ from functions.decision_council.monitoring import evaluate_daily_rollback
 from functions.decision_council.reputation import ReputationLedger
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.order_simulator import simulate_order_book
+from functions.execution.trade_pairing import build_trade_pairing_ledgers
 from functions.pricing.feature_leakage_audit import audit_feature_columns
 from functions.pipeline_cache import file_fingerprint
 from functions.report_builder import build_strategy_report, save_strategy_report
@@ -165,6 +173,10 @@ class GovernanceBacktestRunner:
         enable_safety_agent: bool = True,
         enable_market_regime_policy: bool = ENABLE_MARKET_REGIME_POLICY,
         entry_confirmation_mode: str = "full",
+        selection_weight_mode: str = "reputation_weighted",
+        regime_overlay_mode: str = "full",
+        risk_hard_gate_enabled: bool = False,
+        probability_bucket_mode: str = "default",
         shadow_fast_mode: bool = False,
         universe_name: str | None = None,
         universe_mode: str = "index_pool_strict",
@@ -189,6 +201,10 @@ class GovernanceBacktestRunner:
         self.enable_safety_agent = bool(enable_safety_agent)
         self.enable_market_regime_policy = bool(enable_market_regime_policy)
         self.entry_confirmation_mode = str(entry_confirmation_mode or "full")
+        self.selection_weight_mode = str(selection_weight_mode or "reputation_weighted")
+        self.regime_overlay_mode = str(regime_overlay_mode or "full")
+        self.risk_hard_gate_enabled = bool(risk_hard_gate_enabled)
+        self.probability_bucket_mode = str(probability_bucket_mode or "default")
         self.shadow_fast_mode = bool(shadow_fast_mode)
         # Registry framework metadata
         self._universe_name = universe_name
@@ -340,7 +356,7 @@ class GovernanceBacktestRunner:
                     progress.update(f"Date: {date_str} | NAV: {nav:,.0f} | Holdings: {holding_count}")
         finally:
             if live_monitor is not None:
-                live_monitor.finish("Backtest complete. Window will stay open until you close it.")
+                live_monitor.finish("回测完成。窗口会保持打开，关闭浏览器标签即可。")
         
         for model_name, shadow in shadows.items():
             shadow_frame = pd.DataFrame(shadow.exposure_rows)
@@ -392,7 +408,7 @@ class GovernanceBacktestRunner:
         candidates, proposals = build_daily_candidates(
             daily,
             reputation_weights=(
-                self.reputation.weights()
+                self._proposal_reputation_weights()
                 if self.enable_reputation
                 else {model_name: 1.0 for model_name in self.alpha_models}
             ),
@@ -406,6 +422,7 @@ class GovernanceBacktestRunner:
             require_constituents=self._require_constituents,
             allow_fallback=self._allow_fallback,
             enable_quality_filters=self._enable_quality_filters,
+            selection_weight_mode=self.selection_weight_mode,
         )
         safety_row = self.engine.safety_signals.loc[pd.Timestamp(date)]
         if isinstance(safety_row, pd.DataFrame):
@@ -418,6 +435,7 @@ class GovernanceBacktestRunner:
             structural_regime_level=structural_regime_level,
             entry_calibrator=self.entry_calibrator,
             confirmation_mode=self.entry_confirmation_mode,
+            probability_bucket_mode=self.probability_bucket_mode,
         )
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
         self.entry_calibrator.schedule_candidates(
@@ -453,8 +471,10 @@ class GovernanceBacktestRunner:
             qualified_entry_count=qualified_entry_count,
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
             liquidity_stress=liquidity_stress,
+            regime_overlay_mode=self.regime_overlay_mode,
         )
         target_exposure_proxy = exposure_authorization["authorized_exposure_max"]
+        high_exposure_gate = self._high_exposure_research_gate(date)
         catchup_decision = decide_exposure_catchup(
             actual_exposure=actual_exposure,
             target_exposure=target_exposure_proxy,
@@ -464,7 +484,22 @@ class GovernanceBacktestRunner:
             qualified_entry_count=qualified_entry_count,
             transition_only=day_index < GOVERNANCE_INITIAL_TRANSITION_DAYS,
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
+            risk_contribution_gate_pass=high_exposure_gate["gate_pass"],
+            top5_risk_contribution_sum=high_exposure_gate["latest_top5_risk_contribution_sum"],
+            risk_symbol_count=high_exposure_gate["latest_risk_symbol_count"],
+            hard_risk_gate_enabled=True,
         )
+        high_exposure_gate_diagnostics = {
+            "high_exposure_research_gate_pass": high_exposure_gate["gate_pass"],
+            "high_exposure_research_gate_reason": high_exposure_gate["gate_reason"],
+            "closed_trade_count_for_gate": high_exposure_gate["closed_trade_count"],
+            "closed_trade_win_rate_for_gate": high_exposure_gate["closed_trade_win_rate"],
+            "profit_factor_for_gate": high_exposure_gate["profit_factor"],
+            "payoff_ratio_for_gate": high_exposure_gate["payoff_ratio"],
+            "realized_pnl_for_gate": high_exposure_gate["realized_pnl"],
+            "actual_target_ratio_for_gate": high_exposure_gate["actual_target_ratio"],
+            "latest_top1_risk_contribution_for_gate": high_exposure_gate["latest_top1_risk_contribution"],
+        }
         _, orders, diagnostics = self.engine.decide_day(
             decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
             decision_date=date,
@@ -482,6 +517,12 @@ class GovernanceBacktestRunner:
             covariance_matrix=self._rolling_candidate_covariance(date, candidates),
         )
         diagnostics.update(catchup_decision.__dict__)
+        diagnostics.update(high_exposure_gate_diagnostics)
+        if (
+            not bool(high_exposure_gate["gate_pass"])
+            and str(diagnostics.get("catchup_block_reason", "")) == "risk_contribution_gate_blocks_catchup"
+        ):
+            diagnostics["catchup_block_reason"] = f"high_exposure_gate:{high_exposure_gate['gate_reason']}"
         diagnostics["regime_name"] = str(regime_name)
         diagnostics["base_exposure_by_regime"] = _base_exposure_by_regime(regime_name)
         diagnostics.update(exposure_authorization)
@@ -500,6 +541,15 @@ class GovernanceBacktestRunner:
                 "catchup_block_reason": diagnostics.get("catchup_block_reason", ""),
                 "catchup_tier": diagnostics.get("catchup_tier", "none"),
                 "accuracy_multiplier": diagnostics.get("accuracy_multiplier", 0.0),
+                "high_exposure_research_gate_pass": diagnostics.get("high_exposure_research_gate_pass", False),
+                "high_exposure_research_gate_reason": diagnostics.get("high_exposure_research_gate_reason", ""),
+                "closed_trade_count_for_gate": diagnostics.get("closed_trade_count_for_gate", 0),
+                "closed_trade_win_rate_for_gate": diagnostics.get("closed_trade_win_rate_for_gate", pd.NA),
+                "profit_factor_for_gate": diagnostics.get("profit_factor_for_gate", pd.NA),
+                "payoff_ratio_for_gate": diagnostics.get("payoff_ratio_for_gate", pd.NA),
+                "realized_pnl_for_gate": diagnostics.get("realized_pnl_for_gate", 0.0),
+                "actual_target_ratio_for_gate": diagnostics.get("actual_target_ratio_for_gate", pd.NA),
+                "latest_top1_risk_contribution_for_gate": diagnostics.get("latest_top1_risk_contribution_for_gate", pd.NA),
                 "qualified_entry_count": diagnostics.get("qualified_entry_count", 0),
                 "regime_name": diagnostics.get("regime_name", ""),
                 "base_exposure_by_regime": diagnostics.get("base_exposure_by_regime", 0.0),
@@ -508,14 +558,30 @@ class GovernanceBacktestRunner:
                 "authorized_exposure_max": diagnostics.get("authorized_exposure_max", target_exposure_proxy),
                 "exposure_authorization_tier": diagnostics.get("exposure_authorization_tier", ""),
                 "exposure_authorization_block_reasons": diagnostics.get("exposure_authorization_block_reasons", ""),
+                "regime_overlay_mode": diagnostics.get("regime_overlay_mode", self.regime_overlay_mode),
+                "regime_overlay_capped": diagnostics.get("regime_overlay_capped", False),
                 "authorization_expected_edge_10d_mean": diagnostics.get("authorization_expected_edge_10d_mean", 0.0),
                 "authorization_p_win_10d_mean": diagnostics.get("authorization_p_win_10d_mean", 0.0),
                 "trailing_buy_accuracy_5d": trailing_buy_accuracy_5d,
                 "best_replacement_edge_10d": diagnostics.get("best_replacement_edge_10d", 0.0),
                 "replacement_opportunity_sell_count": diagnostics.get("replacement_opportunity_sell_count", 0),
+                "profit_giveback_observation_count": diagnostics.get("profit_giveback_observation_count", 0),
+                "post_entry_failure_exit_count": diagnostics.get("post_entry_failure_exit_count", 0),
+                "trend_break_observation_count": diagnostics.get("trend_break_observation_count", 0),
+                "volume_distribution_observation_count": diagnostics.get("volume_distribution_observation_count", 0),
                 "covariance_risk_model_used": diagnostics.get("covariance_risk_model_used", False),
                 "portfolio_covariance_volatility": diagnostics.get("portfolio_covariance_volatility", 0.0),
                 "max_risk_contribution": diagnostics.get("max_risk_contribution", 0.0),
+                "risk_contribution_gate_pass": diagnostics.get("risk_contribution_gate_pass", True),
+                "risk_contribution_exposure_scale": diagnostics.get("risk_contribution_exposure_scale", 1.0),
+                "risk_symbol_count": diagnostics.get("risk_symbol_count", 0),
+                "risk_contribution_block_reason": diagnostics.get("risk_contribution_block_reason", ""),
+                "top5_risk_contribution_sum": diagnostics.get("top5_risk_contribution_sum", 0.0),
+                "risk_new_buy_block": diagnostics.get("risk_new_buy_block", False),
+                "risk_catchup_block": diagnostics.get("risk_catchup_block", False),
+                "risk_new_buy_block_applied": diagnostics.get("risk_new_buy_block_applied", False),
+                "risk_catchup_block_applied": diagnostics.get("risk_catchup_block_applied", False),
+                "risk_blocked_new_buy_weight": diagnostics.get("risk_blocked_new_buy_weight", 0.0),
                 "avg_pairwise_correlation": diagnostics.get("avg_pairwise_correlation", 0.0),
                 "covariance_condition_number": diagnostics.get("covariance_condition_number", 0.0),
                 "corporate_action_cash_delta": corporate_action_summary["cash_delta"],
@@ -564,6 +630,15 @@ class GovernanceBacktestRunner:
                 "expected_edge_10d",
                 "edge_to_risk_10d",
                 "entry_edge_rank_pct",
+                "orderflow_candidate_score",
+                "reversal_entry_score",
+                "breakout_gate_score",
+                "trend_hold_score",
+                "module_candidate_score",
+                "module_entry_score",
+                "module_hold_score",
+                "entry_block_reason",
+                "breakout_probability_bucket_pass",
             ]
             if column in candidates.columns
         ]
@@ -642,6 +717,8 @@ class GovernanceBacktestRunner:
             "effective_target_exposure_cap": float(diagnostics.get("effective_target_exposure_cap", 0.0)),
             "exposure_authorization_tier": str(diagnostics.get("exposure_authorization_tier", "")),
             "exposure_authorization_block_reasons": str(diagnostics.get("exposure_authorization_block_reasons", "")),
+            "regime_overlay_mode": str(diagnostics.get("regime_overlay_mode", self.regime_overlay_mode)),
+            "regime_overlay_capped": bool(diagnostics.get("regime_overlay_capped", False)),
             "authorization_expected_edge_10d_mean": _safe_float(diagnostics.get("authorization_expected_edge_10d_mean"), default=0.0),
             "authorization_p_win_10d_mean": _safe_float(diagnostics.get("authorization_p_win_10d_mean"), default=0.0),
             "constraint_cash_reserve": float(diagnostics.get("constraint_cash_reserve", 0.0)),
@@ -651,6 +728,17 @@ class GovernanceBacktestRunner:
             "candidate_count": int(len(candidates)),
             "entry_confirmed_count": int(diagnostics.get("qualified_entry_count", 0)),
             "entry_block_summary": entry_block_summary,
+            "orderflow_candidate_score_mean": _safe_numeric_mean(candidates.get("orderflow_candidate_score")),
+            "reversal_entry_score_mean": _safe_numeric_mean(candidates.get("reversal_entry_score")),
+            "breakout_gate_score_mean": _safe_numeric_mean(candidates.get("breakout_gate_score")),
+            "trend_hold_score_mean": _safe_numeric_mean(candidates.get("trend_hold_score")),
+            "module_candidate_score_mean": _safe_numeric_mean(candidates.get("module_candidate_score")),
+            "module_entry_score_mean": _safe_numeric_mean(candidates.get("module_entry_score")),
+            "module_hold_score_mean": _safe_numeric_mean(candidates.get("module_hold_score")),
+            "orderflow_candidate_pass_count": int(candidates.get("orderflow_candidate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "reversal_confirm_pass_count": int(candidates.get("reversal_confirm_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "breakout_gate_pass_count": int(candidates.get("breakout_gate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "breakout_probability_bucket_pass_count": int(candidates.get("breakout_probability_bucket_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "exposure_gap": float(diagnostics.get("exposure_gap", 0.0)),
             "catchup_allowed": bool(diagnostics.get("catchup_allowed", False)),
             "catchup_buy_budget": float(diagnostics.get("catchup_buy_budget", 0.0)),
@@ -661,9 +749,23 @@ class GovernanceBacktestRunner:
             "trailing_sell_accuracy_5d": _safe_float(trailing_sell_accuracy_5d, default=float("nan")),
             "best_replacement_edge_10d": _safe_float(diagnostics.get("best_replacement_edge_10d"), default=0.0),
             "replacement_opportunity_sell_count": int(diagnostics.get("replacement_opportunity_sell_count", 0)),
+            "profit_giveback_observation_count": int(diagnostics.get("profit_giveback_observation_count", 0)),
+            "post_entry_failure_exit_count": int(diagnostics.get("post_entry_failure_exit_count", 0)),
+            "trend_break_observation_count": int(diagnostics.get("trend_break_observation_count", 0)),
+            "volume_distribution_observation_count": int(diagnostics.get("volume_distribution_observation_count", 0)),
             "covariance_risk_model_used": bool(diagnostics.get("covariance_risk_model_used", False)),
             "portfolio_covariance_volatility": _safe_float(diagnostics.get("portfolio_covariance_volatility"), default=0.0),
             "max_risk_contribution": _safe_float(diagnostics.get("max_risk_contribution"), default=0.0),
+            "risk_contribution_gate_pass": bool(diagnostics.get("risk_contribution_gate_pass", True)),
+            "risk_contribution_exposure_scale": _safe_float(diagnostics.get("risk_contribution_exposure_scale"), default=1.0),
+            "risk_symbol_count": int(diagnostics.get("risk_symbol_count", 0)),
+            "risk_contribution_block_reason": str(diagnostics.get("risk_contribution_block_reason", "")),
+            "top5_risk_contribution_sum": _safe_float(diagnostics.get("top5_risk_contribution_sum"), default=0.0),
+            "risk_new_buy_block": bool(diagnostics.get("risk_new_buy_block", False)),
+            "risk_catchup_block": bool(diagnostics.get("risk_catchup_block", False)),
+            "risk_new_buy_block_applied": bool(diagnostics.get("risk_new_buy_block_applied", False)),
+            "risk_catchup_block_applied": bool(diagnostics.get("risk_catchup_block_applied", False)),
+            "risk_blocked_new_buy_weight": _safe_float(diagnostics.get("risk_blocked_new_buy_weight"), default=0.0),
             "avg_pairwise_correlation": _safe_float(diagnostics.get("avg_pairwise_correlation"), default=0.0),
             "covariance_condition_number": _safe_float(diagnostics.get("covariance_condition_number"), default=0.0),
             "order_count": int(len(orders)) if orders is not None else 0,
@@ -746,6 +848,11 @@ class GovernanceBacktestRunner:
         self.factor_weight_rows.extend(rows)
         rows.sort(key=lambda item: (abs(float(item["weight_delta"])), float(item["weight"])), reverse=True)
         return rows
+
+    def _proposal_reputation_weights(self) -> dict[str, float]:
+        if str(self.selection_weight_mode).lower() in {"role_balanced", "reputation_auxiliary", "no_reputation_selection"}:
+            return {model_name: 1.0 for model_name in self.alpha_models}
+        return self.reputation.weights()
 
     def _holding_price_paths(self, *, date) -> list[dict]:
         if not getattr(self, "_last_position_mark_rows", None):
@@ -977,6 +1084,17 @@ class GovernanceBacktestRunner:
             "entry_evidence_usable_count": int(candidates.get("entry_evidence_grade", pd.Series("", index=candidates.index)).astype(str).isin(["strong", "usable"]).sum()),
             "starter_position_allowed_count": int(candidates.get("starter_position_allowed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "confirmed_add_position_allowed_count": int(candidates.get("confirmed_add_position_allowed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "orderflow_candidate_score_mean": _safe_numeric_mean(candidates.get("orderflow_candidate_score")),
+            "reversal_entry_score_mean": _safe_numeric_mean(candidates.get("reversal_entry_score")),
+            "breakout_gate_score_mean": _safe_numeric_mean(candidates.get("breakout_gate_score")),
+            "trend_hold_score_mean": _safe_numeric_mean(candidates.get("trend_hold_score")),
+            "module_candidate_score_mean": _safe_numeric_mean(candidates.get("module_candidate_score")),
+            "module_entry_score_mean": _safe_numeric_mean(candidates.get("module_entry_score")),
+            "module_hold_score_mean": _safe_numeric_mean(candidates.get("module_hold_score")),
+            "orderflow_candidate_pass_count": int(candidates.get("orderflow_candidate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "reversal_confirm_pass_count": int(candidates.get("reversal_confirm_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "breakout_gate_pass_count": int(candidates.get("breakout_gate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "breakout_probability_bucket_pass_count": int(candidates.get("breakout_probability_bucket_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
         }
         for reason, count in reason_counts.head(8).items():
             row[f"entry_reason_count_{reason}"] = int(count)
@@ -1145,17 +1263,32 @@ class GovernanceBacktestRunner:
             dtype=float,
         )
         invested_value = float(total_position_value)
-        weights = (
+        sleeve_weights = (
             nominal_values / invested_value
             if invested_value > 0 and not nominal_values.empty
             else pd.Series(dtype=float)
         )
-        sorted_weights = weights.sort_values(ascending=False).reset_index(drop=True)
-        snapshot["top1_weight"] = float(sorted_weights.iloc[0]) if len(sorted_weights) else 0.0
-        snapshot["top5_weight_sum"] = float(sorted_weights.head(5).sum()) if len(sorted_weights) else 0.0
-        weight_square_sum = float(sorted_weights.pow(2).sum()) if len(sorted_weights) else 0.0
-        snapshot["effective_n"] = float(1.0 / weight_square_sum) if weight_square_sum > 0 else 0.0
-        snapshot["holding_count"] = int(len(sorted_weights))
+        nominal_nav = float(snapshot.get("nominal_nav", 0.0) or 0.0)
+        account_weights = (
+            nominal_values / nominal_nav
+            if nominal_nav > 0 and not nominal_values.empty
+            else pd.Series(dtype=float)
+        )
+        sorted_sleeve_weights = sleeve_weights.sort_values(ascending=False).reset_index(drop=True)
+        sorted_account_weights = account_weights.sort_values(ascending=False).reset_index(drop=True)
+        snapshot["top1_sleeve_weight"] = float(sorted_sleeve_weights.iloc[0]) if len(sorted_sleeve_weights) else 0.0
+        snapshot["top5_sleeve_weight_sum"] = float(sorted_sleeve_weights.head(5).sum()) if len(sorted_sleeve_weights) else 0.0
+        sleeve_weight_square_sum = float(sorted_sleeve_weights.pow(2).sum()) if len(sorted_sleeve_weights) else 0.0
+        snapshot["sleeve_effective_n"] = float(1.0 / sleeve_weight_square_sum) if sleeve_weight_square_sum > 0 else 0.0
+        snapshot["top1_account_weight"] = float(sorted_account_weights.iloc[0]) if len(sorted_account_weights) else 0.0
+        snapshot["top5_account_weight_sum"] = float(sorted_account_weights.head(5).sum()) if len(sorted_account_weights) else 0.0
+        account_weight_square_sum = float(sorted_account_weights.pow(2).sum()) if len(sorted_account_weights) else 0.0
+        snapshot["account_effective_n"] = float(1.0 / account_weight_square_sum) if account_weight_square_sum > 0 else 0.0
+        snapshot["top1_weight"] = snapshot["top1_sleeve_weight"]
+        snapshot["top5_weight_sum"] = snapshot["top5_sleeve_weight_sum"]
+        snapshot["effective_n"] = snapshot["sleeve_effective_n"]
+        snapshot["weight_basis"] = "sleeve_weight_legacy"
+        snapshot["holding_count"] = int(len(sorted_sleeve_weights))
         snapshot.update({"date": pd.Timestamp(date), "decision_id": f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}", "safety_sell_flow_impact_estimate": 0.0})
         snapshot["stale_price_position_count"] = sum(int(row["valuation_source"] == "last_known_close") for row in rows)
         snapshot["missing_price_position_count"] = sum(int(row["valuation_source"] == "missing_mark") for row in rows)
@@ -1164,7 +1297,10 @@ class GovernanceBacktestRunner:
         self._last_position_mark_rows = rows
         if rows and not self.shadow_fast_mode:
             invested_nav = max(float(total_position_value), 1e-12)
+            account_nav = max(nominal_nav, 1e-12)
             for row in rows:
+                sleeve_weight = float(row["market_value"]) / invested_nav if invested_nav > 0 else 0.0
+                account_weight = float(row["market_value"]) / account_nav if account_nav > 0 else 0.0
                 self.holdings_rows.append(
                     {
                         "date": pd.Timestamp(date),
@@ -1173,7 +1309,11 @@ class GovernanceBacktestRunner:
                         "shares": float(row["shares"]),
                         "price": float(row["price"]),
                         "market_value": float(row["market_value"]),
-                        "weight": float(row["market_value"]) / invested_nav if invested_nav > 0 else 0.0,
+                        "account_weight": account_weight,
+                        "sleeve_weight": sleeve_weight,
+                        "portfolio_exposure": float(total_position_value) / account_nav if account_nav > 0 else 0.0,
+                        "weight": sleeve_weight,
+                        "weight_basis": "sleeve_weight_legacy",
                         "entry_date": row.get("entry_date", pd.NaT),
                         "entry_price": row.get("entry_price", pd.NA),
                         "unrealized_return": row.get("unrealized_return", pd.NA),
@@ -1464,6 +1604,94 @@ class GovernanceBacktestRunner:
             return pd.DataFrame()
         return returns.cov()
 
+    def _latest_price_frame_for_trade_pairing(self, execution_ledger: pd.DataFrame) -> pd.DataFrame:
+        if execution_ledger is None or execution_ledger.empty or "symbol" not in execution_ledger.columns:
+            return pd.DataFrame(columns=["date", "symbol", "trade_close"])
+        price_col = "trade_close" if "trade_close" in self.features.columns else "close"
+        required = {"date", "symbol", price_col}
+        if not required.issubset(set(self.features.columns)):
+            return pd.DataFrame(columns=["date", "symbol", "trade_close"])
+        symbols = set(execution_ledger["symbol"].astype(str).dropna().unique())
+        if not symbols:
+            return pd.DataFrame(columns=["date", "symbol", "trade_close"])
+        data = self.features.loc[
+            self.features["symbol"].astype(str).isin(symbols),
+            ["date", "symbol", price_col],
+        ].copy()
+        if price_col != "trade_close":
+            data = data.rename(columns={price_col: "trade_close"})
+        data["date"] = pd.to_datetime(data["date"], errors="coerce")
+        data["trade_close"] = pd.to_numeric(data["trade_close"], errors="coerce")
+        return data.dropna(subset=["date", "symbol", "trade_close"])
+
+    def _high_exposure_research_gate(self, date) -> dict:
+        trade_summary = self._rolling_trade_pair_summary(date)
+        closed_trade_count = int(trade_summary.get("realized_trade_count", 0) or 0)
+        closed_trade_win_rate = _safe_float(trade_summary.get("closed_trade_win_rate"), default=float("nan"))
+        profit_factor = _safe_float(trade_summary.get("profit_factor"), default=float("nan"))
+        payoff_ratio = _safe_float(trade_summary.get("payoff_ratio"), default=float("nan"))
+        realized_pnl = _safe_float(trade_summary.get("realized_pnl"), default=0.0)
+
+        latest = self.exposure_rows[-1] if self.exposure_rows else {}
+        latest_top1_risk = _safe_float(latest.get("max_risk_contribution"), default=0.0)
+        latest_top5_risk = _safe_float(latest.get("top5_risk_contribution_sum"), default=0.0)
+        latest_risk_symbol_count = int(_safe_float(latest.get("risk_symbol_count"), default=0.0))
+        actual_target_ratio = _recent_actual_target_ratio(self.exposure_rows)
+
+        reasons = []
+        if closed_trade_count < int(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_TRADES):
+            reasons.append("insufficient_closed_trades")
+        if not (pd.notna(profit_factor) and profit_factor >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_PROFIT_FACTOR)):
+            reasons.append("profit_factor_below_threshold")
+        if realized_pnl <= float(GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL):
+            reasons.append("realized_pnl_not_positive")
+        payoff_or_win_ok = (
+            (pd.notna(payoff_ratio) and payoff_ratio >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO))
+            or (pd.notna(closed_trade_win_rate) and closed_trade_win_rate >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_WIN_RATE))
+        )
+        if not payoff_or_win_ok:
+            reasons.append("payoff_and_win_rate_below_threshold")
+        if latest_top1_risk > float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION):
+            reasons.append("top1_risk_contribution_above_threshold")
+
+        tracking_ok = pd.notna(actual_target_ratio) and actual_target_ratio >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_ACTUAL_TARGET_RATIO)
+        if not tracking_ok:
+            reasons.append("actual_target_tracking_low_ramp_only")
+
+        hard_reasons = [reason for reason in reasons if reason != "actual_target_tracking_low_ramp_only"]
+        gate_pass = not hard_reasons
+        return {
+            "gate_pass": bool(gate_pass),
+            "gate_reason": "passed" if not reasons else "|".join(reasons),
+            "closed_trade_count": closed_trade_count,
+            "closed_trade_win_rate": closed_trade_win_rate,
+            "profit_factor": profit_factor,
+            "payoff_ratio": payoff_ratio,
+            "realized_pnl": realized_pnl,
+            "actual_target_ratio": actual_target_ratio,
+            "latest_top1_risk_contribution": latest_top1_risk,
+            "latest_top5_risk_contribution_sum": latest_top5_risk,
+            "latest_risk_symbol_count": latest_risk_symbol_count,
+        }
+
+    def _rolling_trade_pair_summary(self, date) -> dict:
+        if not self.execution_rows:
+            return {}
+        ledger = pd.DataFrame(self.execution_rows)
+        if ledger.empty or "trade_date" not in ledger.columns:
+            return {}
+        ledger["trade_date"] = pd.to_datetime(ledger["trade_date"], errors="coerce")
+        cutoff = pd.Timestamp(date)
+        ledger = ledger[ledger["trade_date"].notna() & (ledger["trade_date"] < cutoff)].copy()
+        if ledger.empty:
+            return {}
+        _, _, summary = build_trade_pairing_ledgers(
+            ledger,
+            latest_prices=None,
+            capital_profile=self.governance_variant,
+        )
+        return summary
+
     def _save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         saved = self.engine.save(self.output_dir)
@@ -1479,6 +1707,15 @@ class GovernanceBacktestRunner:
             "governance_account_audit_ledger": pd.DataFrame(self.account_audit_rows),
             "governance_corporate_action_ledger": self.corporate_actions.audit_frame(),
         }
+        trade_pairs, open_positions, trade_summary = build_trade_pairing_ledgers(
+            extra["governance_execution_ledger"],
+            latest_prices=self._latest_price_frame_for_trade_pairing(extra["governance_execution_ledger"]),
+            capital_profile=self.governance_variant,
+        )
+        extra["governance_trade_pairs"] = trade_pairs
+        extra["governance_open_positions"] = open_positions
+        extra["governance_trade_pair_summary"] = pd.DataFrame([trade_summary])
+        extra["governance_pnl_by_sell_reason"] = _pnl_by_sell_reason(trade_pairs)
         extra["governance_attribution_ledger"] = build_governance_attribution(
             daily_result=extra["governance_daily_result"],
             feature_data=self.features,
@@ -1519,6 +1756,8 @@ class GovernanceBacktestRunner:
             attribution_ledger=extra["governance_attribution_ledger"],
             bucket_attribution=extra["governance_bucket_attribution"],
             quality_reports=quality_reports,
+            trade_pair_summary=extra["governance_trade_pair_summary"],
+            pnl_by_sell_reason=extra["governance_pnl_by_sell_reason"],
         )
         summary_path = (
             GOVERNANCE_SUMMARY_CSV
@@ -1581,6 +1820,8 @@ class GovernanceBacktestRunner:
         attribution_ledger=None,
         bucket_attribution=None,
         quality_reports=None,
+        trade_pair_summary=None,
+        pnl_by_sell_reason=None,
     ):
         if daily_result.empty:
             return pd.DataFrame(
@@ -1729,6 +1970,19 @@ class GovernanceBacktestRunner:
         rolling_beat = quality_reports.get("governance_rolling_beat_report", pd.DataFrame())
         validation = quality_reports.get("governance_strategy_validation_matrix", pd.DataFrame())
         rebound_diagnostics = quality_reports.get("governance_rebound_entry_diagnostics", pd.DataFrame())
+        trade_summary = trade_pair_summary.copy() if trade_pair_summary is not None else pd.DataFrame()
+        trade_row = trade_summary.iloc[0].to_dict() if not trade_summary.empty else {}
+        closed_trade_count = int(_safe_float(trade_row.get("realized_trade_count"), default=0.0))
+        closed_trade_win_rate = _safe_float(trade_row.get("closed_trade_win_rate"), default=float("nan"))
+        realized_pnl = _safe_float(trade_row.get("realized_pnl"), default=0.0)
+        gross_profit = _safe_float(trade_row.get("gross_profit"), default=0.0)
+        gross_loss = _safe_float(trade_row.get("gross_loss"), default=0.0)
+        avg_win = _safe_float(trade_row.get("avg_win"), default=float("nan"))
+        avg_loss = _safe_float(trade_row.get("avg_loss"), default=float("nan"))
+        payoff_ratio = _safe_float(trade_row.get("payoff_ratio"), default=float("nan"))
+        profit_factor = _safe_float(trade_row.get("profit_factor"), default=float("nan"))
+        open_position_count = int(_safe_float(trade_row.get("open_position_count"), default=0.0))
+        pnl_by_sell_reason_text = _format_pnl_by_sell_reason(pnl_by_sell_reason)
         pwin10_ece = _calibration_ece(calibration, horizon_days=10)
         pwin10_wilson_lower = _calibration_best_wilson(calibration, horizon_days=10)
         buy_expectancy_10d = _payoff_metric(payoff, horizon_days=10, side="buy", metric="expectancy")
@@ -1791,6 +2045,17 @@ class GovernanceBacktestRunner:
                     "buy_hit_rate_10d": buy_hit_rate_10d,
                     "sell_expectancy_10d": sell_expectancy_10d,
                     "normal_sell_expectancy_10d": normal_sell_expectancy_10d,
+                    "closed_trade_count": closed_trade_count,
+                    "closed_trade_win_rate": closed_trade_win_rate,
+                    "realized_pnl": realized_pnl,
+                    "gross_profit": gross_profit,
+                    "gross_loss": gross_loss,
+                    "avg_win": avg_win,
+                    "avg_loss": avg_loss,
+                    "payoff_ratio": payoff_ratio,
+                    "profit_factor": profit_factor,
+                    "open_position_count": open_position_count,
+                    "pnl_by_sell_reason": pnl_by_sell_reason_text,
                     "rebound_buy_expectancy_10d": rebound_buy_expectancy_10d,
                     "rebound_buy_excess_10d": rebound_buy_excess_10d,
                     "rebound_day_count": rebound_day_count,
@@ -1808,16 +2073,31 @@ class GovernanceBacktestRunner:
                     "validation_gate_pass_ratio": validation_gate_pass_ratio,
                     "validation_gate_fail_count": validation_gate_fail_count,
                     "high_exposure_research_gate": bool(
-                        pd.notna(pwin10_wilson_lower)
-                        and float(pwin10_wilson_lower) >= 0.50
-                        and pd.notna(buy_expectancy_10d)
-                        and float(buy_expectancy_10d) > 0.0
-                        and float(max_risk_contribution_observed or 0.0) <= 0.35
+                        closed_trade_count >= int(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_TRADES)
+                        and pd.notna(profit_factor)
+                        and float(profit_factor) >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_PROFIT_FACTOR)
+                        and float(realized_pnl) > float(GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL)
+                        and (
+                            (pd.notna(payoff_ratio) and float(payoff_ratio) >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO))
+                            or (
+                                pd.notna(closed_trade_win_rate)
+                                and float(closed_trade_win_rate) >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_WIN_RATE)
+                            )
+                        )
+                        and float(max_risk_contribution_observed or 0.0) <= float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION)
                         and float(validation_gate_pass_ratio or 0.0) >= 0.60
                     ),
+                    "account_total_exposure": float(pd.to_numeric(data.get("actual_exposure", pd.Series(dtype=float)), errors="coerce").mean()),
+                    "top1_account_weight": float(pd.to_numeric(data.get("top1_account_weight", pd.Series(dtype=float)), errors="coerce").mean()),
+                    "top5_account_weight_sum": float(pd.to_numeric(data.get("top5_account_weight_sum", pd.Series(dtype=float)), errors="coerce").mean()),
+                    "account_effective_n": float(pd.to_numeric(data.get("account_effective_n", pd.Series(dtype=float)), errors="coerce").mean()),
+                    "top1_sleeve_weight": float(pd.to_numeric(data.get("top1_sleeve_weight", data.get("top1_weight", pd.Series(dtype=float))), errors="coerce").mean()),
+                    "top5_sleeve_weight_sum": float(pd.to_numeric(data.get("top5_sleeve_weight_sum", data.get("top5_weight_sum", pd.Series(dtype=float))), errors="coerce").mean()),
+                    "sleeve_effective_n": float(pd.to_numeric(data.get("sleeve_effective_n", data.get("effective_n", pd.Series(dtype=float))), errors="coerce").mean()),
                     "top1_weight": float(pd.to_numeric(data.get("top1_weight", pd.Series(dtype=float)), errors="coerce").mean()),
                     "top5_weight_sum": float(pd.to_numeric(data.get("top5_weight_sum", pd.Series(dtype=float)), errors="coerce").mean()),
                     "effective_n": float(pd.to_numeric(data.get("effective_n", pd.Series(dtype=float)), errors="coerce").mean()),
+                    "weight_basis": "top*_weight/effective_n are legacy sleeve-weight fields; use account_* and sleeve_* fields",
                     "degradation_flags": "|".join(degradation_flags),
                     "degradation_count": len(degradation_flags),
                     "price_basis": "nominal_unadjusted",
@@ -1908,6 +2188,10 @@ def run_governance_backtest(
     alpha_bundle: str | None = None,
     entry_confirmation_mode: str = "full",
     policy_exit_mode: str = "full",
+    selection_weight_mode: str = "reputation_weighted",
+    regime_overlay_mode: str = "full",
+    risk_hard_gate_enabled: bool = False,
+    probability_bucket_mode: str = "default",
     registry_version: str | None = None,
     target_index_codes: tuple[str, ...] = (),
     require_constituents: bool = True,
@@ -1955,6 +2239,7 @@ def run_governance_backtest(
             enable_sector_cap=enable_sector_cap,
             enable_safety_agent=enable_safety_agent,
             exit_mode=policy_exit_mode,
+            risk_hard_gate_enabled=risk_hard_gate_enabled,
         ),
         prepared_features=True,
         enable_shadow_portfolios=enable_shadow_portfolios,
@@ -1963,6 +2248,10 @@ def run_governance_backtest(
         enable_sector_cap=enable_sector_cap,
         enable_safety_agent=enable_safety_agent,
         entry_confirmation_mode=entry_confirmation_mode,
+        selection_weight_mode=selection_weight_mode,
+        regime_overlay_mode=regime_overlay_mode,
+        risk_hard_gate_enabled=risk_hard_gate_enabled,
+        probability_bucket_mode=probability_bucket_mode,
         universe_name=universe_name,
         universe_mode=universe_mode,
         alpha_bundle=alpha_bundle,
@@ -2030,6 +2319,87 @@ def _risk_gate_max_contribution(risk_contribution: pd.DataFrame) -> float:
         else "risk_contribution_share"
     )
     return _safe_numeric_max(data.get(metric_col), default=0.0)
+
+
+def _recent_actual_target_ratio(exposure_rows: list[dict], *, window: int = 20) -> float:
+    if not exposure_rows:
+        return pd.NA
+    data = pd.DataFrame(exposure_rows).tail(int(window)).copy()
+    if not {"actual_exposure", "target_exposure"}.issubset(data.columns):
+        return pd.NA
+    actual = pd.to_numeric(data["actual_exposure"], errors="coerce")
+    target = pd.to_numeric(data["target_exposure"], errors="coerce")
+    ratio = (actual / target.replace(0.0, pd.NA)).dropna()
+    if ratio.empty:
+        return pd.NA
+    return float(ratio.median())
+
+
+def _pnl_by_sell_reason(trade_pairs: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "sell_reason",
+        "closed_trade_count",
+        "closed_trade_win_rate",
+        "realized_pnl",
+        "gross_profit",
+        "gross_loss",
+        "avg_win",
+        "avg_loss",
+        "payoff_ratio",
+        "profit_factor",
+    ]
+    if trade_pairs is None or trade_pairs.empty:
+        return pd.DataFrame(columns=columns)
+    data = trade_pairs.copy()
+    data["realized_pnl_amount"] = pd.to_numeric(data.get("realized_pnl_amount"), errors="coerce")
+    reason_source = data.get("sell_reason", data.get("close_reason", pd.Series("", index=data.index)))
+    data["sell_reason"] = reason_source.fillna("").astype(str).replace("", "unknown")
+    data = data[data["realized_pnl_amount"].notna()].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for reason, group in data.groupby("sell_reason", dropna=False):
+        pnl = pd.to_numeric(group["realized_pnl_amount"], errors="coerce").dropna()
+        wins = pnl[pnl > 0.0]
+        losses = pnl[pnl < 0.0]
+        gross_profit = float(wins.sum()) if len(wins) else 0.0
+        gross_loss = float(losses.sum()) if len(losses) else 0.0
+        avg_win = float(wins.mean()) if len(wins) else pd.NA
+        avg_loss = float(losses.mean()) if len(losses) else pd.NA
+        rows.append(
+            {
+                "sell_reason": str(reason),
+                "closed_trade_count": int(len(pnl)),
+                "closed_trade_win_rate": float((pnl > 0.0).mean()) if len(pnl) else pd.NA,
+                "realized_pnl": float(pnl.sum()) if len(pnl) else 0.0,
+                "gross_profit": gross_profit,
+                "gross_loss": gross_loss,
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "payoff_ratio": (
+                    float(avg_win / abs(avg_loss))
+                    if pd.notna(avg_win) and pd.notna(avg_loss) and abs(float(avg_loss)) > 1e-12
+                    else pd.NA
+                ),
+                "profit_factor": (
+                    float(gross_profit / abs(gross_loss))
+                    if abs(gross_loss) > 1e-12
+                    else pd.NA
+                ),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values("realized_pnl", ascending=False)
+
+
+def _format_pnl_by_sell_reason(pnl_by_sell_reason: pd.DataFrame) -> str:
+    if pnl_by_sell_reason is None or pnl_by_sell_reason.empty:
+        return ""
+    parts = []
+    data = pnl_by_sell_reason.copy()
+    data["realized_pnl"] = pd.to_numeric(data.get("realized_pnl"), errors="coerce")
+    for _, row in data.sort_values("realized_pnl", ascending=False).head(8).iterrows():
+        parts.append(f"{row.get('sell_reason')}:{float(row.get('realized_pnl', 0.0)):.2f}")
+    return "|".join(parts)
 
 
 def _validation_pass_ratio(validation: pd.DataFrame) -> float:
@@ -2436,8 +2806,15 @@ def _authorize_exposure_by_regime(
     qualified_entry_count: int,
     trailing_buy_accuracy_5d,
     liquidity_stress: float,
+    regime_overlay_mode: str = "full",
 ) -> dict:
     base = _base_exposure_by_regime(regime_name)
+    overlay_mode = str(regime_overlay_mode or "full").strip().lower()
+    overlay_capped = False
+    if overlay_mode in {"conservative", "no_active_boost", "risk_only"}:
+        capped_base = min(float(base), 0.60)
+        overlay_capped = bool(capped_base < float(base))
+        base = capped_base
     risk = str(risk_level).lower()
     regime = str(regime_name).lower()
     data = candidates.copy() if candidates is not None else pd.DataFrame()
@@ -2514,6 +2891,8 @@ def _authorize_exposure_by_regime(
         "authorization_calibration_trust_10d_mean": float(calibration_trust_mean),
         "authorization_trailing_buy_accuracy_5d": trailing_accuracy,
         "authorization_liquidity_stress": float(liquidity_stress),
+        "regime_overlay_mode": overlay_mode,
+        "regime_overlay_capped": overlay_capped,
     }
 
 

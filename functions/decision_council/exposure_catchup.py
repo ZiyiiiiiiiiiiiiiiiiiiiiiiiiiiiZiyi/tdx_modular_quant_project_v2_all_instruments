@@ -44,6 +44,10 @@ def decide_exposure_catchup(
     qualified_entry_count: int,
     transition_only: bool,
     trailing_buy_accuracy_5d: float | None = None,
+    risk_contribution_gate_pass: bool = True,
+    top5_risk_contribution_sum: float = 0.0,
+    risk_symbol_count: int = 999,
+    hard_risk_gate_enabled: bool = False,
 ) -> ExposureCatchupDecision:
     """Decide whether and how much extra buy budget can pursue target exposure."""
     actual = max(float(actual_exposure), 0.0)
@@ -69,6 +73,10 @@ def decide_exposure_catchup(
         block_reason = "liquidity_stress"
     elif tier == "none":
         block_reason = "insufficient_confirmed_entries"
+    elif bool(hard_risk_gate_enabled) and not bool(risk_contribution_gate_pass):
+        block_reason = "risk_contribution_gate_blocks_catchup"
+    elif bool(hard_risk_gate_enabled) and float(top5_risk_contribution_sum) > 0.80 and int(risk_symbol_count) < 8:
+        block_reason = "top5_risk_contribution_blocks_catchup"
     elif rate <= 0.0:
         block_reason = "zero_catchup_rate"
 

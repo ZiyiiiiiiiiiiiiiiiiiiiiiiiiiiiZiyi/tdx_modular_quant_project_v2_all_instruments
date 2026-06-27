@@ -183,6 +183,40 @@ VALUATION_LEDGER_PREFIX = "backtest_valuation_ledger"
 CORPORATE_ACTION_LEDGER_CSV = REPORT_DIR / "corporate_action_ledger.csv"
 ADJUSTMENT_PTI_QUALITY_CSV = REPORT_DIR / "adjustment_pti_quality_report.csv"
 
+DEFAULT_BACKTEST_CAPITAL_PROFILE = "institutional_1m"
+BACKTEST_CAPITAL_PROFILES = {
+    "institutional_1m": {
+        "label": "1,000,000 baseline",
+        "initial_cash": float(BACKTEST_INITIAL_CASH),
+        "min_cash_buffer": 0.0,
+        "max_positions": None,
+        "affordability_first": False,
+        "skip_unaffordable_symbols": False,
+        "notes": "Legacy baseline profile. Uses the existing strategy target breadth.",
+    },
+    "institutional_10m": {
+        "label": "10,000,000 large account",
+        "initial_cash": 10_000_000.0,
+        "min_cash_buffer": 0.0,
+        "max_positions": None,
+        "affordability_first": False,
+        "skip_unaffordable_symbols": False,
+        "notes": "Large-account comparison profile for high-capacity research.",
+    },
+    "retail_20k": {
+        "label": "20,000 retail",
+        "initial_cash": 20_000.0,
+        "min_cash_buffer": 500.0,
+        "max_positions": 5,
+        "affordability_first": True,
+        "skip_unaffordable_symbols": True,
+        "notes": "Small-account profile with lot-size and cash-buffer discipline.",
+    },
+}
+
+TRADE_PAIR_LEDGER_PREFIX = "backtest_trade_pairs"
+OPEN_POSITION_LEDGER_PREFIX = "backtest_open_positions"
+
 EXECUTION_MODEL_VERSION = "tdx_daily_t_plus_1_nominal_v2"
 SIGNAL_TIME_RULE = "t_close_after_market"
 ORDER_TIME_RULE = "t_plus_1_open_preferred_daily_proxy"
@@ -212,6 +246,64 @@ ABNORMAL_RETURN_CSV = REPORT_DIR / "abnormal_return_rows.csv"
 DATA_QUALITY_SUMMARY_CSV = REPORT_DIR / "data_quality_summary.csv"
 DATA_CONTINUITY_REPORT_CSV = REPORT_DIR / "data_continuity_report.csv"
 DATA_CONTINUITY_GAP_DAYS_WARN = 10
+
+
+def get_backtest_capital_profile(
+    profile_name=None,
+    *,
+    initial_cash=None,
+    max_positions_override="__profile_default__",
+    min_cash_buffer=None,
+):
+    selected = str(profile_name or DEFAULT_BACKTEST_CAPITAL_PROFILE)
+    if selected not in BACKTEST_CAPITAL_PROFILES:
+        raise ValueError(
+            f"Unknown backtest capital profile: {selected}. "
+            f"Available: {sorted(BACKTEST_CAPITAL_PROFILES)}"
+        )
+    profile = dict(BACKTEST_CAPITAL_PROFILES[selected])
+    profile["name"] = selected
+    profile["initial_cash"] = float(profile["initial_cash"])
+    profile["min_cash_buffer"] = float(profile.get("min_cash_buffer", 0.0) or 0.0)
+    max_positions = profile.get("max_positions")
+    profile["max_positions"] = None if max_positions in (None, "", 0) else int(max_positions)
+    profile["affordability_first"] = bool(profile.get("affordability_first", False))
+    profile["skip_unaffordable_symbols"] = bool(profile.get("skip_unaffordable_symbols", False))
+    override_parts = []
+    if initial_cash not in (None, ""):
+        profile["initial_cash"] = float(initial_cash)
+        if profile["initial_cash"] <= 0:
+            raise ValueError("Backtest initial cash must be positive")
+        override_parts.append(f"cash{_profile_number_slug(profile['initial_cash'])}")
+    if max_positions_override != "__profile_default__":
+        if max_positions_override in (None, "", 0, "0"):
+            profile["max_positions"] = None
+            override_parts.append("posall")
+        else:
+            profile["max_positions"] = int(max_positions_override)
+            if profile["max_positions"] <= 0:
+                raise ValueError("Backtest max positions must be positive or blank/0 for unlimited")
+            override_parts.append(f"pos{profile['max_positions']}")
+    if min_cash_buffer not in (None, ""):
+        profile["min_cash_buffer"] = float(min_cash_buffer)
+        if profile["min_cash_buffer"] < 0:
+            raise ValueError("Backtest min cash buffer cannot be negative")
+        override_parts.append(f"buf{_profile_number_slug(profile['min_cash_buffer'])}")
+    if override_parts:
+        profile["base_profile"] = selected
+        profile["name"] = f"{selected}__{'__'.join(override_parts)}"
+        profile["label"] = f"{profile.get('label', selected)} custom"
+    return profile
+
+
+def backtest_profile_suffix(profile_name=None):
+    selected = str(profile_name or DEFAULT_BACKTEST_CAPITAL_PROFILE)
+    return "" if selected == DEFAULT_BACKTEST_CAPITAL_PROFILE else f"__{selected}"
+
+
+def _profile_number_slug(value):
+    text = f"{float(value):.2f}".rstrip("0").rstrip(".")
+    return text.replace(".", "p").replace("-", "m")
 
 # User-facing strategy defaults. Keep these here so main.py, batch runners,
 # quick runners, and the auto-complete workflow cannot drift into different
@@ -636,6 +728,19 @@ GOVERNANCE_CATCHUP_RATE_WARNING = 0.10
 GOVERNANCE_CATCHUP_EXTRA_BUDGET_NORMAL = 0.02
 GOVERNANCE_CATCHUP_EXTRA_BUDGET_WARNING = 0.01
 GOVERNANCE_CATCHUP_MAX_BUDGET = 0.05
+# Research gate for allowing active exposure catch-up / high-exposure behavior.
+# These thresholds are intentionally conservative and auditable:
+# - profit factor is primary because recent diagnostics showed high win-rate can
+#   still lose money when average losses dominate average wins.
+# - closed trade count avoids amplifying noise from a tiny sample.
+# - actual/target tracking is a ramp factor rather than a hard block.
+GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_TRADES = 100
+GOVERNANCE_HIGH_EXPOSURE_MIN_PROFIT_FACTOR = 1.20
+GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO = 1.25
+GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_WIN_RATE = 0.45
+GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION = 0.35
+GOVERNANCE_HIGH_EXPOSURE_MIN_ACTUAL_TARGET_RATIO = 0.60
+GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL = 0.0
 
 # Position-management P0 contract defaults. These values define the first
 # conservative Kelly implementation and are intentionally explicit because the

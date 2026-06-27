@@ -33,6 +33,7 @@ Thumbs.db
 data/processed/
 data/reports/
 results/
+runs/
 
 # Large/generated data artifacts
 *.parquet
