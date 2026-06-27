@@ -71,6 +71,7 @@ def build_layer_ablation_diagnostics(
     risk = pd.DataFrame(risk_rows)
     modules = pd.DataFrame(module_rows)
     reasons = pd.DataFrame(reason_rows)
+    increments = _incremental_contribution(summary)
     problems = _problem_ranking(summary, validation)
 
     saved: dict[str, Path] = {}
@@ -81,9 +82,10 @@ def build_layer_ablation_diagnostics(
     saved["risk"] = _save_csv(risk, output_dir / f"layer_ablation_risk_concentration_{suite_id}.csv")
     saved["module_weights"] = _save_csv(modules, output_dir / f"layer_ablation_module_weights_{suite_id}.csv")
     saved["order_reasons"] = _save_csv(reasons, output_dir / f"layer_ablation_order_reasons_{suite_id}.csv")
+    saved["incremental_contribution"] = _save_csv(increments, output_dir / f"layer_ablation_incremental_contribution_{suite_id}.csv")
     saved["problem_ranking"] = _save_csv(problems, output_dir / f"layer_ablation_problem_ranking_{suite_id}.csv")
-    saved.update(_save_plots(summary, payoff, calibration, risk, modules, output_dir, suite_id))
-    saved["report"] = _save_markdown_report(summary, problems, saved, output_dir / f"layer_ablation_diagnostic_report_{suite_id}.md")
+    saved.update(_save_plots(summary, payoff, calibration, risk, modules, increments, output_dir, suite_id))
+    saved["report"] = _save_markdown_report(summary, increments, problems, saved, output_dir / f"layer_ablation_diagnostic_report_{suite_id}.md")
     return saved
 
 
@@ -139,11 +141,18 @@ def _risk_summary_rows(path: Path, context: dict) -> list[dict]:
     rows = []
     grouped = data.groupby("date", dropna=False) if "date" in data.columns else [(None, data)]
     for date, group in grouped:
+        ranked = group.sort_values(metric_col, ascending=False)
+        top_symbols = ranked["symbol"].astype(str).head(5).tolist() if "symbol" in ranked.columns else []
+        top_values = pd.to_numeric(ranked.get(metric_col), errors="coerce").head(5).tolist()
         item = dict(context)
         item.update(
             {
                 "date": date,
                 "max_risk_contribution": float(group[metric_col].max()) if group[metric_col].notna().any() else np.nan,
+                "top1_risk_symbol": top_symbols[0] if top_symbols else "",
+                "top1_risk_contribution": float(top_values[0]) if top_values else np.nan,
+                "top5_risk_symbols": ",".join(top_symbols),
+                "top5_risk_contribution_sum": float(np.nansum(top_values)) if top_values else np.nan,
                 "mean_risk_contribution": float(group[metric_col].mean()) if group[metric_col].notna().any() else np.nan,
                 "max_target_weight": float(group["target_weight"].max()) if group["target_weight"].notna().any() else np.nan,
                 "risk_symbol_count": int(group["symbol"].nunique()) if "symbol" in group.columns else int(len(group)),
@@ -151,6 +160,79 @@ def _risk_summary_rows(path: Path, context: dict) -> list[dict]:
         )
         rows.append(item)
     return rows
+
+
+def _incremental_contribution(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty or "suite_step" not in summary.columns:
+        return pd.DataFrame()
+    metrics = [
+        "total_return",
+        "sharpe",
+        "max_drawdown",
+        "avg_actual_exposure",
+        "holding_portfolio_return",
+        "benchmark_excess_return",
+        "buy_expectancy_10d",
+        "sell_expectancy_10d",
+        "p_win_10d_ece",
+        "max_risk_contribution_observed",
+    ]
+    group_keys = [key for key in ["suite_id", "universe_name"] if key in summary.columns]
+    rows = []
+    grouped = summary.groupby(group_keys, dropna=False) if group_keys else [((), summary)]
+    for group_key, group in grouped:
+        base = group[group["suite_step"].astype(str).eq("01_core_base")]
+        if base.empty:
+            continue
+        base_row = base.iloc[0]
+        for _, row in group.iterrows():
+            item = {
+                "suite_step": row.get("suite_step"),
+                "variant_name": row.get("variant_name"),
+                "alpha_bundle": row.get("alpha_bundle"),
+            }
+            if group_keys:
+                if not isinstance(group_key, tuple):
+                    group_key = (group_key,)
+                item.update(dict(zip(group_keys, group_key)))
+            for metric in metrics:
+                if metric not in group.columns:
+                    continue
+                observed = pd.to_numeric(pd.Series([row.get(metric)]), errors="coerce").iloc[0]
+                baseline = pd.to_numeric(pd.Series([base_row.get(metric)]), errors="coerce").iloc[0]
+                item[f"{metric}_value"] = observed
+                item[f"{metric}_delta_vs_core_base"] = observed - baseline if pd.notna(observed) and pd.notna(baseline) else np.nan
+            item["research_action"] = _incremental_action(item)
+            rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def _incremental_action(row: dict) -> str:
+    step = str(row.get("suite_step", ""))
+    buy_delta = row.get("buy_expectancy_10d_delta_vs_core_base", np.nan)
+    hold_delta = row.get("holding_portfolio_return_delta_vs_core_base", np.nan)
+    risk_delta = row.get("max_risk_contribution_observed_delta_vs_core_base", np.nan)
+    try:
+        buy_delta = float(buy_delta)
+    except Exception:
+        buy_delta = np.nan
+    try:
+        hold_delta = float(hold_delta)
+    except Exception:
+        hold_delta = np.nan
+    try:
+        risk_delta = float(risk_delta)
+    except Exception:
+        risk_delta = np.nan
+    if step == "01_core_base":
+        return "baseline"
+    if np.isfinite(buy_delta) and buy_delta > 0 and np.isfinite(hold_delta) and hold_delta >= 0 and (not np.isfinite(risk_delta) or risk_delta <= 0.10):
+        return "candidate_for_mainline"
+    if np.isfinite(buy_delta) and buy_delta < 0 and np.isfinite(hold_delta) and hold_delta < 0:
+        return "candidate_to_remove_or_downgrade"
+    if np.isfinite(risk_delta) and risk_delta > 0.20:
+        return "risk_concentration_warning"
+    return "needs_manual_review"
 
 
 def _module_weight_rows(path: Path, context: dict) -> list[dict]:
@@ -311,6 +393,7 @@ def _save_plots(
     calibration: pd.DataFrame,
     risk: pd.DataFrame,
     modules: pd.DataFrame,
+    increments: pd.DataFrame,
     output_dir: Path,
     suite_id: str,
 ) -> dict[str, Path]:
@@ -342,6 +425,10 @@ def _save_plots(
         path = output_dir / f"layer_ablation_module_weights_{suite_id}.png"
         _plot_modules(plt, modules, path)
         saved["module_plot"] = path
+    if increments is not None and not increments.empty:
+        path = output_dir / f"layer_ablation_incremental_contribution_{suite_id}.png"
+        _plot_incremental(plt, increments, path)
+        saved["incremental_plot"] = path
     return saved
 
 
@@ -450,9 +537,38 @@ def _plot_modules(plt, modules: pd.DataFrame, path: Path) -> None:
     plt.close(fig)
 
 
-def _save_markdown_report(summary: pd.DataFrame, problems: pd.DataFrame, saved: dict[str, Path], path: Path) -> Path:
+def _plot_incremental(plt, increments: pd.DataFrame, path: Path) -> None:
+    data = increments.copy()
+    if "suite_step" not in data.columns:
+        return
+    data = data[~data["suite_step"].astype(str).eq("01_core_base")].copy()
+    if data.empty:
+        return
+    data["label"] = data["suite_step"].astype(str).str.replace("_", "\n", regex=False)
+    metrics = [
+        ("buy_expectancy_10d_delta_vs_core_base", "Buy Exp 10D Delta"),
+        ("holding_portfolio_return_delta_vs_core_base", "Holding Return Delta"),
+        ("benchmark_excess_return_delta_vs_core_base", "Top30 Excess Delta"),
+        ("max_risk_contribution_observed_delta_vs_core_base", "Risk Contribution Delta"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(18, 9))
+    for axis, (metric, title) in zip(axes.ravel(), metrics):
+        values = pd.to_numeric(data.get(metric), errors="coerce").fillna(0.0)
+        colors = ["#1f7a5a" if value >= 0 else "#b3403a" for value in values]
+        axis.bar(data["label"], values, color=colors)
+        axis.axhline(0, color="#30343b", linewidth=0.8)
+        axis.set_title(title)
+        axis.grid(axis="y", alpha=0.25)
+        axis.tick_params(axis="x", labelsize=7)
+    fig.suptitle("Incremental Contribution vs 01_core_base", fontsize=15, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_markdown_report(summary: pd.DataFrame, increments: pd.DataFrame, problems: pd.DataFrame, saved: dict[str, Path], path: Path) -> Path:
     lines = [
-        "# Governance Layer Ablation Diagnostic Report",
+        "# Governance Enhanced Module Diagnostic Report",
         "",
         "## Summary",
         "",
@@ -462,6 +578,23 @@ def _save_markdown_report(summary: pd.DataFrame, problems: pd.DataFrame, saved: 
     else:
         display_cols = [col for col in ["suite_step", *KEY_METRICS] if col in summary.columns]
         lines.append(_markdown_table(summary[display_cols]))
+    lines.extend(["", "## Incremental Contribution vs 01_core_base", ""])
+    if increments is None or increments.empty:
+        lines.append("No incremental contribution rows were available.")
+    else:
+        display_cols = [
+            col
+            for col in [
+                "suite_step",
+                "buy_expectancy_10d_delta_vs_core_base",
+                "holding_portfolio_return_delta_vs_core_base",
+                "benchmark_excess_return_delta_vs_core_base",
+                "max_risk_contribution_observed_delta_vs_core_base",
+                "research_action",
+            ]
+            if col in increments.columns
+        ]
+        lines.append(_markdown_table(increments[display_cols]))
     lines.extend(["", "## Problem Ranking", ""])
     if problems is None or problems.empty:
         lines.append("No diagnostic threshold failures were detected.")

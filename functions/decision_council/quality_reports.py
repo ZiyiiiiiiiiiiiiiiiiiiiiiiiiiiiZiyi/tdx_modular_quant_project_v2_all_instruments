@@ -79,6 +79,7 @@ def build_governance_quality_reports(
         "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals),
         "governance_factor_role_report": build_factor_role_report(alpha_proposals),
         "governance_rolling_beat_report": build_rolling_beat_report(attribution_ledger),
+        "governance_module_role_summary": build_module_role_summary(ideal_portfolio_plan),
     }
     reports["governance_rebound_entry_diagnostics"] = build_rebound_entry_diagnostics(
         reports.get("governance_entry_payoff_by_regime", pd.DataFrame()),
@@ -86,6 +87,64 @@ def build_governance_quality_reports(
     )
     reports["governance_strategy_validation_matrix"] = build_strategy_validation_matrix(reports)
     return reports
+
+
+def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFrame:
+    """Audit whether the role-separated entry chain is doing useful filtering."""
+    if ideal_portfolio_plan is None or ideal_portfolio_plan.empty:
+        return pd.DataFrame()
+    data = ideal_portfolio_plan.copy()
+    data["decision_date"] = pd.to_datetime(data.get("decision_date"), errors="coerce")
+    if data["decision_date"].isna().all():
+        return pd.DataFrame()
+    numeric_columns = [
+        "orderflow_candidate_score",
+        "reversal_entry_score",
+        "breakout_gate_score",
+        "trend_hold_score",
+        "module_candidate_score",
+        "module_entry_score",
+        "module_hold_score",
+        "ideal_weight",
+        "expected_edge_10d",
+        "conservative_expected_edge_10d",
+        "p_win_10d_wilson_lower",
+    ]
+    for column in numeric_columns:
+        if column not in data.columns:
+            data[column] = np.nan
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    for column in ["entry_confirmed", "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass", "breakout_probability_bucket_pass"]:
+        if column not in data.columns:
+            data[column] = False
+        data[column] = data[column].fillna(False).astype(bool)
+    rows = []
+    for date, group in data.groupby("decision_date", sort=True):
+        weighted = group[pd.to_numeric(group["ideal_weight"], errors="coerce").fillna(0.0) > 0.0]
+        source = weighted if not weighted.empty else group
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "selected_count": int(len(group)),
+                "weighted_selected_count": int(len(weighted)),
+                "entry_confirmed_count": int(group["entry_confirmed"].sum()),
+                "orderflow_pass_count": int(group["orderflow_candidate_pass"].sum()),
+                "reversal_pass_count": int(group["reversal_confirm_pass"].sum()),
+                "breakout_pass_count": int(group["breakout_gate_pass"].sum()),
+                "breakout_probability_bucket_pass_count": int(group["breakout_probability_bucket_pass"].sum()),
+                "avg_orderflow_candidate_score": _safe_mean(source["orderflow_candidate_score"]),
+                "avg_reversal_entry_score": _safe_mean(source["reversal_entry_score"]),
+                "avg_breakout_gate_score": _safe_mean(source["breakout_gate_score"]),
+                "avg_trend_hold_score": _safe_mean(source["trend_hold_score"]),
+                "avg_module_candidate_score": _safe_mean(source["module_candidate_score"]),
+                "avg_module_entry_score": _safe_mean(source["module_entry_score"]),
+                "avg_module_hold_score": _safe_mean(source["module_hold_score"]),
+                "avg_expected_edge_10d": _safe_mean(source["expected_edge_10d"]),
+                "avg_conservative_expected_edge_10d": _safe_mean(source["conservative_expected_edge_10d"]),
+                "avg_p_win_10d_wilson_lower": _safe_mean(source["p_win_10d_wilson_lower"]),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def build_rebound_entry_diagnostics(payoff_by_regime: pd.DataFrame, *, daily_result: pd.DataFrame | None) -> pd.DataFrame:
@@ -389,7 +448,7 @@ def build_entry_payoff_report(
         for keys, group in outcomes.groupby(["side", "reason"], dropna=False):
             side, reason = keys
             rows.append(_payoff_row(group, horizon=horizon, layer="executed", side=side, reason=reason))
-    return pd.DataFrame(rows).sort_values(["horizon_days", "side", "sample_count"], ascending=[True, True, False]).reset_index(drop=True)
+    return _rows_frame(rows, sort_by=["horizon_days", "side", "sample_count"], ascending=[True, True, False])
 
 
 def build_selection_funnel_attribution(
@@ -429,7 +488,7 @@ def build_selection_funnel_attribution(
             continue
         for layer, group in outcomes.groupby("layer", dropna=False):
             rows.append(_payoff_row(group, horizon=horizon, layer=layer, side="", reason=""))
-    return pd.DataFrame(rows).sort_values(["horizon_days", "layer"]).reset_index(drop=True)
+    return _rows_frame(rows, sort_by=["horizon_days", "layer"])
 
 
 def build_entry_payoff_by_regime(
@@ -471,7 +530,7 @@ def build_entry_payoff_by_regime(
             rows.append(row)
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["horizon_days", "regime_name", "side"]).reset_index(drop=True)
+    return _rows_frame(rows, sort_by=["horizon_days", "regime_name", "side"])
 
 
 def build_entry_decision_audit(
@@ -600,7 +659,7 @@ def build_position_lifecycle_report(
                 "post_entry_failure_flag": bool(len(path) >= 8 and mfe < 0.015 and end_return < -0.035),
             }
         )
-    return pd.DataFrame(rows).sort_values(["entry_date", "symbol"]).reset_index(drop=True)
+    return _rows_frame(rows, sort_by=["entry_date", "symbol"])
 
 
 def build_capacity_stress_report(
@@ -711,7 +770,7 @@ def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int 
                 "redundancy_flag": bool((peers.abs().max() if not peers.empty else 0.0) >= 0.85),
             }
         )
-    return pd.DataFrame(rows).sort_values("max_abs_rank_corr_to_other", ascending=False).reset_index(drop=True)
+    return _rows_frame(rows, sort_by=["max_abs_rank_corr_to_other"], ascending=False)
 
 
 def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
@@ -926,6 +985,23 @@ def _weighted_metric(group: pd.DataFrame, metric: str) -> float:
     if not valid.any():
         return np.nan
     return float((values[valid] * weights[valid]).sum() / max(float(weights[valid].sum()), 1e-12))
+
+
+def _safe_mean(values) -> float:
+    data = pd.to_numeric(values, errors="coerce").dropna()
+    return float(data.mean()) if not data.empty else np.nan
+
+
+def _rows_frame(rows: list[dict], *, sort_by: list[str], ascending=True) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    available = [column for column in sort_by if column in frame.columns]
+    if not available:
+        return frame.reset_index(drop=True)
+    if isinstance(ascending, list):
+        ascending = ascending[: len(available)]
+    return frame.sort_values(available, ascending=ascending).reset_index(drop=True)
 
 
 def _mean_positive(values) -> float:

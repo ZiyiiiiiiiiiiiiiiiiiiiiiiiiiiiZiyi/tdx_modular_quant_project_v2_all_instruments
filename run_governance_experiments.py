@@ -244,6 +244,7 @@ def run_single_experiment(
         enable_sector_cap=variant_spec.enable_sector_cap,
         enable_safety_agent=variant_spec.enable_safety_agent,
         exit_mode=variant_spec.extra.get("exit_mode", "full"),
+        risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
     )
 
     # Run backtest
@@ -260,6 +261,10 @@ def run_single_experiment(
         enable_safety_agent=variant_spec.enable_safety_agent,
         enable_market_regime_policy=variant_spec.enable_market_regime_policy,
         entry_confirmation_mode=variant_spec.extra.get("entry_confirmation_mode", "full"),
+        selection_weight_mode=variant_spec.extra.get("selection_weight_mode", "reputation_weighted"),
+        regime_overlay_mode=variant_spec.extra.get("regime_overlay_mode", "full"),
+        risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
+        probability_bucket_mode=variant_spec.extra.get("probability_bucket_mode", "default"),
         governance_variant=variant_name,
         universe_mode=universe_spec.mode,
         data_fingerprints={"feature_daily_parquet": file_fingerprint(FEATURE_DAILY_PARQUET)},

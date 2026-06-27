@@ -32,6 +32,7 @@ from config import (
     ADJUSTMENT_FACTORS_PARQUET,
     ADJUSTMENT_DATA_VERSION,
     BASELINE_VERSION,
+    BACKTEST_CAPITAL_PROFILES,
     BACKTEST_INITIAL_CASH,
     BACKTEST_RISK_FREE_RATE,
     BACKTEST_SKIPPED_STRATEGIES_CSV,
@@ -88,7 +89,10 @@ from config import (
     CLI_GOVERNANCE_END_DATE,
     CLI_GOVERNANCE_MAX_DAYS,
     CLI_GOVERNANCE_START_DATE,
+    DEFAULT_BACKTEST_CAPITAL_PROFILE,
     assert_valid_configuration,
+    backtest_profile_suffix,
+    get_backtest_capital_profile,
     strategy_params_hash,
 )
 from pipeline_steps import (
@@ -352,6 +356,30 @@ def parse_args():
     parser.add_argument("--no-live-monitor", action="store_true", help="Disable the low-memory governance metrics window.")
     parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=CLI_MAIN_SAFETY_PROXY_MODE)
     parser.add_argument(
+        "--capital-profile",
+        choices=sorted(BACKTEST_CAPITAL_PROFILES),
+        default=DEFAULT_BACKTEST_CAPITAL_PROFILE,
+        help="Backtest account profile. Default keeps the legacy 1,000,000 baseline.",
+    )
+    parser.add_argument(
+        "--initial-cash",
+        type=float,
+        default=None,
+        help="Override the selected backtest capital profile's initial cash.",
+    )
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help="Override max holdings per rebalance. Use 0 for unlimited.",
+    )
+    parser.add_argument(
+        "--min-cash-buffer",
+        type=float,
+        default=None,
+        help="Override minimum cash buffer kept out of buys.",
+    )
+    parser.add_argument(
         "--governance-variant",
         choices=list_governance_variant_names(),
         default=CLI_MAIN_GOVERNANCE_VARIANT,
@@ -457,11 +485,30 @@ def _build_strategy_signature():
     return build_signature(payload), outputs
 
 
-def _build_backtest_signature(strategy_names):
+def _capital_profile_from_args(args):
+    return get_backtest_capital_profile(
+        getattr(args, "capital_profile", DEFAULT_BACKTEST_CAPITAL_PROFILE),
+        initial_cash=getattr(args, "initial_cash", None),
+        max_positions_override=(
+            getattr(args, "max_positions", None)
+            if getattr(args, "max_positions", None) is not None
+            else "__profile_default__"
+        ),
+        min_cash_buffer=getattr(args, "min_cash_buffer", None),
+    )
+
+
+def _backtest_summary_path(capital_profile_name: str) -> Path:
+    return RESULT_DIR / f"backtest_strategy_summary{backtest_profile_suffix(capital_profile_name)}.csv"
+
+
+def _build_backtest_signature(strategy_names, capital_profile):
+    suffix = backtest_profile_suffix(capital_profile["name"])
     payload = {
         "step": "run_backtests",
         "params": {
-            "initial_cash": BACKTEST_INITIAL_CASH,
+            "capital_profile": capital_profile["name"],
+            "initial_cash": capital_profile["initial_cash"],
             "risk_free_rate": BACKTEST_RISK_FREE_RATE,
             "show_plot": BACKTEST_SHOW_PLOT,
         },
@@ -474,18 +521,21 @@ def _build_backtest_signature(strategy_names):
             code_file_fingerprint("functions/execution/order_simulator.py"),
             code_file_fingerprint("functions/execution/execution_rules.py"),
             code_file_fingerprint("functions/execution/cost_model.py"),
+            code_file_fingerprint("functions/execution/trade_pairing.py"),
         ],
     }
-    outputs = [RESULT_DIR / "backtest_strategy_summary.csv"]
+    outputs = [_backtest_summary_path(capital_profile["name"])]
     for name in strategy_names:
         outputs.extend(
             [
-                RESULT_DIR / f"backtest_daily_result_{name}.csv",
-                RESULT_DIR / f"backtest_daily_result_{name}.parquet",
-                RESULT_DIR / f"backtest_metrics_{name}.csv",
-                RESULT_DIR / f"backtest_holdings_{name}.csv",
-                RESULT_DIR / f"backtest_orders_{name}.csv",
-                RESULT_DIR / f"equity_curve_{name}.png",
+                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.csv",
+                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.parquet",
+                RESULT_DIR / f"backtest_metrics_{name}{suffix}.csv",
+                RESULT_DIR / f"backtest_holdings_{name}{suffix}.csv",
+                RESULT_DIR / f"backtest_orders_{name}{suffix}.csv",
+                RESULT_DIR / f"backtest_trade_pairs_{name}{suffix}.csv",
+                RESULT_DIR / f"backtest_open_positions_{name}{suffix}.csv",
+                RESULT_DIR / f"equity_curve_{name}{suffix}.png",
             ]
         )
     learning_strategy_names = [
@@ -493,7 +543,7 @@ def _build_backtest_signature(strategy_names):
         if name.startswith("classic_ml_") or name.startswith("quantum_inspired_")
     ]
     for name in learning_strategy_names:
-        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}.csv")
+        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}{suffix}.csv")
     return build_signature(payload), outputs
 
 
@@ -520,6 +570,7 @@ def metrics_to_record(strategy_name, metrics):
         "sharpe",
         "max_drawdown",
         "win_rate",
+        "trade_win_rate",
         "turnover_ratio",
         "transaction_cost_ratio",
         "blocked_order_count",
@@ -552,6 +603,16 @@ def metrics_to_record(strategy_name, metrics):
         "signal_trigger_rate",
         "adjustment_coverage_ratio",
         "adjustment_coverage_threshold",
+        "capital_initial_cash",
+        "capital_min_cash_buffer",
+        "capital_max_positions",
+        "realized_trade_count",
+        "winning_trade_count",
+        "losing_trade_count",
+        "realized_pnl_amount",
+        "unrealized_pnl_amount",
+        "open_position_count",
+        "inventory_underflow_count",
     ]
     for col in numeric_cols:
         record[col] = pd.to_numeric(record.get(col), errors="coerce")
@@ -753,6 +814,7 @@ def run_low_memory(args):
                 gc.collect()
 
         if args.mode in {"pipeline", "backtest", "all"} and RUN_STEP_6_BACKTEST:
+            capital_profile = _capital_profile_from_args(args)
             records = []
             skipped_rows = []
             for index, strategy_name in enumerate(
@@ -766,7 +828,7 @@ def run_low_memory(args):
                     stage="Backtest",
                     detail="Waiting to start",
                 )
-                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}.csv"
+                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}{backtest_profile_suffix(capital_profile['name'])}.csv"
                 if args.resume and metrics_path.exists():
                     print(f"Skip existing backtest: {strategy_name}")
                     progress_window.update(
@@ -779,6 +841,7 @@ def run_low_memory(args):
                     continue
                 outcome = _low_memory_run_backtest(
                     strategy_name,
+                    capital_profile=capital_profile,
                     progress_hook=lambda stage, detail, idx=index, name=strategy_name: progress_window.update(
                         current=idx - 1,
                         total=len(selected_names),
@@ -802,7 +865,7 @@ def run_low_memory(args):
                 )
                 gc.collect()
             if records:
-                _save_low_memory_summary(records)
+                _save_low_memory_summary(records, capital_profile_name=capital_profile["name"])
             if skipped_rows:
                 _save_skipped_backtest_report(skipped_rows)
 
@@ -871,7 +934,13 @@ def _low_memory_generate_selection(strategy_name, progress_hook=None):
     del features, selection
 
 
-def _low_memory_run_backtest(strategy_name, progress_hook=None):
+def _low_memory_run_backtest(
+    strategy_name,
+    progress_hook=None,
+    capital_profile_name=DEFAULT_BACKTEST_CAPITAL_PROFILE,
+    capital_profile=None,
+):
+    capital_profile = capital_profile or get_backtest_capital_profile(capital_profile_name)
     selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
     if not selection_path.exists():
         print(f"Skip backtest {strategy_name}: selection file is missing")
@@ -895,10 +964,12 @@ def _low_memory_run_backtest(strategy_name, progress_hook=None):
             progress_hook("run_backtest", "Running backtest engine")
         _, metrics, _ = run_backtest(
             df_selection=selection,
-            initial_cash=BACKTEST_INITIAL_CASH,
+            initial_cash=capital_profile["initial_cash"],
             risk_free_rate=BACKTEST_RISK_FREE_RATE,
             show_plot=False,
             strategy_name=strategy_name,
+            capital_profile_name=capital_profile["name"],
+            capital_profile=capital_profile,
             factor_description=STRATEGY_FACTOR_DESCRIPTIONS.get(strategy_name),
             compute_theoretical_upper_bound=False,
             start_date=STRATEGY_START_DATE,
@@ -914,7 +985,7 @@ def _low_memory_run_backtest(strategy_name, progress_hook=None):
             "reason": reason,
         }
     if progress_hook is not None:
-        progress_hook("backtest_done", "Backtest completed")
+        progress_hook("backtest_done", "回测完成")
     record = metrics_to_record(strategy_name, metrics)
     return {
         "status": "ok",
@@ -953,6 +1024,10 @@ def _run_single_governance_variant(
         enable_reputation=variant_spec.enable_reputation,
         entry_confirmation_mode=variant_spec.extra.get("entry_confirmation_mode", "full"),
         policy_exit_mode=variant_spec.extra.get("exit_mode", "full"),
+        selection_weight_mode=variant_spec.extra.get("selection_weight_mode", "reputation_weighted"),
+        regime_overlay_mode=variant_spec.extra.get("regime_overlay_mode", "full"),
+        risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
+        probability_bucket_mode=variant_spec.extra.get("probability_bucket_mode", "default"),
         output_dir=output_dir,
         universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
@@ -1095,6 +1170,27 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
     return runtime_args
 
 
+def _apply_interactive_backtest_params(args, selection: dict):
+    runtime_args = argparse.Namespace(**vars(args))
+    backtest = selection.get("backtest", {}) if isinstance(selection, dict) else {}
+    if not isinstance(backtest, dict):
+        return runtime_args
+    capital_profile = str(backtest.get("capital_profile", "")).strip()
+    if capital_profile:
+        runtime_args.capital_profile = capital_profile
+    initial_cash = str(backtest.get("initial_cash", "")).strip()
+    max_positions = str(backtest.get("max_positions", "")).strip()
+    min_cash_buffer = str(backtest.get("min_cash_buffer", "")).strip()
+    if initial_cash:
+        runtime_args.initial_cash = float(initial_cash)
+    if max_positions:
+        runtime_args.max_positions = int(max_positions)
+    if min_cash_buffer:
+        runtime_args.min_cash_buffer = float(min_cash_buffer)
+    _capital_profile_from_args(runtime_args)
+    return runtime_args
+
+
 def run_governance_mainline_review_from_main(args):
     """Run the two-universe governance review flow from the main launcher."""
     from build_governance_mainline_report import build_report
@@ -1159,15 +1255,23 @@ def run_governance_layer_validation_from_main(args):
 
 LAYER_ABLATION_SUITE = (
     ("governance_core_base", "validation_core_bundle", "01_core_base"),
-    ("governance_core_plus_regime", "validation_core_bundle", "02_core_plus_regime"),
-    ("governance_core_plus_probability", "validation_core_bundle", "03_core_plus_probability"),
-    ("governance_core_plus_complex_exit", "validation_core_bundle", "04_core_plus_complex_exit"),
-    ("governance_full_mainline_control", "president_core_bundle", "05_full_mainline_control"),
+    ("governance_core_base", "diagnostic_trend_bundle", "02_trend_only"),
+    ("governance_core_base", "diagnostic_reversal_bundle", "03_reversal_only"),
+    ("governance_core_base", "diagnostic_orderflow_bundle", "04_orderflow_only"),
+    ("governance_core_base", "diagnostic_breakout_bundle", "05_breakout_only"),
+    ("governance_core_base", "diagnostic_core_minus_trend_bundle", "06_core_minus_trend"),
+    ("governance_core_base", "diagnostic_core_minus_reversal_bundle", "07_core_minus_reversal"),
+    ("governance_core_base", "diagnostic_core_minus_orderflow_bundle", "08_core_minus_orderflow"),
+    ("governance_core_base", "diagnostic_core_minus_breakout_bundle", "09_core_minus_breakout"),
+    ("governance_core_plus_regime", "validation_core_bundle", "10_core_plus_regime"),
+    ("governance_core_plus_probability", "validation_core_bundle", "11_core_plus_probability"),
+    ("governance_core_plus_complex_exit", "validation_core_bundle", "12_core_plus_complex_exit"),
+    ("governance_full_mainline_control", "president_core_bundle", "13_full_mainline_control"),
 )
 
 
 def run_governance_layer_ablation_suite_from_main(args):
-    """Run all layer-ablation lines for the selected universes and window."""
+    """Run the enhanced module/layer diagnostic suite for the selected universes and window."""
     from functions.decision_council.live_monitor import GovernanceLiveMonitor
     from functions.decision_council.layer_ablation_diagnostics import build_layer_ablation_diagnostics
     from run_governance_experiments import build_output_path, run_single_experiment
@@ -1181,7 +1285,7 @@ def run_governance_layer_ablation_suite_from_main(args):
     for universe_name in review_universes:
         for variant_name, alpha_bundle, suite_step in LAYER_ABLATION_SUITE:
             print("=" * 72)
-            print(f"Running layer ablation step: {suite_step}")
+            print(f"Running enhanced diagnostic step: {suite_step}")
             print(f"  Universe: {universe_name}")
             print(f"  Variant: {variant_name}")
             print(f"  Alpha Bundle: {alpha_bundle}")
@@ -1260,7 +1364,7 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
         if touches_governance and runtime_args.governance_shadow_portfolios is None:
             runtime_args.governance_shadow_portfolios = False
         shadow_state = "on" if runtime_args.governance_shadow_portfolios else "off"
-        return runtime_args, "full", f"Full historical review window, shadow_portfolios={shadow_state}."
+        return runtime_args, "full", f"完整历史复核窗口，影子组合={shadow_state}。"
 
     configured_end = pd.Timestamp(runtime_args.governance_end_date or CLI_GOVERNANCE_END_DATE)
     configured_start = pd.Timestamp(runtime_args.governance_start_date or CLI_GOVERNANCE_START_DATE)
@@ -1299,7 +1403,7 @@ def launch_interactive_main_menu():
         [sys.executable, "-u", str(launcher_script), str(state_path)],
         cwd=str(Path(__file__).resolve().parent),
     )
-    print(f"Main Launcher started in external browser mode (pid={proc.pid}).")
+    print(f"主启动页已在外部浏览器模式启动（pid={proc.pid}）。")
 
     selection = {}
     last_wait_notice = time.time()
@@ -1311,7 +1415,7 @@ def launch_interactive_main_menu():
             except Exception:
                 pass
         if time.time() - last_wait_notice >= 15:
-            print("Waiting for launcher selection...")
+            print("等待你在启动页选择任务...")
             last_wait_notice = time.time()
         time.sleep(0.2)
 
@@ -1334,9 +1438,10 @@ def run_interactive_selection(selection, args):
     if not tasks:
         print("Interactive launcher cancelled.")
         return
-    runtime_args = _apply_interactive_governance_params(args, selection, tasks)
+    runtime_args = _apply_interactive_backtest_params(args, selection)
+    runtime_args = _apply_interactive_governance_params(runtime_args, selection, tasks)
     runtime_args, profile_name, profile_note = _apply_runtime_profile(runtime_args, profile, tasks)
-    print(f"Launcher runtime profile: {profile_name}")
+    print(f"启动页运行档位：{profile_name}")
     print(profile_note)
     if (
         "governance_active" in tasks
@@ -1347,7 +1452,7 @@ def run_interactive_selection(selection, args):
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         runtime_args.governance_universes = selected_universes
         print(
-            "Governance selection: "
+            "治理任务选择："
             f"universes={list(selected_universes)}, "
             f"start={runtime_args.governance_start_date}, "
             f"end={runtime_args.governance_end_date}, "
@@ -1355,7 +1460,7 @@ def run_interactive_selection(selection, args):
         )
 
     if "main_pipeline" in tasks:
-        main()
+        main(runtime_args)
     if "governance_active" in tasks:
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         _run_single_governance_variant(
@@ -1444,10 +1549,11 @@ def _run_leakage_audit() -> dict | None:
     )
 
 
-def _save_low_memory_summary(records):
+def _save_low_memory_summary(records, capital_profile_name=DEFAULT_BACKTEST_CAPITAL_PROFILE):
     batch_df = pd.DataFrame(records)
+    suffix = backtest_profile_suffix(capital_profile_name)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    output = RESULT_DIR / "backtest_strategy_summary_batch.csv"
+    output = RESULT_DIR / f"backtest_strategy_summary_batch{suffix}.csv"
     if output.exists():
         existing = pd.read_csv(output)
         if "execution_model_version" in batch_df.columns:
@@ -1465,13 +1571,14 @@ def _save_low_memory_summary(records):
     summary.to_csv(output, index=False, encoding="utf-8-sig")
     report_file = save_strategy_report(
         build_strategy_report(summary),
-        RESULT_DIR / "strategy_diagnostic_report_batch.md",
+        RESULT_DIR / f"strategy_diagnostic_report_batch{suffix}.md",
     )
     print("Saved low-memory batch summary:", output)
     print("Saved low-memory diagnostic report:", report_file)
 
 
-def main():
+def main(args=None):
+    args = args or parse_args()
     assert_formal_prerequisites()
     run_dir = None
     progress_window = StrategyTaskProgressWindow()
@@ -1637,6 +1744,7 @@ def main():
 
         if RUN_STEP_6_BACKTEST:
             print("\n========== STEP 6: run backtests ==========")
+            capital_profile = _capital_profile_from_args(args)
             if not available_strategy_names:
                 available_strategy_names = [
                     name for name in strategy_names
@@ -1647,7 +1755,7 @@ def main():
                 raise RuntimeError("No strategy selections available for backtest")
 
             available_strategy_names = sorted(available_strategy_names)
-            step_signature, step_outputs = _build_backtest_signature(available_strategy_names)
+            step_signature, step_outputs = _build_backtest_signature(available_strategy_names, capital_profile)
             if should_skip_step("step_6_backtest", step_signature, step_outputs):
                 print("Skip step 6: strategy selections and backtest formulas unchanged.")
             else:
@@ -1670,6 +1778,7 @@ def main():
                     )
                     outcome = _low_memory_run_backtest(
                         name,
+                        capital_profile=capital_profile,
                         progress_hook=lambda stage, detail, idx=index, strategy_name=name: progress_window.update(
                             current=idx - 1,
                             total=len(available_strategy_names),
@@ -1696,10 +1805,11 @@ def main():
                 if backtest_records:
                     summary_df = build_strategy_summary(pd.DataFrame(backtest_records))
                     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-                    summary_file = RESULT_DIR / "backtest_strategy_summary.csv"
+                    summary_file = _backtest_summary_path(capital_profile["name"])
                     summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
                     report_text = build_strategy_report(summary_df)
-                    report_file = save_strategy_report(report_text)
+                    report_output = RESULT_DIR / f"strategy_diagnostic_report{backtest_profile_suffix(capital_profile['name'])}.md"
+                    report_file = save_strategy_report(report_text, report_output)
                     print_strategy_rankings(summary_df)
                     print("Saved strategy ranking summary:", summary_file)
                     print("Saved strategy diagnostic report:", report_file)
@@ -1790,7 +1900,7 @@ if __name__ == "__main__":
         assert_valid_configuration()
         if len(sys.argv) == 1:
             cli_args = parse_args()
-            print("Opening Main Launcher in the browser.")
+            print("正在浏览器中打开主启动页。")
             tasks = launch_interactive_main_menu()
             run_interactive_selection(tasks, cli_args)
             sys.exit(0)

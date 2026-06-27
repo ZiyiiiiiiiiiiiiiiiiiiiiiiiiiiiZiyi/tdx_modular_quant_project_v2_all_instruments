@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 import os
 import subprocess
 import sys
@@ -90,7 +91,7 @@ class GovernanceLiveMonitor:
         self._write_state(
             {
                 "command": "finish",
-                "message": message or "Completed. Browser monitor can stay open.",
+                "message": message or "回测完成。窗口会保持打开，关闭浏览器标签即可。",
             }
         )
 
@@ -117,7 +118,7 @@ class GovernanceLiveMonitor:
     def _start_browser_monitor(self) -> None:
         script_path = Path(__file__).with_name("live_monitor_web.py")
         if not script_path.exists():
-            print("Live governance monitor disabled: browser monitor script is missing.")
+            print("治理实时监控已禁用：浏览器监控脚本不存在。")
             self._closed = True
             return
         state_dir = Path(tempfile.gettempdir()) / "tdx_governance_live_monitor"
@@ -128,11 +129,11 @@ class GovernanceLiveMonitor:
                 [sys.executable, "-u", str(script_path), str(self._state_path)],
                 cwd=str(Path(__file__).resolve().parents[2]),
             )
-            print("Live governance monitor started in external browser mode.")
+            print("治理实时监控已在外部浏览器模式启动。")
         except Exception as exc:
             self._proc = None
             self._closed = True
-            print(f"Live governance monitor disabled: {exc}")
+            print(f"治理实时监控已禁用：{exc}")
 
     def _write_state(self, payload: dict) -> None:
         if self._state_path is None:
@@ -164,8 +165,8 @@ class GovernanceLiveMonitor:
         self._write_failures += 1
         if self._write_failures in {1, 5, 25}:
             print(
-                "Live governance monitor skipped a state update because Windows locked "
-                f"the monitor file. Backtest continues. Last error: {last_error}"
+                "治理实时监控跳过了一次状态更新，因为 Windows 锁定了监控文件。"
+                f"回测会继续运行。最后错误：{last_error}"
             )
 
 
@@ -174,10 +175,18 @@ def _make_json_safe(value):
         return {str(key): _make_json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_make_json_safe(item) for item in value]
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
     if isinstance(value, Path):
         return str(value)
+    text_value = str(value)
+    if text_value in {"<NA>", "NaT", "nan", "NaN", "None"}:
+        return None
     if hasattr(value, "isoformat"):
         try:
             return value.isoformat()
@@ -185,7 +194,14 @@ def _make_json_safe(value):
             pass
     if hasattr(value, "item"):
         try:
-            return value.item()
+            return _make_json_safe(value.item())
         except Exception:
             pass
-    return value
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except Exception:
+        text = str(value)
+        if text in {"<NA>", "NaT", "nan", "NaN", "None"}:
+            return None
+        return text

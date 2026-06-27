@@ -283,6 +283,7 @@ def build_daily_candidates(
     universe_mode: str = "index_pool_strict",
     require_constituents: bool = True,
     allow_fallback: bool = False,
+    selection_weight_mode: str = "reputation_weighted",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Combine rule proposals with tradable feature rows for president-policy input.
@@ -348,6 +349,19 @@ def build_daily_candidates(
         "score_orderflow_accumulation",
         "score_orderflow_efficiency",
         "score_eod_close_strength",
+        "score_mean_reversion",
+        "score_rsi_reversal",
+        "score_kdj_oversold_cross",
+        "score_low_volume_pullback",
+        "score_consecutive_decline_rebound",
+        "score_price_volume_breakout",
+        "score_turtle_breakout",
+        "score_limit_up_follow",
+        "score_ma_break",
+        "score_mom_lowvol",
+        "score_macd_trend",
+        "score_macd_cross",
+        "score_ma_cross",
     ]
     source = source[[column for column in keep if column in source.columns]].copy()
     candidates = source.merge(combined, on="symbol", how="inner")
@@ -384,7 +398,12 @@ def build_daily_candidates(
         candidates = _apply_buy_quality_filters(candidates)
     
     candidates = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
-    if "kelly_score" in candidates.columns:
+    selection_mode = str(selection_weight_mode or "reputation_weighted").strip().lower()
+    if selection_mode == "role_balanced":
+        candidates["role_balanced_score"] = _role_balanced_selection_score(candidates)
+        candidates["primary_score"] = candidates["role_balanced_score"]
+        candidates["score_authority"] = "role_balanced_orderflow_reversal_breakout_trend"
+    elif "kelly_score" in candidates.columns:
         candidates["primary_score"] = pd.to_numeric(
             candidates["kelly_score"], errors="coerce"
         )
@@ -411,6 +430,72 @@ def build_daily_candidates(
             | candidates["symbol"].astype(str).isin(held)
         ]
     return candidates.reset_index(drop=True), proposals
+
+
+def _role_balanced_selection_score(candidates: pd.DataFrame) -> pd.Series:
+    """Use module roles as the main candidate score instead of reputation weights."""
+    data = candidates.copy()
+    orderflow = _module_score(
+        data,
+        (
+            "score_orderflow_amount_shock",
+            "score_orderflow_close_drive",
+            "score_orderflow_accumulation",
+            "score_orderflow_efficiency",
+            "score_eod_close_strength",
+        ),
+    )
+    reversal = _module_score(
+        data,
+        (
+            "score_mean_reversion",
+            "score_rsi_reversal",
+            "score_kdj_oversold_cross",
+            "score_low_volume_pullback",
+            "score_consecutive_decline_rebound",
+        ),
+    )
+    breakout = _module_score(
+        data,
+        (
+            "score_price_volume_breakout",
+            "score_turtle_breakout",
+            "score_limit_up_follow",
+            "score_ma_break",
+        ),
+    )
+    trend = _module_score(
+        data,
+        (
+            "score_mom_lowvol",
+            "score_macd_trend",
+            "score_macd_cross",
+            "score_ma_cross",
+            "ret_20",
+        ),
+    )
+    alpha = pd.to_numeric(data.get("alpha_percentile", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    return (
+        0.34 * orderflow
+        + 0.30 * reversal
+        + 0.22 * breakout
+        + 0.10 * trend
+        + 0.04 * alpha
+    ).fillna(0.0).clip(0.0, 1.0)
+
+
+def _module_score(data: pd.DataFrame, columns: tuple[str, ...]) -> pd.Series:
+    available = [column for column in columns if column in data.columns]
+    if not available:
+        return pd.Series(0.0, index=data.index, dtype="float64")
+    ranked = []
+    for column in available:
+        values = pd.to_numeric(data[column], errors="coerce")
+        if values.notna().sum() <= 1:
+            ranked.append(pd.Series(0.0, index=data.index, dtype="float64"))
+        else:
+            ranked.append(values.rank(pct=True).fillna(0.0).clip(0.0, 1.0))
+    return pd.concat(ranked, axis=1).mean(axis=1).fillna(0.0).clip(0.0, 1.0)
 
 
 def _empty_candidates() -> pd.DataFrame:

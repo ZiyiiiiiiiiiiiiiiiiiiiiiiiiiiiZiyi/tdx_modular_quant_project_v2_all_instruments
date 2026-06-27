@@ -17,11 +17,11 @@ from pathlib import Path
 
 
 HTML = """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Governance Live Monitor</title>
+  <title>治理实时监控</title>
   <style>
     :root {
       --bg: #eef2ed;
@@ -171,125 +171,125 @@ HTML = """<!doctype html>
 </head>
 <body>
   <div class="header">
-    <div class="title">GOVERNANCE LIVE MONITOR</div>
-    <div class="status" id="status">Waiting for session...</div>
+    <div class="title">治理实时监控</div>
+    <div class="status" id="status">等待运行会话...</div>
   </div>
   <div class="shell">
     <div>
       <div class="panel">
-        <h3>Core Metrics</h3>
+        <h3>核心指标</h3>
         <div class="metrics" id="metrics"></div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Performance: Account vs Top Strength 30% Benchmark</h3>
+        <h3>账户表现 vs 强度前 30% 基准</h3>
         <div class="chart-wrap">
           <canvas id="perfChart" width="900" height="420"></canvas>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Excess NAV</h3>
+        <h3>超额净值</h3>
         <div class="chart-wrap">
           <canvas id="excessChart" class="compact" width="900" height="260"></canvas>
         </div>
       </div>
       <div class="grid" style="margin-top:16px;">
         <div class="panel">
-          <h3>Benchmark & Excess</h3>
-          <pre id="benchmarkText">Waiting for data...</pre>
+          <h3>基准与超额</h3>
+          <pre id="benchmarkText">等待数据...</pre>
         </div>
         <div class="panel">
-          <h3>Exposure & Cash</h3>
-          <pre id="exposureText">Waiting for data...</pre>
+          <h3>仓位与现金</h3>
+          <pre id="exposureText">等待数据...</pre>
         </div>
       </div>
       <div class="grid" style="margin-top:16px;">
         <div class="panel">
-          <h3>Entry Gate</h3>
-          <pre id="entryGateText">Waiting for data...</pre>
+          <h3>买入门控</h3>
+          <pre id="entryGateText">等待数据...</pre>
         </div>
         <div class="panel">
-          <h3>Trade Quality</h3>
-          <pre id="tradeQualityText">Waiting for data...</pre>
+          <h3>交易质量</h3>
+          <pre id="tradeQualityText">等待数据...</pre>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Alpha Factor Weight Lines</h3>
+        <h3>Alpha 因子权重曲线</h3>
         <div class="chart-wrap">
           <canvas id="factorChart" class="compact" width="900" height="260"></canvas>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Alpha Module Weight Lines</h3>
+        <h3>Alpha 模块权重曲线</h3>
         <div class="chart-wrap">
           <canvas id="moduleChart" class="compact" width="900" height="260"></canvas>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Current Holdings 90D Paths (Price Relative, Not Entry PnL)</h3>
+        <h3>当前持仓 90 日价格路径（相对价格，不是入场盈亏）</h3>
         <div class="chart-wrap">
           <canvas id="holdingPathChart" class="compact" width="900" height="260"></canvas>
         </div>
       </div>
       <div class="grid" style="margin-top:16px;">
         <div class="panel">
-          <h3>Holdings</h3>
+          <h3>持仓</h3>
           <div class="section">
             <table class="list-table">
-              <thead><tr><th>Symbol</th><th>Value</th><th>Weight</th></tr></thead>
+              <thead><tr><th>代码</th><th>市值</th><th>账户权重</th></tr></thead>
               <tbody id="holdingsBody"></tbody>
             </table>
           </div>
         </div>
         <div class="panel">
-          <h3>Candidates</h3>
-          <pre id="candidatesText">Waiting for data...</pre>
+          <h3>候选股票</h3>
+          <pre id="candidatesText">等待数据...</pre>
         </div>
       </div>
     </div>
     <div>
       <div class="panel">
-        <h3>Safety</h3>
-        <pre id="safetyText">Waiting for data...</pre>
+        <h3>安全状态</h3>
+        <pre id="safetyText">等待数据...</pre>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Risk Model</h3>
-        <pre id="riskModelText">Waiting for data...</pre>
+        <h3>风险模型</h3>
+        <pre id="riskModelText">等待数据...</pre>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Orders</h3>
-        <pre id="ordersText">Waiting for data...</pre>
+        <h3>订单</h3>
+        <pre id="ordersText">等待数据...</pre>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Order Reasons</h3>
-        <pre id="orderReasonText">Waiting for data...</pre>
+        <h3>订单原因</h3>
+        <pre id="orderReasonText">等待数据...</pre>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Pending Orders</h3>
-        <pre id="pendingText">Waiting for data...</pre>
+        <h3>未完成订单</h3>
+        <pre id="pendingText">等待数据...</pre>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Alpha Module Weights</h3>
+        <h3>Alpha 模块权重</h3>
         <div class="section">
           <table class="list-table">
-            <thead><tr><th>Module</th><th>Share</th><th>Factors</th><th>Pred</th></tr></thead>
+            <thead><tr><th>模块</th><th>占比</th><th>因子数</th><th>预测</th></tr></thead>
             <tbody id="moduleWeightsBody"></tbody>
           </table>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Alpha Factor Weights</h3>
+        <h3>Alpha 因子权重</h3>
         <div class="section">
           <table class="list-table">
-            <thead><tr><th>Module</th><th>Role</th><th>Factor</th><th>Weight</th><th>Share</th><th>Delta</th><th>Pred</th><th>Why</th></tr></thead>
+            <thead><tr><th>模块</th><th>角色</th><th>因子</th><th>权重</th><th>占比</th><th>变化</th><th>预测</th><th>原因</th></tr></thead>
             <tbody id="factorWeightsBody"></tbody>
           </table>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>Position Lifecycle</h3>
+        <h3>持仓生命周期</h3>
         <div class="section">
           <table class="list-table">
-            <thead><tr><th>Symbol</th><th>Entry</th><th>Unreal</th><th>MFE</th><th>MAE</th><th>Giveback</th><th>Alert</th></tr></thead>
+            <thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>最大有利</th><th>最大不利</th><th>回吐</th><th>警报</th></tr></thead>
             <tbody id="lifecycleBody"></tbody>
           </table>
         </div>
@@ -300,33 +300,33 @@ HTML = """<!doctype html>
 
   <script>
     const metricDefs = [
-      ["total_return", "Account Return"],
-      ["current_drawdown", "Current DD"],
-      ["account_max_drawdown", "Account Max DD"],
-      ["holding_max_drawdown", "Holding Max DD"],
-      ["benchmark_max_drawdown", "Top30 Benchmark Max DD"],
-      ["excess_max_drawdown", "Excess Max DD"],
-      ["sharpe", "Annual Sharpe"],
-      ["annual_volatility", "Annual Vol"],
-      ["nav", "NAV"],
-      ["cash", "Cash"],
-      ["holdings", "Holdings"],
-      ["risk_level", "Risk Level"],
-      ["exposure_cap", "Exposure Cap"],
-      ["target_exposure", "Target Exposure"],
-      ["actual_exposure", "Actual Exposure"],
-      ["exposure_gap", "Exposure Gap"],
-      ["valid_invested_nav", "Holding/Invested NAV"],
-      ["benchmark_nav", "Top30 Benchmark NAV"],
-      ["excess_nav", "Excess NAV"],
-      ["cash_drag", "Cash Drag"],
-      ["buy_accuracy_5d", "Buy Acc 5D"],
-      ["sell_accuracy_5d", "Sell Acc 5D"],
-      ["candidate_count", "Candidates"],
-      ["confirmed_count", "Confirmed"],
-      ["order_count", "Orders"],
-      ["lifecycle_alerts", "Lifecycle Alerts"],
-      ["pending_orders", "Pending Orders"],
+      ["total_return", "账户收益"],
+      ["current_drawdown", "当前回撤"],
+      ["account_max_drawdown", "账户最大回撤"],
+      ["holding_max_drawdown", "持仓最大回撤"],
+      ["benchmark_max_drawdown", "前30强度基准最大回撤"],
+      ["excess_max_drawdown", "超额最大回撤"],
+      ["sharpe", "年化夏普"],
+      ["annual_volatility", "年化波动"],
+      ["nav", "账户净值"],
+      ["cash", "现金"],
+      ["holdings", "持仓数"],
+      ["risk_level", "风险等级"],
+      ["exposure_cap", "仓位上限"],
+      ["target_exposure", "目标仓位"],
+      ["actual_exposure", "实际仓位"],
+      ["exposure_gap", "仓位缺口"],
+      ["valid_invested_nav", "持仓/投入净值"],
+      ["benchmark_nav", "前30强度基准净值"],
+      ["excess_nav", "超额净值"],
+      ["cash_drag", "现金拖累"],
+      ["buy_accuracy_5d", "买入5日准确率"],
+      ["sell_accuracy_5d", "卖出5日准确率"],
+      ["candidate_count", "候选数"],
+      ["confirmed_count", "确认数"],
+      ["order_count", "订单数"],
+      ["lifecycle_alerts", "生命周期警报"],
+      ["pending_orders", "未完成订单"],
     ];
     const metricsRoot = document.getElementById("metrics");
     for (const [key, label] of metricDefs) {
@@ -416,14 +416,14 @@ HTML = """<!doctype html>
 
       ctx.fillStyle = "#6c675d";
       ctx.font = "12px Microsoft YaHei UI";
-      ctx.fillText("Account vs Top Strength 30% Benchmark", left, top + 2);
+      ctx.fillText("账户 vs 强度前30%基准", left, top + 2);
       ctx.fillStyle = "#147a54";
-      ctx.fillText("Account", left, top + 18);
+      ctx.fillText("账户", left, top + 18);
       ctx.fillStyle = "#b3403a";
-      ctx.fillText("Top30 Bench", left + 78, top + 18);
+      ctx.fillText("前30基准", left + 78, top + 18);
       ctx.fillStyle = "#6c675d";
-      ctx.fillText("Drawdown", left, split + 18);
-      ctx.fillText("Cash vs Invested", left, lowerMid + 18);
+      ctx.fillText("回撤", left, split + 18);
+      ctx.fillText("现金 vs 已投入", left, lowerMid + 18);
 
       const nets = history.map(x => x.navMultiple);
       const benchmark = history.map(x => x.benchmarkNav);
@@ -446,7 +446,7 @@ HTML = """<!doctype html>
       const left = 56, right = w - 18, top = 24, bottom = h - 30;
       ctx.fillStyle = "#6c675d";
       ctx.font = "12px Microsoft YaHei UI";
-      ctx.fillText("Excess NAV = Account NAV / Benchmark NAV", left, top - 6);
+      ctx.fillText("超额净值 = 账户净值 / 基准净值", left, top - 6);
       drawSeries(ctx, history.map(x => x.excessNav), left, right, top + 14, bottom, "#2c7fb8", 1.0);
     }
     function paddedRange(values) {
@@ -509,7 +509,7 @@ HTML = """<!doctype html>
       ctx.strokeRect(barLeft, top + 10, barRight - barLeft, bottom - top - 18);
       ctx.fillStyle = "#8b8578";
       ctx.font = "12px Consolas";
-      ctx.fillText(`Cash ${fmtMoney(cash)}`, barLeft, top);
+      ctx.fillText(`现金 ${fmtMoney(cash)}`, barLeft, top);
       ctx.fillText(`Invested ${fmtMoney(invested)}`, barRight - 170, top);
     }
 
@@ -524,7 +524,7 @@ HTML = """<!doctype html>
       if (!factorHistory.length) {
         ctx.fillStyle = "#6c675d";
         ctx.font = "13px Microsoft YaHei UI";
-        ctx.fillText("Waiting for alpha factor weights...", 24, 32);
+        ctx.fillText("等待 Alpha 因子权重数据...", 24, 32);
         return;
       }
       const left = 58, right = w - 170, top = 24, bottom = h - 32;
@@ -597,7 +597,7 @@ HTML = """<!doctype html>
       if (!moduleHistory.length) {
         ctx.fillStyle = "#6c675d";
         ctx.font = "13px Microsoft YaHei UI";
-        ctx.fillText("Waiting for alpha module weights...", 24, 32);
+        ctx.fillText("等待 Alpha 模块权重数据...", 24, 32);
         return;
       }
       const left = 58, right = w - 170, top = 24, bottom = h - 32;
@@ -655,7 +655,7 @@ HTML = """<!doctype html>
       if (!usable.length) {
         ctx.fillStyle = "#6c675d";
         ctx.font = "13px Microsoft YaHei UI";
-        ctx.fillText("No active holding paths yet.", 24, 32);
+        ctx.fillText("暂无有效持仓路径。", 24, 32);
         return;
       }
       const left = 58, right = w - 170, top = 24, bottom = h - 32;
@@ -715,18 +715,18 @@ HTML = """<!doctype html>
         history = [];
         factorHistory = [];
         moduleHistory = [];
-        document.title = payload.title || "Governance Live Monitor";
-        document.getElementById("status").textContent = `Starting: ${payload.title || ""}`;
+        document.title = payload.title || "治理实时监控";
+        document.getElementById("status").textContent = `正在开始：${payload.title || ""}`;
         document.getElementById("progressBar").style.width = "0%";
         return;
       }
       if (cmd === "finish") {
-        document.getElementById("status").textContent = payload.message || "Completed.";
+        document.getElementById("status").textContent = payload.message || "已完成。";
         document.getElementById("progressBar").style.width = "100%";
         return;
       }
       if (cmd === "close") {
-        document.getElementById("status").textContent = "Monitor closed.";
+        document.getElementById("status").textContent = "监控已关闭。";
         return;
       }
       if (cmd !== "update") return;
@@ -834,99 +834,133 @@ HTML = """<!doctype html>
       document.getElementById("status").textContent = `${String(payload.date || "").slice(0,10)} | ${dayIndex + 1}/${totalDays} | ${progress.toFixed(1)}%`;
 
       document.getElementById("benchmarkText").textContent = [
-        `account_nav            : ${fmtNum(navMultiple, 4)} (${fmtPct(totalReturn)})`,
-        `benchmark_id           : top_strength_30pct_equal_weight`,
-        `benchmark_nav          : ${fmtNum(benchmarkNav, 4)} (${fmtPct(benchmarkNav - 1.0)})`,
-        `excess_nav             : ${fmtNum(excessNav, 4)} (${fmtPct(excessNav - 1.0)})`,
-        `account_max_dd         : ${fmtPct(maxDrawdown)}`,
-        `holding_max_dd         : ${fmtPct(holdingMaxDrawdown)}`,
-        `benchmark_max_dd       : ${fmtPct(benchmarkMaxDrawdown)}`,
-        `excess_max_dd          : ${fmtPct(excessMaxDrawdown)}`,
-        `benchmark_return_5d    : ${fmtPct(Number(ms.benchmark_return_5d))}`,
-        `benchmark_return_20d   : ${fmtPct(Number(ms.benchmark_return_20d))}`,
-        `benchmark_drawdown_5d  : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
-        `benchmark_drawdown_20d : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
-        `underwater_from_peak   : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
-        `beat_ratio_20d         : ${fmtPct(rollingBeatRatio(20))}`,
-        `beat_ratio_60d         : ${fmtPct(rollingBeatRatio(60))}`,
-        `beat_ratio_120d        : ${fmtPct(rollingBeatRatio(120))}`
+        `账户净值              : ${fmtNum(navMultiple, 4)} (${fmtPct(totalReturn)})`,
+        `基准ID                : top_strength_30pct_equal_weight`,
+        `基准净值              : ${fmtNum(benchmarkNav, 4)} (${fmtPct(benchmarkNav - 1.0)})`,
+        `超额净值              : ${fmtNum(excessNav, 4)} (${fmtPct(excessNav - 1.0)})`,
+        `账户最大回撤          : ${fmtPct(maxDrawdown)}`,
+        `持仓最大回撤          : ${fmtPct(holdingMaxDrawdown)}`,
+        `基准最大回撤          : ${fmtPct(benchmarkMaxDrawdown)}`,
+        `超额最大回撤          : ${fmtPct(excessMaxDrawdown)}`,
+        `基准5日收益           : ${fmtPct(Number(ms.benchmark_return_5d))}`,
+        `基准20日收益          : ${fmtPct(Number(ms.benchmark_return_20d))}`,
+        `基准5日回撤           : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
+        `基准20日回撤          : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
+        `距峰值回撤            : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
+        `20日跑赢比例          : ${fmtPct(rollingBeatRatio(20))}`,
+        `60日跑赢比例          : ${fmtPct(rollingBeatRatio(60))}`,
+        `120日跑赢比例         : ${fmtPct(rollingBeatRatio(120))}`
       ].join("\\n");
 
       document.getElementById("exposureText").textContent = [
-        `cash                   : ${fmtMoney(Number(exposure.cash || 0))}`,
-        `invested               : ${fmtMoney(Number(exposure.invested_value || 0))}`,
-        `actual_exposure        : ${fmtPct(actualExposure)}`,
-        `target_exposure        : ${fmtPct(targetExposure)}`,
-        `authorized_cap         : ${fmtPct(Number(ms.effective_target_exposure_cap || 0))}`,
-        `exposure_gap           : ${fmtPct(exposureGap)}`,
-        `cash_drag_latest       : ${fmtPct(cashDrag)}`,
-        `normal_turnover_weight : ${fmtPct(Number(ms.normal_turnover_weight || 0))}`,
-        `turnover_budget        : ${fmtPct(Number(ms.turnover_budget || 0))}`,
-        `catchup_allowed        : ${String(Boolean(ms.catchup_allowed || false))}`,
-        `catchup_tier           : ${String(ms.catchup_tier || "none")}`,
-        `catchup_block          : ${String(ms.catchup_block_reason || "--")}`
+        `现金                  : ${fmtMoney(Number(exposure.cash || 0))}`,
+        `已投入市值            : ${fmtMoney(Number(exposure.invested_value || 0))}`,
+        `实际仓位              : ${fmtPct(actualExposure)}`,
+        `目标仓位              : ${fmtPct(targetExposure)}`,
+        `授权仓位上限          : ${fmtPct(Number(ms.effective_target_exposure_cap || 0))}`,
+        `仓位缺口              : ${fmtPct(exposureGap)}`,
+        `最新现金拖累          : ${fmtPct(cashDrag)}`,
+        `普通换手权重          : ${fmtPct(Number(ms.normal_turnover_weight || 0))}`,
+        `换手预算              : ${fmtPct(Number(ms.turnover_budget || 0))}`,
+        `允许追仓              : ${String(Boolean(ms.catchup_allowed || false))}`,
+        `追仓档位              : ${String(ms.catchup_tier || "none")}`,
+        `追仓拦截原因          : ${String(ms.catchup_block_reason || "--")}`
       ].join("\\n");
 
       document.getElementById("entryGateText").textContent = [
-        `candidate_count        : ${String(ms.candidate_count ?? 0)}`,
-        `entry_confirmed_count  : ${String(ms.entry_confirmed_count ?? 0)}`,
-        `confirmed_ratio        : ${fmtPct(Number(ms.candidate_count || 0) > 0 ? Number(ms.entry_confirmed_count || 0) / Number(ms.candidate_count || 1) : 0)}`,
-        `trailing_buy_acc_5d    : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
-        `auth_p_win_10d_mean    : ${fmtPct(Number(ms.authorization_p_win_10d_mean || 0))}`,
-        `auth_edge_10d_mean     : ${fmtPct(Number(ms.authorization_expected_edge_10d_mean || 0))}`,
-        `authorization_tier     : ${String(ms.exposure_authorization_tier || "--")}`,
-        `authorization_blocks   : ${String(ms.exposure_authorization_block_reasons || "--")}`,
+        `候选数量              : ${String(ms.candidate_count ?? 0)}`,
+        `买入确认数量          : ${String(ms.entry_confirmed_count ?? 0)}`,
+        `确认比例              : ${fmtPct(Number(ms.candidate_count || 0) > 0 ? Number(ms.entry_confirmed_count || 0) / Number(ms.candidate_count || 1) : 0)}`,
+        `订单流通过数          : ${String(ms.orderflow_candidate_pass_count ?? 0)}`,
+        `反转通过数            : ${String(ms.reversal_confirm_pass_count ?? 0)}`,
+        `突破通过数            : ${String(ms.breakout_gate_pass_count ?? 0)}`,
+        `突破60-65桶通过数     : ${String(ms.breakout_probability_bucket_pass_count ?? 0)}`,
+        `订单流均分            : ${fmtNum(Number(ms.orderflow_candidate_score_mean), 3)}`,
+        `反转均分              : ${fmtNum(Number(ms.reversal_entry_score_mean), 3)}`,
+        `突破均分              : ${fmtNum(Number(ms.breakout_gate_score_mean), 3)}`,
+        `趋势持有均分          : ${fmtNum(Number(ms.trend_hold_score_mean), 3)}`,
+        `模块候选均分          : ${fmtNum(Number(ms.module_candidate_score_mean), 3)}`,
+        `模块买入均分          : ${fmtNum(Number(ms.module_entry_score_mean), 3)}`,
+        `模块持有均分          : ${fmtNum(Number(ms.module_hold_score_mean), 3)}`,
+        `买入5日准确率         : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
+        `授权10日胜率均值      : ${fmtPct(Number(ms.authorization_p_win_10d_mean || 0))}`,
+        `授权10日优势均值      : ${fmtPct(Number(ms.authorization_expected_edge_10d_mean || 0))}`,
+        `授权档位              : ${String(ms.exposure_authorization_tier || "--")}`,
+        `授权拦截              : ${String(ms.exposure_authorization_block_reasons || "--")}`,
+        `市场状态叠加模式      : ${String(ms.regime_overlay_mode || "--")}`,
+        `市场状态是否限幅      : ${String(Boolean(ms.regime_overlay_capped || false))}`,
         "",
-        "Block Reasons:",
-        ...summaryLines(ms.entry_block_summary || [], "no block data")
+        "拦截原因：",
+        ...summaryLines(ms.entry_block_summary || [], "暂无拦截数据")
       ].join("\\n");
 
       document.getElementById("tradeQualityText").textContent = [
-        `trailing_buy_acc_5d    : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
-        `trailing_sell_acc_5d   : ${fmtPct(Number(ms.trailing_sell_accuracy_5d))}`,
-        `best_replacement_edge  : ${fmtPct(Number(ms.best_replacement_edge_10d || 0))}`,
-        `replacement_sell_count : ${String(ms.replacement_opportunity_sell_count ?? 0)}`,
-        `lifecycle_alert_count  : ${String(ms.lifecycle_alert_count ?? 0)}`,
-        `planned_order_count    : ${String(ms.order_count ?? 0)}`,
-        `pending_order_count    : ${String(ms.pending_order_count ?? 0)}`,
+        `买入5日准确率         : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
+        `卖出5日准确率         : ${fmtPct(Number(ms.trailing_sell_accuracy_5d))}`,
+        `最佳替换优势          : ${fmtPct(Number(ms.best_replacement_edge_10d || 0))}`,
+        `替换卖出数量          : ${String(ms.replacement_opportunity_sell_count ?? 0)}`,
+        `利润回吐观察数        : ${String(ms.profit_giveback_observation_count ?? 0)}`,
+        `入场失败卖出数        : ${String(ms.post_entry_failure_exit_count ?? 0)}`,
+        `趋势破坏观察数        : ${String(ms.trend_break_observation_count ?? 0)}`,
+        `量能分布观察数        : ${String(ms.volume_distribution_observation_count ?? 0)}`,
+        `生命周期警报数        : ${String(ms.lifecycle_alert_count ?? 0)}`,
+        `计划订单数            : ${String(ms.order_count ?? 0)}`,
+        `未完成订单数          : ${String(ms.pending_order_count ?? 0)}`,
         "",
-        "Order Reasons:",
-        ...summaryLines(ms.order_reason_summary || [], "no order reasons")
+        "订单原因：",
+        ...summaryLines(ms.order_reason_summary || [], "暂无订单原因")
       ].join("\\n");
 
       document.getElementById("riskModelText").textContent = [
-        `cov_risk_model_used    : ${String(Boolean(ms.covariance_risk_model_used || false))}`,
-        `portfolio_cov_vol      : ${fmtPct(Number(ms.portfolio_covariance_volatility || 0))}`,
-        `max_risk_contribution  : ${fmtPct(Number(ms.max_risk_contribution || 0))}`,
-        `avg_pairwise_corr      : ${fmtNum(Number(ms.avg_pairwise_correlation || 0), 3)}`,
-        `condition_number       : ${fmtNum(Number(ms.covariance_condition_number || 0), 1)}`,
-        `risk_level             : ${String(ms.risk_level || "--")}`,
-        `raw_risk_level         : ${String(ms.raw_risk_level || "--")}`,
-        `liquidity_stress       : ${fmtPct(Number(ms.market_liquidity_stress_ratio || 0))}`,
-        `unresolved_safety_exp  : ${fmtPct(Number(ms.unresolved_safety_exposure || 0))}`,
-        `planned_safety_sell    : ${fmtPct(Number(ms.planned_safety_sell_weight || 0))}`
+        `使用协方差风险模型    : ${String(Boolean(ms.covariance_risk_model_used || false))}`,
+        `组合协方差波动        : ${fmtPct(Number(ms.portfolio_covariance_volatility || 0))}`,
+        `最大风险贡献          : ${fmtPct(Number(ms.max_risk_contribution || 0))}`,
+        `前5风险贡献合计       : ${fmtPct(Number(ms.top5_risk_contribution_sum || 0))}`,
+        `风险门控通过          : ${String(Boolean(ms.risk_contribution_gate_pass ?? true))}`,
+        `风险仓位缩放          : ${fmtNum(Number(ms.risk_contribution_exposure_scale || 1), 3)}`,
+        `风险股票数            : ${String(ms.risk_symbol_count ?? 0)}`,
+        `风险拦截原因          : ${String(ms.risk_contribution_block_reason || "--")}`,
+        `新买入拦截            : ${String(Boolean(ms.risk_new_buy_block || false))}`,
+        `新买入拦截已应用      : ${String(Boolean(ms.risk_new_buy_block_applied || false))}`,
+        `追仓拦截              : ${String(Boolean(ms.risk_catchup_block || false))}`,
+        `追仓拦截已应用        : ${String(Boolean(ms.risk_catchup_block_applied || false))}`,
+        `被拦截新买入权重      : ${fmtPct(Number(ms.risk_blocked_new_buy_weight || 0))}`,
+        `平均两两相关          : ${fmtNum(Number(ms.avg_pairwise_correlation || 0), 3)}`,
+        `条件数                : ${fmtNum(Number(ms.covariance_condition_number || 0), 1)}`,
+        `风险等级              : ${String(ms.risk_level || "--")}`,
+        `原始风险等级          : ${String(ms.raw_risk_level || "--")}`,
+        `流动性压力            : ${fmtPct(Number(ms.market_liquidity_stress_ratio || 0))}`,
+        `未解决安全仓位        : ${fmtPct(Number(ms.unresolved_safety_exposure || 0))}`,
+        `计划安全卖出          : ${fmtPct(Number(ms.planned_safety_sell_weight || 0))}`
       ].join("\\n");
 
       const body = document.getElementById("holdingsBody");
       body.innerHTML = "";
+      const accountNavForWeights = Number(exposure.nominal_nav || exposure.liquidatable_nav || nav || 0);
       const ranked = holdings
         .filter(x => String(x.symbol || "").trim())
-        .map(x => ({symbol: String(x.symbol), market_value: Number(x.market_value || 0)}))
+        .map(x => ({
+          symbol: String(x.symbol),
+          market_value: Number(x.market_value || 0),
+          account_weight: Number(x.account_weight)
+        }))
         .sort((a,b)=>b.market_value-a.market_value)
         .slice(0, 16);
       for (const item of ranked) {
         const tr = document.createElement("tr");
-        const weight = nav > 0 ? item.market_value / nav : 0;
+        const weight = Number.isFinite(item.account_weight)
+          ? item.account_weight
+          : (accountNavForWeights > 0 ? item.market_value / accountNavForWeights : 0);
         tr.innerHTML = `<td>${item.symbol}</td><td>${fmtMoney(item.market_value)}</td><td>${fmtPct(weight)}</td>`;
         body.appendChild(tr);
       }
-      if (!ranked.length) body.innerHTML = `<tr><td colspan="3">No holdings yet.</td></tr>`;
+      if (!ranked.length) body.innerHTML = `<tr><td colspan="3">暂无持仓。</td></tr>`;
 
       const lifecycleBody = document.getElementById("lifecycleBody");
       lifecycleBody.innerHTML = "";
       const lifecycleRows = (ms.holding_lifecycle_preview || []).slice(0, 12);
       for (const item of lifecycleRows) {
-        const alert = item.profit_giveback_flag ? "giveback" : item.post_entry_failure_flag ? "entry_fail" : "";
+        const alert = item.profit_giveback_flag ? "利润回吐" : item.post_entry_failure_flag ? "入场失败" : "";
         const tr = document.createElement("tr");
         tr.innerHTML = [
           `<td>${String(item.symbol || "")}</td>`,
@@ -935,43 +969,43 @@ HTML = """<!doctype html>
           `<td>${fmtPct(Number(item.mfe || 0))}</td>`,
           `<td>${fmtPct(Number(item.mae || 0))}</td>`,
           `<td>${fmtPct(Number(item.giveback_from_peak || 0))}</td>`,
-          `<td style="color:${alert ? "#b3403a" : "#173f35"}">${alert || "ok"}</td>`
+          `<td style="color:${alert ? "#b3403a" : "#173f35"}">${alert || "正常"}</td>`
         ].join("");
         lifecycleBody.appendChild(tr);
       }
-      if (!lifecycleRows.length) lifecycleBody.innerHTML = `<tr><td colspan="7">No lifecycle records yet.</td></tr>`;
+      if (!lifecycleRows.length) lifecycleBody.innerHTML = `<tr><td colspan="7">暂无持仓生命周期记录。</td></tr>`;
 
-      const candidateLines = [`Top Candidates (${Number(ms.candidate_count || 0)})`, "", "symbol       score     pct    exp5d   conf   p10d  edge10  e/r"];
+      const candidateLines = [`候选股票前列（${Number(ms.candidate_count || 0)}）`, "", "代码         分数     分位   5日预期 候选 买入 突破 趋势 拦截原因"];
       for (const item of (ms.candidate_preview || [])) {
         candidateLines.push(
-          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.alpha_percentile || 0),2).padStart(6)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.aggregate_confidence || 0),2).padStart(6)} ${fmtPct(Number(item.p_win_10d_calibrated || 0)).padStart(6)} ${fmtPct(Number(item.expected_edge_10d || 0)).padStart(7)} ${fmtNum(Number(item.edge_to_risk_10d || 0),2).padStart(5)}`
+          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.alpha_percentile || 0),2).padStart(6)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.module_candidate_score || 0),2).padStart(6)} ${fmtNum(Number(item.module_entry_score || 0),2).padStart(5)} ${fmtNum(Number(item.breakout_gate_score || 0),2).padStart(5)} ${fmtNum(Number(item.trend_hold_score || 0),2).padStart(5)} ${String(item.entry_block_reason || "").slice(0,18)}`
         );
       }
-      if ((ms.candidate_preview || []).length === 0) candidateLines.push("No candidate preview available.");
-      candidateLines.push("", `Confirmed Candidates (${Number(ms.entry_confirmed_count || 0)})`, "");
+      if ((ms.candidate_preview || []).length === 0) candidateLines.push("暂无候选预览。");
+      candidateLines.push("", `已确认候选（${Number(ms.entry_confirmed_count || 0)}）`, "");
       for (const item of (ms.confirmed_preview || [])) {
         candidateLines.push(
-          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.alpha_percentile || 0),2).padStart(6)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.aggregate_confidence || 0),2).padStart(6)} ${fmtPct(Number(item.p_win_10d_calibrated || 0)).padStart(6)} ${fmtPct(Number(item.expected_edge_10d || 0)).padStart(7)} ${fmtNum(Number(item.edge_to_risk_10d || 0),2).padStart(5)}`
+          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.alpha_percentile || 0),2).padStart(6)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.module_candidate_score || 0),2).padStart(6)} ${fmtNum(Number(item.module_entry_score || 0),2).padStart(5)} ${fmtNum(Number(item.breakout_gate_score || 0),2).padStart(5)} ${fmtNum(Number(item.trend_hold_score || 0),2).padStart(5)} ${String(item.entry_block_reason || "").slice(0,18)}`
         );
       }
-      if ((ms.confirmed_preview || []).length === 0) candidateLines.push("No confirmed candidate preview available.");
+      if ((ms.confirmed_preview || []).length === 0) candidateLines.push("暂无已确认候选预览。");
       document.getElementById("candidatesText").textContent = candidateLines.join("\\n");
 
-      const orderLines = ["Latest Planned Orders", ""];
+      const orderLines = ["最新计划订单", ""];
       for (const item of (ms.order_preview || [])) {
         orderLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} ${fmtPct(Number(item.delta_weight || 0)).padStart(8)}  p=${String(item.priority ?? "")}  ${String(item.reason || "")}`);
       }
-      if ((ms.order_preview || []).length === 0) orderLines.push("No new orders on this refresh.");
+      if ((ms.order_preview || []).length === 0) orderLines.push("本次刷新没有新订单。");
       document.getElementById("ordersText").textContent = orderLines.join("\\n");
 
-      const pendingLines = [`Pending Orders (${Number(ms.pending_order_count || 0)})`, ""];
+      const pendingLines = [`未完成订单（${Number(ms.pending_order_count || 0)}）`, ""];
       for (const item of (ms.pending_preview || [])) {
         pendingLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} shares=${fmtNum(Number(item.remaining_shares || 0),0).padStart(10)} ${String(item.status || "").padEnd(14)} lock=${fmtNum(Number(item.lock_days || 0),0)} ${String(item.reason || "")}`);
       }
-      if ((ms.pending_preview || []).length === 0) pendingLines.push("No active pending orders.");
+      if ((ms.pending_preview || []).length === 0) pendingLines.push("暂无有效未完成订单。");
       document.getElementById("pendingText").textContent = pendingLines.join("\\n");
 
-      document.getElementById("orderReasonText").textContent = summaryLines(ms.order_reason_summary || [], "No planned orders.").join("\\n");
+      document.getElementById("orderReasonText").textContent = summaryLines(ms.order_reason_summary || [], "暂无计划订单。").join("\\n");
 
       const moduleBody = document.getElementById("moduleWeightsBody");
       moduleBody.innerHTML = "";
@@ -982,14 +1016,14 @@ HTML = """<!doctype html>
       for (const item of moduleRows) {
         const tr = document.createElement("tr");
         tr.innerHTML = [
-          `<td>${String(item.factor_module || "unknown").slice(0, 22)}</td>`,
+          `<td>${String(item.factor_module || "未知").slice(0, 22)}</td>`,
           `<td>${fmtPct(Number(item.weight_share || 0))}</td>`,
           `<td>${String(item.factor_count ?? 0)}</td>`,
           `<td>${fmtPct(Number(item.avg_predicted_return_5d || 0))}</td>`
         ].join("");
         moduleBody.appendChild(tr);
       }
-      if (!moduleRows.length) moduleBody.innerHTML = `<tr><td colspan="4">No module weights yet.</td></tr>`;
+      if (!moduleRows.length) moduleBody.innerHTML = `<tr><td colspan="4">暂无模块权重。</td></tr>`;
 
       const factorBody = document.getElementById("factorWeightsBody");
       factorBody.innerHTML = "";
@@ -1001,7 +1035,7 @@ HTML = """<!doctype html>
         const delta = Number(item.weight_delta || 0);
         const tr = document.createElement("tr");
         tr.innerHTML = [
-          `<td>${String(item.factor_module || "unknown").slice(0, 18)}</td>`,
+          `<td>${String(item.factor_module || "未知").slice(0, 18)}</td>`,
           `<td>${String(item.factor_role || "entry_alpha").slice(0, 18)}</td>`,
           `<td>${String(item.model_name || "").slice(0, 24)}</td>`,
           `<td>${fmtNum(Number(item.weight || 0), 2)}</td>`,
@@ -1012,52 +1046,52 @@ HTML = """<!doctype html>
         ].join("");
         factorBody.appendChild(tr);
       }
-      if (!factorRows.length) factorBody.innerHTML = `<tr><td colspan="8">No factor weights yet.</td></tr>`;
+      if (!factorRows.length) factorBody.innerHTML = `<tr><td colspan="8">暂无因子权重。</td></tr>`;
 
       const safe = [
-        "Safety State",
+        "安全状态",
         "",
-        `risk_level              : ${String(ms.risk_level || "--")}`,
-        `raw_risk_level          : ${String(ms.raw_risk_level || "--")}`,
-        `trigger_streak_days     : ${String(ms.trigger_streak_days ?? "--")}`,
-        `trigger_source          : ${String(ms.trigger_source || "--")}`,
-        `benchmark_drawdown_5d   : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
-        `benchmark_drawdown_20d  : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
-        `benchmark_return_5d     : ${fmtPct(Number(ms.benchmark_return_5d))}`,
-        `benchmark_return_20d    : ${fmtPct(Number(ms.benchmark_return_20d))}`,
-        `underwater_from_peak    : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
-        `liquidity_stress_ratio  : ${fmtPct(Number(ms.market_liquidity_stress_ratio || 0))}`,
-        `structural_regime       : ${String(ms.structural_regime_level || "--")}`,
-        `regime_exposure_budget  : ${fmtPct(Number(ms.regime_exposure_budget || 0))}`,
-        `safety_exposure_cap     : ${fmtPct(Number(ms.safety_exposure_cap || 0))}`,
-        `hard_freeze_active      : ${String(Boolean(ms.hard_freeze_active || false))}`,
-        `exposure_cap            : ${fmtPct(Number(ms.exposure_cap || 0))}`,
-        `target_exposure         : ${fmtPct(Number(ms.target_exposure || 0))}`,
-        `actual_exposure         : ${fmtPct(actualExposure)}`,
-        `exposure_gap            : ${fmtPct(exposureGap)}`,
-        `catchup_allowed         : ${String(Boolean(ms.catchup_allowed || false))}`,
-        `catchup_tier            : ${String(ms.catchup_tier || "none")}`,
-        `accuracy_multiplier     : ${fmtNum(Number(ms.accuracy_multiplier || 0), 2)}`,
-        `catchup_block_reason    : ${String(ms.catchup_block_reason || "--")}`,
-        `catchup_buy_budget      : ${fmtPct(Number(ms.catchup_buy_budget || 0))}`,
-        `trailing_buy_acc_5d     : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
-        `best_replacement_edge10 : ${fmtPct(Number(ms.best_replacement_edge_10d || 0))}`,
-        `replacement_sell_count  : ${String(ms.replacement_opportunity_sell_count ?? 0)}`,
-        `cov_risk_model_used     : ${String(Boolean(ms.covariance_risk_model_used || false))}`,
-        `portfolio_cov_vol       : ${fmtPct(Number(ms.portfolio_covariance_volatility || 0))}`,
-        `max_risk_contribution   : ${fmtPct(Number(ms.max_risk_contribution || 0))}`,
-        `avg_pairwise_corr       : ${fmtNum(Number(ms.avg_pairwise_correlation || 0), 3)}`,
-        `unresolved_safety_exp   : ${fmtPct(Number(ms.unresolved_safety_exposure || 0))}`,
-        `planned_safety_sell     : ${fmtPct(Number(ms.planned_safety_sell_weight || 0))}`,
-        `constraint_cash_reserve : ${fmtPct(Number(ms.constraint_cash_reserve || 0))}`,
-        `normal_turnover_weight  : ${fmtPct(Number(ms.normal_turnover_weight || 0))}`,
-        `total_target_drift      : ${fmtPct(Number(ms.total_target_drift || 0))}`,
-        `regime                  : ${String(ms.regime || "--")}`,
-        `base_exposure_by_regime : ${fmtPct(Number(ms.base_exposure_by_regime || 0))}`,
-        `raw_safety_cap          : ${fmtPct(Number(ms.raw_safety_exposure_cap || 0))}`,
-        `effective_target_cap    : ${fmtPct(Number(ms.effective_target_exposure_cap || 0))}`,
-        `turnover_budget         : ${fmtPct(Number(ms.turnover_budget || 0))}`,
-        `top_n                   : ${String(ms.top_n ?? "--")}`
+        `风险等级              : ${String(ms.risk_level || "--")}`,
+        `原始风险等级          : ${String(ms.raw_risk_level || "--")}`,
+        `触发连续天数          : ${String(ms.trigger_streak_days ?? "--")}`,
+        `触发来源              : ${String(ms.trigger_source || "--")}`,
+        `基准5日回撤           : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
+        `基准20日回撤          : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
+        `基准5日收益           : ${fmtPct(Number(ms.benchmark_return_5d))}`,
+        `基准20日收益          : ${fmtPct(Number(ms.benchmark_return_20d))}`,
+        `距峰值回撤            : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
+        `流动性压力比例        : ${fmtPct(Number(ms.market_liquidity_stress_ratio || 0))}`,
+        `结构性市场状态        : ${String(ms.structural_regime_level || "--")}`,
+        `状态仓位预算          : ${fmtPct(Number(ms.regime_exposure_budget || 0))}`,
+        `安全仓位上限          : ${fmtPct(Number(ms.safety_exposure_cap || 0))}`,
+        `硬冻结                : ${String(Boolean(ms.hard_freeze_active || false))}`,
+        `仓位上限              : ${fmtPct(Number(ms.exposure_cap || 0))}`,
+        `目标仓位              : ${fmtPct(Number(ms.target_exposure || 0))}`,
+        `实际仓位              : ${fmtPct(actualExposure)}`,
+        `仓位缺口              : ${fmtPct(exposureGap)}`,
+        `允许追仓              : ${String(Boolean(ms.catchup_allowed || false))}`,
+        `追仓档位              : ${String(ms.catchup_tier || "none")}`,
+        `准确率乘数            : ${fmtNum(Number(ms.accuracy_multiplier || 0), 2)}`,
+        `追仓拦截原因          : ${String(ms.catchup_block_reason || "--")}`,
+        `追仓买入预算          : ${fmtPct(Number(ms.catchup_buy_budget || 0))}`,
+        `买入5日准确率         : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
+        `最佳替换10日优势      : ${fmtPct(Number(ms.best_replacement_edge_10d || 0))}`,
+        `替换卖出数量          : ${String(ms.replacement_opportunity_sell_count ?? 0)}`,
+        `使用协方差风险模型    : ${String(Boolean(ms.covariance_risk_model_used || false))}`,
+        `组合协方差波动        : ${fmtPct(Number(ms.portfolio_covariance_volatility || 0))}`,
+        `最大风险贡献          : ${fmtPct(Number(ms.max_risk_contribution || 0))}`,
+        `平均两两相关          : ${fmtNum(Number(ms.avg_pairwise_correlation || 0), 3)}`,
+        `未解决安全仓位        : ${fmtPct(Number(ms.unresolved_safety_exposure || 0))}`,
+        `计划安全卖出          : ${fmtPct(Number(ms.planned_safety_sell_weight || 0))}`,
+        `约束现金保留          : ${fmtPct(Number(ms.constraint_cash_reserve || 0))}`,
+        `普通换手权重          : ${fmtPct(Number(ms.normal_turnover_weight || 0))}`,
+        `总目标漂移            : ${fmtPct(Number(ms.total_target_drift || 0))}`,
+        `运行状态              : ${String(ms.regime || "--")}`,
+        `状态基础仓位          : ${fmtPct(Number(ms.base_exposure_by_regime || 0))}`,
+        `原始安全上限          : ${fmtPct(Number(ms.raw_safety_exposure_cap || 0))}`,
+        `有效目标上限          : ${fmtPct(Number(ms.effective_target_exposure_cap || 0))}`,
+        `换手预算              : ${fmtPct(Number(ms.turnover_budget || 0))}`,
+        `最大持股数            : ${String(ms.top_n ?? "--")}`
       ];
       document.getElementById("safetyText").textContent = safe.join("\\n");
 
@@ -1076,7 +1110,7 @@ HTML = """<!doctype html>
           renderState(payload);
         }
       } catch (err) {
-        document.getElementById("status").textContent = `Monitor connection issue: ${err}`;
+        document.getElementById("status").textContent = `监控连接异常：${err}`;
       }
       setTimeout(poll, 1000);
     }
@@ -1104,7 +1138,7 @@ def _read_payload(state_path: Path) -> dict:
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("Usage: live_monitor_web.py <state_json_path>")
+        print("用法: live_monitor_web.py <state_json_path>")
         return 1
 
     state_path = Path(argv[1])
@@ -1146,13 +1180,13 @@ def main(argv: list[str]) -> int:
     threading.Thread(target=shutdown_watcher, args=(server,), daemon=True).start()
 
     url = f"http://127.0.0.1:{port}/"
-    print(f"Governance Live Monitor browser URL: {url}")
+    print(f"治理实时监控浏览器地址: {url}")
     try:
       opened = webbrowser.open(url, new=1)
     except Exception:
       opened = False
     if not opened:
-        print("Browser did not open automatically. Open the URL above manually.")
+        print("浏览器没有自动打开，请手动打开上面的地址。")
 
     try:
         server.serve_forever(poll_interval=0.25)

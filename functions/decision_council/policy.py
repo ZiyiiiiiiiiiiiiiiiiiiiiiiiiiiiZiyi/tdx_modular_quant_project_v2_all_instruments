@@ -38,10 +38,18 @@ ORDER_COLUMNS = [
 class RulesBasedPresidentPolicy:
     """Convert ranked candidates and hard constraints into one daily plan."""
 
-    def __init__(self, *, enable_sector_cap: bool = False, enable_safety_agent: bool = True, exit_mode: str = "full"):
+    def __init__(
+        self,
+        *,
+        enable_sector_cap: bool = False,
+        enable_safety_agent: bool = True,
+        exit_mode: str = "full",
+        risk_hard_gate_enabled: bool = False,
+    ):
         self.enable_sector_cap = bool(enable_sector_cap)
         self.enable_safety_agent = bool(enable_safety_agent)
         self.exit_mode = str(exit_mode or "full").strip().lower()
+        self.risk_hard_gate_enabled = bool(risk_hard_gate_enabled)
         self.portfolio_constructor = PortfolioConstructionCommittee(enable_sector_cap=enable_sector_cap)
 
     def decide(self, context: DecisionContext) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -86,11 +94,25 @@ class RulesBasedPresidentPolicy:
             exposure_cap=allocatable_cap,
             covariance_matrix=context.covariance_matrix,
         )
+        if self.risk_hard_gate_enabled:
+            allocated, hard_gate_diagnostics = _apply_policy_risk_hard_gate(
+                allocated,
+                current_weights=context.current_weights,
+                diagnostics=allocation_diagnostics,
+            )
+            allocation_diagnostics.update(hard_gate_diagnostics)
         target_weights = dict(zip(allocated["symbol"], allocated["target_weight"]))
         target_weights.update(locked_weights)
         ideal = self._ideal_plan(context, allocated, locked_weights, allocation_diagnostics)
         replacement_edge = _best_replacement_edge(eligible, set(context.current_weights))
-        orders, order_diagnostics = self._build_orders(context, target_weights, eligible, safety_cap, replacement_edge)
+        orders, order_diagnostics = self._build_orders(
+            context,
+            target_weights,
+            eligible,
+            safety_cap,
+            replacement_edge,
+            risk_catchup_block=bool(allocation_diagnostics.get("risk_catchup_block_applied", False)),
+        )
         diagnostics = {
             **allocation_diagnostics,
             **order_diagnostics,
@@ -127,6 +149,18 @@ class RulesBasedPresidentPolicy:
             "entry_evidence_grade",
             "entry_confirmed",
             "entry_block_reason",
+            "orderflow_candidate_score",
+            "reversal_entry_score",
+            "breakout_gate_score",
+            "trend_hold_score",
+            "module_candidate_score",
+            "module_entry_score",
+            "module_hold_score",
+            "orderflow_candidate_pass",
+            "reversal_confirm_pass",
+            "breakout_gate_pass",
+            "breakout_probability_bucket_pass",
+            "probability_bucket_mode",
         ]
         plan = allocated.copy()
         if not plan.empty:
@@ -168,6 +202,18 @@ class RulesBasedPresidentPolicy:
                     "entry_evidence_grade": pd.NA,
                     "entry_confirmed": pd.NA,
                     "entry_block_reason": "pending_locked",
+                    "orderflow_candidate_score": pd.NA,
+                    "reversal_entry_score": pd.NA,
+                    "breakout_gate_score": pd.NA,
+                    "trend_hold_score": pd.NA,
+                    "module_candidate_score": pd.NA,
+                    "module_entry_score": pd.NA,
+                    "module_hold_score": pd.NA,
+                    "orderflow_candidate_pass": pd.NA,
+                    "reversal_confirm_pass": pd.NA,
+                    "breakout_gate_pass": pd.NA,
+                    "breakout_probability_bucket_pass": pd.NA,
+                    "probability_bucket_mode": pd.NA,
                 }
             )
         if locked_rows and plan.empty:
@@ -185,7 +231,7 @@ class RulesBasedPresidentPolicy:
                 keep[column] = pd.NA
         return keep[columns].copy()
 
-    def _build_orders(self, context, target_weights, eligible, safety_cap, replacement_edge: float):
+    def _build_orders(self, context, target_weights, eligible, safety_cap, replacement_edge: float, *, risk_catchup_block: bool = False):
         current = {str(symbol): float(weight) for symbol, weight in context.current_weights.items()}
         symbols = sorted(set(current) | set(target_weights))
         safety_shortfall = max(sum(current.values()) - float(safety_cap), 0.0)
@@ -227,6 +273,7 @@ class RulesBasedPresidentPolicy:
             is_catchup_buy = (
                 delta > 0
                 and context.catchup_allowed
+                and not bool(risk_catchup_block)
                 and reason == "normal_buy"
                 and old <= 1e-12
             )
@@ -274,6 +321,16 @@ class RulesBasedPresidentPolicy:
             "replacement_opportunity_sell_count": int(
                 orders.get("reason", pd.Series(dtype=object)).astype(str).eq("replacement_opportunity_exit").sum()
             ) if not orders.empty else 0,
+            "profit_giveback_observation_count": _flag_count(eligible, "profit_giveback_exit"),
+            "post_entry_failure_exit_count": int(
+                orders.get("reason", pd.Series(dtype=object)).astype(str).eq("post_entry_failure_exit").sum()
+            ) if not orders.empty else 0,
+            "trend_break_observation_count": int(
+                eligible.apply(_trend_break_exit, axis=1).sum()
+            ) if eligible is not None and not eligible.empty else 0,
+            "volume_distribution_observation_count": int(
+                eligible.apply(_volume_distribution_exit, axis=1).sum()
+            ) if eligible is not None and not eligible.empty else 0,
         }
 
     @staticmethod
@@ -310,24 +367,50 @@ def _prepare_candidates(candidates):
     return data
 
 
+def _apply_policy_risk_hard_gate(allocated: pd.DataFrame, *, current_weights, diagnostics: dict) -> tuple[pd.DataFrame, dict]:
+    data = allocated.copy()
+    if data.empty:
+        return data, {
+            "risk_hard_gate_enabled": True,
+            "risk_new_buy_block_applied": False,
+            "risk_catchup_block_applied": False,
+        }
+    held = {str(symbol) for symbol, weight in dict(current_weights or {}).items() if float(weight) > 1e-12}
+    new_buy_block = bool(diagnostics.get("risk_new_buy_block", False))
+    catchup_block = bool(diagnostics.get("risk_catchup_block", False))
+    blocked_new_weight = 0.0
+    if new_buy_block and "symbol" in data.columns:
+        is_new = ~data["symbol"].astype(str).isin(held)
+        blocked_new_weight = float(pd.to_numeric(data.loc[is_new, "target_weight"], errors="coerce").fillna(0.0).sum())
+        data.loc[is_new, "target_weight"] = 0.0
+    return data, {
+        "risk_hard_gate_enabled": True,
+        "risk_new_buy_block_applied": bool(new_buy_block),
+        "risk_catchup_block_applied": bool(catchup_block),
+        "risk_blocked_new_buy_weight": blocked_new_weight,
+    }
+
+
 def _order_reason(symbol, delta, candidate_row, context, replacement_edge: float = 0.0, exit_mode: str = "full"):
     if delta < 0 and symbol in context.hard_qualification_symbols:
         return "qualification_exit"
     if delta < 0 and candidate_row is not None and bool(candidate_row.get("alpha_collapse_exit", False)):
         return "alpha_collapse_consensus"
-    if delta < 0 and str(exit_mode or "full").lower() in {"simple", "minimal", "no_complex_exit"}:
+    mode = str(exit_mode or "observe_complex_exit").lower()
+    if delta < 0 and candidate_row is not None and bool(candidate_row.get("post_entry_failure_exit", False)):
+        return "post_entry_failure_exit"
+    if delta < 0 and mode in {"simple", "minimal", "no_complex_exit", "observe_complex_exit", "full"}:
         return "normal_sell"
     if delta < 0 and candidate_row is not None:
-        if bool(candidate_row.get("profit_giveback_exit", False)):
-            return "profit_giveback_exit"
-        if bool(candidate_row.get("post_entry_failure_exit", False)):
-            return "post_entry_failure_exit"
-        if _volume_distribution_exit(candidate_row):
-            return "volume_distribution_exit"
-        if _trend_break_exit(candidate_row):
-            return "trend_break_exit"
-        if _replacement_opportunity_exit(candidate_row, replacement_edge):
-            return "replacement_opportunity_exit"
+        if mode in {"active_complex_exit", "complex_exit"}:
+            if bool(candidate_row.get("profit_giveback_exit", False)):
+                return "profit_giveback_exit"
+            if _volume_distribution_exit(candidate_row):
+                return "volume_distribution_exit"
+            if _trend_break_exit(candidate_row):
+                return "trend_break_exit"
+            if _replacement_opportunity_exit(candidate_row, replacement_edge):
+                return "replacement_opportunity_exit"
     return "normal_buy" if delta > 0 else "normal_sell"
 
 
@@ -381,12 +464,13 @@ def _holding_age_review_passed(candidate_row) -> bool:
         return False
     if bool(candidate_row.get("alpha_collapse_exit", False)):
         return False
-    if bool(candidate_row.get("profit_giveback_exit", False)) or bool(candidate_row.get("post_entry_failure_exit", False)):
-        return False
-    if _trend_break_exit(candidate_row) or _volume_distribution_exit(candidate_row):
+    if bool(candidate_row.get("post_entry_failure_exit", False)):
         return False
     alpha_percentile = float(pd.to_numeric(pd.Series([candidate_row.get("alpha_percentile", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
     expected_return = float(pd.to_numeric(pd.Series([candidate_row.get("expected_return_5d", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+    trend_hold_score = float(pd.to_numeric(pd.Series([candidate_row.get("trend_hold_score", 0.5)]), errors="coerce").fillna(0.5).iloc[0])
+    if trend_hold_score < 0.35 and alpha_percentile < 0.45 and expected_return < 0.0:
+        return False
     return alpha_percentile >= 0.50 or expected_return >= 0.0
 
 
@@ -410,3 +494,9 @@ def _safe_row_float(candidate_row, column: str, default):
     if value.empty:
         return default
     return float(value.iloc[0])
+
+
+def _flag_count(data: pd.DataFrame, column: str) -> int:
+    if data is None or data.empty or column not in data.columns:
+        return 0
+    return int(data[column].fillna(False).astype(bool).sum())

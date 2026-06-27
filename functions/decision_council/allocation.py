@@ -168,6 +168,13 @@ def _apply_covariance_risk_budget(
             "covariance_risk_model_used": False,
             "portfolio_covariance_volatility": 0.0,
             "max_risk_contribution": 0.0,
+            "risk_contribution_gate_pass": True,
+            "risk_contribution_exposure_scale": 1.0,
+            "risk_symbol_count": 0,
+            "risk_contribution_block_reason": "covariance_unavailable",
+            "top5_risk_contribution_sum": 0.0,
+            "risk_new_buy_block": False,
+            "risk_catchup_block": False,
             "avg_pairwise_correlation": 0.0,
             "covariance_condition_number": 0.0,
         }
@@ -181,6 +188,13 @@ def _apply_covariance_risk_budget(
             "covariance_risk_model_used": False,
             "portfolio_covariance_volatility": 0.0,
             "max_risk_contribution": 0.0,
+            "risk_contribution_gate_pass": True,
+            "risk_contribution_exposure_scale": 1.0,
+            "risk_symbol_count": int(len(available)),
+            "risk_contribution_block_reason": "insufficient_covariance_symbols",
+            "top5_risk_contribution_sum": 0.0,
+            "risk_new_buy_block": False,
+            "risk_catchup_block": False,
             "avg_pairwise_correlation": 0.0,
             "covariance_condition_number": 0.0,
         }
@@ -204,6 +218,13 @@ def _apply_covariance_risk_budget(
             "covariance_risk_model_used": True,
             "portfolio_covariance_volatility": 0.0,
             "max_risk_contribution": 0.0,
+            "risk_contribution_gate_pass": True,
+            "risk_contribution_exposure_scale": 1.0,
+            "risk_symbol_count": int(len(available)),
+            "risk_contribution_block_reason": "zero_weight",
+            "top5_risk_contribution_sum": 0.0,
+            "risk_new_buy_block": False,
+            "risk_catchup_block": False,
             "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
             "covariance_condition_number": _condition_number(sigma),
         }
@@ -215,12 +236,40 @@ def _apply_covariance_risk_budget(
         scale = min(0.85 * float(max_risk_contribution) / max(float(rc[offender]), 1e-12), 0.75)
         scale = max(scale, 0.05)
         weights[offender] *= scale
+    rc_after = _risk_contribution(weights, sigma)
+    max_rc_after = float(np.nanmax(rc_after)) if rc_after.size and weights.sum() > 0 else 0.0
+    exposure_scale = 1.0
+    block_reason = ""
+    if len(available) <= 4 and float(weights.sum()) > 0.40:
+        exposure_scale = min(exposure_scale, 0.40 / max(float(weights.sum()), 1e-12))
+        block_reason = "too_few_covariance_symbols"
+    if max_rc_after > 0.50 and float(weights.sum()) > 0.30:
+        exposure_scale = min(exposure_scale, 0.30 / max(float(weights.sum()), 1e-12))
+        block_reason = "extreme_single_name_risk_contribution"
+    elif max_rc_after > 0.35 and float(weights.sum()) > 0.60:
+        exposure_scale = min(exposure_scale, 0.60 / max(float(weights.sum()), 1e-12))
+        block_reason = "single_name_risk_contribution_above_research_gate"
+    if exposure_scale < 1.0:
+        weights = weights * float(exposure_scale)
+        rc_after = _risk_contribution(weights, sigma)
+        max_rc_after = float(np.nanmax(rc_after)) if rc_after.size and weights.sum() > 0 else 0.0
+    top_values = sorted([float(max(value, 0.0)) for value in rc_after], reverse=True)
+    top5_sum = float(np.nansum(top_values[:5])) if top_values else 0.0
+    risk_new_buy_block = bool(max_rc_after > 0.35)
+    risk_catchup_block = bool(top5_sum > 0.80 and len(available) < 8)
     data.loc[indexer, "target_weight"] = weights
     variance = float(weights @ sigma @ weights)
     return {
         "covariance_risk_model_used": True,
         "portfolio_covariance_volatility": float(np.sqrt(max(variance, 0.0))),
-        "max_risk_contribution": float(np.nanmax(_risk_contribution(weights, sigma))) if weights.sum() > 0 else 0.0,
+        "max_risk_contribution": max_rc_after,
+        "risk_contribution_gate_pass": bool(max_rc_after <= max(float(max_risk_contribution), 0.35) and len(available) >= 5),
+        "risk_contribution_exposure_scale": float(exposure_scale),
+        "risk_symbol_count": int(len(available)),
+        "risk_contribution_block_reason": block_reason or "passed",
+        "top5_risk_contribution_sum": top5_sum,
+        "risk_new_buy_block": risk_new_buy_block,
+        "risk_catchup_block": risk_catchup_block,
         "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
         "covariance_condition_number": _condition_number(sigma),
         "covariance_shrinkage_used": float(lam),
@@ -282,6 +331,13 @@ def _empty_diagnostics(exposure_cap: float) -> dict:
         "covariance_risk_model_used": False,
         "portfolio_covariance_volatility": 0.0,
         "max_risk_contribution": 0.0,
+        "risk_contribution_gate_pass": True,
+        "risk_contribution_exposure_scale": 1.0,
+        "risk_symbol_count": 0,
+        "risk_contribution_block_reason": "not_evaluated",
+        "top5_risk_contribution_sum": 0.0,
+        "risk_new_buy_block": False,
+        "risk_catchup_block": False,
         "avg_pairwise_correlation": 0.0,
         "covariance_condition_number": 0.0,
     }

@@ -25,6 +25,30 @@ ORDERFLOW_COLUMNS = (
     "score_orderflow_close_drive",
     "score_orderflow_accumulation",
     "score_orderflow_efficiency",
+    "score_eod_close_strength",
+)
+
+REVERSAL_COLUMNS = (
+    "score_mean_reversion",
+    "score_rsi_reversal",
+    "score_kdj_oversold_cross",
+    "score_low_volume_pullback",
+    "score_consecutive_decline_rebound",
+)
+
+BREAKOUT_COLUMNS = (
+    "score_price_volume_breakout",
+    "score_turtle_breakout",
+    "score_limit_up_follow",
+    "score_ma_break",
+)
+
+TREND_COLUMNS = (
+    "score_mom_lowvol",
+    "score_macd_trend",
+    "score_macd_cross",
+    "score_ma_cross",
+    "ret_20",
 )
 
 
@@ -35,6 +59,7 @@ def apply_entry_confirmation(
     structural_regime_level: str = "bull",
     entry_calibrator=None,
     confirmation_mode: str = "full",
+    probability_bucket_mode: str = "default",
 ) -> pd.DataFrame:
     """Annotate candidates with entry confirmation diagnostics."""
     data = candidates.copy()
@@ -66,6 +91,38 @@ def apply_entry_confirmation(
         pd.Series(True, index=data.index)
         if not available_orderflow_columns
         else orderflow_confirm_count >= int(GOVERNANCE_ENTRY_MIN_ORDERFLOW_CONFIRMATIONS)
+    )
+    data["orderflow_candidate_score"] = _module_score(data, ORDERFLOW_COLUMNS)
+    data["reversal_entry_score"] = _module_score(data, REVERSAL_COLUMNS)
+    data["breakout_gate_score"] = _module_score(data, BREAKOUT_COLUMNS)
+    data["trend_hold_score"] = _module_score(data, TREND_COLUMNS)
+    data["module_candidate_score"] = (
+        0.60 * data["orderflow_candidate_score"]
+        + 0.20 * data["breakout_gate_score"]
+        + 0.20 * alpha_percentile.clip(0.0, 1.0)
+    )
+    data["module_entry_score"] = (
+        0.50 * data["reversal_entry_score"]
+        + 0.30 * data["breakout_gate_score"]
+        + 0.20 * data["orderflow_candidate_score"]
+    )
+    data["module_hold_score"] = (
+        0.50 * data["trend_hold_score"]
+        + 0.30 * data["orderflow_candidate_score"]
+        + 0.20 * alpha_percentile.clip(0.0, 1.0)
+    )
+    data["orderflow_candidate_pass"] = (
+        data["orderflow_candidate_score"].ge(0.50)
+        | data["orderflow_candidate_score"].rank(pct=True).ge(0.60)
+        | orderflow_confirmation.astype(bool)
+    )
+    data["reversal_confirm_pass"] = (
+        data["reversal_entry_score"].ge(0.45)
+        | data["reversal_entry_score"].rank(pct=True).ge(0.70)
+    )
+    data["breakout_gate_pass"] = (
+        data["breakout_gate_score"].ge(0.50)
+        | data["breakout_gate_score"].rank(pct=True).ge(0.80)
     )
     is_rebound = str(structural_regime_level).lower() == "rebound"
     rebound_follow_through = _rebound_follow_through(
@@ -172,6 +229,15 @@ def apply_entry_confirmation(
     conservative_edge_to_risk_10d = pd.to_numeric(data.get("conservative_edge_to_risk_10d"), errors="coerce").fillna(edge_to_risk_10d)
     p_win_10d = pd.to_numeric(data.get("p_win_10d_calibrated"), errors="coerce").fillna(0.0)
     p_win_10d_lower = pd.to_numeric(data.get("p_win_10d_wilson_lower"), errors="coerce").fillna((p_win_10d - 0.08).clip(0.30, 0.58))
+    mode_bucket = str(probability_bucket_mode or "default").strip().lower()
+    data["breakout_probability_bucket_pass"] = (
+        pd.Series(mode_bucket in {"breakout_high_confidence", "breakout_60_65"}, index=data.index)
+        &
+        data["breakout_gate_pass"].astype(bool)
+        & p_win_10d.ge(0.60)
+        & p_win_10d.lt(0.65)
+        & p_win_10d_lower.ge(0.48)
+    )
     calibration_trust_10d = pd.to_numeric(data.get("entry_calibration_trust_10d"), errors="coerce").fillna(0.0).clip(0.0, 1.0)
     data["entry_edge_rank_pct"] = edge_to_risk_10d.rank(pct=True).fillna(0.0)
     data["entry_conservative_edge_rank_pct"] = conservative_edge_to_risk_10d.rank(pct=True).fillna(0.0)
@@ -193,7 +259,23 @@ def apply_entry_confirmation(
         & p_win_10d.ge(0.50)
         & p_win_10d_lower.ge(0.42)
         & alpha_percentile.ge(max(float(threshold) - 0.10, 0.50))
+        & data["orderflow_candidate_pass"].astype(bool)
+        & data["reversal_confirm_pass"].astype(bool)
         & market_confirm.astype(bool)
+    )
+    role_confirm = (
+        data["orderflow_candidate_pass"].astype(bool)
+        & data["reversal_confirm_pass"].astype(bool)
+        & (
+            data["breakout_gate_pass"].astype(bool)
+            | data["breakout_probability_bucket_pass"].astype(bool)
+            | (
+                p_win_10d_lower.ge(0.50)
+                & conservative_edge_10d.ge(float(GOVERNANCE_ENTRY_MIN_EXPECTED_RETURN_AFTER_COST))
+            )
+        )
+        & market_confirm.astype(bool)
+        & checks["liquidity_confirmation"].astype(bool)
     )
     mode = str(confirmation_mode or "full").strip().lower()
     if is_rebound:
@@ -205,7 +287,8 @@ def apply_entry_confirmation(
         )
         soft_confirm &= rebound_follow_through.astype(bool)
         edge_confirm &= rebound_evidence
-    confirmed = (~hard_veto.astype(bool)) & (soft_confirm | edge_confirm)
+        role_confirm &= rebound_follow_through.astype(bool)
+    confirmed = (~hard_veto.astype(bool)) & (role_confirm | edge_confirm)
     if mode in {"fixed_percentile_only", "no_probability", "no_probability_edge"}:
         confirmed = (
             ~hard_veto.astype(bool)
@@ -216,12 +299,15 @@ def apply_entry_confirmation(
         if is_rebound:
             confirmed &= rebound_follow_through.astype(bool)
     data["starter_position_allowed"] = confirmed & (
-        data["calibrated_win_prob_5d"].ge(0.50)
-        | expected_edge_10d.ge(float(GOVERNANCE_ENTRY_MIN_EXPECTED_RETURN_AFTER_COST))
+        data["orderflow_candidate_pass"].astype(bool)
+        & data["reversal_confirm_pass"].astype(bool)
     )
     data["confirmed_add_position_allowed"] = confirmed & (
-        p_win_10d_lower.ge(0.48)
-        | data["entry_conservative_edge_rank_pct"].ge(0.80)
+        data["breakout_gate_pass"].astype(bool)
+        & (
+            p_win_10d_lower.ge(0.48)
+            | data["entry_conservative_edge_rank_pct"].ge(0.80)
+        )
     )
     data["entry_quality_score"] = _quality_score(
         alpha_percentile=alpha_percentile,
@@ -229,12 +315,19 @@ def apply_entry_confirmation(
         confidence=confidence,
         orderflow_confirm_count=orderflow_confirm_count,
     )
+    data["entry_quality_score"] = (
+        0.45 * data["entry_quality_score"]
+        + 0.30 * data["module_entry_score"]
+        + 0.15 * data["module_candidate_score"]
+        + 0.10 * data["module_hold_score"]
+    ).clip(0.0, 1.0)
     data["entry_confirmation_mode"] = mode
+    data["probability_bucket_mode"] = mode_bucket
     if not ENABLE_GOVERNANCE_ENTRY_CONFIRMATION:
         confirmed = pd.Series(True, index=data.index)
     data["entry_confirmed"] = confirmed.astype(bool)
     data["entry_block_reason"] = [
-        _first_block_reason(row_index, checks, risk_level)
+        _first_block_reason(row_index, checks, risk_level, data)
         if not bool(data.at[row_index, "entry_confirmed"])
         else "confirmed"
         for row_index in data.index
@@ -246,6 +339,21 @@ def _numeric_series(data: pd.DataFrame, column: str, *, default: float | None) -
     if column in data.columns:
         return pd.to_numeric(data[column], errors="coerce")
     return pd.Series(default, index=data.index, dtype="float64")
+
+
+def _module_score(data: pd.DataFrame, columns: tuple[str, ...]) -> pd.Series:
+    """Rank-normalize heterogeneous factor columns into a 0-1 module score."""
+    available = [column for column in columns if column in data.columns]
+    if not available:
+        return pd.Series(0.0, index=data.index, dtype="float64")
+    ranked = []
+    for column in available:
+        values = pd.to_numeric(data[column], errors="coerce")
+        if values.notna().sum() <= 1:
+            ranked.append(pd.Series(0.0, index=data.index, dtype="float64"))
+            continue
+        ranked.append(values.rank(pct=True).fillna(0.0).clip(0.0, 1.0))
+    return pd.concat(ranked, axis=1).mean(axis=1).fillna(0.0).clip(0.0, 1.0)
 
 
 def _alpha_threshold(risk_level: str, structural_regime_level: str) -> float:
@@ -331,9 +439,21 @@ def _entry_evidence_grade(
     return pd.Series("blocked", index=p_win_lower.index).mask(starter, "starter").mask(usable, "usable").mask(strong, "strong")
 
 
-def _first_block_reason(row_index, checks: dict[str, pd.Series], risk_level: str) -> str:
+def _first_block_reason(row_index, checks: dict[str, pd.Series], risk_level: str, data: pd.DataFrame | None = None) -> str:
     if str(risk_level).lower() in {"high", "crisis"}:
         return "risk_level_blocks_new_buy"
+    if data is not None:
+        for reason, column in (
+            ("orderflow_candidate", "orderflow_candidate_pass"),
+            ("reversal_confirm", "reversal_confirm_pass"),
+            ("breakout_gate", "breakout_gate_pass"),
+        ):
+            if column in data.columns:
+                try:
+                    if not bool(data.at[row_index, column]):
+                        return reason
+                except Exception:
+                    continue
     for name, mask in checks.items():
         try:
             if not bool(mask.loc[row_index]):

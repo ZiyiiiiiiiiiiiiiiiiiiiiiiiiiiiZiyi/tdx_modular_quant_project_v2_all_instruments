@@ -65,6 +65,14 @@ class GovernanceVariantRegistry:
                 description="Main governance variant with reputation weighting and safety agent enabled.",
                 status="active",
                 governance_variant_tag="president",
+                extra={
+                    "entry_confirmation_mode": "full",
+                    "exit_mode": "observe_complex_exit",
+                    "selection_weight_mode": "role_balanced",
+                    "regime_overlay_mode": "conservative",
+                    "risk_hard_gate_enabled": True,
+                    "probability_bucket_mode": "breakout_high_confidence",
+                },
             )
         )
         self.register(
@@ -175,7 +183,7 @@ class GovernanceVariantRegistry:
                 extra={
                     "purpose": "layer_ablation_suite",
                     "entry_confirmation_mode": "full",
-                    "exit_mode": "full",
+                    "exit_mode": "active_complex_exit",
                     "layer_added": "complex_exit",
                 },
             )
@@ -201,7 +209,7 @@ class GovernanceVariantRegistry:
                 extra={
                     "purpose": "layer_ablation_suite",
                     "entry_confirmation_mode": "full",
-                    "exit_mode": "full",
+                    "exit_mode": "observe_complex_exit",
                     "layer_added": "full_mainline_control",
                 },
             )
