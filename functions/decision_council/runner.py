@@ -1,7 +1,6 @@
 """Historical daily runner for the phase-one rules-based governance strategy."""
 from __future__ import annotations
 
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -10,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import (
+    COMMISSION_RATE,
     ENABLE_MARKET_REGIME_POLICY,
     FEATURE_DAILY_PARQUET,
     GOVERNANCE_ALPHA_CANDIDATE_LIMIT,
@@ -25,18 +25,67 @@ from config import (
     GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO,
     GOVERNANCE_HIGH_EXPOSURE_MIN_PROFIT_FACTOR,
     GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL,
+    GOVERNANCE_ENTRY_MATRIX_EXIT_DECAY_THRESHOLD,
+    GOVERNANCE_ENTRY_MATRIX_EXTREME_THRESHOLD,
+    GOVERNANCE_ENTRY_MATRIX_WATCH_THRESHOLD,
+    GOVERNANCE_ENTRY_MATRIX_STARTER_2,
+    GOVERNANCE_ENTRY_MATRIX_STRONG_STARTER,
+    GOVERNANCE_ENTRY_SUCCESS_PROB_NORMAL,
+    GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS,
+    GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS,
+    GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT,
+    GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+    GOVERNANCE_DEFENSIVE_SLEEVE_ASSETS,
+    GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN,
+    GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK,
+    GOVERNANCE_DOWNTREND_DECAY_EXIT,
+    GOVERNANCE_EXHAUSTION_ADD_MAX,
+    GOVERNANCE_EXHAUSTION_BUY_MAX,
+    GOVERNANCE_FOLLOW_THROUGH_STARTER_2,
+    GOVERNANCE_FOLLOW_THROUGH_STRONG,
+    GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K,
+    GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_HIGH,
+    GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL,
+    GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_WEAK,
+    GOVERNANCE_HARD_STOP_COOLDOWN_DAYS,
+    GOVERNANCE_LAYER_ADD_GAPS,
+    GOVERNANCE_LAYER_WEIGHTS,
+    GOVERNANCE_MAX_ADD_LAYERS_LARGE,
+    GOVERNANCE_MAX_ADD_LAYERS_RETAIL_20K,
+    GOVERNANCE_MAX_POSITION_WEIGHT,
+    GOVERNANCE_PROFIT_GIVEBACK_1,
+    GOVERNANCE_PROFIT_GIVEBACK_2,
+    GOVERNANCE_PROFIT_GIVEBACK_3,
+    GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER,
+    GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT,
+    GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK,
+    GOVERNANCE_PROFIT_PROTECT_TRIGGER_1,
+    GOVERNANCE_PROFIT_PROTECT_TRIGGER_2,
+    GOVERNANCE_PROFIT_PROTECT_TRIGGER_3,
+    GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS,
+    GOVERNANCE_PROFIT_TAKE_COOLDOWN_DAYS,
+    GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE,
+    GOVERNANCE_SIGNAL_FAILURE_COOLDOWN_DAYS,
+    GOVERNANCE_STALE_EXIT_DAYS,
+    GOVERNANCE_STALE_REDUCE_DAYS,
+    GOVERNANCE_STALE_WATCH_DAYS,
     GOVERNANCE_INITIAL_TRANSITION_DAYS,
     GOVERNANCE_INITIAL_CASH,
     GOVERNANCE_END_DATE,
     GOVERNANCE_OUTPUT_DIR,
     GOVERNANCE_PRELOAD_CALENDAR_DAYS,
     GOVERNANCE_REPUTATION_WARMUP_DAYS,
+    GOVERNANCE_RETAIL_STARTER_2_LOTS,
+    GOVERNANCE_RETAIL_STRONG_STARTER_LOTS,
     GOVERNANCE_REPORT_MD,
     GOVERNANCE_START_DATE,
     GOVERNANCE_SUMMARY_CSV,
+    SLIPPAGE_RATE,
+    STAMP_DUTY_RATE,
     MIN_LOT_SIZE,
     MARKET_REGIME_BENCHMARK_SYMBOL,
     SAFETY_PROXY_MODE,
+    TRANSFER_FEE_RATE,
 )
 from functions.decision_council.accounting import build_exposure_snapshot, calculate_five_day_reward
 from functions.decision_council.account_state import (
@@ -58,46 +107,176 @@ from functions.decision_council.leakage import validate_governance_split
 from functions.decision_council.market_regime_policy import MarketRegimePolicy
 from functions.decision_council.proposals import build_daily_candidates
 from functions.decision_council.plots import save_governance_diagnostic_plots
+from functions.decision_council.policy import ORDER_COLUMNS, ORDER_PRIORITIES
 from functions.decision_council.quality_reports import build_governance_quality_reports
 from functions.decision_council.monitoring import evaluate_daily_rollback
 from functions.decision_council.reputation import ReputationLedger
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.order_simulator import simulate_order_book
 from functions.execution.trade_pairing import build_trade_pairing_ledgers
+from functions.output_naming import dated_run_dir
 from functions.pricing.feature_leakage_audit import audit_feature_columns
 from functions.pipeline_cache import file_fingerprint
 from functions.report_builder import build_strategy_report, save_strategy_report
 
 
-def archive_existing_governance_output(output_dir: Path) -> Path | None:
-    """Archive the previous run before fixed-name outputs are overwritten."""
-    output_dir = Path(output_dir)
-    if not output_dir.exists() or not any(output_dir.iterdir()):
-        return None
+EXECUTION_LEDGER_COLUMNS = [
+    "symbol",
+    "trade_date",
+    "side",
+    "target_shares",
+    "executed_shares",
+    "price",
+    "trade_notional",
+    "total_cost",
+    "market_amount",
+    "execution_status",
+    "same_day_sell_blocked",
+    "price_limit_blocked_flag",
+    "suspension_blocked_flag",
+    "order_id",
+    "decision_id",
+    "reason",
+    "position_state",
+    "position_exit_reason",
+    "add_layer",
+    "add_allowed",
+    "add_block_reason",
+    "entry_matrix_score",
+    "entry_alpha_score",
+    "entry_timing_score",
+    "entry_liquidity_score",
+    "alpha_quality_score",
+    "surge_capture_score",
+    "follow_through_score",
+    "exhaustion_score",
+    "entry_success_probability",
+    "entry_size_tier",
+    "planned_entry_lots",
+    "empirical_distribution_score",
+    "final_entry_score",
+    "tail_risk_proxy",
+    "trend_direction_score",
+    "peak_decay_score",
+    "profit_protection_pressure",
+    "dynamic_giveback_limit",
+    "future_loss_risk_score",
+    "entry_alpha_quality_at_buy",
+    "alpha_quality_drop_from_entry",
+    "downtrend_decay_score",
+    "post_entry_failure_score",
+]
 
-    archive_root = output_dir.parent / "_archive" / output_dir.name
-    archive_root.mkdir(parents=True, exist_ok=True)
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
-    archive_dir = archive_root / timestamp
-    suffix = 1
-    while archive_dir.exists():
-        suffix += 1
-        archive_dir = archive_root / f"{timestamp}_{suffix:02d}"
-    shutil.copytree(output_dir, archive_dir)
-    _clear_governance_output_files(output_dir)
-    return archive_dir
+HOLDINGS_LEDGER_COLUMNS = [
+    "date",
+    "decision_id",
+    "symbol",
+    "shares",
+    "price",
+    "market_value",
+    "account_weight",
+    "sleeve_weight",
+    "portfolio_exposure",
+    "weight",
+    "weight_basis",
+    "entry_date",
+    "entry_price",
+    "unrealized_return",
+    "mfe",
+    "mae",
+    "giveback_from_peak",
+    "trend_direction_score",
+    "peak_decay_score",
+    "profit_protection_pressure",
+    "dynamic_giveback_limit",
+    "future_loss_risk_score",
+    "profit_giveback_flag",
+    "post_entry_failure_flag",
+    "lock_days",
+    "stale_days",
+    "valuation_source",
+    "stale_haircut_ratio",
+]
+
+POSITION_STATE_LEDGER_COLUMNS = [
+    "date",
+    "symbol",
+    "position_state",
+    "exit_state",
+    "position_exit_reason",
+    "paper_exit_reason",
+    "paper_exit_state",
+    "cooldown_active",
+    "paper_cooldown_active",
+    "cooldown_until",
+    "cooldown_reason",
+    "cooldown_override",
+    "protecting_profit",
+    "profit_protection_triggered",
+    "buy_sell_conflict_cooldown_days",
+    "add_allowed",
+    "add_block_reason",
+    "add_layer",
+    "add_budget",
+    "hard_stop_exit",
+    "profit_hard_stop_exit",
+    "paper_hard_stop_exit",
+    "paper_profit_hard_stop_exit",
+    "hard_stop_net_mfe",
+    "hard_stop_net_unrealized",
+    "hard_stop_giveback_from_net_peak",
+    "profit_giveback_exit",
+    "paper_profit_giveback_exit",
+    "post_entry_failure_exit",
+    "paper_post_entry_failure_exit",
+    "alpha_collapse_exit",
+    "paper_alpha_collapse_exit",
+    "signal_failure_exit",
+    "paper_signal_failure_exit",
+    "stale_time_reduce",
+    "paper_stale_time_reduce",
+    "stale_time_exit",
+    "paper_stale_time_exit",
+    "alpha_quality_score",
+    "surge_capture_score",
+    "follow_through_score",
+    "exhaustion_score",
+    "entry_success_probability",
+    "entry_size_tier",
+    "planned_entry_lots",
+    "empirical_distribution_score",
+    "final_entry_score",
+    "tail_risk_proxy",
+    "trend_direction_score",
+    "peak_decay_score",
+    "profit_protection_pressure",
+    "dynamic_giveback_limit",
+    "future_loss_risk_score",
+    "downtrend_decay_score",
+    "post_entry_failure_score",
+]
+
+
+def _frame_with_columns(rows, columns: list[str]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = pd.Series(dtype="object")
+    return frame
+
+
+def archive_existing_governance_output(output_dir: Path) -> Path | None:
+    """Deprecated compatibility hook.
+
+    Governance outputs now use run-stamped directories, so old artifacts should
+    not be copied, moved, or cleared automatically.
+    """
+    return None
 
 
 def _clear_governance_output_files(output_dir: Path) -> None:
-    """Remove stale fixed-name output files after archiving without recursive deletion."""
-    for child in Path(output_dir).iterdir():
-        if child.is_file() or child.is_symlink():
-            child.unlink()
-            continue
-        raise RuntimeError(
-            "Governance output cleanup refuses to remove directories automatically. "
-            f"Please clear this directory manually before rerunning: {child}"
-        )
+    """Deprecated. Automatic governance output cleanup is intentionally disabled."""
+    raise RuntimeError("Automatic governance output cleanup is disabled; use a new run-stamped output directory.")
 
 
 class ProgressTracker:
@@ -176,7 +355,8 @@ class GovernanceBacktestRunner:
         selection_weight_mode: str = "reputation_weighted",
         regime_overlay_mode: str = "full",
         risk_hard_gate_enabled: bool = False,
-        probability_bucket_mode: str = "default",
+        governance_control_mode: str = "normal",
+        alpha_collapse_exit_enabled: bool = True,
         shadow_fast_mode: bool = False,
         universe_name: str | None = None,
         universe_mode: str = "index_pool_strict",
@@ -187,6 +367,8 @@ class GovernanceBacktestRunner:
         allow_fallback: bool = False,
         allowed_instrument_types: tuple[str, ...] = GOVERNANCE_ALLOWED_INSTRUMENT_TYPES,
         enable_quality_filters: bool = True,
+        max_positions: int | None = None,
+        capital_profile: dict | None = None,
     ):
         self.features = feature_df if prepared_features else _prepare_features(feature_df)
         self.features["date"] = pd.to_datetime(self.features["date"], errors="coerce")
@@ -204,7 +386,8 @@ class GovernanceBacktestRunner:
         self.selection_weight_mode = str(selection_weight_mode or "reputation_weighted")
         self.regime_overlay_mode = str(regime_overlay_mode or "full")
         self.risk_hard_gate_enabled = bool(risk_hard_gate_enabled)
-        self.probability_bucket_mode = str(probability_bucket_mode or "default")
+        self.governance_control_mode = _normalize_governance_control_mode(governance_control_mode)
+        self.alpha_collapse_exit_enabled = bool(alpha_collapse_exit_enabled)
         self.shadow_fast_mode = bool(shadow_fast_mode)
         # Registry framework metadata
         self._universe_name = universe_name
@@ -216,6 +399,13 @@ class GovernanceBacktestRunner:
         self._allow_fallback = bool(allow_fallback)
         self._allowed_instrument_types = tuple(allowed_instrument_types)
         self._enable_quality_filters = bool(enable_quality_filters)
+        self._max_positions_override = int(max_positions) if max_positions not in (None, "", 0) else None
+        self.capital_profile = dict(capital_profile or {})
+        self.capital_profile.setdefault("name", "custom")
+        self.capital_usage_mode = _normalize_capital_usage_mode(
+            self.capital_profile.get("capital_usage_mode", GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT)
+        )
+        self._retail_lot_adapter_enabled = bool(self.capital_profile.get("retail_lot_adapter", False))
         self._daily_feature_indices = (
             shared_daily_feature_indices
             if shared_daily_feature_indices is not None
@@ -248,6 +438,13 @@ class GovernanceBacktestRunner:
         self.positions: dict[str, Position] = {}
         self.holding_days: dict[str, int] = {}
         self.position_lifecycle: dict[str, dict] = {}
+        self.position_cooldowns: dict[str, dict] = {}
+        self.position_state_rows = []
+        self.retail_execution_rows = []
+        self.entry_formula_audit_rows = []
+        self.retail_executable_rank_rows = []
+        self.defensive_sleeve_rows = []
+        self._close_history_by_symbol: dict[str, pd.DataFrame] | None = None
         self.engine = PhaseOneDecisionCouncilEngine(
             self.features,
             safety_proxy_mode=safety_proxy_mode,
@@ -271,7 +468,11 @@ class GovernanceBacktestRunner:
         self._pending_alpha_collapse_exits = []
         self._normal_rebalance_dates = frozenset()
         # Market regime policy for dynamic parameter adjustment
-        self.market_regime_policy = MarketRegimePolicy() if self.enable_market_regime_policy else None
+        self.market_regime_policy = (
+            MarketRegimePolicy()
+            if self.enable_market_regime_policy and self._control_enabled("regime")
+            else None
+        )
         self._current_regime = "bear"  # Default to bear
         self._regime_params_cache: dict[pd.Timestamp, object | None] = {}
         if self.market_regime_policy is not None:
@@ -402,16 +603,16 @@ class GovernanceBacktestRunner:
         
         # Get regime-adjusted parameters if market regime policy is enabled
         regime_params = self._get_regime_params(date)
+        if not self._control_enabled("regime"):
+            regime_params = None
         current_turnover_budget = regime_params.default_turnover_budget if regime_params else GOVERNANCE_DEFAULT_TURNOVER_BUDGET
         current_min_score_percentile = regime_params.min_score_percentile if regime_params else None
         
         candidates, proposals = build_daily_candidates(
             daily,
-            reputation_weights=(
-                self._proposal_reputation_weights()
-                if self.enable_reputation
-                else {model_name: 1.0 for model_name in self.alpha_models}
-            ),
+            # Reputation remains recorded for diagnostics, but does not directly
+            # change candidate admission. This keeps the live path factor-matrix led.
+            reputation_weights={model_name: 1.0 for model_name in self.alpha_models},
             holding_days=self.holding_days,
             candidate_limit=GOVERNANCE_ALPHA_CANDIDATE_LIMIT,
             model_names=self.alpha_models,
@@ -432,12 +633,22 @@ class GovernanceBacktestRunner:
         candidates = apply_entry_confirmation(
             candidates,
             risk_level=risk_level,
-            structural_regime_level=structural_regime_level,
+            structural_regime_level=structural_regime_level if self._control_enabled("regime") else "neutral",
             entry_calibrator=self.entry_calibrator,
-            confirmation_mode=self.entry_confirmation_mode,
-            probability_bucket_mode=self.probability_bucket_mode,
+            confirmation_mode="factor_only" if self.governance_control_mode in {"factor_only", "safe_factor_only"} else self.entry_confirmation_mode,
+            capital_usage_mode=self.capital_usage_mode,
         )
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
+        candidates = self._apply_position_state_constraints(candidates, date=date, exposure=exposure)
+        candidates = self._apply_optional_exit_controls(candidates)
+        defensive_candidates = self._record_defensive_sleeve_diagnostics(
+            date=date,
+            daily=daily,
+            risk_level=risk_level,
+            structural_regime_level=structural_regime_level,
+            stock_candidate_count=int(candidates.get("entry_confirmed", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()),
+        )
+        self._record_entry_formula_and_retail_rank(date=date, candidates=candidates, daily=daily, exposure=exposure)
         self.entry_calibrator.schedule_candidates(
             candidates,
             day_index=day_index,
@@ -471,9 +682,18 @@ class GovernanceBacktestRunner:
             qualified_entry_count=qualified_entry_count,
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
             liquidity_stress=liquidity_stress,
-            regime_overlay_mode=self.regime_overlay_mode,
+            regime_overlay_mode=self.regime_overlay_mode if self._control_enabled("regime_overlay") else "off",
         )
         target_exposure_proxy = exposure_authorization["authorized_exposure_max"]
+        force_deploy_target = self._force_deploy_target_exposure(
+            risk_level=risk_level,
+            structural_regime_level=structural_regime_level,
+            safety_exposure_cap=safety_exposure_cap,
+            liquidity_stress=liquidity_stress,
+        )
+        if force_deploy_target is not None:
+            target_exposure_proxy = max(float(target_exposure_proxy), float(force_deploy_target))
+            target_exposure_proxy = min(float(target_exposure_proxy), float(safety_exposure_cap))
         high_exposure_gate = self._high_exposure_research_gate(date)
         catchup_decision = decide_exposure_catchup(
             actual_exposure=actual_exposure,
@@ -507,7 +727,7 @@ class GovernanceBacktestRunner:
             current_weights=self._current_weights(daily, exposure["nominal_nav"]),
             holding_days=self.holding_days,
             turnover_budget=current_turnover_budget,
-            top_n=regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N,
+            top_n=self._max_positions_override or (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N),
             allow_normal_rebalance=allow_normal_rebalance,
             transition_only=day_index < GOVERNANCE_INITIAL_TRANSITION_DAYS,
             hard_qualification_symbols=self._hard_qualification_symbols(),
@@ -515,6 +735,17 @@ class GovernanceBacktestRunner:
             catchup_allowed=catchup_decision.catchup_allowed,
             target_exposure_cap=target_exposure_proxy,
             covariance_matrix=self._rolling_candidate_covariance(date, candidates),
+        )
+        orders = self._augment_force_deploy_diversify_orders(
+            orders=orders,
+            candidates=candidates,
+            defensive_candidates=defensive_candidates,
+            decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
+            decision_date=date,
+            current_weights=self._current_weights(daily, exposure["nominal_nav"]),
+            nominal_nav=exposure["nominal_nav"],
+            daily=daily,
+            target_exposure=target_exposure_proxy,
         )
         diagnostics.update(catchup_decision.__dict__)
         diagnostics.update(high_exposure_gate_diagnostics)
@@ -527,10 +758,27 @@ class GovernanceBacktestRunner:
         diagnostics["base_exposure_by_regime"] = _base_exposure_by_regime(regime_name)
         diagnostics.update(exposure_authorization)
         diagnostics["trailing_buy_accuracy_5d"] = trailing_buy_accuracy_5d
-        self._register_orders(orders, daily, exposure["nominal_nav"])
+        retail_diagnostics = self._register_orders(orders, daily, exposure["nominal_nav"])
+        diagnostics.update(retail_diagnostics)
         self.exposure_rows[-1].update(
             {
                 "target_exposure": diagnostics["target_exposure"],
+                "capital_usage_mode": self.capital_usage_mode,
+                "force_deploy_enabled": self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+                "target_holding_count": int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K),
+                "holding_shortfall_count": max(
+                    int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K)
+                    - int(exposure.get("holding_count", 0) or 0),
+                    0,
+                ),
+                "idle_cash": float(exposure.get("cash", self.cash) or 0.0),
+                "idle_cash_ratio": float(exposure.get("cash", self.cash) or 0.0) / max(float(exposure.get("nominal_nav", self.initial_cash) or self.initial_cash), 1e-12),
+                "defensive_candidate_count": int(len(defensive_candidates)) if defensive_candidates is not None else 0,
+                "defensive_eligible_count": (
+                    int(defensive_candidates.get("defensive_state", pd.Series(dtype=str)).astype(str).eq("eligible_defensive").sum())
+                    if defensive_candidates is not None and not defensive_candidates.empty
+                    else 0
+                ),
                 "unresolved_safety_exposure": diagnostics["unresolved_safety_exposure"],
                 "constraint_cash_reserve": diagnostics["constraint_cash_reserve"],
                 "allow_normal_rebalance": allow_normal_rebalance,
@@ -558,6 +806,12 @@ class GovernanceBacktestRunner:
                 "authorized_exposure_max": diagnostics.get("authorized_exposure_max", target_exposure_proxy),
                 "exposure_authorization_tier": diagnostics.get("exposure_authorization_tier", ""),
                 "exposure_authorization_block_reasons": diagnostics.get("exposure_authorization_block_reasons", ""),
+                "governance_control_mode": self.governance_control_mode,
+                "reputation_control_enabled": self._control_enabled("reputation"),
+                "regime_control_enabled": self._control_enabled("regime"),
+                "cooldown_control_enabled": self._control_enabled("cooldown"),
+                "hard_stop_control_enabled": self._control_enabled("hard_stop_exit"),
+                "alpha_collapse_exit_enabled": self.alpha_collapse_exit_enabled,
                 "regime_overlay_mode": diagnostics.get("regime_overlay_mode", self.regime_overlay_mode),
                 "regime_overlay_capped": diagnostics.get("regime_overlay_capped", False),
                 "authorization_expected_edge_10d_mean": diagnostics.get("authorization_expected_edge_10d_mean", 0.0),
@@ -586,6 +840,11 @@ class GovernanceBacktestRunner:
                 "covariance_condition_number": diagnostics.get("covariance_condition_number", 0.0),
                 "corporate_action_cash_delta": corporate_action_summary["cash_delta"],
                 "corporate_action_stock_dividend_shares": corporate_action_summary["stock_dividend_shares"],
+                "retail_order_count": retail_diagnostics.get("retail_order_count", 0),
+                "retail_upgraded_to_one_lot_count": retail_diagnostics.get("retail_upgraded_to_one_lot_count", 0),
+                "retail_blocked_count": retail_diagnostics.get("retail_blocked_count", 0),
+                "retail_lot_cash_insufficient_count": retail_diagnostics.get("retail_lot_cash_insufficient_count", 0),
+                "retail_state_block_count": retail_diagnostics.get("retail_state_block_count", 0),
             }
         )
         market_total_amount = float(pd.to_numeric(daily["amount"], errors="coerce").fillna(0.0).sum())
@@ -637,8 +896,32 @@ class GovernanceBacktestRunner:
                 "module_candidate_score",
                 "module_entry_score",
                 "module_hold_score",
+                "entry_matrix_score",
+                "entry_alpha_score",
+                "entry_timing_score",
+                "entry_liquidity_score",
+                "alpha_quality_score",
+                "surge_capture_score",
+                "follow_through_score",
+                "exhaustion_score",
+                "entry_success_probability",
+                "entry_size_tier",
+                "planned_entry_lots",
+                "trend_direction_score",
+                "peak_decay_score",
+                "profit_protection_pressure",
+                "dynamic_giveback_limit",
+                "future_loss_risk_score",
+                "downtrend_decay_score",
+                "post_entry_failure_score",
+                "entry_quality_tier",
+                "surge_buy_flag",
+                "position_state",
+                "add_allowed",
+                "add_block_reason",
+                "position_exit_reason",
+                "cooldown_active",
                 "entry_block_reason",
-                "breakout_probability_bucket_pass",
             ]
             if column in candidates.columns
         ]
@@ -658,7 +941,20 @@ class GovernanceBacktestRunner:
 
         order_preview = []
         if orders is not None and not orders.empty:
-            order_cols = [column for column in ["symbol", "side", "delta_weight", "reason", "priority"] if column in orders.columns]
+            order_cols = [
+                column
+                for column in [
+                    "symbol",
+                    "side",
+                    "delta_weight",
+                    "reason",
+                    "priority",
+                    "position_state",
+                    "add_layer",
+                    "entry_matrix_score",
+                ]
+                if column in orders.columns
+            ]
             for _, row in orders.loc[:, order_cols].head(10).iterrows():
                 order_preview.append({key: row.get(key) for key in order_cols})
         order_reason_summary = _top_value_counts(
@@ -683,6 +979,7 @@ class GovernanceBacktestRunner:
         account_net_value = nav_amount / max(float(self.initial_cash), 1e-12)
         excess_net_value = account_net_value / max(float(benchmark_nav), 1e-12)
         trailing_sell_accuracy_5d = self._trailing_trade_accuracy(date, side="sell", horizon_days=5, lookback_trades=60)
+        trade_summary = self._rolling_trade_pair_summary(date)
         lifecycle_alert_count = int(
             sum(
                 bool(row.get("profit_giveback_flag", False)) or bool(row.get("post_entry_failure_flag", False))
@@ -717,6 +1014,12 @@ class GovernanceBacktestRunner:
             "effective_target_exposure_cap": float(diagnostics.get("effective_target_exposure_cap", 0.0)),
             "exposure_authorization_tier": str(diagnostics.get("exposure_authorization_tier", "")),
             "exposure_authorization_block_reasons": str(diagnostics.get("exposure_authorization_block_reasons", "")),
+            "governance_control_mode": self.governance_control_mode,
+            "reputation_control_enabled": bool(self._control_enabled("reputation")),
+            "regime_control_enabled": bool(self._control_enabled("regime")),
+            "cooldown_control_enabled": bool(self._control_enabled("cooldown")),
+            "hard_stop_control_enabled": bool(self._control_enabled("hard_stop_exit")),
+            "alpha_collapse_exit_enabled": bool(self.alpha_collapse_exit_enabled),
             "regime_overlay_mode": str(diagnostics.get("regime_overlay_mode", self.regime_overlay_mode)),
             "regime_overlay_capped": bool(diagnostics.get("regime_overlay_capped", False)),
             "authorization_expected_edge_10d_mean": _safe_float(diagnostics.get("authorization_expected_edge_10d_mean"), default=0.0),
@@ -735,10 +1038,35 @@ class GovernanceBacktestRunner:
             "module_candidate_score_mean": _safe_numeric_mean(candidates.get("module_candidate_score")),
             "module_entry_score_mean": _safe_numeric_mean(candidates.get("module_entry_score")),
             "module_hold_score_mean": _safe_numeric_mean(candidates.get("module_hold_score")),
+            "entry_alpha_score_mean": _safe_numeric_mean(candidates.get("entry_alpha_score")),
+            "entry_timing_score_mean": _safe_numeric_mean(candidates.get("entry_timing_score")),
+            "entry_liquidity_score_mean": _safe_numeric_mean(candidates.get("entry_liquidity_score")),
+            "entry_matrix_score_mean": _safe_numeric_mean(candidates.get("entry_matrix_score")),
+            "alpha_quality_score_mean": _safe_numeric_mean(candidates.get("alpha_quality_score")),
+            "surge_capture_score_mean": _safe_numeric_mean(candidates.get("surge_capture_score")),
+            "follow_through_score_mean": _safe_numeric_mean(candidates.get("follow_through_score")),
+            "exhaustion_score_mean": _safe_numeric_mean(candidates.get("exhaustion_score")),
+            "entry_success_probability_mean": _safe_numeric_mean(candidates.get("entry_success_probability")),
+            "empirical_distribution_score_mean": _safe_numeric_mean(candidates.get("empirical_distribution_score")),
+            "final_entry_score_mean": _safe_numeric_mean(candidates.get("final_entry_score")),
+            "tail_risk_proxy_mean": _safe_numeric_mean(candidates.get("tail_risk_proxy")),
+            "trend_direction_score_mean": _safe_numeric_mean(candidates.get("trend_direction_score")),
+            "peak_decay_score_mean": _safe_numeric_mean(candidates.get("peak_decay_score")),
+            "profit_protection_pressure_mean": _safe_numeric_mean(candidates.get("profit_protection_pressure")),
+            "future_loss_risk_score_mean": _safe_numeric_mean(candidates.get("future_loss_risk_score")),
+            "downtrend_decay_score_mean": _safe_numeric_mean(candidates.get("downtrend_decay_score")),
+            "post_entry_failure_score_mean": _safe_numeric_mean(candidates.get("post_entry_failure_score")),
             "orderflow_candidate_pass_count": int(candidates.get("orderflow_candidate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "reversal_confirm_pass_count": int(candidates.get("reversal_confirm_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "breakout_gate_pass_count": int(candidates.get("breakout_gate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
-            "breakout_probability_bucket_pass_count": int(candidates.get("breakout_probability_bucket_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "surge_candidate_count": int(candidates.get("surge_buy_flag", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "strong_starter_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("starter_strong").sum()),
+            "starter_2_lot_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("starter_2_lot").sum()),
+            "diversify_1_lot_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("diversify_1_lot").sum()),
+            "exhaustion_block_count": int(pd.to_numeric(candidates.get("exhaustion_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0).ge(float(GOVERNANCE_EXHAUSTION_BUY_MAX)).sum()),
+            "downtrend_decay_count": int(pd.to_numeric(candidates.get("downtrend_decay_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0).ge(float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK)).sum()),
+            "protecting_profit_count": int(candidates.get("position_state", pd.Series("", index=candidates.index)).astype(str).str.lower().eq("protecting_profit").sum()),
+            "buy_sell_conflict_cooldown_days": int(GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS),
             "exposure_gap": float(diagnostics.get("exposure_gap", 0.0)),
             "catchup_allowed": bool(diagnostics.get("catchup_allowed", False)),
             "catchup_buy_budget": float(diagnostics.get("catchup_buy_budget", 0.0)),
@@ -747,6 +1075,20 @@ class GovernanceBacktestRunner:
             "accuracy_multiplier": _safe_float(diagnostics.get("accuracy_multiplier"), default=0.0),
             "trailing_buy_accuracy_5d": _safe_float(diagnostics.get("trailing_buy_accuracy_5d"), default=float("nan")),
             "trailing_sell_accuracy_5d": _safe_float(trailing_sell_accuracy_5d, default=float("nan")),
+            "closed_trade_count": int(trade_summary.get("realized_trade_count", 0) or 0),
+            "closed_trade_win_rate": _safe_float(trade_summary.get("closed_trade_win_rate"), default=float("nan")),
+            "realized_pnl": _safe_float(trade_summary.get("realized_pnl"), default=0.0),
+            "gross_profit": _safe_float(trade_summary.get("gross_profit"), default=0.0),
+            "gross_loss": _safe_float(trade_summary.get("gross_loss"), default=0.0),
+            "avg_win": _safe_float(trade_summary.get("avg_win"), default=float("nan")),
+            "avg_loss": _safe_float(trade_summary.get("avg_loss"), default=float("nan")),
+            "payoff_ratio": _safe_float(trade_summary.get("payoff_ratio"), default=float("nan")),
+            "profit_factor": _safe_float(trade_summary.get("profit_factor"), default=float("nan")),
+            **_control_avoided_loss_summary(
+                pd.DataFrame(self.execution_rows),
+                self.features,
+                as_of=pd.Timestamp(date),
+            ),
             "best_replacement_edge_10d": _safe_float(diagnostics.get("best_replacement_edge_10d"), default=0.0),
             "replacement_opportunity_sell_count": int(diagnostics.get("replacement_opportunity_sell_count", 0)),
             "profit_giveback_observation_count": int(diagnostics.get("profit_giveback_observation_count", 0)),
@@ -771,6 +1113,11 @@ class GovernanceBacktestRunner:
             "order_count": int(len(orders)) if orders is not None else 0,
             "order_reason_summary": order_reason_summary,
             "pending_order_count": int(len(pending_preview)),
+            "retail_order_count": int(diagnostics.get("retail_order_count", 0)),
+            "retail_upgraded_to_one_lot_count": int(diagnostics.get("retail_upgraded_to_one_lot_count", 0)),
+            "retail_blocked_count": int(diagnostics.get("retail_blocked_count", 0)),
+            "retail_lot_cash_insufficient_count": int(diagnostics.get("retail_lot_cash_insufficient_count", 0)),
+            "retail_state_block_count": int(diagnostics.get("retail_state_block_count", 0)),
             "candidate_preview": candidate_preview,
             "confirmed_preview": confirmed_preview,
             "order_preview": order_preview,
@@ -781,7 +1128,7 @@ class GovernanceBacktestRunner:
             "holding_lifecycle_preview": lifecycle_preview,
             "lifecycle_alert_count": lifecycle_alert_count,
             "regime": getattr(regime_params, "regime_name", "default") if regime_params is not None else "default",
-            "top_n": getattr(regime_params, "max_positions", GOVERNANCE_DEFAULT_TOP_N) if regime_params is not None else GOVERNANCE_DEFAULT_TOP_N,
+            "top_n": self._max_positions_override or (getattr(regime_params, "max_positions", GOVERNANCE_DEFAULT_TOP_N) if regime_params is not None else GOVERNANCE_DEFAULT_TOP_N),
             "turnover_budget": float(turnover_budget),
         }
 
@@ -850,9 +1197,63 @@ class GovernanceBacktestRunner:
         return rows
 
     def _proposal_reputation_weights(self) -> dict[str, float]:
+        if not self._control_enabled("reputation"):
+            return {model_name: 1.0 for model_name in self.alpha_models}
         if str(self.selection_weight_mode).lower() in {"role_balanced", "reputation_auxiliary", "no_reputation_selection"}:
             return {model_name: 1.0 for model_name in self.alpha_models}
         return self.reputation.weights()
+
+    def _apply_optional_exit_controls(self, candidates: pd.DataFrame) -> pd.DataFrame:
+        if candidates is None or candidates.empty:
+            return candidates
+        data = candidates.copy()
+        alpha_exit = data.get("alpha_collapse_exit", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+        data["paper_alpha_collapse_exit"] = alpha_exit
+        if not self.alpha_collapse_exit_enabled:
+            data["alpha_collapse_exit"] = False
+        return data
+
+    def _control_enabled(self, control_name: str) -> bool:
+        mode = str(self.governance_control_mode or "normal").lower()
+        control = str(control_name or "").lower()
+        if mode == "normal":
+            return True
+        if mode == "factor_only":
+            return control not in {
+                "reputation",
+                "regime",
+                "regime_overlay",
+                "cooldown",
+                "profit_giveback_exit",
+                "signal_failure_exit",
+                "stale_exit",
+                "post_entry_failure_exit",
+                "hard_stop_exit",
+            }
+        if mode == "safe_factor_only":
+            return control not in {
+                "reputation",
+                "regime",
+                "regime_overlay",
+                "cooldown",
+                "profit_giveback_exit",
+                "signal_failure_exit",
+                "stale_exit",
+                "post_entry_failure_exit",
+            }
+        if mode == "paper_controls":
+            return control not in {
+                "reputation",
+                "regime",
+                "regime_overlay",
+                "cooldown",
+                "profit_giveback_exit",
+                "signal_failure_exit",
+                "stale_exit",
+                "post_entry_failure_exit",
+                "hard_stop_exit",
+            }
+        return True
 
     def _holding_price_paths(self, *, date) -> list[dict]:
         if not getattr(self, "_last_position_mark_rows", None):
@@ -866,7 +1267,7 @@ class GovernanceBacktestRunner:
         if not symbols:
             return []
         end_date = pd.Timestamp(date)
-        start_date = end_date - pd.Timedelta(days=120)
+        start_date = end_date - pd.Timedelta(days=270)
         close_col = "close_nominal" if "close_nominal" in self.features.columns else "close"
         prices = self.features[
             self.features["symbol"].astype(str).isin(symbols)
@@ -877,27 +1278,64 @@ class GovernanceBacktestRunner:
         prices[close_col] = pd.to_numeric(prices[close_col], errors="coerce")
         prices = prices.dropna(subset=["date", "symbol", close_col]).sort_values(["symbol", "date"])
         paths = []
+        lifecycle_by_symbol = {
+            str(row.get("symbol", "")): row
+            for row in getattr(self, "_last_position_mark_rows", []) or []
+        }
         for symbol, group in prices.groupby("symbol", sort=False):
-            group = group.tail(90)
+            group = group.tail(180)
             close = pd.to_numeric(group[close_col], errors="coerce").dropna()
             initial = float(close.iloc[0]) if not close.empty and float(close.iloc[0]) > 0 else 0.0
             if initial <= 0:
                 continue
+            lifecycle = lifecycle_by_symbol.get(str(symbol), {})
+            entry_date = pd.to_datetime(lifecycle.get("entry_date"), errors="coerce")
+            entry_price = _safe_float(lifecycle.get("entry_price"), default=0.0)
+            if entry_price <= 0.0:
+                entry_price = _safe_float(lifecycle.get("price"), default=0.0)
+            latest_price = _safe_float(lifecycle.get("price"), default=0.0)
+            entry_index = None
             points = [
                 {
                     "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
                     "value": float(row[close_col]) / initial,
+                    "entry_value": float(row[close_col]) / entry_price if entry_price > 0.0 else None,
                 }
                 for _, row in group.iterrows()
                 if pd.notna(row[close_col])
             ]
+            if pd.notna(entry_date):
+                entry_date_ts = pd.Timestamp(entry_date)
+                for idx, point in enumerate(points):
+                    if pd.Timestamp(point["date"]) >= entry_date_ts:
+                        entry_index = idx
+                        break
             if len(points) >= 2:
-                paths.append({"symbol": str(symbol), "points": points})
+                paths.append(
+                    {
+                        "symbol": str(symbol),
+                        "entry_date": entry_date.strftime("%Y-%m-%d") if pd.notna(entry_date) else "",
+                        "entry_price": float(entry_price) if entry_price > 0.0 else None,
+                        "latest_price": float(latest_price) if latest_price > 0.0 else None,
+                        "unrealized_return": _safe_float(lifecycle.get("unrealized_return"), default=float("nan")),
+                        "entry_index": entry_index,
+                        "points": points,
+                    }
+                )
         return paths
 
     def _holding_lifecycle_preview(self) -> list[dict]:
         rows = []
+        latest_state_by_symbol = {}
+        if self.position_state_rows:
+            latest_date = max(pd.Timestamp(row.get("date")) for row in self.position_state_rows if row.get("date") is not None)
+            latest_state_by_symbol = {
+                str(row.get("symbol", "")): row
+                for row in self.position_state_rows
+                if pd.Timestamp(row.get("date")) == latest_date
+            }
         for row in getattr(self, "_last_position_mark_rows", []) or []:
+            state = latest_state_by_symbol.get(str(row.get("symbol", "")), {})
             rows.append(
                 {
                     "symbol": str(row.get("symbol", "")),
@@ -908,8 +1346,18 @@ class GovernanceBacktestRunner:
                     "mfe": _safe_float(row.get("mfe"), default=0.0),
                     "mae": _safe_float(row.get("mae"), default=0.0),
                     "giveback_from_peak": _safe_float(row.get("giveback_from_peak"), default=0.0),
+                    "trend_direction_score": _safe_float(row.get("trend_direction_score"), default=0.0),
+                    "peak_decay_score": _safe_float(row.get("peak_decay_score"), default=0.0),
+                    "profit_protection_pressure": _safe_float(row.get("profit_protection_pressure"), default=0.0),
+                    "dynamic_giveback_limit": _safe_float(row.get("dynamic_giveback_limit"), default=0.0),
+                    "future_loss_risk_score": _safe_float(row.get("future_loss_risk_score"), default=0.0),
                     "profit_giveback_flag": bool(row.get("profit_giveback_flag", False)),
                     "post_entry_failure_flag": bool(row.get("post_entry_failure_flag", False)),
+                    "position_state": state.get("position_state", ""),
+                    "add_allowed": bool(state.get("add_allowed", False)),
+                    "add_block_reason": state.get("add_block_reason", ""),
+                    "position_exit_reason": state.get("position_exit_reason", ""),
+                    "cooldown_until": state.get("cooldown_until", ""),
                 }
             )
         return sorted(rows, key=lambda item: float(item.get("market_value", 0.0)), reverse=True)[:12]
@@ -956,7 +1404,7 @@ class GovernanceBacktestRunner:
         data["date_norm"] = data["date"].dt.normalize()
         return data.drop_duplicates("date_norm", keep="last").set_index("date_norm")["benchmark_nav"].astype(float).to_dict()
 
-    def _update_lifecycle_on_buy(self, symbol: str, *, date, price: float, shares: float, current) -> None:
+    def _update_lifecycle_on_buy(self, symbol: str, *, date, price: float, shares: float, current, signal=None) -> None:
         symbol = str(symbol)
         price = float(price)
         shares = float(shares)
@@ -971,11 +1419,27 @@ class GovernanceBacktestRunner:
         else:
             entry_price = price
             entry_date = pd.Timestamp(date)
+        signal = signal if signal is not None else {}
+        entry_alpha_quality = _safe_float(
+            signal.get("alpha_quality_score") if hasattr(signal, "get") else pd.NA,
+            default=float(existing.get("entry_alpha_quality_score", 0.0)) if existing else 0.0,
+        )
         self.position_lifecycle[symbol] = {
             "entry_date": pd.Timestamp(entry_date),
             "entry_price": float(entry_price),
             "peak_price": max(float(existing.get("peak_price", price)) if existing else price, price),
             "trough_price": min(float(existing.get("trough_price", price)) if existing else price, price),
+            "buy_count": int(existing.get("buy_count", 1) + 1) if existing and previous_shares > 0.0 else 1,
+            "last_buy_date": pd.Timestamp(date),
+            "entry_alpha_quality_score": (
+                float(existing.get("entry_alpha_quality_score", entry_alpha_quality))
+                if existing and previous_shares > 0.0
+                else float(entry_alpha_quality)
+            ),
+            "latest_buy_alpha_quality_score": entry_alpha_quality,
+            "entry_matrix_score": _safe_float(signal.get("entry_matrix_score") if hasattr(signal, "get") else pd.NA, default=0.0),
+            "entry_timing_score": _safe_float(signal.get("entry_timing_score") if hasattr(signal, "get") else pd.NA, default=0.0),
+            "entry_size_tier": str(signal.get("entry_size_tier", "") if hasattr(signal, "get") else ""),
         }
 
     def _mark_lifecycle(self, symbol: str, *, date, price: float) -> dict:
@@ -990,8 +1454,14 @@ class GovernanceBacktestRunner:
                 "mfe": pd.NA,
                 "mae": pd.NA,
                 "giveback_from_peak": pd.NA,
+                "trend_direction_score": pd.NA,
+                "peak_decay_score": pd.NA,
+                "profit_protection_pressure": pd.NA,
+                "dynamic_giveback_limit": pd.NA,
+                "future_loss_risk_score": pd.NA,
                 "profit_giveback_flag": False,
                 "post_entry_failure_flag": False,
+                "entry_alpha_quality_score": pd.NA,
             }
         state["peak_price"] = max(float(state.get("peak_price", price)), price)
         state["trough_price"] = min(float(state.get("trough_price", price)), price)
@@ -1002,6 +1472,26 @@ class GovernanceBacktestRunner:
         mae = float(state["trough_price"]) / entry_price - 1.0 if entry_price > 0.0 else 0.0
         giveback = (mfe - unrealized) / max(mfe, 1e-12) if mfe > 0.0 else 0.0
         holding_days = int(self.holding_days.get(symbol, 0))
+        market_shape = self._lifecycle_market_shape(symbol=symbol, date=date, entry_price=entry_price, peak_price=float(state["peak_price"]))
+        trend_direction_score = _safe_float(market_shape.get("trend_direction_score"), default=0.50)
+        peak_decay_score = _safe_float(market_shape.get("peak_decay_score"), default=0.0)
+        dynamic_giveback_limit = _dynamic_giveback_limit(
+            mfe=mfe,
+            trend_direction_score=trend_direction_score,
+            peak_decay_score=peak_decay_score,
+            orderflow_decay_score=0.0,
+        )
+        profit_protection_pressure = _clip01(
+            0.45 * (giveback / max(dynamic_giveback_limit, 1e-12))
+            + 0.30 * peak_decay_score
+            + 0.25 * (1.0 - trend_direction_score)
+        ) if mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1) else 0.0
+        future_loss_risk_score = _clip01(
+            0.35 * peak_decay_score
+            + 0.30 * (1.0 - trend_direction_score)
+            + 0.20 * max(-unrealized / 0.12, 0.0)
+            + 0.15 * max(giveback - dynamic_giveback_limit, 0.0) / max(1.0 - dynamic_giveback_limit, 1e-12)
+        )
         return {
             "entry_date": entry_date,
             "entry_price": entry_price,
@@ -1009,8 +1499,70 @@ class GovernanceBacktestRunner:
             "mfe": float(mfe),
             "mae": float(mae),
             "giveback_from_peak": float(giveback),
-            "profit_giveback_flag": bool(mfe >= 0.08 and giveback >= 0.45 and holding_days >= 3),
+            "trend_direction_score": float(trend_direction_score),
+            "peak_decay_score": float(peak_decay_score),
+            "profit_protection_pressure": float(profit_protection_pressure),
+            "dynamic_giveback_limit": float(dynamic_giveback_limit),
+            "future_loss_risk_score": float(future_loss_risk_score),
+            "profit_giveback_flag": bool(mfe >= 0.08 and giveback >= dynamic_giveback_limit and holding_days >= 3),
             "post_entry_failure_flag": bool(holding_days >= 6 and mfe < 0.02 and unrealized < -0.02),
+            "entry_alpha_quality_score": state.get("entry_alpha_quality_score", pd.NA),
+        }
+
+    def _lifecycle_market_shape(self, *, symbol: str, date, entry_price: float, peak_price: float) -> dict:
+        history = self._close_history(str(symbol))
+        if history.empty:
+            return {"trend_direction_score": 0.50, "peak_decay_score": 0.0}
+        data = history.copy()
+        data["date"] = pd.to_datetime(data["date"], errors="coerce")
+        data["close"] = pd.to_numeric(data["close"], errors="coerce")
+        data = data.dropna(subset=["date", "close"])
+        data = data[data["date"] <= pd.Timestamp(date)].tail(60).copy()
+        if len(data) < 8:
+            return {"trend_direction_score": 0.50, "peak_decay_score": 0.0}
+        close = data["close"].astype(float).reset_index(drop=True)
+        latest = float(close.iloc[-1])
+        ma5 = close.rolling(5, min_periods=3).mean()
+        ma10 = close.rolling(10, min_periods=5).mean()
+        ma20 = close.rolling(20, min_periods=10).mean()
+        ma_slope = 0.0
+        if len(ma20.dropna()) >= 6:
+            ma_slope = float(ma20.dropna().iloc[-1] / max(ma20.dropna().iloc[-6], 1e-12) - 1.0)
+        recent = close.tail(10)
+        previous = close.iloc[-25:-10] if len(close) >= 25 else close.iloc[:-10]
+        recent_high = float(recent.max())
+        recent_low = float(recent.min())
+        previous_high = float(previous.max()) if len(previous) else recent_high
+        previous_low = float(previous.min()) if len(previous) else recent_low
+        higher_high_low_score = _clip01(
+            0.50
+            + 5.0 * (recent_high / max(previous_high, 1e-12) - 1.0)
+            + 5.0 * (recent_low / max(previous_low, 1e-12) - 1.0)
+        )
+        ma_slope_score = _clip01(0.50 + 8.0 * ma_slope)
+        twenty_high = float(close.tail(20).max())
+        twenty_low = float(close.tail(20).min())
+        pullback_recovery_score = _clip01((latest - twenty_low) / max(twenty_high - twenty_low, 1e-12))
+        short_ma_reclaim_score = _clip01(0.50 + 0.25 * (latest >= float(ma5.iloc[-1])) + 0.25 * (latest >= float(ma10.iloc[-1])))
+        drawdown_from_peak = max(float(peak_price) - latest, 0.0) / max(float(peak_price), 1e-12)
+        trend_direction_score = _clip01(
+            0.25 * higher_high_low_score
+            + 0.25 * ma_slope_score
+            + 0.20 * pullback_recovery_score
+            + 0.15 * short_ma_reclaim_score
+            + 0.15 * (1.0 - min(drawdown_from_peak / 0.20, 1.0))
+        )
+        peak_lower_ratio = max(float(peak_price) - recent_high, 0.0) / max(float(peak_price), 1e-12)
+        below_ma20 = 1.0 if pd.notna(ma20.iloc[-1]) and latest < float(ma20.iloc[-1]) else 0.0
+        peak_decay_score = _clip01(
+            0.35 * min(drawdown_from_peak / 0.12, 1.0)
+            + 0.30 * min(peak_lower_ratio / 0.04, 1.0)
+            + 0.20 * (1.0 - trend_direction_score)
+            + 0.15 * below_ma20
+        )
+        return {
+            "trend_direction_score": float(trend_direction_score),
+            "peak_decay_score": float(peak_decay_score),
         }
 
     def _attach_position_lifecycle_signals(self, candidates: pd.DataFrame, *, date) -> pd.DataFrame:
@@ -1027,6 +1579,13 @@ class GovernanceBacktestRunner:
                 "position_mfe": row.get("mfe", pd.NA),
                 "position_mae": row.get("mae", pd.NA),
                 "position_giveback_from_peak": row.get("giveback_from_peak", pd.NA),
+                "trend_direction_score": row.get("trend_direction_score", pd.NA),
+                "peak_decay_score": row.get("peak_decay_score", pd.NA),
+                "profit_protection_pressure": row.get("profit_protection_pressure", pd.NA),
+                "dynamic_giveback_limit": row.get("dynamic_giveback_limit", pd.NA),
+                "future_loss_risk_score": row.get("future_loss_risk_score", pd.NA),
+                "position_holding_days": int(self.holding_days.get(symbol, 0)),
+                "position_entry_alpha_quality_score": row.get("entry_alpha_quality_score", pd.NA),
             }
         for column, default in (
             ("profit_giveback_exit", False),
@@ -1035,10 +1594,682 @@ class GovernanceBacktestRunner:
             ("position_mfe", pd.NA),
             ("position_mae", pd.NA),
             ("position_giveback_from_peak", pd.NA),
+            ("trend_direction_score", pd.NA),
+            ("peak_decay_score", pd.NA),
+            ("profit_protection_pressure", pd.NA),
+            ("dynamic_giveback_limit", pd.NA),
+            ("future_loss_risk_score", pd.NA),
+            ("position_holding_days", 0),
+            ("position_entry_alpha_quality_score", pd.NA),
         ):
             data[column] = data["symbol"].astype(str).map(lambda symbol: flags.get(symbol, {}).get(column, default))
-        data["post_entry_failure_exit"] = _confirm_post_entry_failure(data)
+        data["post_entry_failure_score"] = _post_entry_failure_score(data)
+        data["post_entry_failure_exit"] = data["post_entry_failure_score"].ge(float(GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE))
         return data
+
+    def _apply_position_state_constraints(self, candidates: pd.DataFrame, *, date, exposure: dict) -> pd.DataFrame:
+        if candidates is None or candidates.empty:
+            return candidates
+        data = candidates.copy()
+        date_ts = pd.Timestamp(date)
+        self._expire_position_cooldowns(date_ts)
+        held_symbols = set(self.positions)
+        nominal_nav = max(float(exposure.get("nominal_nav", 0.0) or 0.0), 1e-12)
+        current_weights = {
+            str(row.get("symbol", "")): float(row.get("market_value", 0.0) or 0.0) / nominal_nav
+            for row in getattr(self, "_last_position_mark_rows", []) or []
+        }
+        state_rows = []
+        max_layers = self._max_add_layers()
+        add_gaps = tuple(float(value) for value in GOVERNANCE_LAYER_ADD_GAPS)
+        layer_weights = tuple(float(value) for value in GOVERNANCE_LAYER_WEIGHTS)
+
+        defaults = {
+            "position_state": "new",
+            "exit_state": False,
+            "position_exit_reason": "",
+            "cooldown_active": False,
+            "cooldown_until": pd.NaT,
+            "cooldown_reason": "",
+            "cooldown_override": False,
+            "protecting_profit": False,
+            "profit_protection_triggered": False,
+            "buy_sell_conflict_cooldown_days": int(GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS),
+            "add_allowed": False,
+            "add_block_reason": "not_held",
+            "add_layer": 0,
+            "add_budget": 0.0,
+            "hard_stop_exit": False,
+            "profit_hard_stop_exit": False,
+            "signal_failure_exit": False,
+            "stale_time_reduce": False,
+            "stale_time_exit": False,
+            "trend_direction_score": pd.NA,
+            "peak_decay_score": pd.NA,
+            "profit_protection_pressure": pd.NA,
+            "dynamic_giveback_limit": pd.NA,
+            "future_loss_risk_score": pd.NA,
+        }
+        for column, default in defaults.items():
+            if column not in data.columns:
+                data[column] = default
+
+        for idx, row in data.iterrows():
+            symbol = str(row.get("symbol", ""))
+            is_held = symbol in held_symbols
+            lifecycle = self.position_lifecycle.get(symbol, {})
+            holding_days = int(self.holding_days.get(symbol, 0))
+            unrealized = _safe_float(row.get("position_unrealized_return"), default=0.0)
+            mfe = _safe_float(row.get("position_mfe"), default=0.0)
+            giveback = _safe_float(row.get("position_giveback_from_peak"), default=0.0)
+            entry_score = _safe_float(row.get("entry_matrix_score"), default=0.0)
+            alpha_quality_score = _safe_float(row.get("alpha_quality_score"), default=entry_score)
+            entry_alpha_quality_at_buy = _safe_float(row.get("position_entry_alpha_quality_score"), default=alpha_quality_score)
+            alpha_quality_drop_from_entry = max(entry_alpha_quality_at_buy - alpha_quality_score, 0.0)
+            surge_score = _safe_float(row.get("surge_capture_score"), default=0.0)
+            follow_through_score = _safe_float(row.get("follow_through_score"), default=0.0)
+            exhaustion_score = _safe_float(row.get("exhaustion_score"), default=0.0)
+            entry_success_probability = _safe_float(row.get("entry_success_probability"), default=0.0)
+            empirical_distribution_score = _safe_float(row.get("empirical_distribution_score"), default=0.0)
+            final_entry_score = _safe_float(row.get("final_entry_score"), default=entry_score)
+            tail_risk_proxy = _safe_float(row.get("tail_risk_proxy"), default=0.0)
+            downtrend_score = _safe_float(row.get("downtrend_decay_score"), default=0.0)
+            post_entry_failure_score = _safe_float(row.get("post_entry_failure_score"), default=0.0)
+            trend_score = _safe_float(row.get("trend_stability_score"), default=0.0)
+            volume_score = _safe_float(row.get("volume_health_score"), default=0.0)
+            trend_direction_score = _safe_float(row.get("trend_direction_score"), default=0.50)
+            peak_decay_score = _safe_float(row.get("peak_decay_score"), default=0.0)
+            orderflow_score = _safe_float(row.get("orderflow_candidate_score"), default=0.50)
+            orderflow_decay_score = max(0.55 - orderflow_score, 0.0) / 0.55
+            dynamic_giveback_limit = _dynamic_giveback_limit(
+                mfe=mfe,
+                trend_direction_score=trend_direction_score,
+                peak_decay_score=peak_decay_score,
+                orderflow_decay_score=orderflow_decay_score,
+            )
+            profit_protection_pressure = _clip01(
+                0.40 * (giveback / max(dynamic_giveback_limit, 1e-12))
+                + 0.25 * peak_decay_score
+                + 0.20 * (1.0 - trend_direction_score)
+                + 0.15 * orderflow_decay_score
+            ) if mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1) else 0.0
+            future_loss_risk_score = _clip01(
+                0.30 * peak_decay_score
+                + 0.25 * (1.0 - trend_direction_score)
+                + 0.20 * downtrend_score
+                + 0.15 * tail_risk_proxy
+                + 0.10 * post_entry_failure_score
+            )
+            account_weight = float(current_weights.get(symbol, 0.0) or 0.0)
+            cooldown = self.position_cooldowns.get(symbol)
+            cooldown_active = bool(cooldown and pd.Timestamp(cooldown.get("cooldown_until")) >= date_ts)
+            cooldown_override = bool(
+                cooldown_active
+                and entry_score >= float(GOVERNANCE_ENTRY_MATRIX_EXTREME_THRESHOLD)
+                and trend_score >= 0.55
+                and volume_score >= 0.55
+            )
+
+            net_unrealized = float(unrealized) - _governance_round_trip_cost_rate()
+            net_mfe = float(mfe) - _governance_round_trip_cost_rate()
+            hard_stop = bool(
+                is_held
+                and net_mfe >= float(GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER)
+                and net_unrealized >= float(GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT)
+                and (net_mfe - net_unrealized) / max(net_mfe, 1e-12) >= float(GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK)
+            )
+            profit_giveback = bool(
+                is_held
+                and mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1)
+                and giveback >= dynamic_giveback_limit
+                and profit_protection_pressure >= 0.70
+            )
+            protecting_profit = bool(
+                is_held
+                and holding_days >= int(GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS)
+                and mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1)
+                and not hard_stop
+                and not profit_giveback
+            )
+            peak_decay_exit = bool(
+                is_held
+                and holding_days >= int(GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS)
+                and mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1)
+                and peak_decay_score >= 0.62
+                and trend_direction_score < 0.48
+                and giveback >= max(dynamic_giveback_limit * 0.75, 0.18)
+            )
+            signal_failure = bool(
+                is_held
+                and holding_days >= int(GOVERNANCE_STALE_WATCH_DAYS)
+                and entry_score < float(GOVERNANCE_ENTRY_MATRIX_EXIT_DECAY_THRESHOLD)
+                and trend_score < 0.45
+            )
+            downtrend_exit = bool(
+                is_held
+                and downtrend_score >= float(GOVERNANCE_DOWNTREND_DECAY_EXIT)
+                and follow_through_score < 0.45
+            )
+            stale_reduce = bool(is_held and holding_days >= int(GOVERNANCE_STALE_REDUCE_DAYS) and unrealized <= 0.0)
+            stale_exit = bool(is_held and holding_days >= int(GOVERNANCE_STALE_EXIT_DAYS) and unrealized <= 0.0)
+
+            exit_reason = ""
+            if hard_stop:
+                exit_reason = "profit_hard_stop_exit"
+            elif profit_giveback:
+                exit_reason = "profit_giveback_exit"
+            elif peak_decay_exit:
+                exit_reason = "profit_giveback_exit"
+            elif bool(row.get("post_entry_failure_exit", False)):
+                exit_reason = "post_entry_failure_exit"
+            elif downtrend_exit:
+                exit_reason = "signal_failure_exit"
+            elif stale_exit:
+                exit_reason = "stale_time_exit"
+            elif signal_failure:
+                exit_reason = "signal_failure_exit"
+            paper_exit_reason = exit_reason
+            if exit_reason in {"hard_stop_exit", "profit_hard_stop_exit"} and not self._control_enabled("hard_stop_exit"):
+                exit_reason = ""
+            elif exit_reason == "profit_giveback_exit" and not self._control_enabled("profit_giveback_exit"):
+                exit_reason = ""
+            elif exit_reason == "post_entry_failure_exit" and not self._control_enabled("post_entry_failure_exit"):
+                exit_reason = ""
+            elif exit_reason in {"signal_failure_exit", "stale_time_exit", "stale_time_reduce"} and not self._control_enabled("signal_failure_exit"):
+                exit_reason = ""
+            exit_state = bool(exit_reason)
+
+            buy_count = int(lifecycle.get("buy_count", 1 if is_held else 0) or 0)
+            next_layer = min(buy_count + 1, max_layers)
+            add_allowed = False
+            add_block_reason = "not_held"
+            if is_held:
+                if exit_state:
+                    add_block_reason = f"exit_state:{exit_reason}"
+                elif stale_reduce and self._control_enabled("stale_exit"):
+                    add_block_reason = "stale_time_reduce"
+                elif cooldown_active and not cooldown_override and self._control_enabled("cooldown"):
+                    add_block_reason = "cooldown_active"
+                elif protecting_profit:
+                    add_block_reason = "protecting_profit_no_add"
+                elif buy_count >= max_layers:
+                    add_block_reason = "max_layers_reached"
+                elif entry_score < 0.65:
+                    add_block_reason = "entry_matrix_score_low"
+                elif downtrend_score >= float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK):
+                    add_block_reason = "downtrend_decay_block"
+                elif exhaustion_score >= float(GOVERNANCE_EXHAUSTION_ADD_MAX):
+                    add_block_reason = "exhaustion_block"
+                elif post_entry_failure_score >= 0.55:
+                    add_block_reason = "post_entry_failure_risk"
+                elif alpha_quality_score < 0.68:
+                    add_block_reason = "alpha_quality_low"
+                elif trend_score < 0.40:
+                    add_block_reason = "trend_stability_low"
+                elif volume_score < 0.40:
+                    add_block_reason = "volume_health_low"
+                elif account_weight >= float(self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT) or GOVERNANCE_MAX_POSITION_WEIGHT):
+                    add_block_reason = "single_name_account_cap"
+                else:
+                    gap_index = min(max(buy_count - 1, 0), len(add_gaps) - 1)
+                    if unrealized <= add_gaps[gap_index]:
+                        add_allowed = True
+                        add_block_reason = "allowed"
+                    else:
+                        add_block_reason = "add_gap_not_reached"
+
+            if is_held:
+                if exit_state:
+                    position_state = "exiting"
+                elif protecting_profit:
+                    position_state = "protecting_profit"
+                else:
+                    position_state = "adding" if add_allowed else "holding"
+            elif cooldown_active and not cooldown_override and self._control_enabled("cooldown"):
+                position_state = "cooldown"
+            elif exhaustion_score >= float(GOVERNANCE_EXHAUSTION_BUY_MAX):
+                position_state = "watching" if entry_score >= float(GOVERNANCE_ENTRY_MATRIX_WATCH_THRESHOLD) else "blocked"
+            elif str(row.get("entry_size_tier", "")).strip().lower() == "starter_strong":
+                position_state = "strong_building"
+            elif (
+                str(row.get("entry_size_tier", "")).strip().lower() in {"starter_1_lot", "starter_2_lot", "diversify_1_lot"}
+                and bool(row.get("entry_confirmed", False))
+            ):
+                position_state = "building"
+            elif bool(row.get("direct_buy_flag", False)) or bool(row.get("surge_buy_flag", False)):
+                position_state = "building"
+            elif bool(row.get("watchlist_flag", False)):
+                position_state = "watching"
+            else:
+                position_state = "blocked"
+
+            if not is_held and exhaustion_score >= float(GOVERNANCE_EXHAUSTION_BUY_MAX):
+                data.at[idx, "entry_confirmed"] = False
+                data.at[idx, "entry_block_reason"] = "exhaustion_block"
+            if cooldown_active and not cooldown_override and not is_held and self._control_enabled("cooldown"):
+                data.at[idx, "entry_confirmed"] = False
+                data.at[idx, "entry_block_reason"] = "cooldown_active"
+
+            layer_index = min(max(next_layer - 1, 0), len(layer_weights) - 1)
+            add_budget = float(layer_weights[layer_index]) * float(GOVERNANCE_MAX_POSITION_WEIGHT) if add_allowed else 0.0
+            post_entry_failure = bool(row.get("post_entry_failure_exit", False))
+            updates = {
+                "position_state": position_state,
+                "exit_state": exit_state,
+                "position_exit_reason": exit_reason,
+                "paper_exit_reason": paper_exit_reason,
+                "paper_exit_state": bool(paper_exit_reason),
+                "cooldown_active": cooldown_active and not cooldown_override and self._control_enabled("cooldown"),
+                "paper_cooldown_active": cooldown_active and not cooldown_override,
+                "cooldown_until": cooldown.get("cooldown_until") if cooldown else pd.NaT,
+                "cooldown_reason": cooldown.get("reason", "") if cooldown else "",
+                "cooldown_override": cooldown_override,
+                "protecting_profit": protecting_profit,
+                "profit_protection_triggered": bool(hard_stop or profit_giveback or protecting_profit),
+                "buy_sell_conflict_cooldown_days": int(GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS),
+                "add_allowed": add_allowed,
+                "add_block_reason": add_block_reason,
+                "add_layer": next_layer if is_held else 0,
+                "add_budget": add_budget,
+                "hard_stop_exit": hard_stop and self._control_enabled("hard_stop_exit"),
+                "profit_hard_stop_exit": hard_stop and self._control_enabled("hard_stop_exit"),
+                "paper_hard_stop_exit": hard_stop,
+                "paper_profit_hard_stop_exit": hard_stop,
+                "hard_stop_net_mfe": net_mfe if is_held else pd.NA,
+                "hard_stop_net_unrealized": net_unrealized if is_held else pd.NA,
+                "hard_stop_giveback_from_net_peak": (
+                    (net_mfe - net_unrealized) / max(net_mfe, 1e-12)
+                    if is_held and net_mfe > 0.0
+                    else pd.NA
+                ),
+                "profit_giveback_exit": bool(profit_giveback or peak_decay_exit) and self._control_enabled("profit_giveback_exit"),
+                "paper_profit_giveback_exit": bool(profit_giveback or peak_decay_exit),
+                "post_entry_failure_exit": post_entry_failure and self._control_enabled("post_entry_failure_exit"),
+                "paper_post_entry_failure_exit": post_entry_failure,
+                "signal_failure_exit": bool(signal_failure or downtrend_exit) and self._control_enabled("signal_failure_exit"),
+                "paper_signal_failure_exit": bool(signal_failure or downtrend_exit),
+                "stale_time_reduce": stale_reduce and self._control_enabled("stale_exit"),
+                "paper_stale_time_reduce": stale_reduce,
+                "stale_time_exit": stale_exit and self._control_enabled("stale_exit"),
+                "paper_stale_time_exit": stale_exit,
+                "alpha_quality_score": alpha_quality_score,
+                "surge_capture_score": surge_score,
+                "follow_through_score": follow_through_score,
+                "exhaustion_score": exhaustion_score,
+                "entry_success_probability": entry_success_probability,
+                "empirical_distribution_score": empirical_distribution_score,
+                "final_entry_score": final_entry_score,
+                "tail_risk_proxy": tail_risk_proxy,
+                "trend_direction_score": trend_direction_score,
+                "peak_decay_score": peak_decay_score,
+                "profit_protection_pressure": profit_protection_pressure,
+                "dynamic_giveback_limit": dynamic_giveback_limit,
+                "future_loss_risk_score": future_loss_risk_score,
+                "entry_size_tier": row.get("entry_size_tier", ""),
+                "planned_entry_lots": row.get("planned_entry_lots", pd.NA),
+                "entry_alpha_quality_at_buy": entry_alpha_quality_at_buy if is_held else pd.NA,
+                "alpha_quality_drop_from_entry": alpha_quality_drop_from_entry if is_held else 0.0,
+                "downtrend_decay_score": downtrend_score,
+                "post_entry_failure_score": post_entry_failure_score,
+            }
+            for key, value in updates.items():
+                data.at[idx, key] = value
+            state_rows.append(
+                {
+                    "date": date_ts,
+                    "symbol": symbol,
+                    "held": is_held,
+                    "holding_days": holding_days,
+                    "account_weight": account_weight,
+                    "entry_matrix_score": entry_score,
+                    "trend_stability_score": trend_score,
+                    "volume_health_score": volume_score,
+                    "trend_direction_score": trend_direction_score,
+                    "peak_decay_score": peak_decay_score,
+                    "profit_protection_pressure": profit_protection_pressure,
+                    "dynamic_giveback_limit": dynamic_giveback_limit,
+                    "future_loss_risk_score": future_loss_risk_score,
+                    "unrealized_return": unrealized,
+                    "mfe": mfe,
+                    "giveback_from_peak": giveback,
+                    **updates,
+                }
+            )
+        self.position_state_rows.extend(state_rows)
+        return data
+
+    def _expire_position_cooldowns(self, date) -> None:
+        date_ts = pd.Timestamp(date)
+        expired = [
+            symbol
+            for symbol, payload in self.position_cooldowns.items()
+            if pd.Timestamp(payload.get("cooldown_until")) < date_ts
+        ]
+        for symbol in expired:
+            self.position_cooldowns.pop(symbol, None)
+
+    def _max_add_layers(self) -> int:
+        if float(self.initial_cash) <= 30_000:
+            return int(GOVERNANCE_MAX_ADD_LAYERS_RETAIL_20K)
+        return int(GOVERNANCE_MAX_ADD_LAYERS_LARGE)
+
+    def _force_deploy_target_exposure(
+        self,
+        *,
+        risk_level: str,
+        structural_regime_level: str,
+        safety_exposure_cap: float,
+        liquidity_stress: float,
+    ) -> float | None:
+        if self.capital_usage_mode != GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY:
+            return None
+        if float(liquidity_stress) >= 0.35:
+            return min(float(safety_exposure_cap), float(GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_HIGH))
+        risk = str(risk_level or "").lower()
+        regime = str(structural_regime_level or "").lower()
+        if risk in {"crisis", "high"}:
+            target = float(GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_HIGH)
+        elif regime in {"weak", "bear"}:
+            target = float(GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_WEAK)
+        else:
+            target = float(self.capital_profile.get("force_deploy_target_exposure_normal", GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL) or GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL)
+        return min(max(target, 0.0), float(safety_exposure_cap))
+
+    def _augment_force_deploy_diversify_orders(
+        self,
+        *,
+        orders: pd.DataFrame,
+        candidates: pd.DataFrame,
+        defensive_candidates: pd.DataFrame | None,
+        decision_id: str,
+        decision_date,
+        current_weights: dict[str, float],
+        nominal_nav: float,
+        daily: pd.DataFrame,
+        target_exposure: float,
+    ) -> pd.DataFrame:
+        if self.capital_usage_mode != GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY:
+            return orders
+        if candidates is None or candidates.empty or float(nominal_nav or 0.0) <= 0.0:
+            return orders
+        min_holdings = int(
+            self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K)
+            or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K
+        )
+        max_positions = int(
+            self._max_positions_override
+            or self.capital_profile.get("max_positions", min_holdings)
+            or min_holdings
+        )
+        existing_symbols = {str(symbol) for symbol, weight in current_weights.items() if float(weight) > 1e-12}
+        buy_symbols: set[str] = set()
+        sell_symbols: set[str] = set()
+        if orders is not None and not orders.empty:
+            sides = orders.get("side", pd.Series(dtype=object)).astype(str)
+            buy_symbols = set(orders.loc[sides.eq("buy"), "symbol"].astype(str))
+            sell_symbols = set(orders.loc[sides.eq("sell"), "symbol"].astype(str))
+        planned_holding_count = len(existing_symbols | buy_symbols)
+        shortfall = max(min(min_holdings, max_positions) - planned_holding_count, 0)
+        if shortfall <= 0:
+            return orders
+
+        price_map = daily.set_index("symbol")["close_nominal"] if "symbol" in daily.columns else pd.Series(dtype=float)
+        min_buffer = float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0)
+        single_cap = float(self.capital_profile.get("retail_single_position_cap", 0.40) or 0.40)
+        exposure_tolerance = float(self.capital_profile.get("retail_target_exposure_tolerance", 0.10) or 0.10)
+        available_cash = max(float(self.cash) - min_buffer, 0.0)
+        current_exposure = sum(float(value) for value in current_weights.values())
+        planned_buy_weight = 0.0
+        if orders is not None and not orders.empty:
+            planned_buy_weight = float(
+                pd.to_numeric(
+                    orders.loc[orders.get("side", pd.Series(dtype=object)).astype(str).eq("buy"), "delta_weight"],
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .clip(lower=0.0)
+                .sum()
+            )
+        exposure_room = max(float(target_exposure) + exposure_tolerance - current_exposure - planned_buy_weight, 0.0)
+        if available_cash <= 0.0 or exposure_room <= 1e-12:
+            return orders
+
+        data = candidates.copy()
+        data["symbol"] = data["symbol"].astype(str)
+        confirmed = data.get("entry_confirmed", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+        tier = data.get("entry_size_tier", pd.Series("", index=data.index)).astype(str).str.lower()
+        state = data.get("position_state", pd.Series("", index=data.index)).astype(str).str.lower()
+        locked_symbols = {str(symbol) for symbol in self.engine.pending_orders.locked_symbols()}
+        data = data[
+            confirmed
+            & tier.isin(["diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"])
+            & state.isin(["building", "strong_building", "holding", "watching"])
+            & ~data["symbol"].isin(existing_symbols | buy_symbols | sell_symbols | locked_symbols)
+        ].copy()
+        supplemental = []
+        used_cash = 0.0
+        used_weight = 0.0
+        stock_candidates = self._force_deploy_order_candidates(
+            data,
+            price_map=price_map,
+            nominal_nav=nominal_nav,
+            available_cash=available_cash,
+            single_cap=single_cap,
+            exposure_room=exposure_room,
+        )
+        for _, row in stock_candidates.iterrows():
+            if len(supplemental) >= shortfall:
+                break
+            payload, one_lot_cash, one_lot_weight = self._force_deploy_order_payload(
+                row=row,
+                decision_id=decision_id,
+                decision_date=decision_date,
+                current_weights=current_weights,
+                reason="force_deploy_diversify_buy",
+                priority=ORDER_PRIORITIES.get("force_deploy_diversify_buy", ORDER_PRIORITIES.get("normal_buy", 5)),
+            )
+            if used_cash + one_lot_cash > available_cash + 1e-12 or used_weight + one_lot_weight > exposure_room + 1e-12:
+                continue
+            supplemental.append(payload)
+            used_cash += one_lot_cash
+            used_weight += one_lot_weight
+
+        if len(supplemental) < shortfall:
+            blocked_symbols = existing_symbols | buy_symbols | sell_symbols | locked_symbols | {str(row["symbol"]) for row in supplemental}
+            defensive_order_candidates = self._force_deploy_defensive_order_candidates(
+                defensive_candidates,
+                price_map=price_map,
+                nominal_nav=nominal_nav,
+                available_cash=max(available_cash - used_cash, 0.0),
+                single_cap=single_cap,
+                exposure_room=max(exposure_room - used_weight, 0.0),
+                blocked_symbols=blocked_symbols,
+            )
+            for _, row in defensive_order_candidates.iterrows():
+                if len(supplemental) >= shortfall:
+                    break
+                payload, one_lot_cash, one_lot_weight = self._force_deploy_order_payload(
+                    row=row,
+                    decision_id=decision_id,
+                    decision_date=decision_date,
+                    current_weights=current_weights,
+                    reason="force_deploy_defensive_buy",
+                    priority=ORDER_PRIORITIES.get("force_deploy_defensive_buy", ORDER_PRIORITIES.get("normal_buy", 6)),
+                )
+                if used_cash + one_lot_cash > available_cash + 1e-12 or used_weight + one_lot_weight > exposure_room + 1e-12:
+                    continue
+                supplemental.append(payload)
+                used_cash += one_lot_cash
+                used_weight += one_lot_weight
+
+        if not supplemental:
+            return orders
+        supplement_frame = pd.DataFrame(supplemental, columns=ORDER_COLUMNS)
+        self.engine.ledgers.append("executable_order_plan", supplement_frame)
+        if orders is None or orders.empty:
+            return supplement_frame
+        return pd.concat([orders, supplement_frame], ignore_index=True)
+
+    def _force_deploy_order_candidates(
+        self,
+        data: pd.DataFrame,
+        *,
+        price_map: pd.Series,
+        nominal_nav: float,
+        available_cash: float,
+        single_cap: float,
+        exposure_room: float,
+    ) -> pd.DataFrame:
+        if data is None or data.empty:
+            return pd.DataFrame()
+        out = data.copy()
+        out["_final_entry_score"] = pd.to_numeric(
+            out.get("final_entry_score", out.get("entry_matrix_score", 0.0)),
+            errors="coerce",
+        ).fillna(0.0)
+        out["_entry_matrix_score"] = pd.to_numeric(out.get("entry_matrix_score", 0.0), errors="coerce").fillna(0.0)
+        out["_exhaustion_score"] = pd.to_numeric(out.get("exhaustion_score", 1.0), errors="coerce").fillna(1.0)
+        out["_downtrend_decay_score"] = pd.to_numeric(out.get("downtrend_decay_score", 1.0), errors="coerce").fillna(1.0)
+        out = self._attach_one_lot_order_costs(out, price_map=price_map, nominal_nav=nominal_nav)
+        out = out[
+            (out["_one_lot_cash_required"] > 0.0)
+            & (out["_one_lot_cash_required"] <= available_cash)
+            & (out["_one_lot_account_weight"] <= single_cap + 1e-12)
+            & (out["_one_lot_account_weight"] <= exposure_room + 1e-12)
+            & (out["_exhaustion_score"] < float(GOVERNANCE_EXHAUSTION_BUY_MAX))
+            & (out["_downtrend_decay_score"] < float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK))
+        ].copy()
+        if out.empty:
+            return out
+        return out.sort_values(
+            ["_final_entry_score", "_entry_matrix_score", "_one_lot_account_weight", "symbol"],
+            ascending=[False, False, True, True],
+        )
+
+    def _force_deploy_defensive_order_candidates(
+        self,
+        defensive_candidates: pd.DataFrame | None,
+        *,
+        price_map: pd.Series,
+        nominal_nav: float,
+        available_cash: float,
+        single_cap: float,
+        exposure_room: float,
+        blocked_symbols: set[str],
+    ) -> pd.DataFrame:
+        if defensive_candidates is None or defensive_candidates.empty:
+            return pd.DataFrame()
+        out = defensive_candidates.copy()
+        out["symbol"] = out["symbol"].astype(str)
+        out = out[~out["symbol"].isin(blocked_symbols)].copy()
+        out["_final_entry_score"] = pd.to_numeric(out.get("defensive_score", 0.0), errors="coerce").fillna(0.0)
+        out["_entry_matrix_score"] = out["_final_entry_score"]
+        out = out[out["_final_entry_score"] >= 0.55].copy()
+        if out.empty:
+            return out
+        out["position_state"] = out.get("defensive_state", "defensive_holding")
+        out["entry_size_tier"] = "defensive_1_lot"
+        out["planned_entry_lots"] = 1
+        out["entry_matrix_score"] = out["_entry_matrix_score"]
+        out["final_entry_score"] = out["_final_entry_score"]
+        out["alpha_quality_score"] = out.get("defensive_trend_score", pd.NA)
+        out["entry_timing_score"] = out.get("defensive_drawdown_resilience", pd.NA)
+        out["entry_liquidity_score"] = out.get("defensive_liquidity_score", pd.NA)
+        out["follow_through_score"] = out.get("defensive_low_vol_score", pd.NA)
+        out["exhaustion_score"] = 0.0
+        out["downtrend_decay_score"] = 0.0
+        out["tail_risk_proxy"] = 1.0 - out["_final_entry_score"].clip(lower=0.0, upper=1.0)
+        out = self._attach_one_lot_order_costs(out, price_map=price_map, nominal_nav=nominal_nav)
+        out = out[
+            (out["_one_lot_cash_required"] > 0.0)
+            & (out["_one_lot_cash_required"] <= available_cash)
+            & (out["_one_lot_account_weight"] <= single_cap + 1e-12)
+            & (out["_one_lot_account_weight"] <= exposure_room + 1e-12)
+        ].copy()
+        if out.empty:
+            return out
+        return out.sort_values(
+            ["_final_entry_score", "_one_lot_account_weight", "symbol"],
+            ascending=[False, True, True],
+        )
+
+    def _attach_one_lot_order_costs(self, data: pd.DataFrame, *, price_map: pd.Series, nominal_nav: float) -> pd.DataFrame:
+        out = data.copy()
+        out["_one_lot_cash_required"] = out["symbol"].astype(str).map(
+            lambda symbol: self._retail_cash_required(
+                side="buy",
+                price=float(price_map.at[symbol]) if symbol in price_map.index and pd.notna(price_map.at[symbol]) else 0.0,
+                shares=float(MIN_LOT_SIZE),
+            )
+        )
+        out["_one_lot_account_weight"] = out["_one_lot_cash_required"] / max(float(nominal_nav), 1e-12)
+        return out
+
+    def _force_deploy_order_payload(
+        self,
+        *,
+        row: pd.Series,
+        decision_id: str,
+        decision_date,
+        current_weights: dict[str, float],
+        reason: str,
+        priority: int,
+    ) -> tuple[dict, float, float]:
+        one_lot_cash = float(row["_one_lot_cash_required"])
+        one_lot_weight = float(row["_one_lot_account_weight"])
+        old_weight = float(current_weights.get(str(row["symbol"]), 0.0))
+        payload = {column: pd.NA for column in ORDER_COLUMNS}
+        payload.update(
+            {
+                "decision_id": str(decision_id),
+                "execution_date": pd.Timestamp(decision_date) + pd.offsets.BDay(1),
+                "symbol": str(row["symbol"]),
+                "side": "buy",
+                "current_weight": old_weight,
+                "target_weight": old_weight + one_lot_weight,
+                "delta_weight": one_lot_weight,
+                "reason": str(reason),
+                "priority": int(priority),
+                "pending_policy": "daily_expiry",
+                "position_state": row.get("position_state", ""),
+                "position_exit_reason": row.get("position_exit_reason", ""),
+                "add_layer": row.get("add_layer", pd.NA),
+                "add_allowed": bool(row.get("add_allowed", False)),
+                "add_block_reason": row.get("add_block_reason", ""),
+                "entry_matrix_score": row.get("entry_matrix_score", pd.NA),
+                "entry_alpha_score": row.get("entry_alpha_score", pd.NA),
+                "entry_timing_score": row.get("entry_timing_score", pd.NA),
+                "entry_liquidity_score": row.get("entry_liquidity_score", pd.NA),
+                "alpha_quality_score": row.get("alpha_quality_score", pd.NA),
+                "surge_capture_score": row.get("surge_capture_score", pd.NA),
+                "follow_through_score": row.get("follow_through_score", pd.NA),
+                "exhaustion_score": row.get("exhaustion_score", pd.NA),
+                "entry_success_probability": row.get("entry_success_probability", pd.NA),
+                "entry_size_tier": row.get("entry_size_tier", ""),
+                "planned_entry_lots": row.get("planned_entry_lots", 1),
+                "empirical_distribution_score": row.get("empirical_distribution_score", pd.NA),
+                "final_entry_score": row.get("final_entry_score", pd.NA),
+                "tail_risk_proxy": row.get("tail_risk_proxy", pd.NA),
+                "trend_direction_score": row.get("trend_direction_score", pd.NA),
+                "peak_decay_score": row.get("peak_decay_score", pd.NA),
+                "profit_protection_pressure": row.get("profit_protection_pressure", pd.NA),
+                "dynamic_giveback_limit": row.get("dynamic_giveback_limit", pd.NA),
+                "future_loss_risk_score": row.get("future_loss_risk_score", pd.NA),
+                "downtrend_decay_score": row.get("downtrend_decay_score", pd.NA),
+                "post_entry_failure_score": row.get("post_entry_failure_score", pd.NA),
+            }
+        )
+        return payload, one_lot_cash, one_lot_weight
+
+    def _register_position_cooldown(self, symbol: str, *, date, reason: str) -> None:
+        reason = str(reason or "normal_sell")
+        days = int(GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS)
+        self.position_cooldowns[str(symbol)] = {
+            "cooldown_start": pd.Timestamp(date),
+            "cooldown_until": pd.Timestamp(date) + pd.offsets.BDay(days),
+            "reason": reason,
+            "cooldown_days": days,
+        }
 
     def _record_entry_confirmation(self, date, candidates: pd.DataFrame) -> None:
         if candidates is None or candidates.empty:
@@ -1063,6 +2294,31 @@ class GovernanceBacktestRunner:
             "top_block_reason": str(reason_counts.index[0]) if not reason_counts.empty else "unknown",
             "top_block_reason_count": int(reason_counts.iloc[0]) if not reason_counts.empty else 0,
             "entry_quality_score_mean": _safe_numeric_mean(candidates.get("entry_quality_score")),
+            "entry_matrix_score_mean": _safe_numeric_mean(candidates.get("entry_matrix_score")),
+            "entry_alpha_score_mean": _safe_numeric_mean(candidates.get("entry_alpha_score")),
+            "entry_timing_score_mean": _safe_numeric_mean(candidates.get("entry_timing_score")),
+            "entry_liquidity_score_mean": _safe_numeric_mean(candidates.get("entry_liquidity_score")),
+            "alpha_quality_score_mean": _safe_numeric_mean(candidates.get("alpha_quality_score")),
+            "surge_capture_score_mean": _safe_numeric_mean(candidates.get("surge_capture_score")),
+            "follow_through_score_mean": _safe_numeric_mean(candidates.get("follow_through_score")),
+            "exhaustion_score_mean": _safe_numeric_mean(candidates.get("exhaustion_score")),
+            "entry_success_probability_mean": _safe_numeric_mean(candidates.get("entry_success_probability")),
+            "empirical_distribution_score_mean": _safe_numeric_mean(candidates.get("empirical_distribution_score")),
+            "final_entry_score_mean": _safe_numeric_mean(candidates.get("final_entry_score")),
+            "tail_risk_proxy_mean": _safe_numeric_mean(candidates.get("tail_risk_proxy")),
+            "downtrend_decay_score_mean": _safe_numeric_mean(candidates.get("downtrend_decay_score")),
+            "post_entry_failure_score_mean": _safe_numeric_mean(candidates.get("post_entry_failure_score")),
+            "surge_buy_flag_count": int(candidates.get("surge_buy_flag", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "strong_starter_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("starter_strong").sum()),
+            "starter_2_lot_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("starter_2_lot").sum()),
+            "diversify_1_lot_count": int(candidates.get("entry_size_tier", pd.Series("", index=candidates.index)).astype(str).eq("diversify_1_lot").sum()),
+            "exhaustion_block_count": int(pd.to_numeric(candidates.get("exhaustion_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0).ge(float(GOVERNANCE_EXHAUSTION_BUY_MAX)).sum()),
+            "protecting_profit_count": int(candidates.get("position_state", pd.Series("", index=candidates.index)).astype(str).str.lower().eq("protecting_profit").sum()),
+            "direct_buy_flag_count": int(candidates.get("direct_buy_flag", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "watchlist_flag_count": int(candidates.get("watchlist_flag", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "cooldown_active_count": int(candidates.get("cooldown_active", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "exit_state_count": int(candidates.get("exit_state", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
+            "add_allowed_count": int(candidates.get("add_allowed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "entry_alpha_threshold_mean": _safe_numeric_mean(candidates.get("entry_alpha_threshold")),
             "entry_orderflow_confirm_mean": _safe_numeric_mean(candidates.get("entry_orderflow_confirm_count")),
             "alpha_confirm_ratio": _safe_numeric_mean(candidates.get("alpha_confirm")),
@@ -1094,11 +2350,260 @@ class GovernanceBacktestRunner:
             "orderflow_candidate_pass_count": int(candidates.get("orderflow_candidate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "reversal_confirm_pass_count": int(candidates.get("reversal_confirm_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
             "breakout_gate_pass_count": int(candidates.get("breakout_gate_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
-            "breakout_probability_bucket_pass_count": int(candidates.get("breakout_probability_bucket_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool).sum()),
         }
         for reason, count in reason_counts.head(8).items():
             row[f"entry_reason_count_{reason}"] = int(count)
         self.entry_confirmation_rows.append(row)
+
+    def _record_defensive_sleeve_diagnostics(
+        self,
+        *,
+        date,
+        daily: pd.DataFrame,
+        risk_level: str,
+        structural_regime_level: str,
+        stock_candidate_count: int,
+    ) -> pd.DataFrame:
+        rows = []
+        if daily is None or daily.empty:
+            return pd.DataFrame()
+        universe = {}
+        for asset_class, symbols in dict(GOVERNANCE_DEFENSIVE_SLEEVE_ASSETS).items():
+            for symbol in symbols:
+                universe[str(symbol).lower()] = str(asset_class)
+        if not universe:
+            return pd.DataFrame()
+        data = daily.copy()
+        data["symbol_key"] = data["symbol"].astype(str).str.lower()
+        data = data[data["symbol_key"].isin(universe)].copy()
+        if data.empty:
+            return pd.DataFrame()
+        amount = pd.to_numeric(data.get("amount", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        amount_ma20 = pd.to_numeric(data.get("amount_ma20", pd.Series(amount, index=data.index)), errors="coerce").replace(0.0, pd.NA)
+        ret20 = pd.to_numeric(data.get("ret_20", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        ret5 = pd.to_numeric(data.get("ret_5", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        vol = pd.to_numeric(data.get("volatility_20", pd.Series(0.02, index=data.index)), errors="coerce").fillna(0.02)
+        close_to_ma20 = pd.to_numeric(data.get("close_to_ma20", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        liquidity_score = (amount / amount_ma20).fillna(1.0).clip(0.0, 2.0) / 2.0
+        low_vol_score = (1.0 - (vol / max(float(vol.median()), 1e-9)).clip(0.0, 2.0) / 2.0).clip(0.0, 1.0)
+        trend_score = (0.65 * ret20.rank(pct=True).fillna(0.0) + 0.35 * ret5.rank(pct=True).fillna(0.0)).clip(0.0, 1.0)
+        drawdown_resilience = (1.0 - close_to_ma20.abs().clip(0.0, 0.20) / 0.20).clip(0.0, 1.0)
+        defensive_score = (
+            0.30 * trend_score
+            + 0.25 * low_vol_score
+            + 0.25 * liquidity_score
+            + 0.20 * drawdown_resilience
+        ).clip(0.0, 1.0)
+        force_deploy = self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
+        risk = str(risk_level or "").lower()
+        for idx, row in data.iterrows():
+            score = _safe_float(defensive_score.loc[idx], default=0.0)
+            state = "inactive"
+            if force_deploy and int(stock_candidate_count) < int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K):
+                state = "eligible_defensive" if score >= 0.55 and risk not in {"crisis"} else "paper_defensive"
+            rows.append(
+                {
+                    "date": pd.Timestamp(date),
+                    "symbol": str(row.get("symbol", "")),
+                    "asset_class": universe.get(str(row.get("symbol_key", "")), "unknown"),
+                    "risk_level": str(risk_level),
+                    "structural_regime_level": str(structural_regime_level),
+                    "stock_candidate_count": int(stock_candidate_count),
+                    "capital_usage_mode": self.capital_usage_mode,
+                    "defensive_score": score,
+                    "defensive_trend_score": _safe_float(trend_score.loc[idx], default=0.0),
+                    "defensive_low_vol_score": _safe_float(low_vol_score.loc[idx], default=0.0),
+                    "defensive_liquidity_score": _safe_float(liquidity_score.loc[idx], default=0.0),
+                    "defensive_drawdown_resilience": _safe_float(drawdown_resilience.loc[idx], default=0.0),
+                    "defensive_state": state,
+                }
+            )
+        self.defensive_sleeve_rows.extend(rows)
+        return pd.DataFrame(rows)
+
+    def _record_entry_formula_and_retail_rank(self, *, date, candidates: pd.DataFrame, daily: pd.DataFrame, exposure: dict) -> None:
+        if self.shadow_fast_mode or candidates is None or candidates.empty:
+            return
+        data = candidates.copy()
+        data["symbol"] = data["symbol"].astype(str)
+        price_map = (
+            daily.assign(symbol=daily["symbol"].astype(str)).set_index("symbol")["close_nominal"].to_dict()
+            if daily is not None and not daily.empty and "close_nominal" in daily.columns
+            else {}
+        )
+        nominal_nav = max(float(exposure.get("nominal_nav", 0.0) or 0.0), 1e-12)
+        available_cash = max(float(self.cash), 0.0)
+        min_buffer = float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0)
+        single_cap = float(self.capital_profile.get("retail_single_position_cap", 0.40) or 0.40)
+        one_lot_cap = float(self.capital_profile.get("retail_one_lot_position_cap", single_cap) or single_cap)
+        min_entry_score = float(self.capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0)
+        current_weights = {
+            str(row.get("symbol", "")): float(row.get("market_value", 0.0) or 0.0) / nominal_nav
+            for row in getattr(self, "_last_position_mark_rows", []) or []
+        }
+        rank_rows = []
+        ordered = data.sort_values(["entry_matrix_score", "primary_score", "symbol"], ascending=[False, False, True]).head(80)
+        for _, row in ordered.iterrows():
+            symbol = str(row.get("symbol", ""))
+            price = _safe_float(price_map.get(symbol), default=float("nan"))
+            one_lot_cash_required = (
+                self._retail_cash_required(side="buy", price=price, shares=float(MIN_LOT_SIZE))
+                if pd.notna(price) and price > 0.0
+                else float("nan")
+            )
+            one_lot_weight = one_lot_cash_required / nominal_nav if pd.notna(one_lot_cash_required) else float("nan")
+            current_weight = float(current_weights.get(symbol, 0.0) or 0.0)
+            state = str(row.get("position_state", "") or "").strip().lower()
+            cash_ok = pd.notna(one_lot_cash_required) and one_lot_cash_required <= max(available_cash - min_buffer, 0.0)
+            cap_ok = pd.notna(one_lot_weight) and current_weight + one_lot_weight <= one_lot_cap + 1e-12
+            state_ok = state not in {"blocked", "cooldown", "exiting", "protecting_profit"} and not bool(row.get("exit_state", False))
+            score_ok = _safe_float(row.get("entry_matrix_score"), default=0.0) >= min_entry_score
+            block_reasons = []
+            if not pd.notna(price) or price <= 0.0:
+                block_reasons.append("missing_price")
+            if not cash_ok:
+                block_reasons.append("lot_size_cash_insufficient")
+            if not cap_ok:
+                block_reasons.append("one_lot_position_cap")
+            if not state_ok:
+                block_reasons.append("position_state")
+            if not score_ok:
+                block_reasons.append("entry_matrix_score")
+            alpha_score = _safe_float(row.get("entry_alpha_score"), default=0.0)
+            timing_score = _safe_float(row.get("entry_timing_score"), default=0.0)
+            liquidity_score = _safe_float(row.get("entry_liquidity_score"), default=0.0)
+            matrix_score = _safe_float(row.get("entry_matrix_score"), default=0.0)
+            alpha_quality_score = _safe_float(row.get("alpha_quality_score"), default=0.0)
+            surge_score = _safe_float(row.get("surge_capture_score"), default=0.0)
+            follow_through_score = _safe_float(row.get("follow_through_score"), default=0.0)
+            exhaustion_score = _safe_float(row.get("exhaustion_score"), default=0.0)
+            entry_success_probability = _safe_float(row.get("entry_success_probability"), default=0.0)
+            downtrend_score = _safe_float(row.get("downtrend_decay_score"), default=0.0)
+            post_failure_score = _safe_float(row.get("post_entry_failure_score"), default=0.0)
+            one_lot_penalty = min(max(one_lot_weight if pd.notna(one_lot_weight) else 1.0, 0.0), 1.0)
+            retail_score = (
+                0.45 * matrix_score
+                + 0.25 * timing_score
+                + 0.15 * liquidity_score
+                + 0.10 * alpha_score
+                + 0.05 * (1.0 - one_lot_penalty)
+            )
+            payload = {
+                "date": pd.Timestamp(date),
+                "symbol": symbol,
+                "primary_score": row.get("primary_score", pd.NA),
+                "alpha_percentile": row.get("alpha_percentile", pd.NA),
+                "expected_return_5d": row.get("expected_return_5d", pd.NA),
+                "entry_alpha_score": alpha_score,
+                "entry_timing_score": timing_score,
+                "entry_liquidity_score": liquidity_score,
+                "entry_matrix_score": matrix_score,
+                "alpha_quality_score": alpha_quality_score,
+                "surge_capture_score": surge_score,
+                "follow_through_score": follow_through_score,
+                "exhaustion_score": exhaustion_score,
+                "entry_success_probability": entry_success_probability,
+                "entry_size_tier": row.get("entry_size_tier", ""),
+                "planned_entry_lots": row.get("planned_entry_lots", pd.NA),
+                "downtrend_decay_score": downtrend_score,
+                "post_entry_failure_score": post_failure_score,
+                "surge_buy_flag": bool(row.get("surge_buy_flag", False)),
+                "entry_confirmed": bool(row.get("entry_confirmed", False)),
+                "entry_quality_tier": row.get("entry_quality_tier", ""),
+                "position_state": row.get("position_state", ""),
+                "entry_block_reason": row.get("entry_block_reason", ""),
+                "retail_executable": not block_reasons,
+                "retail_block_reason": "|".join(block_reasons),
+                "retail_executable_score": float(retail_score),
+                "price": price,
+                "one_lot_cash_required": one_lot_cash_required,
+                "one_lot_account_weight": one_lot_weight,
+                "retail_one_lot_position_cap": one_lot_cap,
+                "available_cash": available_cash,
+                "cash_buffer_required": min_buffer,
+                "forward_return_1d": self._forward_return(symbol, date, 1),
+                "forward_return_3d": self._forward_return(symbol, date, 3),
+                "forward_return_5d": self._forward_return(symbol, date, 5),
+                "forward_return_10d": self._forward_return(symbol, date, 10),
+                "forward_return_20d": self._forward_return(symbol, date, 20),
+            }
+            payload.update(self._post_entry_price_diagnostics(symbol, date, price))
+            self.entry_formula_audit_rows.append(payload)
+            if payload["retail_executable"] or payload["entry_confirmed"]:
+                rank_rows.append(payload)
+        rank_rows = sorted(
+            rank_rows,
+            key=lambda item: (
+                -int(bool(item.get("retail_executable", False))),
+                -float(item.get("retail_executable_score", 0.0) or 0.0),
+                str(item.get("symbol", "")),
+            ),
+        )[:40]
+        for rank, row in enumerate(rank_rows, start=1):
+            payload = dict(row)
+            payload["retail_executable_rank"] = rank
+            self.retail_executable_rank_rows.append(payload)
+
+    def _forward_return(self, symbol: str, date, horizon_days: int):
+        try:
+            pivot = self._return_pivot
+            if pivot is None or pivot.empty or symbol not in pivot.columns:
+                return pd.NA
+            dates = pivot.index
+            loc = dates.searchsorted(pd.Timestamp(date))
+            future_loc = loc + int(horizon_days)
+            if loc >= len(dates) or future_loc > len(dates):
+                return pd.NA
+            returns = pd.to_numeric(pivot.iloc[loc:future_loc][symbol], errors="coerce").dropna()
+            if returns.empty:
+                return pd.NA
+            return float((1.0 + returns).prod() - 1.0)
+        except Exception:
+            return pd.NA
+
+    def _close_history(self, symbol: str) -> pd.DataFrame:
+        if self._close_history_by_symbol is None:
+            close_col = "close_nominal" if "close_nominal" in self.features.columns else "close"
+            if close_col not in self.features.columns:
+                self._close_history_by_symbol = {}
+            else:
+                data = self.features[["symbol", "date", close_col]].copy()
+                data["symbol"] = data["symbol"].astype(str)
+                data["date"] = pd.to_datetime(data["date"], errors="coerce")
+                data["close"] = pd.to_numeric(data[close_col], errors="coerce")
+                data = data.dropna(subset=["symbol", "date", "close"]).sort_values(["symbol", "date"])
+                self._close_history_by_symbol = {
+                    str(group_symbol): group[["date", "close"]].reset_index(drop=True)
+                    for group_symbol, group in data.groupby("symbol", sort=False)
+                }
+        return self._close_history_by_symbol.get(str(symbol), pd.DataFrame(columns=["date", "close"]))
+
+    def _post_entry_price_diagnostics(self, symbol: str, date, entry_price) -> dict:
+        result = {
+            "best_buy_after_entry_date": pd.NaT,
+            "best_buy_after_entry_gap": pd.NA,
+            "worst_drawdown_after_entry": pd.NA,
+        }
+        price = _safe_float(entry_price, default=0.0)
+        if price <= 0.0:
+            return result
+        history = self._close_history(symbol)
+        if history.empty:
+            return result
+        dates = pd.to_datetime(history["date"], errors="coerce")
+        loc = dates.searchsorted(pd.Timestamp(date), side="right")
+        window = history.iloc[loc : loc + 10].copy()
+        if window.empty:
+            return result
+        closes = pd.to_numeric(window["close"], errors="coerce").dropna()
+        if closes.empty:
+            return result
+        best_idx = closes.idxmin()
+        best_price = float(closes.loc[best_idx])
+        result["best_buy_after_entry_date"] = pd.Timestamp(window.loc[best_idx, "date"])
+        result["best_buy_after_entry_gap"] = float(best_price / price - 1.0)
+        result["worst_drawdown_after_entry"] = float(closes.min() / price - 1.0)
+        return result
 
     def _build_shadow_runners(self):
         return {
@@ -1161,6 +2666,32 @@ class GovernanceBacktestRunner:
                 "order_id": order["order_id"],
                 "decision_id": order["decision_id"],
                 "reason": order["reason"],
+                "position_state": order.get("position_state", ""),
+                "position_exit_reason": order.get("position_exit_reason", ""),
+                "add_layer": order.get("add_layer", pd.NA),
+                "add_allowed": order.get("add_allowed", False),
+                "add_block_reason": order.get("add_block_reason", ""),
+                "entry_matrix_score": order.get("entry_matrix_score", pd.NA),
+                "entry_alpha_score": order.get("entry_alpha_score", pd.NA),
+                "entry_timing_score": order.get("entry_timing_score", pd.NA),
+                "entry_liquidity_score": order.get("entry_liquidity_score", pd.NA),
+                "alpha_quality_score": order.get("alpha_quality_score", pd.NA),
+                "surge_capture_score": order.get("surge_capture_score", pd.NA),
+                "follow_through_score": order.get("follow_through_score", pd.NA),
+                "exhaustion_score": order.get("exhaustion_score", pd.NA),
+                "entry_success_probability": order.get("entry_success_probability", pd.NA),
+                "entry_size_tier": order.get("entry_size_tier", ""),
+                "planned_entry_lots": order.get("planned_entry_lots", pd.NA),
+                "empirical_distribution_score": order.get("empirical_distribution_score", pd.NA),
+                "final_entry_score": order.get("final_entry_score", pd.NA),
+                "tail_risk_proxy": order.get("tail_risk_proxy", pd.NA),
+                "trend_direction_score": order.get("trend_direction_score", pd.NA),
+                "peak_decay_score": order.get("peak_decay_score", pd.NA),
+                "profit_protection_pressure": order.get("profit_protection_pressure", pd.NA),
+                "dynamic_giveback_limit": order.get("dynamic_giveback_limit", pd.NA),
+                "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
+                "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
+                "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
             }
             rows.append(row)
         if not rows:
@@ -1191,7 +2722,14 @@ class GovernanceBacktestRunner:
                     acquired_date=pd.Timestamp(date),
                 )
                 self.holding_days.setdefault(symbol, 0)
-                self._update_lifecycle_on_buy(symbol, date=date, price=float(fill["price"]), shares=shares, current=current)
+                self._update_lifecycle_on_buy(
+                    symbol,
+                    date=date,
+                    price=float(fill["price"]),
+                    shares=shares,
+                    current=current,
+                    signal=fill,
+                )
             else:
                 current = self.positions.get(symbol)
                 shares = min(shares, current.shares if current else 0.0)
@@ -1203,6 +2741,7 @@ class GovernanceBacktestRunner:
                     self.positions.pop(symbol, None)
                     self.holding_days.pop(symbol, None)
                     self.position_lifecycle.pop(symbol, None)
+                    self._register_position_cooldown(symbol, date=date, reason=str(fill.get("reason", "")))
                 else:
                     self.positions[symbol] = Position(remaining, current.acquired_date)
             fill_map[order_id] = shares
@@ -1320,6 +2859,11 @@ class GovernanceBacktestRunner:
                         "mfe": row.get("mfe", pd.NA),
                         "mae": row.get("mae", pd.NA),
                         "giveback_from_peak": row.get("giveback_from_peak", pd.NA),
+                        "trend_direction_score": row.get("trend_direction_score", pd.NA),
+                        "peak_decay_score": row.get("peak_decay_score", pd.NA),
+                        "profit_protection_pressure": row.get("profit_protection_pressure", pd.NA),
+                        "dynamic_giveback_limit": row.get("dynamic_giveback_limit", pd.NA),
+                        "future_loss_risk_score": row.get("future_loss_risk_score", pd.NA),
                         "profit_giveback_flag": row.get("profit_giveback_flag", False),
                         "post_entry_failure_flag": row.get("post_entry_failure_flag", False),
                         "lock_days": int(row["lock_days"]),
@@ -1332,9 +2876,20 @@ class GovernanceBacktestRunner:
         return snapshot
 
     def _register_orders(self, orders, daily, nominal_nav):
+        diagnostics = {
+            "retail_order_count": 0,
+            "retail_upgraded_to_one_lot_count": 0,
+            "retail_blocked_count": 0,
+            "retail_lot_cash_insufficient_count": 0,
+            "retail_state_block_count": 0,
+            "retail_no_price_count": 0,
+        }
         if orders.empty:
-            return
+            return diagnostics
+        if self._retail_lot_adapter_enabled:
+            orders = self._sort_retail_orders(orders)
         prices = daily.set_index("symbol")["close_nominal"]
+        reserved_cash = 0.0
         for _, order in orders.iterrows():
             symbol = str(order["symbol"])
             mark = self.price_ledger.mark(symbol, as_of=order["execution_date"] - pd.offsets.BDay(1))
@@ -1343,11 +2898,72 @@ class GovernanceBacktestRunner:
             elif mark is not None:
                 order_price = float(mark.price)
             else:
+                self._record_retail_execution_diagnostic(
+                    order=order,
+                    nominal_nav=nominal_nav,
+                    price=pd.NA,
+                    one_lot_cost=pd.NA,
+                    strategy_target_notional=abs(float(order["delta_weight"])) * float(nominal_nav),
+                    adjusted_target_notional=0.0,
+                    target_shares=0.0,
+                    available_cash=max(float(self.cash) - reserved_cash, 0.0),
+                    retail_action="blocked_no_price",
+                    retail_block_reason="missing_price",
+                )
+                diagnostics["retail_no_price_count"] += 1
+                diagnostics["retail_blocked_count"] += 1
                 continue
             shares = abs(float(order["delta_weight"])) * float(nominal_nav) / order_price
             shares = float(int(shares // MIN_LOT_SIZE) * MIN_LOT_SIZE)
+            strategy_target_notional = abs(float(order["delta_weight"])) * float(nominal_nav)
+            retail_action = "unchanged"
+            retail_block_reason = ""
+            one_lot_cost = float(order_price) * float(MIN_LOT_SIZE)
+            one_lot_cash_required = self._retail_cash_required(
+                side=str(order["side"]),
+                price=order_price,
+                shares=float(MIN_LOT_SIZE),
+            )
+            if self._retail_lot_adapter_enabled and str(order["side"]) == "buy":
+                diagnostics["retail_order_count"] += 1
+                shares, retail_action, retail_block_reason = self._adapt_retail_buy_order(
+                    order=order,
+                    strategy_target_notional=strategy_target_notional,
+                    order_price=order_price,
+                    nominal_nav=nominal_nav,
+                    reserved_cash=reserved_cash,
+                    initial_shares=shares,
+                    one_lot_cash_required=one_lot_cash_required,
+                )
+                if retail_action in {"upgraded_to_one_lot", "upgraded_to_one_lot_strong"}:
+                    diagnostics["retail_upgraded_to_one_lot_count"] += 1
+                if retail_block_reason:
+                    diagnostics["retail_blocked_count"] += 1
+                    if retail_block_reason in {"lot_size_cash_insufficient", "cash_buffer"}:
+                        diagnostics["retail_lot_cash_insufficient_count"] += 1
+                    if retail_block_reason == "position_state":
+                        diagnostics["retail_state_block_count"] += 1
+                self._record_retail_execution_diagnostic(
+                    order=order,
+                    nominal_nav=nominal_nav,
+                    price=order_price,
+                    one_lot_cost=one_lot_cost,
+                    one_lot_cash_required=one_lot_cash_required,
+                    strategy_target_notional=strategy_target_notional,
+                    adjusted_target_notional=float(shares) * float(order_price),
+                    target_shares=shares,
+                    available_cash=max(float(self.cash) - reserved_cash, 0.0),
+                    retail_action=retail_action,
+                    retail_block_reason=retail_block_reason,
+                )
             if shares <= 0:
                 continue
+            if self._retail_lot_adapter_enabled and str(order["side"]) == "buy":
+                reserved_cash += self._retail_cash_required(
+                    side=str(order["side"]),
+                    price=order_price,
+                    shares=shares,
+                )
             payload = {
                 "decision_id": order["decision_id"],
                 "symbol": symbol,
@@ -1356,11 +2972,252 @@ class GovernanceBacktestRunner:
                 "priority": int(order["priority"]),
                 "created_date": order["execution_date"] - pd.offsets.BDay(1),
                 "target_shares": shares,
+                "position_state": order.get("position_state", ""),
+                "position_exit_reason": order.get("position_exit_reason", ""),
+                "add_layer": order.get("add_layer", pd.NA),
+                "add_allowed": order.get("add_allowed", False),
+                "add_block_reason": order.get("add_block_reason", ""),
+                "entry_matrix_score": order.get("entry_matrix_score", pd.NA),
+                "entry_alpha_score": order.get("entry_alpha_score", pd.NA),
+                "entry_timing_score": order.get("entry_timing_score", pd.NA),
+                "entry_liquidity_score": order.get("entry_liquidity_score", pd.NA),
+                "alpha_quality_score": order.get("alpha_quality_score", pd.NA),
+                "surge_capture_score": order.get("surge_capture_score", pd.NA),
+                "follow_through_score": order.get("follow_through_score", pd.NA),
+                "exhaustion_score": order.get("exhaustion_score", pd.NA),
+                "entry_success_probability": order.get("entry_success_probability", pd.NA),
+                "entry_size_tier": order.get("entry_size_tier", ""),
+                "planned_entry_lots": order.get("planned_entry_lots", pd.NA),
+                "empirical_distribution_score": order.get("empirical_distribution_score", pd.NA),
+                "final_entry_score": order.get("final_entry_score", pd.NA),
+                "tail_risk_proxy": order.get("tail_risk_proxy", pd.NA),
+                "trend_direction_score": order.get("trend_direction_score", pd.NA),
+                "peak_decay_score": order.get("peak_decay_score", pd.NA),
+                "profit_protection_pressure": order.get("profit_protection_pressure", pd.NA),
+                "dynamic_giveback_limit": order.get("dynamic_giveback_limit", pd.NA),
+                "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
+                "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
+                "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
             }
             if order["side"] == "sell":
                 self.engine.pending_orders.upsert_sell_intent(payload)
             else:
                 self.engine.pending_orders.add_order(payload)
+        return diagnostics
+
+    def _sort_retail_orders(self, orders: pd.DataFrame) -> pd.DataFrame:
+        if orders is None or orders.empty:
+            return orders
+        data = orders.copy()
+        side = data.get("side", pd.Series("", index=data.index)).astype(str).str.lower()
+        data["_retail_side_priority"] = side.map({"sell": 0, "buy": 1}).fillna(2)
+        matrix = pd.to_numeric(data.get("entry_matrix_score", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        timing = pd.to_numeric(data.get("entry_timing_score", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        liquidity = pd.to_numeric(data.get("entry_liquidity_score", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        alpha = pd.to_numeric(data.get("entry_alpha_score", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        data["_retail_order_score"] = 0.50 * matrix + 0.25 * timing + 0.15 * liquidity + 0.10 * alpha
+        sorted_data = data.sort_values(
+            ["_retail_side_priority", "_retail_order_score", "priority", "symbol"],
+            ascending=[True, False, True, True],
+        )
+        return sorted_data.drop(columns=["_retail_side_priority", "_retail_order_score"])
+
+    def _adapt_retail_buy_order(
+        self,
+        *,
+        order,
+        strategy_target_notional: float,
+        order_price: float,
+        nominal_nav: float,
+        reserved_cash: float,
+        initial_shares: float,
+        one_lot_cash_required: float | None = None,
+    ) -> tuple[float, str, str]:
+        state = str(order.get("position_state", "") or "").strip().lower()
+        if state in {"blocked", "cooldown", "exiting", "protecting_profit"} or bool(order.get("exit_state", False)):
+            return 0.0, "blocked", "position_state"
+        if order_price <= 0.0 or nominal_nav <= 0.0:
+            return 0.0, "blocked", "invalid_price_or_nav"
+
+        min_buffer = float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0)
+        single_cap = float(self.capital_profile.get("retail_single_position_cap", 0.40) or 0.40)
+        exposure_tolerance = float(self.capital_profile.get("retail_target_exposure_tolerance", 0.10) or 0.10)
+        strong_threshold = float(self.capital_profile.get("retail_strong_entry_matrix_threshold", 0.75) or 0.75)
+        entry_score = _safe_float(order.get("entry_matrix_score"), default=0.0)
+        alpha_quality = _safe_float(order.get("alpha_quality_score"), default=0.0)
+        follow_through = _safe_float(order.get("follow_through_score"), default=0.0)
+        exhaustion = _safe_float(order.get("exhaustion_score"), default=0.0)
+        downtrend = _safe_float(order.get("downtrend_decay_score"), default=0.0)
+        entry_probability = _safe_float(order.get("entry_success_probability"), default=0.0)
+        min_entry_score = float(self.capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0)
+        tier = str(order.get("entry_size_tier", "") or "").strip().lower()
+        force_deploy = self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
+        if force_deploy and tier == "diversify_1_lot":
+            min_entry_score = min(min_entry_score, float(GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN))
+        elif tier == "starter_1_lot":
+            min_entry_score = min(min_entry_score, float(GOVERNANCE_ENTRY_MATRIX_WATCH_THRESHOLD))
+        one_lot_position_cap = float(
+            self.capital_profile.get("retail_one_lot_position_cap", single_cap) or single_cap
+        )
+        one_lot_cost = float(order_price) * float(MIN_LOT_SIZE)
+        one_lot_cash_required = (
+            float(one_lot_cash_required)
+            if one_lot_cash_required is not None
+            else self._retail_cash_required(side="buy", price=order_price, shares=float(MIN_LOT_SIZE))
+        )
+        available_cash = max(float(self.cash) - float(reserved_cash), 0.0)
+        affordable_cash = max(available_cash - min_buffer, 0.0)
+        if one_lot_cash_required > affordable_cash:
+            return 0.0, "blocked", "lot_size_cash_insufficient"
+
+        current_weight = _safe_float(order.get("current_weight"), default=0.0)
+        one_lot_weight = one_lot_cash_required / max(float(nominal_nav), 1e-12)
+        if current_weight + one_lot_weight > single_cap + 1e-12:
+            return 0.0, "blocked", "single_position_cap"
+        if initial_shares < float(MIN_LOT_SIZE) and one_lot_weight > one_lot_position_cap + 1e-12:
+            return 0.0, "blocked", "one_lot_position_cap"
+
+        target_exposure = 0.0
+        if self.exposure_rows:
+            target_exposure = _safe_float(self.exposure_rows[-1].get("target_exposure"), default=0.0)
+        current_exposure = 0.0
+        if self.exposure_rows:
+            current_exposure = _safe_float(self.exposure_rows[-1].get("nominal_exposure"), default=0.0)
+        if target_exposure > 1e-12 and current_exposure + one_lot_weight > target_exposure + exposure_tolerance + 1e-12:
+            return 0.0, "blocked", "target_exposure_tolerance"
+
+        if initial_shares >= float(MIN_LOT_SIZE):
+            return initial_shares, "unchanged", ""
+        if strategy_target_notional <= 0.0 and not (force_deploy and tier in {"diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"}):
+            return 0.0, "blocked", "target_notional_zero"
+        if entry_score < min_entry_score:
+            return 0.0, "blocked", "entry_matrix_score"
+        if exhaustion >= float(GOVERNANCE_EXHAUSTION_BUY_MAX):
+            return 0.0, "blocked", "exhaustion_block"
+        if downtrend >= float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK):
+            return 0.0, "blocked", "downtrend_decay_block"
+
+        planned_lots = int(max(_safe_float(order.get("planned_entry_lots"), default=1.0), 1.0))
+        if tier == "starter_strong" or (
+            entry_score >= max(strong_threshold, float(GOVERNANCE_ENTRY_MATRIX_STRONG_STARTER))
+            and alpha_quality >= 0.70
+            and follow_through >= float(GOVERNANCE_FOLLOW_THROUGH_STRONG)
+        ):
+            planned_lots = max(planned_lots, int(GOVERNANCE_RETAIL_STRONG_STARTER_LOTS))
+        elif tier == "starter_2_lot" or (
+            entry_score >= float(GOVERNANCE_ENTRY_MATRIX_STARTER_2)
+            and follow_through >= float(GOVERNANCE_FOLLOW_THROUGH_STARTER_2)
+        ):
+            planned_lots = max(planned_lots, int(GOVERNANCE_RETAIL_STARTER_2_LOTS))
+        else:
+            planned_lots = 1
+
+        max_cash_lots = int(affordable_cash // max(one_lot_cash_required, 1e-12))
+        max_cap_lots = int(max((single_cap - current_weight) * max(float(nominal_nav), 1e-12), 0.0) // max(one_lot_cash_required, 1e-12))
+        executable_lots = max(min(planned_lots, max_cash_lots, max_cap_lots), 0)
+        if executable_lots <= 0:
+            return 0.0, "blocked", "lot_size_cash_or_cap"
+        shares = float(executable_lots) * float(MIN_LOT_SIZE)
+        if executable_lots >= 3:
+            return shares, "upgraded_to_three_lots_strong", ""
+        if executable_lots >= 2:
+            return shares, "upgraded_to_two_lots", ""
+        return shares, "upgraded_to_one_lot", ""
+
+    def _retail_cash_required(self, *, side: str, price: float, shares: float) -> float:
+        if float(price) <= 0.0 or float(shares) <= 0.0:
+            return 0.0
+        costs = estimate_trade_costs(
+            pd.DataFrame(
+                [
+                    {
+                        "side": str(side),
+                        "price": float(price),
+                        "target_shares": float(shares),
+                    }
+                ]
+            )
+        )
+        row = costs.iloc[0]
+        return float(row.get("trade_notional", 0.0)) + float(row.get("total_cost", 0.0))
+
+    def _record_retail_execution_diagnostic(
+        self,
+        *,
+        order,
+        nominal_nav: float,
+        price,
+        one_lot_cost,
+        strategy_target_notional: float,
+        adjusted_target_notional: float,
+        target_shares: float,
+        available_cash: float,
+        retail_action: str,
+        retail_block_reason: str,
+        one_lot_cash_required=None,
+    ) -> None:
+        if not self._retail_lot_adapter_enabled:
+            return
+        min_buffer = float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0)
+        adjusted_notional = _safe_float(adjusted_target_notional, default=0.0)
+        single_after = _safe_float(order.get("current_weight"), default=0.0) + (
+            adjusted_notional / max(float(nominal_nav), 1e-12)
+        )
+        self.retail_execution_rows.append(
+            {
+                "decision_id": order.get("decision_id", ""),
+                "execution_date": order.get("execution_date", pd.NaT),
+                "symbol": str(order.get("symbol", "")),
+                "side": str(order.get("side", "")),
+                "strategy_target_weight": _safe_float(order.get("delta_weight"), default=0.0),
+                "strategy_target_notional": float(strategy_target_notional),
+                "adjusted_target_notional": adjusted_notional,
+                "price": price,
+                "one_lot_cost": one_lot_cost,
+                "one_lot_cash_required": _safe_float(one_lot_cash_required, default=_safe_float(one_lot_cost, default=0.0)),
+                "target_shares": float(target_shares or 0.0),
+                "available_cash": float(available_cash),
+                "cash_buffer_required": min_buffer,
+                "single_position_weight_after": single_after,
+                "lot_upgrade_ratio": (
+                    _safe_float(one_lot_cost, default=0.0) / max(float(strategy_target_notional), 1e-12)
+                    if _safe_float(one_lot_cost, default=0.0) > 0.0
+                    else pd.NA
+                ),
+                "retail_one_lot_position_cap": float(
+                    self.capital_profile.get("retail_one_lot_position_cap", self.capital_profile.get("retail_single_position_cap", 0.40))
+                    or self.capital_profile.get("retail_single_position_cap", 0.40)
+                ),
+                "retail_min_entry_matrix_score": float(
+                    self.capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0
+                ),
+                "position_state": order.get("position_state", ""),
+                "entry_matrix_score": order.get("entry_matrix_score", pd.NA),
+                "entry_alpha_score": order.get("entry_alpha_score", pd.NA),
+                "entry_timing_score": order.get("entry_timing_score", pd.NA),
+                "entry_liquidity_score": order.get("entry_liquidity_score", pd.NA),
+                "alpha_quality_score": order.get("alpha_quality_score", pd.NA),
+                "surge_capture_score": order.get("surge_capture_score", pd.NA),
+                "follow_through_score": order.get("follow_through_score", pd.NA),
+                "exhaustion_score": order.get("exhaustion_score", pd.NA),
+                "entry_success_probability": order.get("entry_success_probability", pd.NA),
+                "entry_size_tier": order.get("entry_size_tier", ""),
+                "planned_entry_lots": order.get("planned_entry_lots", pd.NA),
+                "empirical_distribution_score": order.get("empirical_distribution_score", pd.NA),
+                "final_entry_score": order.get("final_entry_score", pd.NA),
+                "tail_risk_proxy": order.get("tail_risk_proxy", pd.NA),
+                "trend_direction_score": order.get("trend_direction_score", pd.NA),
+                "peak_decay_score": order.get("peak_decay_score", pd.NA),
+                "profit_protection_pressure": order.get("profit_protection_pressure", pd.NA),
+                "dynamic_giveback_limit": order.get("dynamic_giveback_limit", pd.NA),
+                "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
+                "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
+                "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
+                "retail_action": str(retail_action),
+                "retail_block_reason": str(retail_block_reason),
+                "capital_profile": str(self.capital_profile.get("name", "")),
+            }
+        )
 
     def _current_weights(self, daily, nominal_nav):
         if nominal_nav <= 0:
@@ -1688,7 +3545,7 @@ class GovernanceBacktestRunner:
         _, _, summary = build_trade_pairing_ledgers(
             ledger,
             latest_prices=None,
-            capital_profile=self.governance_variant,
+            capital_profile=self._trade_pairing_capital_profile(),
         )
         return summary
 
@@ -1697,10 +3554,67 @@ class GovernanceBacktestRunner:
         saved = self.engine.save(self.output_dir)
         extra = {
             "governance_daily_result": pd.DataFrame(self.exposure_rows),
-            "governance_holdings_ledger": pd.DataFrame(self.holdings_rows),
-            "governance_execution_ledger": pd.DataFrame(self.execution_rows),
-            "governance_reward_ledger": pd.DataFrame(self.reward_rows),
+            "governance_holdings_ledger": _frame_with_columns(self.holdings_rows, HOLDINGS_LEDGER_COLUMNS),
+            "governance_execution_ledger": _frame_with_columns(self.execution_rows, EXECUTION_LEDGER_COLUMNS),
+            "governance_reward_ledger": _frame_with_columns(
+                self.reward_rows,
+                ["date", "symbol", "side", "trade_date", "reward_5d", "reward_source"],
+            ),
             "governance_entry_confirmation_ledger": pd.DataFrame(self.entry_confirmation_rows),
+            "governance_position_state_ledger": _frame_with_columns(
+                self.position_state_rows,
+                POSITION_STATE_LEDGER_COLUMNS,
+            ),
+            "governance_retail_execution_diagnostics": pd.DataFrame(
+                self.retail_execution_rows,
+                columns=[
+                    "decision_id",
+                    "execution_date",
+                    "symbol",
+                    "side",
+                    "strategy_target_weight",
+                    "strategy_target_notional",
+                    "adjusted_target_notional",
+                    "price",
+                    "one_lot_cost",
+                    "one_lot_cash_required",
+                    "target_shares",
+                    "available_cash",
+                    "cash_buffer_required",
+                    "single_position_weight_after",
+                    "lot_upgrade_ratio",
+                    "retail_one_lot_position_cap",
+                    "retail_min_entry_matrix_score",
+                    "position_state",
+                    "entry_matrix_score",
+                    "entry_alpha_score",
+                    "entry_timing_score",
+                    "entry_liquidity_score",
+                    "alpha_quality_score",
+                    "surge_capture_score",
+                    "follow_through_score",
+                    "exhaustion_score",
+                    "entry_success_probability",
+                    "entry_size_tier",
+                    "planned_entry_lots",
+                    "empirical_distribution_score",
+                    "final_entry_score",
+                    "tail_risk_proxy",
+                    "trend_direction_score",
+                    "peak_decay_score",
+                    "profit_protection_pressure",
+                    "dynamic_giveback_limit",
+                    "future_loss_risk_score",
+                    "downtrend_decay_score",
+                    "post_entry_failure_score",
+                    "retail_action",
+                    "retail_block_reason",
+                    "capital_profile",
+                ],
+            ),
+            "governance_entry_formula_audit": pd.DataFrame(self.entry_formula_audit_rows),
+            "governance_retail_executable_rank": pd.DataFrame(self.retail_executable_rank_rows),
+            "governance_defensive_sleeve_diagnostics": pd.DataFrame(self.defensive_sleeve_rows),
             "governance_factor_weight_ledger": pd.DataFrame(self.factor_weight_rows),
             "governance_alpha_proposals": pd.concat(self.alpha_rows, ignore_index=True) if self.alpha_rows else pd.DataFrame(),
             "governance_alpha_collapse_exit_diagnostics": pd.DataFrame(self.alpha_collapse_exit_rows),
@@ -1710,12 +3624,32 @@ class GovernanceBacktestRunner:
         trade_pairs, open_positions, trade_summary = build_trade_pairing_ledgers(
             extra["governance_execution_ledger"],
             latest_prices=self._latest_price_frame_for_trade_pairing(extra["governance_execution_ledger"]),
-            capital_profile=self.governance_variant,
+            capital_profile=self._trade_pairing_capital_profile(),
         )
         extra["governance_trade_pairs"] = trade_pairs
         extra["governance_open_positions"] = open_positions
         extra["governance_trade_pair_summary"] = pd.DataFrame([trade_summary])
+        extra["governance_ideal_vs_executed"] = _ideal_vs_executed(
+            extra["governance_entry_formula_audit"],
+            extra["governance_execution_ledger"],
+        )
+        extra["governance_entry_timing_diagnostics"] = _entry_timing_diagnostics(
+            extra["governance_entry_formula_audit"],
+            extra["governance_execution_ledger"],
+        )
         extra["governance_pnl_by_sell_reason"] = _pnl_by_sell_reason(trade_pairs)
+        extra["governance_future_loss_duration_audit"] = _future_loss_duration_audit(
+            trade_pairs,
+            self.features,
+            horizon_days=40,
+        )
+        extra["governance_control_avoided_loss_ledger"] = _control_avoided_loss_ledger(
+            extra["governance_execution_ledger"],
+            self.features,
+        )
+        extra["governance_control_avoided_loss_summary"] = _control_avoided_loss_summary_frame(
+            extra["governance_control_avoided_loss_ledger"]
+        )
         extra["governance_attribution_ledger"] = build_governance_attribution(
             daily_result=extra["governance_daily_result"],
             feature_data=self.features,
@@ -1758,6 +3692,7 @@ class GovernanceBacktestRunner:
             quality_reports=quality_reports,
             trade_pair_summary=extra["governance_trade_pair_summary"],
             pnl_by_sell_reason=extra["governance_pnl_by_sell_reason"],
+            control_avoided_loss_summary=extra["governance_control_avoided_loss_summary"],
         )
         summary_path = (
             GOVERNANCE_SUMMARY_CSV
@@ -1810,6 +3745,12 @@ class GovernanceBacktestRunner:
         )
         return saved
 
+    def _trade_pairing_capital_profile(self) -> str:
+        profile_name = str(self.capital_profile.get("name", "") or "").strip()
+        if profile_name:
+            return f"{self.governance_variant}__{profile_name}"
+        return str(self.governance_variant)
+
     def _build_governance_summary(
         self,
         *,
@@ -1822,6 +3763,7 @@ class GovernanceBacktestRunner:
         quality_reports=None,
         trade_pair_summary=None,
         pnl_by_sell_reason=None,
+        control_avoided_loss_summary=None,
     ):
         if daily_result.empty:
             return pd.DataFrame(
@@ -1983,6 +3925,7 @@ class GovernanceBacktestRunner:
         profit_factor = _safe_float(trade_row.get("profit_factor"), default=float("nan"))
         open_position_count = int(_safe_float(trade_row.get("open_position_count"), default=0.0))
         pnl_by_sell_reason_text = _format_pnl_by_sell_reason(pnl_by_sell_reason)
+        control_loss_summary = _control_avoided_loss_summary_from_frame(control_avoided_loss_summary)
         pwin10_ece = _calibration_ece(calibration, horizon_days=10)
         pwin10_wilson_lower = _calibration_best_wilson(calibration, horizon_days=10)
         buy_expectancy_10d = _payoff_metric(payoff, horizon_days=10, side="buy", metric="expectancy")
@@ -2056,6 +3999,16 @@ class GovernanceBacktestRunner:
                     "profit_factor": profit_factor,
                     "open_position_count": open_position_count,
                     "pnl_by_sell_reason": pnl_by_sell_reason_text,
+                    "control_exit_count": control_loss_summary["control_exit_count"],
+                    "control_avoided_loss_to_window_low": control_loss_summary["avoided_loss_to_window_low"],
+                    "control_avoided_loss_to_window_end": control_loss_summary["avoided_loss_to_window_end"],
+                    "hard_stop_avoided_loss_to_window_low": control_loss_summary["hard_stop_avoided_loss_to_window_low"],
+                    "alpha_collapse_avoided_loss_to_window_low": control_loss_summary["alpha_collapse_avoided_loss_to_window_low"],
+                    "safety_deleveraging_avoided_loss_to_window_low": control_loss_summary["safety_deleveraging_avoided_loss_to_window_low"],
+                    "control_counterfactual_note": (
+                        "Avoided-loss diagnostics compare actual sell net price with the post-exit "
+                        f"{int(GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS)}-trading-day low/end; not live tradable PnL."
+                    ),
                     "rebound_buy_expectancy_10d": rebound_buy_expectancy_10d,
                     "rebound_buy_excess_10d": rebound_buy_excess_10d,
                     "rebound_day_count": rebound_day_count,
@@ -2085,7 +4038,6 @@ class GovernanceBacktestRunner:
                             )
                         )
                         and float(max_risk_contribution_observed or 0.0) <= float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION)
-                        and float(validation_gate_pass_ratio or 0.0) >= 0.60
                     ),
                     "account_total_exposure": float(pd.to_numeric(data.get("actual_exposure", pd.Series(dtype=float)), errors="coerce").mean()),
                     "top1_account_weight": float(pd.to_numeric(data.get("top1_account_weight", pd.Series(dtype=float)), errors="coerce").mean()),
@@ -2111,6 +4063,12 @@ class GovernanceBacktestRunner:
                     "exposure_cap_mode": "rule_based_safety_agent" if self.enable_safety_agent else "disabled",
                     "safety_agent_enabled": self.enable_safety_agent,
                     "reputation_enabled": self.enable_reputation,
+                    "governance_control_mode": self.governance_control_mode,
+                    "reputation_control_enabled": self._control_enabled("reputation"),
+                    "regime_control_enabled": self._control_enabled("regime"),
+                    "cooldown_control_enabled": self._control_enabled("cooldown"),
+                    "hard_stop_control_enabled": self._control_enabled("hard_stop_exit"),
+                    "alpha_collapse_exit_enabled": self.alpha_collapse_exit_enabled,
                     "reputation_window_ready": reputation_window_ready,
                     "reputation_window_observed_days": reputation_window_observed_days,
                     "reputation_window_required_days": int(GOVERNANCE_REPUTATION_WARMUP_DAYS),
@@ -2191,7 +4149,7 @@ def run_governance_backtest(
     selection_weight_mode: str = "reputation_weighted",
     regime_overlay_mode: str = "full",
     risk_hard_gate_enabled: bool = False,
-    probability_bucket_mode: str = "default",
+    probability_bucket_mode: str | None = None,
     registry_version: str | None = None,
     target_index_codes: tuple[str, ...] = (),
     require_constituents: bool = True,
@@ -2200,13 +4158,22 @@ def run_governance_backtest(
     enable_quality_filters: bool = True,
     enable_shadow_portfolios: bool = True,
     show_live_monitor: bool = False,
+    initial_cash: float = GOVERNANCE_INITIAL_CASH,
+    max_positions: int | None = None,
+    capital_profile: dict | None = None,
+    governance_control_mode: str = "normal",
+    alpha_collapse_exit_enabled: bool = True,
 ) -> dict[str, Path]:
     from functions.decision_council.policy import RulesBasedPresidentPolicy
 
+    # Deprecated compatibility only. Probability-bucket logic was removed from
+    # the strategy path, but older interactive launchers/notebook state may still
+    # pass this keyword after module reloads.
+    _ = probability_bucket_mode
+
     output_dir = Path(output_dir)
-    archived_path = archive_existing_governance_output(output_dir)
-    if archived_path is not None:
-        print(f"Archived previous governance outputs to: {archived_path}")
+    if not output_dir.name.startswith("run"):
+        output_dir = dated_run_dir(output_dir)
 
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE) if (start_date or GOVERNANCE_START_DATE) else None
     effective_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE) if (end_date or GOVERNANCE_END_DATE) else None
@@ -2232,6 +4199,7 @@ def run_governance_backtest(
     features = _prepare_features(features, copy=False)
     runner = GovernanceBacktestRunner(
         features,
+        initial_cash=float(initial_cash),
         output_dir=output_dir,
         safety_proxy_mode=safety_proxy_mode,
         data_fingerprints={"feature_daily_parquet": file_fingerprint(feature_path)},
@@ -2251,7 +4219,8 @@ def run_governance_backtest(
         selection_weight_mode=selection_weight_mode,
         regime_overlay_mode=regime_overlay_mode,
         risk_hard_gate_enabled=risk_hard_gate_enabled,
-        probability_bucket_mode=probability_bucket_mode,
+        governance_control_mode=governance_control_mode,
+        alpha_collapse_exit_enabled=alpha_collapse_exit_enabled,
         universe_name=universe_name,
         universe_mode=universe_mode,
         alpha_bundle=alpha_bundle,
@@ -2261,6 +4230,8 @@ def run_governance_backtest(
         allow_fallback=allow_fallback,
         allowed_instrument_types=allowed_instrument_types,
         enable_quality_filters=enable_quality_filters,
+        max_positions=max_positions,
+        capital_profile=capital_profile,
     )
     return runner.run(
         start_date=effective_start,
@@ -2335,6 +4306,166 @@ def _recent_actual_target_ratio(exposure_rows: list[dict], *, window: int = 20) 
     return float(ratio.median())
 
 
+def _ideal_vs_executed(entry_audit: pd.DataFrame, execution_ledger: pd.DataFrame) -> pd.DataFrame:
+    if entry_audit is None or entry_audit.empty:
+        return pd.DataFrame()
+    data = entry_audit.copy()
+    data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series("", index=data.index)).astype(str)
+    buys = pd.DataFrame()
+    if execution_ledger is not None and not execution_ledger.empty:
+        buys = execution_ledger.copy()
+        buys["trade_date"] = pd.to_datetime(buys.get("trade_date"), errors="coerce")
+        buys["symbol"] = buys.get("symbol", pd.Series("", index=buys.index)).astype(str)
+        buys = buys[
+            buys.get("side", pd.Series("", index=buys.index)).astype(str).str.lower().eq("buy")
+            & pd.to_numeric(buys.get("executed_shares", pd.Series(0.0, index=buys.index)), errors="coerce").fillna(0.0).gt(0.0)
+        ].copy()
+        if not buys.empty:
+            buys = buys.groupby(["trade_date", "symbol"], as_index=False).agg(
+                executed_buy=("executed_shares", "sum"),
+                executed_notional=("trade_notional", "sum"),
+                execution_status=("execution_status", "last"),
+                buy_reason=("reason", "last"),
+            )
+    if buys.empty:
+        data["executed_buy"] = 0.0
+        data["executed_notional"] = 0.0
+        data["execution_status"] = ""
+        data["buy_reason"] = ""
+    else:
+        data = data.merge(
+            buys,
+            left_on=["date", "symbol"],
+            right_on=["trade_date", "symbol"],
+            how="left",
+        )
+        data["executed_buy"] = pd.to_numeric(data.get("executed_buy"), errors="coerce").fillna(0.0)
+        data["executed_notional"] = pd.to_numeric(data.get("executed_notional"), errors="coerce").fillna(0.0)
+        data["execution_status"] = data.get("execution_status", pd.Series("", index=data.index)).fillna("")
+        data["buy_reason"] = data.get("buy_reason", pd.Series("", index=data.index)).fillna("")
+        if "trade_date" in data.columns:
+            data = data.drop(columns=["trade_date"])
+    data["executed_flag"] = pd.to_numeric(data["executed_buy"], errors="coerce").fillna(0.0).gt(0.0)
+    preferred = [
+        "date",
+        "symbol",
+        "executed_flag",
+        "executed_buy",
+        "executed_notional",
+        "execution_status",
+        "buy_reason",
+        "retail_executable",
+        "retail_block_reason",
+        "retail_executable_score",
+        "entry_confirmed",
+        "entry_alpha_score",
+        "entry_timing_score",
+        "entry_liquidity_score",
+        "entry_matrix_score",
+        "alpha_quality_score",
+        "surge_capture_score",
+        "follow_through_score",
+        "exhaustion_score",
+        "entry_success_probability",
+        "entry_size_tier",
+        "planned_entry_lots",
+        "downtrend_decay_score",
+        "post_entry_failure_score",
+        "primary_score",
+        "alpha_percentile",
+        "expected_return_5d",
+        "one_lot_cash_required",
+        "one_lot_account_weight",
+        "retail_one_lot_position_cap",
+        "forward_return_5d",
+        "forward_return_10d",
+        "forward_return_20d",
+    ]
+    columns = [column for column in preferred if column in data.columns]
+    extras = [column for column in data.columns if column not in columns]
+    return data[columns + extras].sort_values(
+        ["date", "executed_flag", "retail_executable_score", "symbol"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+
+
+def _entry_timing_diagnostics(entry_audit: pd.DataFrame, execution_ledger: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "date",
+        "symbol",
+        "entry_matrix_score",
+        "alpha_quality_score",
+        "entry_timing_score",
+        "surge_capture_score",
+        "follow_through_score",
+        "exhaustion_score",
+        "downtrend_decay_score",
+        "post_entry_failure_score",
+        "entry_size_tier",
+        "planned_lots",
+        "executed_lots",
+        "empirical_distribution_score",
+        "final_entry_score",
+        "tail_risk_proxy",
+        "trend_direction_score",
+        "peak_decay_score",
+        "profit_protection_pressure",
+        "dynamic_giveback_limit",
+        "future_loss_risk_score",
+        "forward_return_1d",
+        "forward_return_3d",
+        "forward_return_5d",
+        "forward_return_10d",
+        "best_buy_after_entry_date",
+        "best_buy_after_entry_gap",
+        "worst_drawdown_after_entry",
+        "entry_confirmed",
+        "entry_block_reason",
+        "position_state",
+        "retail_executable",
+        "retail_block_reason",
+    ]
+    if entry_audit is None or entry_audit.empty:
+        return pd.DataFrame(columns=columns)
+    data = entry_audit.copy()
+    data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
+    data["symbol"] = data.get("symbol", pd.Series("", index=data.index)).astype(str)
+    data["planned_lots"] = pd.to_numeric(data.get("planned_entry_lots"), errors="coerce").fillna(0.0)
+    if execution_ledger is None or execution_ledger.empty:
+        data["executed_lots"] = 0.0
+    else:
+        executions = execution_ledger.copy()
+        executions["trade_date"] = pd.to_datetime(executions.get("trade_date"), errors="coerce")
+        executions["symbol"] = executions.get("symbol", pd.Series("", index=executions.index)).astype(str)
+        side = executions.get("side", pd.Series("", index=executions.index)).astype(str).str.lower()
+        executions = executions[side.eq("buy")].copy()
+        if executions.empty:
+            data["executed_lots"] = 0.0
+        else:
+            buys = (
+                executions.groupby(["trade_date", "symbol"], as_index=False)
+                .agg(executed_shares=("executed_shares", "sum"))
+            )
+            buys["executed_lots"] = pd.to_numeric(buys["executed_shares"], errors="coerce").fillna(0.0) / float(MIN_LOT_SIZE)
+            data = data.merge(
+                buys[["trade_date", "symbol", "executed_lots"]],
+                left_on=["date", "symbol"],
+                right_on=["trade_date", "symbol"],
+                how="left",
+            )
+            data["executed_lots"] = pd.to_numeric(data.get("executed_lots"), errors="coerce").fillna(0.0)
+            if "trade_date" in data.columns:
+                data = data.drop(columns=["trade_date"])
+    for column in columns:
+        if column not in data.columns:
+            data[column] = pd.NA
+    return data[columns].sort_values(
+        ["date", "executed_lots", "entry_matrix_score", "symbol"],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
+
+
 def _pnl_by_sell_reason(trade_pairs: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "sell_reason",
@@ -2391,6 +4522,264 @@ def _pnl_by_sell_reason(trade_pairs: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns).sort_values("realized_pnl", ascending=False)
 
 
+def _future_loss_duration_audit(trade_pairs: pd.DataFrame, features: pd.DataFrame, *, horizon_days: int = 40) -> pd.DataFrame:
+    columns = [
+        "symbol",
+        "entry_date",
+        "exit_date",
+        "sell_reason",
+        "exit_price",
+        "exit_net_price",
+        "exit_shares",
+        "realized_pnl_amount",
+        "realized_pnl_pct",
+        "future_5d_return_if_hold",
+        "future_10d_return_if_hold",
+        "future_20d_return_if_hold",
+        "future_40d_return_if_hold",
+        "future_low_after_exit",
+        "future_low_date",
+        "days_to_future_low",
+        "loss_days_after_exit",
+        "observed_future_days",
+        "avoided_loss_to_future_low",
+        "continued_loss_flag",
+    ]
+    if trade_pairs is None or trade_pairs.empty or features is None or features.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"symbol", "entry_date", "exit_date", "sell_reason", "exit_price", "exit_shares"}
+    if not required.issubset(trade_pairs.columns):
+        return pd.DataFrame(columns=columns)
+    price_col = "close_nominal" if "close_nominal" in features.columns else "close"
+    if not {"date", "symbol", price_col}.issubset(features.columns):
+        return pd.DataFrame(columns=columns)
+    prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
+    prices["symbol"] = prices["symbol"].astype(str)
+    prices[price_col] = pd.to_numeric(prices[price_col], errors="coerce")
+    prices = prices.dropna(subset=["date", "symbol", price_col]).sort_values(["symbol", "date"])
+    rows = []
+    for _, trade in trade_pairs.iterrows():
+        symbol = str(trade.get("symbol", ""))
+        exit_date = pd.to_datetime(trade.get("exit_date"), errors="coerce")
+        if not symbol or pd.isna(exit_date):
+            continue
+        exit_price = _safe_float(trade.get("exit_net_price"), default=_safe_float(trade.get("exit_price"), default=0.0))
+        shares = _safe_float(trade.get("exit_shares"), default=0.0)
+        if exit_price <= 0.0 or shares <= 0.0:
+            continue
+        path = prices[(prices["symbol"].eq(symbol)) & (prices["date"] > pd.Timestamp(exit_date))].head(int(horizon_days)).copy()
+        if path.empty:
+            continue
+        close = path[price_col].astype(float).reset_index(drop=True)
+        dates = path["date"].reset_index(drop=True)
+        returns = {}
+        for horizon in (5, 10, 20, 40):
+            if len(close) >= horizon:
+                returns[horizon] = float(close.iloc[horizon - 1] / exit_price - 1.0)
+            else:
+                returns[horizon] = pd.NA
+        low_idx = int(close.idxmin())
+        low_price = float(close.iloc[low_idx])
+        low_date = pd.Timestamp(dates.iloc[low_idx])
+        loss_days = int((close < exit_price).sum())
+        rows.append(
+            {
+                "symbol": symbol,
+                "entry_date": trade.get("entry_date", pd.NaT),
+                "exit_date": exit_date,
+                "sell_reason": str(trade.get("sell_reason", "")),
+                "exit_price": _safe_float(trade.get("exit_price"), default=exit_price),
+                "exit_net_price": exit_price,
+                "exit_shares": shares,
+                "realized_pnl_amount": _safe_float(trade.get("realized_pnl_amount"), default=0.0),
+                "realized_pnl_pct": _safe_float(trade.get("realized_pnl_pct"), default=0.0),
+                "future_5d_return_if_hold": returns[5],
+                "future_10d_return_if_hold": returns[10],
+                "future_20d_return_if_hold": returns[20],
+                "future_40d_return_if_hold": returns[40],
+                "future_low_after_exit": low_price,
+                "future_low_date": low_date,
+                "days_to_future_low": int(low_idx + 1),
+                "loss_days_after_exit": loss_days,
+                "observed_future_days": int(len(close)),
+                "avoided_loss_to_future_low": max((exit_price - low_price) * shares, 0.0),
+                "continued_loss_flag": bool(loss_days >= min(10, len(close)) or low_price < exit_price * 0.95),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+CONTROL_AVOIDED_LOSS_REASONS = ("profit_hard_stop_exit", "hard_stop_exit", "alpha_collapse_consensus", "safety_deleveraging")
+
+
+def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.DataFrame, *, as_of=None) -> pd.DataFrame:
+    columns = [
+        "trade_date",
+        "symbol",
+        "sell_reason",
+        "exit_price",
+        "exit_net_price",
+        "executed_shares",
+        "horizon_days",
+        "maturity_date",
+        "window_low_date",
+        "window_low_price",
+        "window_end_date",
+        "window_end_price",
+        "avoided_loss_to_window_low",
+        "avoided_loss_to_window_end",
+        "counterfactual_window_observed_days",
+        "counterfactual_note",
+    ]
+    if execution_ledger is None or execution_ledger.empty or features is None or features.empty:
+        return pd.DataFrame(columns=columns)
+    required = {"trade_date", "symbol", "side", "reason", "price", "executed_shares"}
+    if not required.issubset(execution_ledger.columns):
+        return pd.DataFrame(columns=columns)
+    price_col = "trade_close" if "trade_close" in features.columns else "close_nominal" if "close_nominal" in features.columns else "close"
+    if not {"date", "symbol", price_col}.issubset(features.columns):
+        return pd.DataFrame(columns=columns)
+    as_of_ts = pd.Timestamp(as_of) if as_of is not None else None
+    sells = execution_ledger.copy()
+    sells["trade_date"] = pd.to_datetime(sells["trade_date"], errors="coerce")
+    sells["side"] = sells["side"].astype(str).str.lower()
+    sells["reason"] = sells["reason"].astype(str)
+    sells["executed_shares"] = pd.to_numeric(sells["executed_shares"], errors="coerce").fillna(0.0)
+    sells["price"] = pd.to_numeric(sells["price"], errors="coerce")
+    sells["total_cost"] = pd.to_numeric(sells.get("total_cost", pd.Series(0.0, index=sells.index)), errors="coerce").fillna(0.0)
+    sells = sells[
+        sells["trade_date"].notna()
+        & sells["side"].eq("sell")
+        & sells["reason"].isin(CONTROL_AVOIDED_LOSS_REASONS)
+        & sells["executed_shares"].gt(0.0)
+        & sells["price"].gt(0.0)
+    ].copy()
+    if sells.empty:
+        return pd.DataFrame(columns=columns)
+    feature_prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    feature_prices["date"] = pd.to_datetime(feature_prices["date"], errors="coerce")
+    feature_prices["symbol"] = feature_prices["symbol"].astype(str)
+    feature_prices[price_col] = pd.to_numeric(feature_prices[price_col], errors="coerce")
+    feature_prices = feature_prices.dropna(subset=["date", "symbol", price_col])
+    rows = []
+    horizon_days = int(GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS)
+    for _, sell in sells.iterrows():
+        symbol = str(sell["symbol"])
+        trade_date = pd.Timestamp(sell["trade_date"])
+        path = feature_prices[
+            (feature_prices["symbol"].eq(symbol))
+            & (feature_prices["date"] > trade_date)
+        ].sort_values("date")
+        if as_of_ts is not None:
+            path = path[path["date"] <= as_of_ts]
+        path = path.head(horizon_days)
+        if path.empty:
+            continue
+        low_idx = path[price_col].idxmin()
+        low_row = path.loc[low_idx]
+        end_row = path.iloc[-1]
+        shares = float(sell["executed_shares"])
+        exit_net_price = float(sell["price"]) - float(sell.get("total_cost", 0.0)) / max(shares, 1e-12)
+        window_low_price = float(low_row[price_col])
+        window_end_price = float(end_row[price_col])
+        rows.append(
+            {
+                "trade_date": trade_date,
+                "symbol": symbol,
+                "sell_reason": str(sell["reason"]),
+                "exit_price": float(sell["price"]),
+                "exit_net_price": exit_net_price,
+                "executed_shares": shares,
+                "horizon_days": horizon_days,
+                "maturity_date": pd.Timestamp(end_row["date"]),
+                "window_low_date": pd.Timestamp(low_row["date"]),
+                "window_low_price": window_low_price,
+                "window_end_date": pd.Timestamp(end_row["date"]),
+                "window_end_price": window_end_price,
+                "avoided_loss_to_window_low": max((exit_net_price - window_low_price) * shares, 0.0),
+                "avoided_loss_to_window_end": max((exit_net_price - window_end_price) * shares, 0.0),
+                "counterfactual_window_observed_days": int(len(path)),
+                "counterfactual_note": "If the control sell had not happened, this is the extra mark-to-low/end loss avoided in the post-exit window.",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "sell_reason",
+        "control_exit_count",
+        "avoided_loss_to_window_low",
+        "avoided_loss_to_window_end",
+        "avg_avoided_loss_to_window_low",
+        "avg_observed_days",
+    ]
+    if ledger is None or ledger.empty:
+        return pd.DataFrame(columns=columns)
+    data = ledger.copy()
+    data["avoided_loss_to_window_low"] = pd.to_numeric(data.get("avoided_loss_to_window_low"), errors="coerce").fillna(0.0)
+    data["avoided_loss_to_window_end"] = pd.to_numeric(data.get("avoided_loss_to_window_end"), errors="coerce").fillna(0.0)
+    data["counterfactual_window_observed_days"] = pd.to_numeric(
+        data.get("counterfactual_window_observed_days"), errors="coerce"
+    ).fillna(0.0)
+    rows = []
+    for reason, group in data.groupby("sell_reason", dropna=False):
+        count = int(len(group))
+        low_sum = float(group["avoided_loss_to_window_low"].sum())
+        rows.append(
+            {
+                "sell_reason": str(reason),
+                "control_exit_count": count,
+                "avoided_loss_to_window_low": low_sum,
+                "avoided_loss_to_window_end": float(group["avoided_loss_to_window_end"].sum()),
+                "avg_avoided_loss_to_window_low": low_sum / max(count, 1),
+                "avg_observed_days": float(group["counterfactual_window_observed_days"].mean()) if count else pd.NA,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values("avoided_loss_to_window_low", ascending=False)
+
+
+def _control_avoided_loss_summary(execution_ledger: pd.DataFrame, features: pd.DataFrame, *, as_of=None) -> dict:
+    return _control_avoided_loss_summary_from_frame(
+        _control_avoided_loss_summary_frame(
+            _control_avoided_loss_ledger(execution_ledger, features, as_of=as_of)
+        )
+    )
+
+
+def _control_avoided_loss_summary_from_frame(summary: pd.DataFrame | None) -> dict:
+    result = {
+        "control_exit_count": 0,
+        "avoided_loss_to_window_low": 0.0,
+        "avoided_loss_to_window_end": 0.0,
+        "profit_hard_stop_avoided_loss_to_window_low": 0.0,
+        "hard_stop_avoided_loss_to_window_low": 0.0,
+        "alpha_collapse_avoided_loss_to_window_low": 0.0,
+        "safety_deleveraging_avoided_loss_to_window_low": 0.0,
+    }
+    if summary is None or summary.empty:
+        return result
+    data = summary.copy()
+    data["sell_reason"] = data.get("sell_reason", pd.Series("", index=data.index)).astype(str)
+    data["control_exit_count"] = pd.to_numeric(data.get("control_exit_count"), errors="coerce").fillna(0.0)
+    data["avoided_loss_to_window_low"] = pd.to_numeric(data.get("avoided_loss_to_window_low"), errors="coerce").fillna(0.0)
+    data["avoided_loss_to_window_end"] = pd.to_numeric(data.get("avoided_loss_to_window_end"), errors="coerce").fillna(0.0)
+    result["control_exit_count"] = int(data["control_exit_count"].sum())
+    result["avoided_loss_to_window_low"] = float(data["avoided_loss_to_window_low"].sum())
+    result["avoided_loss_to_window_end"] = float(data["avoided_loss_to_window_end"].sum())
+    for reason, key in (
+        ("profit_hard_stop_exit", "profit_hard_stop_avoided_loss_to_window_low"),
+        ("hard_stop_exit", "hard_stop_avoided_loss_to_window_low"),
+        ("alpha_collapse_consensus", "alpha_collapse_avoided_loss_to_window_low"),
+        ("safety_deleveraging", "safety_deleveraging_avoided_loss_to_window_low"),
+    ):
+        rows = data[data["sell_reason"].eq(reason)]
+        result[key] = float(rows["avoided_loss_to_window_low"].sum()) if not rows.empty else 0.0
+    result["hard_stop_avoided_loss_to_window_low"] += result["profit_hard_stop_avoided_loss_to_window_low"]
+    return result
+
+
 def _format_pnl_by_sell_reason(pnl_by_sell_reason: pd.DataFrame) -> str:
     if pnl_by_sell_reason is None or pnl_by_sell_reason.empty:
         return ""
@@ -2421,6 +4810,77 @@ def _safe_float(value, default=0.0) -> float:
     if numeric.empty:
         return float(default)
     return float(numeric.iloc[0])
+
+
+def _clip01(value) -> float:
+    return min(max(_safe_float(value, default=0.0), 0.0), 1.0)
+
+
+def _dynamic_giveback_limit(
+    *,
+    mfe: float,
+    trend_direction_score: float,
+    peak_decay_score: float,
+    orderflow_decay_score: float,
+) -> float:
+    mfe = max(_safe_float(mfe, default=0.0), 0.0)
+    if mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_3):
+        base = float(GOVERNANCE_PROFIT_GIVEBACK_3)
+    elif mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_2):
+        base = float(GOVERNANCE_PROFIT_GIVEBACK_2)
+    else:
+        base = float(GOVERNANCE_PROFIT_GIVEBACK_1) + 0.05
+    trend_decay_penalty = max(0.55 - _safe_float(trend_direction_score, default=0.50), 0.0) * 0.30
+    peak_decay_penalty = _clip01(peak_decay_score) * 0.12
+    orderflow_penalty = _clip01(orderflow_decay_score) * 0.08
+    return min(max(base - trend_decay_penalty - peak_decay_penalty - orderflow_penalty, 0.18), 0.55)
+
+
+def _governance_round_trip_cost_rate() -> float:
+    return (
+        2.0 * float(COMMISSION_RATE)
+        + 2.0 * float(SLIPPAGE_RATE)
+        + float(STAMP_DUTY_RATE)
+        + 2.0 * float(TRANSFER_FEE_RATE)
+    )
+
+
+def _normalize_governance_control_mode(value) -> str:
+    mode = str(value or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "full": "normal",
+        "factor": "factor_only",
+        "factor_only_stop": "factor_only",
+        "stop": "factor_only",
+        "stop_mode": "factor_only",
+        "paper": "paper_controls",
+        "paper_control": "paper_controls",
+        "safe_factor": "safe_factor_only",
+        "safe_stop": "safe_factor_only",
+    }
+    mode = aliases.get(mode, mode)
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    if mode not in allowed:
+        raise ValueError(f"Unknown governance_control_mode '{value}'. Available: {sorted(allowed)}")
+    return mode
+
+
+def _normalize_capital_usage_mode(value) -> str:
+    mode = str(value or GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT).strip().lower()
+    aliases = {
+        "cash": "allow_cash",
+        "allow": "allow_cash",
+        "idle_cash": "allow_cash",
+        "force": GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+        "forced": GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+        "full": GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+        "deploy": GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"allow_cash", GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY}:
+        return GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT
+    return mode
 
 
 def _best_bucket(bucket_frame: pd.DataFrame, dimension: str, metric: str) -> str:
@@ -2606,20 +5066,47 @@ def _aggregate_factor_modules(factor_weights: list[dict]) -> list[dict]:
 def _confirm_post_entry_failure(candidates: pd.DataFrame) -> pd.Series:
     if candidates is None or candidates.empty:
         return pd.Series(dtype=bool)
+    return _post_entry_failure_score(candidates).ge(float(GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE))
+
+
+def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
+    if candidates is None or candidates.empty:
+        return pd.Series(dtype=float)
     watch = candidates.get("post_entry_failure_watch", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
     unrealized = pd.to_numeric(candidates.get("position_unrealized_return", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
-    p_lower = pd.to_numeric(candidates.get("p_win_10d_wilson_lower", pd.Series(0.5, index=candidates.index)), errors="coerce").fillna(0.5)
-    conservative_edge = pd.to_numeric(candidates.get("conservative_expected_edge_10d", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     alpha = pd.to_numeric(candidates.get("alpha_percentile", pd.Series(0.5, index=candidates.index)), errors="coerce").fillna(0.5)
+    alpha_quality = pd.to_numeric(candidates.get("alpha_quality_score", pd.Series(0.5, index=candidates.index)), errors="coerce").fillna(0.5)
+    entry_alpha_quality = pd.to_numeric(
+        candidates.get("position_entry_alpha_quality_score", pd.Series(alpha_quality, index=candidates.index)),
+        errors="coerce",
+    ).fillna(alpha_quality)
+    alpha_quality_drop = (entry_alpha_quality - alpha_quality).clip(lower=0.0, upper=1.0)
     ret5 = pd.to_numeric(candidates.get("ret_5", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     ret20 = pd.to_numeric(candidates.get("ret_20", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     close_to_ma20 = pd.to_numeric(candidates.get("close_to_ma20", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     flow_count = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
-    alpha_weak = (p_lower < 0.42) | (conservative_edge < -0.003) | (alpha < 0.45)
-    trend_weak = (ret5 < -0.02) | (ret20 < -0.04) | (close_to_ma20 < -0.03)
-    flow_weak = flow_count <= 1
-    severe_loss = unrealized < -0.055
-    return watch & (severe_loss | (alpha_weak & trend_weak) | (trend_weak & flow_weak))
+    holding_days = pd.to_numeric(candidates.get("position_holding_days", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
+    alpha_collapse = (
+        alpha.lt(0.45).astype(float) * 0.35
+        + alpha_quality.lt(0.55).astype(float) * 0.25
+        + (alpha_quality_drop / 0.12).clip(0.0, 1.0) * 0.40
+    ).clip(0.0, 1.0)
+    trend_weak = (
+        ret5.lt(-0.02).astype(float) * 0.35
+        + ret20.lt(-0.04).astype(float) * 0.35
+        + close_to_ma20.lt(-0.03).astype(float) * 0.30
+    ).clip(0.0, 1.0)
+    orderflow_bad = flow_count.le(1).astype(float)
+    loss_bad = ((-unrealized - 0.015) / 0.055).clip(0.0, 1.0)
+    stale_bad = ((holding_days - 6.0) / 14.0).clip(0.0, 1.0)
+    score = (
+        0.30 * loss_bad
+        + 0.25 * alpha_collapse
+        + 0.20 * orderflow_bad
+        + 0.15 * trend_weak
+        + 0.10 * stale_bad
+    ).clip(0.0, 1.0)
+    return score.where(watch | holding_days.ge(3), 0.0)
 
 
 def build_shadow_factor_diagnostics(
@@ -2811,6 +5298,21 @@ def _authorize_exposure_by_regime(
     base = _base_exposure_by_regime(regime_name)
     overlay_mode = str(regime_overlay_mode or "full").strip().lower()
     overlay_capped = False
+    if overlay_mode in {"off", "disabled", "none"}:
+        return {
+            "authorized_exposure_max": float(safety_exposure_cap),
+            "exposure_authorization_tier": "control_mode_off",
+            "exposure_authorization_block_reasons": "",
+            "authorization_expected_edge_10d_mean": 0.0,
+            "authorization_conservative_expected_edge_10d_mean": 0.0,
+            "authorization_p_win_10d_mean": 0.0,
+            "authorization_p_win_10d_wilson_lower_mean": 0.0,
+            "authorization_calibration_trust_10d_mean": 0.0,
+            "authorization_trailing_buy_accuracy_5d": _safe_float(trailing_buy_accuracy_5d, default=0.52),
+            "authorization_liquidity_stress": float(liquidity_stress),
+            "regime_overlay_mode": overlay_mode,
+            "regime_overlay_capped": False,
+        }
     if overlay_mode in {"conservative", "no_active_boost", "risk_only"}:
         capped_base = min(float(base), 0.60)
         overlay_capped = bool(capped_base < float(base))
@@ -2828,46 +5330,45 @@ def _authorize_exposure_by_regime(
     pwin_mean = _safe_numeric_mean(confirmed.get("p_win_10d_calibrated"), default=0.0)
     pwin_lower_mean = _safe_numeric_mean(confirmed.get("p_win_10d_wilson_lower"), default=max(pwin_mean - 0.08, 0.0))
     calibration_trust_mean = _safe_numeric_mean(confirmed.get("entry_calibration_trust_10d"), default=0.0)
+    matrix_mean = _safe_numeric_mean(confirmed.get("entry_matrix_score"), default=0.0)
+    alpha_quality_mean = _safe_numeric_mean(confirmed.get("alpha_quality_score"), default=0.0)
+    follow_through_mean = _safe_numeric_mean(confirmed.get("follow_through_score"), default=0.0)
+    exhaustion_mean = _safe_numeric_mean(confirmed.get("exhaustion_score"), default=0.0)
     trailing_accuracy = _safe_float(trailing_buy_accuracy_5d, default=0.52) if trailing_buy_accuracy_5d is not None else 0.52
     block_reasons = []
     tier = "defensive"
     multiplier = 0.55
+    quality_ok = bool(matrix_mean >= 0.68 and alpha_quality_mean >= 0.64 and follow_through_mean >= 0.50 and exhaustion_mean < 0.60)
 
     if risk in {"crisis", "high"}:
         block_reasons.append(f"risk_level_{risk}")
         tier = "risk_capped"
         multiplier = 0.50 if risk == "high" else 0.35
     elif regime == "bull" and int(qualified_entry_count) >= 3 and float(liquidity_stress) < 0.25:
-        if trailing_accuracy >= 0.44 or conservative_edge_mean >= -0.002 or pwin_lower_mean >= 0.42:
+        if quality_ok or trailing_accuracy >= 0.44:
             tier = "full"
-            if pwin_lower_mean >= 0.50 and conservative_edge_mean > 0.0 and calibration_trust_mean >= 0.35:
-                multiplier = 1.0
-            else:
-                multiplier = 0.90
+            multiplier = 0.90
         else:
             block_reasons.append("weak_bull_entry_evidence")
             multiplier = 0.75
     elif regime == "rebound" and int(qualified_entry_count) >= 3 and float(liquidity_stress) < 0.22:
         tier = "rebound_confirmed"
-        if pwin_lower_mean >= 0.48 and conservative_edge_mean > 0.0 and calibration_trust_mean >= 0.35:
-            multiplier = 0.90
-        elif pwin_lower_mean >= 0.45 and conservative_edge_mean >= -0.001:
+        if quality_ok:
             multiplier = 0.72
-            block_reasons.append("rebound_partial_evidence")
         else:
             multiplier = 0.55
             block_reasons.append("weak_rebound_entry_evidence")
     elif regime == "neutral" and int(qualified_entry_count) >= 3 and float(liquidity_stress) < 0.25:
         tier = "normal_high"
-        multiplier = 0.90 if trailing_accuracy >= 0.44 or conservative_edge_mean >= -0.002 else 0.75
+        multiplier = 0.85 if quality_ok or trailing_accuracy >= 0.44 else 0.70
     elif int(qualified_entry_count) < 2:
         block_reasons.append("too_few_confirmed_entries")
         multiplier = 0.55
     elif float(liquidity_stress) >= 0.25:
         block_reasons.append("liquidity_stress")
         multiplier = 0.65
-    elif conservative_edge_mean <= -0.004 and trailing_accuracy < 0.40:
-        block_reasons.append("negative_edge_and_weak_accuracy")
+    elif matrix_mean < 0.62 and trailing_accuracy < 0.40:
+        block_reasons.append("weak_matrix_and_accuracy")
         multiplier = 0.60
     elif regime == "weak":
         tier = "weak_participation"

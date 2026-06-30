@@ -6,7 +6,6 @@ import pyarrow.parquet as pq
 from config import (
     DEFAULT_BACKTEST_CAPITAL_PROFILE,
     FEATURE_DAILY_PARQUET,
-    LIQUIDITY_LOCK_REPORT_CSV,
     MIN_LOT_SIZE,
     OPEN_POSITION_LEDGER_PREFIX,
     ORDER_LEDGER_PREFIX,
@@ -30,6 +29,7 @@ from functions.execution.valuation import (
     build_blocked_order_valuation_ledger,
     valuation_discount_by_date,
 )
+from functions.output_naming import run_suffix
 from functions.benchmark import build_benchmark_return_frame
 from functions.governance import research_status_dict
 from functions.event_and_hedge import estimate_static_alpha_beta
@@ -653,31 +653,26 @@ def run_backtest(
     daily_result["benchmark_symbol"] = benchmark_meta.get("benchmark_symbol", "")
     holdings_record = daily_result[["date", "holding_count"]].copy()
     suffix = backtest_profile_suffix(capital_profile["name"])
-    liquidity_report_csv = (
-        LIQUIDITY_LOCK_REPORT_CSV.with_name(
-            f"{LIQUIDITY_LOCK_REPORT_CSV.stem}{suffix}{LIQUIDITY_LOCK_REPORT_CSV.suffix}"
-        )
-        if suffix
-        else LIQUIDITY_LOCK_REPORT_CSV
-    )
+    liquidity_report_csv = RESULT_DIR / f"extreme_liquidity_lock_report{suffix}{run_suffix()}.csv"
     liquidity_report = build_liquidity_lock_report(
         pd.concat(delayed_orders, ignore_index=True) if delayed_orders else pd.DataFrame()
     )
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    daily_csv = RESULT_DIR / f"backtest_daily_result_{strategy_name}{suffix}.csv"
-    daily_parquet = RESULT_DIR / f"backtest_daily_result_{strategy_name}{suffix}.parquet"
-    metrics_csv = RESULT_DIR / f"backtest_metrics_{strategy_name}{suffix}.csv"
-    holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}{suffix}.csv"
-    plot_file = RESULT_DIR / f"equity_curve_{strategy_name}{suffix}.png"
-    learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}{suffix}.csv"
-    order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    trade_pair_csv = RESULT_DIR / f"{TRADE_PAIR_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    open_position_csv = RESULT_DIR / f"{OPEN_POSITION_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}{suffix}.csv"
-    risk_monitor_csv = RESULT_DIR / f"risk_monitoring_{strategy_name}{suffix}.csv"
+    dated_suffix = f"{suffix}{run_suffix()}"
+    daily_csv = RESULT_DIR / f"backtest_daily_result_{strategy_name}{dated_suffix}.csv"
+    daily_parquet = RESULT_DIR / f"backtest_daily_result_{strategy_name}{dated_suffix}.parquet"
+    metrics_csv = RESULT_DIR / f"backtest_metrics_{strategy_name}{dated_suffix}.csv"
+    holdings_csv = RESULT_DIR / f"backtest_holdings_{strategy_name}{dated_suffix}.csv"
+    plot_file = RESULT_DIR / f"equity_curve_{strategy_name}{dated_suffix}.png"
+    learning_meta_csv = RESULT_DIR / f"backtest_learning_metadata_{strategy_name}{dated_suffix}.csv"
+    order_ledger_csv = RESULT_DIR / f"{ORDER_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    trade_pair_csv = RESULT_DIR / f"{TRADE_PAIR_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    open_position_csv = RESULT_DIR / f"{OPEN_POSITION_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    tax_ledger_csv = RESULT_DIR / f"{TAX_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    cash_ledger_csv = RESULT_DIR / f"{CASH_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    valuation_ledger_csv = RESULT_DIR / f"{VALUATION_LEDGER_PREFIX}_{strategy_name}{dated_suffix}.csv"
+    risk_monitor_csv = RESULT_DIR / f"risk_monitoring_{strategy_name}{dated_suffix}.csv"
 
     daily_result.to_csv(daily_csv, index=False, encoding="utf-8-sig")
     daily_result.to_parquet(daily_parquet, index=False)

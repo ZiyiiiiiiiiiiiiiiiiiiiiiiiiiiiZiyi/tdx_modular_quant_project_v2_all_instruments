@@ -435,7 +435,11 @@ def _feature_resource_summary():
 def _load_governance_summary():
     path = Path(GOVERNANCE_SUMMARY_CSV)
     if not path.exists():
-        return pd.DataFrame()
+        candidates = list(path.parent.rglob("governance_strategy_summary.csv"))
+        candidates.extend(path.parent.rglob("governance_strategy_summary_run*.csv"))
+        if not candidates:
+            return pd.DataFrame()
+        path = max(candidates, key=lambda item: item.stat().st_mtime)
     return pd.read_csv(path)
 
 

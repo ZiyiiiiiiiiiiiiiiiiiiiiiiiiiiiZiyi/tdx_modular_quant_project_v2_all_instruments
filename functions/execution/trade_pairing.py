@@ -22,6 +22,10 @@ def build_trade_pairing_ledgers(
     data["reason"] = _series_or_default(data, "reason").astype(str)
     data["order_id"] = _series_or_default(data, "order_id").astype(str)
     data["decision_id"] = _series_or_default(data, "decision_id").astype(str)
+    data["position_state"] = _series_or_default(data, "position_state").astype(str)
+    data["position_exit_reason"] = _series_or_default(data, "position_exit_reason").astype(str)
+    data["add_layer"] = pd.to_numeric(_series_or_default(data, "add_layer"), errors="coerce")
+    data["entry_matrix_score"] = pd.to_numeric(_series_or_default(data, "entry_matrix_score"), errors="coerce")
     data = data[
         data["trade_date"].notna()
         & data["side"].isin(["buy", "sell"])
@@ -54,10 +58,17 @@ def build_trade_pairing_ledgers(
                     "entry_reason": str(row.get("reason", "")),
                     "entry_order_id": str(row.get("order_id", "")),
                     "entry_decision_id": str(row.get("decision_id", "")),
+                    "entry_matrix_score": row.get("entry_matrix_score", pd.NA),
+                    "entry_add_layer": row.get("add_layer", pd.NA),
+                    "add_layer_count": 1,
                 }
             else:
                 position["shares"] = float(position["shares"]) + shares
                 position["total_cost"] = float(position["total_cost"]) + buy_total_cost
+                position["add_layer_count"] = max(
+                    int(position.get("add_layer_count", 1) or 1),
+                    int(row.get("add_layer")) if pd.notna(row.get("add_layer")) else int(position.get("add_layer_count", 1) or 1) + 1,
+                )
             continue
 
         position = positions.get(symbol)
@@ -94,9 +105,14 @@ def build_trade_pairing_ledgers(
                     "entry_reason": str(position.get("entry_reason", "")),
                     "entry_order_id": str(position.get("entry_order_id", "")),
                     "entry_decision_id": str(position.get("entry_decision_id", "")),
+                    "entry_matrix_score_at_buy": position.get("entry_matrix_score", pd.NA),
+                    "entry_add_layer": position.get("entry_add_layer", pd.NA),
+                    "add_layer_count": position.get("add_layer_count", 1),
                     "sell_reason": str(row.get("reason", "")),
                     "sell_order_id": str(row.get("order_id", "")),
                     "sell_decision_id": str(row.get("decision_id", "")),
+                    "position_state_at_sell": str(row.get("position_state", "")),
+                    "position_exit_reason_at_sell": str(row.get("position_exit_reason", "")),
                     "close_reason": str(row.get("reason", "")) or "sell_fill_weighted_cost",
                     "pairing_method": "weighted_average_cost",
                     "capital_profile": capital_profile,
@@ -171,6 +187,9 @@ def build_trade_pairing_ledgers(
                 "entry_reason": str(position.get("entry_reason", "")),
                 "entry_order_id": str(position.get("entry_order_id", "")),
                 "entry_decision_id": str(position.get("entry_decision_id", "")),
+                "entry_matrix_score_at_buy": position.get("entry_matrix_score", pd.NA),
+                "entry_add_layer": position.get("entry_add_layer", pd.NA),
+                "add_layer_count": position.get("add_layer_count", 1),
                 "pairing_method": "weighted_average_cost",
                 "capital_profile": capital_profile,
             }

@@ -125,6 +125,7 @@ from functions.pipeline_cache import (
     mark_step_completed,
     should_skip_step,
 )
+from functions.output_naming import dated_run_dir, reset_run_timestamp, run_suffix
 from functions.progress import progress_iter
 from functions.governance import build_research_status, print_runtime_disclosure
 from functions.report_utils import print_project_status
@@ -380,9 +381,26 @@ def parse_args():
         help="Override minimum cash buffer kept out of buys.",
     )
     parser.add_argument(
+        "--capital-usage-mode",
+        choices=["allow_cash", "force_deploy"],
+        default=None,
+        help="allow_cash permits idle cash; force_deploy tries to fill diversified/defensive sleeves before holding cash.",
+    )
+    parser.add_argument(
         "--governance-variant",
         choices=list_governance_variant_names(),
         default=CLI_MAIN_GOVERNANCE_VARIANT,
+    )
+    parser.add_argument(
+        "--governance-control-mode",
+        choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
+        default="normal",
+        help="Governance control switch for stop-mode experiments.",
+    )
+    parser.add_argument(
+        "--disable-alpha-collapse-exit",
+        action="store_true",
+        help="Record alpha-collapse exit as paper diagnostics but do not execute alpha_collapse_consensus sells.",
     )
     parser.add_argument("--registry-suite", action="store_true", help="Run the main strategy pipeline and governance main version sequentially.")
     return parser.parse_args()
@@ -481,7 +499,7 @@ def _build_strategy_signature():
         ],
     }
     outputs = [PROCESSED_DIR / f"{name}.parquet" for name in strategy_names]
-    outputs.extend(REPORT_DIR / f"strategy_selection_summary_{name}.csv" for name in strategy_names)
+    outputs.extend(REPORT_DIR / f"strategy_selection_summary_{name}{run_suffix()}.csv" for name in strategy_names)
     return build_signature(payload), outputs
 
 
@@ -495,11 +513,40 @@ def _capital_profile_from_args(args):
             else "__profile_default__"
         ),
         min_cash_buffer=getattr(args, "min_cash_buffer", None),
+        capital_usage_mode=getattr(args, "capital_usage_mode", None),
     )
 
 
+def _is_small_capital_profile(capital_profile: dict | None) -> bool:
+    profile = dict(capital_profile or {})
+    return (
+        profile.get("name") == "small_capital_branch"
+        or profile.get("base_profile") == "small_capital_branch"
+        or bool(profile.get("retail_lot_adapter", False))
+    )
+
+
+def _governance_control_mode_from_args(args) -> str:
+    mode = str(getattr(args, "governance_control_mode", "normal") or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "full": "normal",
+        "factor": "factor_only",
+        "stop": "factor_only",
+        "stop_mode": "factor_only",
+        "paper": "paper_controls",
+        "safe_factor": "safe_factor_only",
+        "safe_stop": "safe_factor_only",
+    }
+    mode = aliases.get(mode, mode)
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    if mode not in allowed:
+        raise ValueError(f"Invalid governance control mode: {mode}. Available: {sorted(allowed)}")
+    return mode
+
+
 def _backtest_summary_path(capital_profile_name: str) -> Path:
-    return RESULT_DIR / f"backtest_strategy_summary{backtest_profile_suffix(capital_profile_name)}.csv"
+    return RESULT_DIR / f"backtest_strategy_summary{backtest_profile_suffix(capital_profile_name)}{run_suffix()}.csv"
 
 
 def _build_backtest_signature(strategy_names, capital_profile):
@@ -524,18 +571,19 @@ def _build_backtest_signature(strategy_names, capital_profile):
             code_file_fingerprint("functions/execution/trade_pairing.py"),
         ],
     }
+    dated_suffix = f"{suffix}{run_suffix()}"
     outputs = [_backtest_summary_path(capital_profile["name"])]
     for name in strategy_names:
         outputs.extend(
             [
-                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.parquet",
-                RESULT_DIR / f"backtest_metrics_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_holdings_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_orders_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_trade_pairs_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_open_positions_{name}{suffix}.csv",
-                RESULT_DIR / f"equity_curve_{name}{suffix}.png",
+                RESULT_DIR / f"backtest_daily_result_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_daily_result_{name}{dated_suffix}.parquet",
+                RESULT_DIR / f"backtest_metrics_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_holdings_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_orders_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_trade_pairs_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_open_positions_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"equity_curve_{name}{dated_suffix}.png",
             ]
         )
     learning_strategy_names = [
@@ -543,7 +591,7 @@ def _build_backtest_signature(strategy_names, capital_profile):
         if name.startswith("classic_ml_") or name.startswith("quantum_inspired_")
     ]
     for name in learning_strategy_names:
-        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}{suffix}.csv")
+        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}{dated_suffix}.csv")
     return build_signature(payload), outputs
 
 
@@ -828,7 +876,7 @@ def run_low_memory(args):
                     stage="Backtest",
                     detail="Waiting to start",
                 )
-                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}{backtest_profile_suffix(capital_profile['name'])}.csv"
+                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}{backtest_profile_suffix(capital_profile['name'])}{run_suffix()}.csv"
                 if args.resume and metrics_path.exists():
                     print(f"Skip existing backtest: {strategy_name}")
                     progress_window.update(
@@ -1003,6 +1051,9 @@ def _run_single_governance_variant(
     universe_name: str | None = None,
     enable_shadow_portfolios: bool = True,
     show_live_monitor: bool = True,
+    capital_profile: dict | None = None,
+    governance_control_mode: str = "normal",
+    alpha_collapse_exit_enabled: bool = True,
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
     from functions.decision_council.runner import run_governance_backtest
@@ -1010,9 +1061,18 @@ def _run_single_governance_variant(
     from functions.universe_registry import get_universe_spec
 
     variant_spec = get_governance_variant_spec(variant_name)
+    capital_profile = capital_profile or get_backtest_capital_profile(DEFAULT_BACKTEST_CAPITAL_PROFILE)
     selected_universe_name = universe_name or variant_spec.universe_name
     universe_spec = get_universe_spec(selected_universe_name)
     output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / variant_spec.alpha_bundle
+    if _is_small_capital_profile(capital_profile):
+        output_dir = output_dir / "small_capital_branch"
+    control_mode = _governance_control_mode_from_args(argparse.Namespace(governance_control_mode=governance_control_mode))
+    if control_mode != "normal":
+        output_dir = output_dir / f"control_{control_mode}"
+    if not bool(alpha_collapse_exit_enabled):
+        output_dir = output_dir / "no_alpha_collapse_exit"
+    output_dir = dated_run_dir(output_dir)
     return run_governance_backtest(
         start_date=start_date,
         end_date=end_date,
@@ -1027,7 +1087,6 @@ def _run_single_governance_variant(
         selection_weight_mode=variant_spec.extra.get("selection_weight_mode", "reputation_weighted"),
         regime_overlay_mode=variant_spec.extra.get("regime_overlay_mode", "full"),
         risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
-        probability_bucket_mode=variant_spec.extra.get("probability_bucket_mode", "default"),
         output_dir=output_dir,
         universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
@@ -1040,11 +1099,17 @@ def _run_single_governance_variant(
         enable_quality_filters=universe_spec.quality_filter_enabled,
         enable_shadow_portfolios=enable_shadow_portfolios,
         show_live_monitor=show_live_monitor,
+        initial_cash=capital_profile["initial_cash"],
+        max_positions=capital_profile.get("max_positions"),
+        capital_profile=capital_profile,
+        governance_control_mode=control_mode,
+        alpha_collapse_exit_enabled=bool(alpha_collapse_exit_enabled),
     )
 
 
 def run_registry_suite(args):
     selected_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     main()
     _run_single_governance_variant(
         "rules_based_president",
@@ -1055,6 +1120,9 @@ def run_registry_suite(args):
         universe_name=selected_universes[0],
         enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
         show_live_monitor=not args.no_live_monitor,
+        capital_profile=capital_profile,
+        governance_control_mode=_governance_control_mode_from_args(args),
+        alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
     )
 
 
@@ -1167,6 +1235,29 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         runtime_args.governance_max_days = max_days_int
     if "shadow_portfolios" in governance:
         runtime_args.governance_shadow_portfolios = bool(governance.get("shadow_portfolios"))
+    control_mode = str(governance.get("control_mode", "")).strip()
+    if control_mode:
+        runtime_args.governance_control_mode = control_mode
+    if "alpha_collapse_exit_enabled" in governance:
+        runtime_args.disable_alpha_collapse_exit = not bool(governance.get("alpha_collapse_exit_enabled"))
+    backtest = selection.get("backtest", {}) if isinstance(selection, dict) else {}
+    if isinstance(backtest, dict):
+        capital_profile = str(backtest.get("capital_profile", "")).strip()
+        if capital_profile:
+            runtime_args.capital_profile = capital_profile
+        initial_cash = str(backtest.get("initial_cash", "")).strip()
+        max_positions = str(backtest.get("max_positions", "")).strip()
+        min_cash_buffer = str(backtest.get("min_cash_buffer", "")).strip()
+        capital_usage_mode = str(backtest.get("capital_usage_mode", "")).strip()
+        if initial_cash:
+            runtime_args.initial_cash = float(initial_cash)
+        if max_positions:
+            runtime_args.max_positions = int(max_positions)
+        if min_cash_buffer:
+            runtime_args.min_cash_buffer = float(min_cash_buffer)
+        if capital_usage_mode:
+            runtime_args.capital_usage_mode = capital_usage_mode
+    _capital_profile_from_args(runtime_args)
     return runtime_args
 
 
@@ -1181,12 +1272,15 @@ def _apply_interactive_backtest_params(args, selection: dict):
     initial_cash = str(backtest.get("initial_cash", "")).strip()
     max_positions = str(backtest.get("max_positions", "")).strip()
     min_cash_buffer = str(backtest.get("min_cash_buffer", "")).strip()
+    capital_usage_mode = str(backtest.get("capital_usage_mode", "")).strip()
     if initial_cash:
         runtime_args.initial_cash = float(initial_cash)
     if max_positions:
         runtime_args.max_positions = int(max_positions)
     if min_cash_buffer:
         runtime_args.min_cash_buffer = float(min_cash_buffer)
+    if capital_usage_mode:
+        runtime_args.capital_usage_mode = capital_usage_mode
     _capital_profile_from_args(runtime_args)
     return runtime_args
 
@@ -1198,6 +1292,7 @@ def run_governance_mainline_review_from_main(args):
     from run_governance_experiments import run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     variant_name = "rules_based_president"
     alpha_bundle = "president_core_bundle"
     shared_live_monitor = None
@@ -1218,6 +1313,11 @@ def run_governance_mainline_review_from_main(args):
             enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
             show_live_monitor=not args.no_live_monitor,
             live_monitor=shared_live_monitor,
+            initial_cash=capital_profile["initial_cash"],
+            max_positions=capital_profile.get("max_positions"),
+            capital_profile=capital_profile,
+            governance_control_mode=_governance_control_mode_from_args(args),
+            alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
         )
     report_path, comparison_path = build_report()
     print(f"Saved review report: {report_path}")
@@ -1230,6 +1330,7 @@ def run_governance_layer_validation_from_main(args):
     from run_governance_experiments import run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     variant_name = "governance_layer_validation"
     alpha_bundle = "validation_core_bundle"
     shared_live_monitor = None
@@ -1250,6 +1351,11 @@ def run_governance_layer_validation_from_main(args):
             enable_shadow_portfolios=False,
             show_live_monitor=not args.no_live_monitor,
             live_monitor=shared_live_monitor,
+            initial_cash=capital_profile["initial_cash"],
+            max_positions=capital_profile.get("max_positions"),
+            capital_profile=capital_profile,
+            governance_control_mode=_governance_control_mode_from_args(args),
+            alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
         )
 
 
@@ -1277,6 +1383,7 @@ def run_governance_layer_ablation_suite_from_main(args):
     from run_governance_experiments import build_output_path, run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     suite_id = pd.Timestamp.now().strftime("suite_%Y%m%d_%H%M%S")
     shared_live_monitor = None
     if not args.no_live_monitor:
@@ -1301,6 +1408,11 @@ def run_governance_layer_ablation_suite_from_main(args):
                 show_live_monitor=not args.no_live_monitor,
                 live_monitor=shared_live_monitor,
                 output_dir_suffix=suite_id,
+                initial_cash=capital_profile["initial_cash"],
+                max_positions=capital_profile.get("max_positions"),
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(args),
+                alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
             )
             summary_path = saved.get("governance_strategy_summary")
             if summary_path is None:
@@ -1335,7 +1447,7 @@ def run_governance_layer_ablation_suite_from_main(args):
             comparison_rows.append(row)
 
     comparison = pd.DataFrame(comparison_rows)
-    output_path = RESULT_DIR / "governance" / f"layer_ablation_suite_comparison_{suite_id}.csv"
+    output_path = RESULT_DIR / "governance" / f"layer_ablation_suite_comparison_{suite_id}{run_suffix()}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"Saved layer ablation suite comparison: {output_path}")
@@ -1433,11 +1545,15 @@ def launch_interactive_main_menu():
 
 
 def run_interactive_selection(selection, args):
+    reset_run_timestamp()
     tasks = [] if not selection else selection.get("tasks", [])
     profile = "full" if not selection else selection.get("profile", "full")
     if not tasks:
         print("Interactive launcher cancelled.")
         return
+    if selection.get("sanitized_task_note"):
+        print(f"Interactive task sanitization: {selection.get('sanitized_task_note')}")
+    print(f"Interactive selected tasks: {tasks}")
     runtime_args = _apply_interactive_backtest_params(args, selection)
     runtime_args = _apply_interactive_governance_params(runtime_args, selection, tasks)
     runtime_args, profile_name, profile_note = _apply_runtime_profile(runtime_args, profile, tasks)
@@ -1463,6 +1579,7 @@ def run_interactive_selection(selection, args):
         main(runtime_args)
     if "governance_active" in tasks:
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
+        capital_profile = _capital_profile_from_args(runtime_args)
         _run_single_governance_variant(
             "rules_based_president",
             start_date=runtime_args.governance_start_date,
@@ -1472,6 +1589,9 @@ def run_interactive_selection(selection, args):
             universe_name=selected_universes[0],
             enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
             show_live_monitor=not runtime_args.no_live_monitor,
+            capital_profile=capital_profile,
+            governance_control_mode=_governance_control_mode_from_args(runtime_args),
+            alpha_collapse_exit_enabled=not bool(getattr(runtime_args, "disable_alpha_collapse_exit", False)),
         )
     if "governance_mainline_review" in tasks:
         run_governance_mainline_review_from_main(runtime_args)
@@ -1487,11 +1607,14 @@ def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
 
     strategy_returns = {}
     for name in strategy_names:
-        daily_path = RESULT_DIR / f"backtest_daily_result_{name}.parquet"
-        if not daily_path.exists():
-            daily_path = RESULT_DIR / f"backtest_daily_result_{name}.csv"
-        if not daily_path.exists():
+        candidates = list(RESULT_DIR.glob(f"backtest_daily_result_{name}*{run_suffix()}.parquet"))
+        candidates.extend(RESULT_DIR.glob(f"backtest_daily_result_{name}*{run_suffix()}.csv"))
+        if not candidates:
+            candidates = list(RESULT_DIR.glob(f"backtest_daily_result_{name}*.parquet"))
+            candidates.extend(RESULT_DIR.glob(f"backtest_daily_result_{name}*.csv"))
+        if not candidates:
             continue
+        daily_path = max(candidates, key=lambda path: path.stat().st_mtime)
         try:
             daily = pd.read_parquet(daily_path) if str(daily_path).endswith(".parquet") else pd.read_csv(daily_path)
             if "daily_return" in daily.columns and not daily.empty:
@@ -1553,25 +1676,12 @@ def _save_low_memory_summary(records, capital_profile_name=DEFAULT_BACKTEST_CAPI
     batch_df = pd.DataFrame(records)
     suffix = backtest_profile_suffix(capital_profile_name)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    output = RESULT_DIR / f"backtest_strategy_summary_batch{suffix}.csv"
-    if output.exists():
-        existing = pd.read_csv(output)
-        if "execution_model_version" in batch_df.columns:
-            current_versions = set(batch_df["execution_model_version"].dropna().astype(str))
-            if "execution_model_version" not in existing.columns:
-                existing = existing.iloc[0:0].copy()
-            else:
-                existing = existing[
-                    existing["execution_model_version"].astype(str).isin(current_versions)
-                ]
-        if not existing.empty:
-            batch_df = pd.concat([existing, batch_df], ignore_index=True)
-        batch_df = batch_df.drop_duplicates(subset=["strategy"], keep="last")
+    output = RESULT_DIR / f"backtest_strategy_summary_batch{suffix}{run_suffix()}.csv"
     summary = build_strategy_summary(batch_df)
     summary.to_csv(output, index=False, encoding="utf-8-sig")
     report_file = save_strategy_report(
         build_strategy_report(summary),
-        RESULT_DIR / f"strategy_diagnostic_report_batch{suffix}.md",
+        RESULT_DIR / f"strategy_diagnostic_report_batch{suffix}{run_suffix()}.md",
     )
     print("Saved low-memory batch summary:", output)
     print("Saved low-memory diagnostic report:", report_file)
@@ -1808,7 +1918,7 @@ def main(args=None):
                     summary_file = _backtest_summary_path(capital_profile["name"])
                     summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
                     report_text = build_strategy_report(summary_df)
-                    report_output = RESULT_DIR / f"strategy_diagnostic_report{backtest_profile_suffix(capital_profile['name'])}.md"
+                    report_output = RESULT_DIR / f"strategy_diagnostic_report{backtest_profile_suffix(capital_profile['name'])}{run_suffix()}.md"
                     report_file = save_strategy_report(report_text, report_output)
                     print_strategy_rankings(summary_df)
                     print("Saved strategy ranking summary:", summary_file)
@@ -1819,7 +1929,7 @@ def main(args=None):
                         from functions.pbo_cscv import pbo_summary_report
                         pbo_result = _run_pbo_analysis(available_strategy_names)
                         if pbo_result is not None:
-                            pbo_report_path = RESULT_DIR / "pbo_overfitting_report.md"
+                            pbo_report_path = RESULT_DIR / f"pbo_overfitting_report{run_suffix()}.md"
                             pbo_report_path.write_text(
                                 pbo_summary_report(pbo_result), encoding="utf-8"
                             )
@@ -1833,7 +1943,7 @@ def main(args=None):
                         from functions.leakage_detector import leakage_audit_report
                         leakage_result = _run_leakage_audit()
                         if leakage_result is not None:
-                            leakage_report_path = RESULT_DIR / "leakage_audit_report.md"
+                            leakage_report_path = RESULT_DIR / f"leakage_audit_report{run_suffix()}.md"
                             leakage_report_path.write_text(
                                 leakage_audit_report(leakage_result), encoding="utf-8"
                             )
@@ -1856,9 +1966,9 @@ def main(args=None):
                         print("\n--- Decision Accuracy Analysis ---")
                         accuracy_results = build_all_strategies_accuracy_report(available_strategy_names)
                         if accuracy_results:
-                            plot_all_accuracy(accuracy_results)
-                            save_accuracy_summary_csv(accuracy_results)
-                            accuracy_md_path = RESULT_DIR / "decision_accuracy_report.md"
+                            plot_all_accuracy(accuracy_results, file_suffix=run_suffix())
+                            save_accuracy_summary_csv(accuracy_results, file_suffix=run_suffix())
+                            accuracy_md_path = RESULT_DIR / f"decision_accuracy_report{run_suffix()}.md"
                             accuracy_md_path.write_text(
                                 accuracy_report_markdown(accuracy_results), encoding="utf-8"
                             )
@@ -1914,6 +2024,7 @@ if __name__ == "__main__":
             run_registry_suite(cli_args)
         elif cli_args.governance:
             selected_universes = _normalize_governance_universes(getattr(cli_args, "governance_universes", None))
+            capital_profile = _capital_profile_from_args(cli_args)
             _run_single_governance_variant(
                 cli_args.governance_variant,
                 start_date=cli_args.governance_start_date,
@@ -1923,6 +2034,9 @@ if __name__ == "__main__":
                 universe_name=selected_universes[0],
                 enable_shadow_portfolios=bool(cli_args.governance_shadow_portfolios) if cli_args.governance_shadow_portfolios is not None else True,
                 show_live_monitor=not cli_args.no_live_monitor,
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(cli_args),
+                alpha_collapse_exit_enabled=not bool(getattr(cli_args, "disable_alpha_collapse_exit", False)),
             )
         elif cli_args.low_memory:
             run_low_memory(cli_args)

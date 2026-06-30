@@ -189,13 +189,13 @@ RUN_HTML = """<!doctype html>
       <div class="section-title">选择要运行的任务</div>
       <label class="item"><input type="checkbox" id="main_pipeline">主策略流水线/回测：使用下面账户参数运行普通策略路径。</label>
       <label class="item"><input type="checkbox" id="governance_active">治理主线单次运行：只跑默认股票池，适合观察弹窗监控和排查行为问题。</label>
-      <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite" checked>增强模块诊断：一次运行核心基线、简单止盈止损、趋势/反转/订单流/突破模块、减模块测试、市场状态、概率、复杂退出和主线对照。</label>
+      <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite">增强模块诊断：一次运行核心基线、简单止盈止损、趋势/反转/订单流/突破模块、减模块测试、市场状态、校准诊断、复杂退出和主线对照。</label>
       <label class="item"><input type="checkbox" id="governance_layer_validation">层验证线：紧凑 8 因子等权测试，关闭声誉/影子组合和市场状态叠加，保留安全模块。用于先判断基础信号有没有边际收益。</label>
-      <label class="item"><input type="checkbox" id="governance_mainline_review">治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
+      <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
 
       <div class="hint">
         当前建议：先运行“增强模块诊断”。<br>
-        目的不是追求一次跑出好看收益，而是定位问题来自趋势、反转、订单流、突破、市场状态、概率校准、简单退出、复杂退出，还是主线叠加。<br>
+        目的不是追求一次跑出好看收益，而是定位问题来自趋势、反转、订单流、突破、市场状态、校准诊断、简单退出、复杂退出，还是主线叠加。<br>
         “治理主线复核”建议在诊断结果明确后再跑。
       </div>
 
@@ -204,9 +204,10 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="capital_profile">资金档位</label>
           <select id="capital_profile">
+            <option value="small_capital_branch" selected>小资金支线（2万，一手适配）</option>
             <option value="institutional_1m">100万基线账户</option>
             <option value="institutional_10m">1000万对照账户</option>
-            <option value="retail_20k" selected>2万小资金账户</option>
+            <option value="retail_20k">2万小资金账户</option>
           </select>
         </div>
         <div class="field">
@@ -214,12 +215,19 @@ RUN_HTML = """<!doctype html>
           <input type="number" id="initial_cash" min="1" step="1000" placeholder="留空=使用所选档位">
         </div>
         <div class="field">
-          <label for="max_positions_account">最多持有股票数，可选</label>
-          <input type="number" id="max_positions_account" min="0" step="1" placeholder="留空=档位默认；0=不限制">
+          <label for="max_positions_account">最多买入/持有股票数量</label>
+          <input type="number" id="max_positions_account" min="0" step="1" placeholder="小资金建议 3-5；留空=档位默认；0=不限制">
         </div>
         <div class="field">
           <label for="min_cash_buffer">现金缓冲，可选</label>
           <input type="number" id="min_cash_buffer" min="0" step="100" placeholder="留空=档位默认">
+        </div>
+        <div class="field">
+          <label for="capital_usage_mode">资金使用模式</label>
+          <select id="capital_usage_mode">
+            <option value="allow_cash" selected>允许空余资金</option>
+            <option value="force_deploy">强制提高资金使用率</option>
+          </select>
         </div>
       </div>
       <div class="mini">
@@ -233,6 +241,15 @@ RUN_HTML = """<!doctype html>
       <label class="item"><input type="checkbox" name="universe" value="csi500_strict">csi500_strict：只看中证500，适合第二层股票池隔离测试。</label>
       <div class="grid">
         <div class="field">
+          <label for="governance_control_mode">控制层模式</label>
+          <select id="governance_control_mode">
+            <option value="normal" selected>正常治理：全部控制启用</option>
+            <option value="factor_only">因子裸跑：暂停 reputation/regime/复杂卖出/冷却/硬止损</option>
+            <option value="paper_controls">纸面控制：控制层只记录，不实际支配买卖</option>
+            <option value="safe_factor_only">安全裸跑：因子裸跑，但保留硬止损</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="start_month">开始月份</label>
           <input type="month" id="start_month" value="2021-01">
         </div>
@@ -245,6 +262,7 @@ RUN_HTML = """<!doctype html>
           <input type="number" id="max_days" min="1" step="1" placeholder="留空=使用完整选择区间">
         </div>
       </div>
+      <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>
       <label class="item"><input type="checkbox" id="shadow_portfolios">启用单因子影子组合：非常慢的诊断模式。普通全历史复核建议关闭。</label>
       <label class="item"><input type="checkbox" id="timestamped_diagnostics" checked disabled>增强诊断后生成带时间戳的表格、图、增量贡献文件和 Markdown 报告。</label>
       <div class="mini">
@@ -274,6 +292,16 @@ RUN_HTML = """<!doctype html>
     </div>
   </div>
   <script>
+    window.addEventListener("DOMContentLoaded", () => {
+      const capitalProfile = document.getElementById("capital_profile");
+      if (capitalProfile) {
+        Array.from(capitalProfile.options).forEach((option) => {
+          option.selected = false;
+          option.defaultSelected = false;
+        });
+        capitalProfile.value = "small_capital_branch";
+      }
+    });
     function currentProfile() {
       const node = document.querySelector('input[name="profile"]:checked');
       return node ? node.value : "full";
@@ -283,6 +311,8 @@ RUN_HTML = """<!doctype html>
       const initialCash = document.getElementById("initial_cash").value.trim();
       const maxPositions = document.getElementById("max_positions_account").value.trim();
       const minCashBuffer = document.getElementById("min_cash_buffer").value.trim();
+      const capitalUsageModeNode = document.getElementById("capital_usage_mode");
+      const capitalUsageMode = capitalUsageModeNode ? capitalUsageModeNode.value : "allow_cash";
       if (initialCash && Number(initialCash) <= 0) {
         throw new Error("初始资金必须大于 0。");
       }
@@ -296,7 +326,8 @@ RUN_HTML = """<!doctype html>
         capital_profile: capitalProfile,
         initial_cash: initialCash,
         max_positions: maxPositions,
-        min_cash_buffer: minCashBuffer
+        min_cash_buffer: minCashBuffer,
+        capital_usage_mode: capitalUsageMode
       };
     }
     function governanceParams(tasks) {
@@ -305,6 +336,10 @@ RUN_HTML = """<!doctype html>
       const endMonth = document.getElementById("end_month").value;
       const maxDays = document.getElementById("max_days").value.trim();
       const shadowPortfolios = document.getElementById("shadow_portfolios").checked;
+      const alphaCollapseExitNode = document.getElementById("alpha_collapse_exit_enabled");
+      const alphaCollapseExitEnabled = alphaCollapseExitNode ? alphaCollapseExitNode.checked : true;
+      const controlModeNode = document.getElementById("governance_control_mode");
+      const controlMode = controlModeNode ? controlModeNode.value : "normal";
       const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite");
       if (touchesGovernance && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
@@ -317,7 +352,9 @@ RUN_HTML = """<!doctype html>
         start_month: startMonth,
         end_month: endMonth,
         max_days: maxDays,
-        shadow_portfolios: shadowPortfolios
+        shadow_portfolios: shadowPortfolios,
+        control_mode: controlMode,
+        alpha_collapse_exit_enabled: alphaCollapseExitEnabled
       };
     }
     async function sendPayload(payload) {
@@ -345,7 +382,7 @@ RUN_HTML = """<!doctype html>
         return;
       }
       try {
-        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks)});
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: false});
       } catch (err) {
         document.getElementById("status").textContent = err.message || String(err);
       }
@@ -355,7 +392,7 @@ RUN_HTML = """<!doctype html>
       document.getElementById("governance_layer_ablation_suite").checked = true;
       document.getElementById("shadow_portfolios").checked = false;
       try {
-        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks)});
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: false});
       } catch (err) {
         document.getElementById("status").textContent = err.message || String(err);
       }
@@ -364,7 +401,7 @@ RUN_HTML = """<!doctype html>
       const tasks = ["governance_layer_ablation_suite"];
       document.getElementById("shadow_portfolios").checked = false;
       try {
-        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks)});
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: false});
       } catch (err) {
         document.getElementById("status").textContent = err.message || String(err);
       }
@@ -376,7 +413,7 @@ RUN_HTML = """<!doctype html>
         return;
       }
       try {
-        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks)});
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: true});
       } catch (err) {
         document.getElementById("status").textContent = err.message || String(err);
       }
@@ -585,6 +622,11 @@ RESULTS_HTML = """<!doctype html>
         <div class="card"><div class="name">未实现盈亏</div><div class="value" id="unrealized_pnl">-</div></div>
         <div class="card"><div class="name">总盈利</div><div class="value" id="gross_profit">-</div></div>
         <div class="card"><div class="name">总亏损</div><div class="value" id="gross_loss">-</div></div>
+        <div class="card"><div class="name">控制卖出次数</div><div class="value" id="control_exit_count">-</div></div>
+        <div class="card"><div class="name">控制节省亏损</div><div class="value" id="control_avoided_loss">-</div></div>
+        <div class="card"><div class="name">硬止损节省</div><div class="value" id="hard_stop_avoided_loss">-</div></div>
+        <div class="card"><div class="name">Alpha塌陷节省</div><div class="value" id="alpha_collapse_avoided_loss">-</div></div>
+        <div class="card"><div class="name">安全降仓节省</div><div class="value" id="safety_deleveraging_avoided_loss">-</div></div>
       </div>
     </div>
 
@@ -715,6 +757,15 @@ RESULTS_HTML = """<!doctype html>
       document.getElementById("gross_profit").className = "value " + signedClass(data.summary.gross_profit);
       document.getElementById("gross_loss").textContent = money(data.summary.gross_loss);
       document.getElementById("gross_loss").className = "value " + signedClass(data.summary.gross_loss);
+      document.getElementById("control_exit_count").textContent = data.summary.control_exit_count || 0;
+      document.getElementById("control_avoided_loss").textContent = money(data.summary.control_avoided_loss_to_window_low);
+      document.getElementById("control_avoided_loss").className = "value " + signedClass(data.summary.control_avoided_loss_to_window_low);
+      document.getElementById("hard_stop_avoided_loss").textContent = money(data.summary.hard_stop_avoided_loss_to_window_low);
+      document.getElementById("hard_stop_avoided_loss").className = "value " + signedClass(data.summary.hard_stop_avoided_loss_to_window_low);
+      document.getElementById("alpha_collapse_avoided_loss").textContent = money(data.summary.alpha_collapse_avoided_loss_to_window_low);
+      document.getElementById("alpha_collapse_avoided_loss").className = "value " + signedClass(data.summary.alpha_collapse_avoided_loss_to_window_low);
+      document.getElementById("safety_deleveraging_avoided_loss").textContent = money(data.summary.safety_deleveraging_avoided_loss_to_window_low);
+      document.getElementById("safety_deleveraging_avoided_loss").className = "value " + signedClass(data.summary.safety_deleveraging_avoided_loss_to_window_low);
       renderStockRows(data.stock_summary || []);
       renderClosedRows(data.closed_trades || []);
       renderOpenRows(data.open_positions || []);
@@ -736,6 +787,89 @@ RESULTS_HTML = """<!doctype html>
         return `<tr>${cell(r.symbol)}${cell(r.entry_date)}${cell(r.valuation_date)}${cell(money(r.avg_cost))}${cell(money(r.latest_price))}${cell(money(r.shares))}${cell(money(r.market_value))}${cell(money(r.unrealized_pnl_amount), signedClass(r.unrealized_pnl_amount))}${cell(pct(r.unrealized_pnl_pct))}</tr>`;
       }).join("");
     }
+    async function fetchJsonWithTimeout(url, timeoutMs = 15000) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        const text = await response.text();
+        let data = {};
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (err) {
+          throw new Error(`服务器返回的不是合法 JSON：${text.slice(0, 180)}`);
+        }
+        if (!response.ok) {
+          throw new Error(data.message || `请求失败，HTTP ${response.status}`);
+        }
+        return data;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    loadRuns = async function() {
+      const status = document.getElementById("status");
+      const select = document.getElementById("run_select");
+      status.textContent = "正在读取 results 目录...";
+      select.innerHTML = "";
+      try {
+        const data = await fetchJsonWithTimeout("/api/results", 15000);
+        if (!data.runs || data.runs.length === 0) {
+          status.textContent = "没有找到回测盈亏结果。请先运行主策略回测或治理主线。";
+          return;
+        }
+        data.runs.forEach((run) => {
+          const opt = document.createElement("option");
+          opt.value = run.key;
+          opt.textContent = `${run.strategy} | ${run.profile} | ${run.modified_time}`;
+          select.appendChild(opt);
+        });
+        status.textContent = `找到 ${data.runs.length} 组回测结果。`;
+        await loadDetail();
+      } catch (err) {
+        status.textContent = `读取结果列表失败：${err.message || err}`;
+      }
+    };
+    loadDetail = async function() {
+      const select = document.getElementById("run_select");
+      if (!select.value) return;
+      const status = document.getElementById("status");
+      status.textContent = "正在汇总已平仓和未平仓盈亏...";
+      try {
+        const data = await fetchJsonWithTimeout(`/api/result-detail?key=${encodeURIComponent(select.value)}`, 30000);
+        document.getElementById("summary_panel").style.display = "";
+        document.getElementById("stock_panel").style.display = "";
+        document.getElementById("closed_panel").style.display = "";
+        document.getElementById("open_panel").style.display = "";
+        document.getElementById("closed_count").textContent = data.summary.realized_trade_count;
+        document.getElementById("win_rate").textContent = pct(data.summary.trade_win_rate);
+        document.getElementById("profit_factor").textContent = num(data.summary.profit_factor);
+        document.getElementById("payoff_ratio").textContent = num(data.summary.payoff_ratio);
+        document.getElementById("realized_pnl").textContent = money(data.summary.realized_pnl_amount);
+        document.getElementById("realized_pnl").className = "value " + signedClass(data.summary.realized_pnl_amount);
+        document.getElementById("unrealized_pnl").textContent = money(data.summary.unrealized_pnl_amount);
+        document.getElementById("unrealized_pnl").className = "value " + signedClass(data.summary.unrealized_pnl_amount);
+        document.getElementById("gross_profit").textContent = money(data.summary.gross_profit);
+        document.getElementById("gross_profit").className = "value " + signedClass(data.summary.gross_profit);
+        document.getElementById("gross_loss").textContent = money(data.summary.gross_loss);
+        document.getElementById("gross_loss").className = "value " + signedClass(data.summary.gross_loss);
+        document.getElementById("control_exit_count").textContent = data.summary.control_exit_count || 0;
+        document.getElementById("control_avoided_loss").textContent = money(data.summary.control_avoided_loss_to_window_low);
+        document.getElementById("control_avoided_loss").className = "value " + signedClass(data.summary.control_avoided_loss_to_window_low);
+        document.getElementById("hard_stop_avoided_loss").textContent = money(data.summary.hard_stop_avoided_loss_to_window_low);
+        document.getElementById("hard_stop_avoided_loss").className = "value " + signedClass(data.summary.hard_stop_avoided_loss_to_window_low);
+        document.getElementById("alpha_collapse_avoided_loss").textContent = money(data.summary.alpha_collapse_avoided_loss_to_window_low);
+        document.getElementById("alpha_collapse_avoided_loss").className = "value " + signedClass(data.summary.alpha_collapse_avoided_loss_to_window_low);
+        document.getElementById("safety_deleveraging_avoided_loss").textContent = money(data.summary.safety_deleveraging_avoided_loss_to_window_low);
+        document.getElementById("safety_deleveraging_avoided_loss").className = "value " + signedClass(data.summary.safety_deleveraging_avoided_loss_to_window_low);
+        renderStockRows(data.stock_summary || []);
+        renderClosedRows(data.closed_trades || []);
+        renderOpenRows(data.open_positions || []);
+        status.textContent = `当前结果：${data.run.strategy}，资金档位 ${data.run.profile}。`;
+      } catch (err) {
+        status.textContent = `读取盈亏明细失败：${err.message || err}`;
+      }
+    };
     window.addEventListener("load", loadRuns);
   </script>
 </body>
@@ -744,9 +878,33 @@ RESULTS_HTML = """<!doctype html>
 
 
 def _write_selection(state_path: Path, payload: dict) -> None:
+    payload = _sanitize_selection_payload(payload)
     tmp_path = state_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(state_path)
+
+
+def _sanitize_selection_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    clean = dict(payload)
+    tasks = clean.get("tasks")
+    if not isinstance(tasks, list):
+        return clean
+    tasks = [str(task) for task in tasks]
+    allow_multi_task = bool(clean.get("allow_multi_task", False))
+    # Mainline review and the enhanced diagnostic suite are both long governance
+    # jobs. If a stale browser page or checkbox state submits both, prefer the
+    # explicitly requested mainline review unless the user clicked "run all".
+    if (
+        not allow_multi_task
+        and "governance_mainline_review" in tasks
+        and "governance_layer_ablation_suite" in tasks
+    ):
+        tasks = [task for task in tasks if task != "governance_layer_ablation_suite"]
+        clean["sanitized_task_note"] = "removed_governance_layer_ablation_suite_when_mainline_review_selected"
+    clean["tasks"] = tasks
+    return clean
 
 
 def _project_dir() -> Path:
@@ -835,13 +993,16 @@ def _discover_result_runs() -> list[dict]:
             }
         )
     for trade_path in results_dir.rglob("governance_trade_pairs.csv"):
+        if "_archive" in trade_path.relative_to(results_dir).parts:
+            continue
         run_dir = trade_path.parent
         open_path = run_dir / "governance_open_positions.csv"
         summary_path = run_dir / "governance_trade_pair_summary.csv"
+        control_loss_path = run_dir / "governance_control_avoided_loss_summary.csv"
         trade_rel = trade_path.relative_to(results_dir).as_posix()
         strategy, profile = _governance_result_identity(run_dir, results_dir)
         modified = max(
-            [path.stat().st_mtime for path in [trade_path, open_path, summary_path] if path.exists()],
+            [path.stat().st_mtime for path in [trade_path, open_path, summary_path, control_loss_path] if path.exists()],
             default=trade_path.stat().st_mtime,
         )
         runs.append(
@@ -873,8 +1034,11 @@ def _governance_result_identity(run_dir: Path, results_dir: Path) -> tuple[str, 
         universe = rel_parts[1]
         variant = rel_parts[2]
         bundle = rel_parts[3]
-        run_name = rel_parts[4]
-        return f"{variant} / {bundle}", f"治理 | {universe} | {run_name}"
+        tail = list(rel_parts[4:])
+        run_name = next((part for part in reversed(tail) if str(part).startswith("run")), tail[-1] if tail else "")
+        profile_parts = [part for part in tail if part != run_name]
+        profile_text = " / ".join(profile_parts) if profile_parts else "default"
+        return f"{variant} / {bundle}", f"治理 | {universe} | {profile_text} | {run_name}"
     if len(rel_parts) >= 4:
         return f"{rel_parts[-3]} / {rel_parts[-2]}", f"治理 | {rel_parts[-1]}"
     return run_dir.name, "治理结果"
@@ -927,6 +1091,10 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
     results_dir = _results_dir()
     trade_rows = _read_csv_rows(results_dir / run.get("trade_rel", ""))
     open_rows = _read_csv_rows(results_dir / run.get("open_rel", "")) if run.get("open_rel") else []
+    control_loss_rows = []
+    if run.get("kind") == "governance" and run.get("trade_rel"):
+        control_loss_path = (results_dir / run["trade_rel"]).parent / "governance_control_avoided_loss_summary.csv"
+        control_loss_rows = _read_csv_rows(control_loss_path)
     latest_holding_by_symbol: dict[str, dict] = {}
     if run.get("kind") == "governance" and run.get("trade_rel"):
         holding_path = (results_dir / run["trade_rel"]).parent / "governance_holdings_ledger.csv"
@@ -1033,6 +1201,7 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
     avg_loss = gross_loss / len(losing_pnls) if losing_pnls else None
     payoff_ratio = (avg_win / abs(avg_loss)) if avg_win is not None and avg_loss and avg_loss < 0.0 else None
     profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0.0 else None
+    control_loss_summary = _control_loss_summary_from_rows(control_loss_rows)
     summary = {
         "realized_trade_count": int(realized_trade_count),
         "winning_trade_count": int(winning_trade_count),
@@ -1049,6 +1218,7 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
         "payoff_ratio": payoff_ratio,
         "profit_factor": profit_factor,
         "open_position_count": len(open_positions),
+        **control_loss_summary,
     }
     return {
         "run": run,
@@ -1073,6 +1243,32 @@ def _empty_stock_bucket(symbol: str) -> dict:
         "open_market_value": 0.0,
         "closed_cost_amount": 0.0,
     }
+
+
+def _control_loss_summary_from_rows(rows: list[dict]) -> dict:
+    summary = {
+        "control_exit_count": 0,
+        "control_avoided_loss_to_window_low": 0.0,
+        "control_avoided_loss_to_window_end": 0.0,
+        "hard_stop_avoided_loss_to_window_low": 0.0,
+        "alpha_collapse_avoided_loss_to_window_low": 0.0,
+        "safety_deleveraging_avoided_loss_to_window_low": 0.0,
+    }
+    for row in rows or []:
+        reason = str(row.get("sell_reason", "")).strip()
+        count = int(_safe_float(row.get("control_exit_count")))
+        low = _safe_float(row.get("avoided_loss_to_window_low"))
+        end = _safe_float(row.get("avoided_loss_to_window_end"))
+        summary["control_exit_count"] += count
+        summary["control_avoided_loss_to_window_low"] += low
+        summary["control_avoided_loss_to_window_end"] += end
+        if reason == "hard_stop_exit":
+            summary["hard_stop_avoided_loss_to_window_low"] += low
+        elif reason == "alpha_collapse_consensus":
+            summary["alpha_collapse_avoided_loss_to_window_low"] += low
+        elif reason == "safety_deleveraging":
+            summary["safety_deleveraging_avoided_loss_to_window_low"] += low
+    return summary
 
 
 def _stock_status(bucket: dict) -> str:
@@ -1115,12 +1311,18 @@ def main(argv: list[str]) -> int:
                 _html_response(self, RESULTS_HTML)
                 return
             if parsed.path == "/api/results":
-                _json_response(self, {"runs": _discover_result_runs()})
+                try:
+                    _json_response(self, {"runs": _discover_result_runs()})
+                except Exception as exc:
+                    _json_response(self, {"message": f"读取结果列表失败：{exc}"}, status=500)
                 return
             if parsed.path == "/api/result-detail":
-                key = parse_qs(parsed.query).get("key", [""])[0]
-                payload, status = _result_detail(key)
-                _json_response(self, payload, status=status)
+                try:
+                    key = parse_qs(parsed.query).get("key", [""])[0]
+                    payload, status = _result_detail(key)
+                    _json_response(self, payload, status=status)
+                except Exception as exc:
+                    _json_response(self, {"message": f"读取盈亏明细失败：{exc}"}, status=500)
                 return
             if parsed.path == "/favicon.ico":
                 self.send_response(204)

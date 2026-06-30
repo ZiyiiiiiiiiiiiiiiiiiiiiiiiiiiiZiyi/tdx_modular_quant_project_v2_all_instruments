@@ -63,9 +63,9 @@ from functions.decision_council.runner import (
     GovernanceBacktestRunner,
     _governance_feature_columns,
     _prepare_features,
-    archive_existing_governance_output,
 )
 from functions.decision_council.policy import RulesBasedPresidentPolicy
+from functions.output_naming import dated_run_dir, run_suffix
 from functions.pipeline_cache import file_fingerprint
 
 
@@ -106,6 +106,34 @@ class ProgressTracker:
 def build_output_path(variant_name: str, alpha_bundle: str, universe_name: str) -> Path:
     """构建输出路径：results/governance/{universe}/{variant}/{bundle}/"""
     return RESULT_DIR / "governance" / universe_name / variant_name / alpha_bundle
+
+
+def _is_small_capital_profile(capital_profile: dict | None) -> bool:
+    profile = dict(capital_profile or {})
+    return (
+        profile.get("name") == "small_capital_branch"
+        or profile.get("base_profile") == "small_capital_branch"
+        or bool(profile.get("retail_lot_adapter", False))
+    )
+
+
+def _normalize_governance_control_mode(value) -> str:
+    mode = str(value or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "full": "normal",
+        "factor": "factor_only",
+        "stop": "factor_only",
+        "stop_mode": "factor_only",
+        "paper": "paper_controls",
+        "safe_factor": "safe_factor_only",
+        "safe_stop": "safe_factor_only",
+    }
+    mode = aliases.get(mode, mode)
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    if mode not in allowed:
+        raise ValueError(f"Invalid governance control mode: {mode}. Available: {sorted(allowed)}")
+    return mode
 
 
 def _read_feature_schema_columns() -> set[str]:
@@ -201,6 +229,11 @@ def run_single_experiment(
     show_live_monitor: bool = False,
     live_monitor=None,
     output_dir_suffix: str | None = None,
+    initial_cash: float = GOVERNANCE_INITIAL_CASH,
+    max_positions: int | None = None,
+    capital_profile: dict | None = None,
+    governance_control_mode: str = "normal",
+    alpha_collapse_exit_enabled: bool = True,
 ) -> dict[str, Path]:
     """运行单个治理实验"""
     variant_spec = get_governance_variant_spec(variant_name)
@@ -208,11 +241,18 @@ def run_single_experiment(
     universe_spec = get_universe_spec(universe_name)
 
     output_dir = build_output_path(variant_name, alpha_bundle, universe_name)
+    if _is_small_capital_profile(capital_profile):
+        output_dir = output_dir / "small_capital_branch"
+    control_mode = _normalize_governance_control_mode(governance_control_mode)
+    if control_mode != "normal":
+        output_dir = output_dir / f"control_{control_mode}"
+    if not bool(alpha_collapse_exit_enabled):
+        output_dir = output_dir / "no_alpha_collapse_exit"
     if output_dir_suffix:
         safe_suffix = str(output_dir_suffix).strip().replace("\\", "_").replace("/", "_")
         if safe_suffix:
             output_dir = output_dir / safe_suffix
-    archived_path = archive_existing_governance_output(output_dir)
+    output_dir = dated_run_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'=' * 60}")
@@ -221,8 +261,6 @@ def run_single_experiment(
     print(f"  Alpha Bundle: {alpha_bundle}")
     print(f"  Universe: {universe_name}")
     print(f"  Output: {output_dir}")
-    if archived_path is not None:
-        print(f"  Archived Previous Output: {archived_path}")
     print("=" * 60)
 
     alpha_models = ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(alpha_bundle)
@@ -250,7 +288,7 @@ def run_single_experiment(
     # Run backtest
     runner = GovernanceBacktestRunner(
         features,
-        initial_cash=GOVERNANCE_INITIAL_CASH,
+        initial_cash=float(initial_cash),
         safety_proxy_mode=safety_proxy_mode,
         output_dir=output_dir,
         alpha_models=alpha_models,
@@ -264,7 +302,6 @@ def run_single_experiment(
         selection_weight_mode=variant_spec.extra.get("selection_weight_mode", "reputation_weighted"),
         regime_overlay_mode=variant_spec.extra.get("regime_overlay_mode", "full"),
         risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
-        probability_bucket_mode=variant_spec.extra.get("probability_bucket_mode", "default"),
         governance_variant=variant_name,
         universe_mode=universe_spec.mode,
         data_fingerprints={"feature_daily_parquet": file_fingerprint(FEATURE_DAILY_PARQUET)},
@@ -276,6 +313,10 @@ def run_single_experiment(
         enable_quality_filters=universe_spec.quality_filter_enabled,
         universe_name=universe_name,
         alpha_bundle=alpha_bundle,
+        max_positions=max_positions,
+        capital_profile=capital_profile,
+        governance_control_mode=control_mode,
+        alpha_collapse_exit_enabled=bool(alpha_collapse_exit_enabled),
     )
 
     saved = runner.run(
@@ -294,6 +335,8 @@ def run_single_experiment(
         "start_date": str(effective_start),
         "end_date": str(effective_end),
         "output_dir": str(output_dir),
+        "governance_control_mode": control_mode,
+        "alpha_collapse_exit_enabled": bool(alpha_collapse_exit_enabled),
         "output_dir_suffix": str(output_dir_suffix or ""),
         "alpha_models": list(alpha_models),
         "enable_reputation": variant_spec.enable_reputation,
@@ -306,6 +349,8 @@ def run_single_experiment(
         "universe_mode": universe_spec.mode,
         "require_constituents": universe_spec.require_constituents,
         "low_memory": low_memory,
+        "initial_cash": float(initial_cash),
+        "max_positions": max_positions,
     }
     metadata_path = output_dir / "experiment_metadata.json"
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -456,7 +501,7 @@ def build_experiment_comparison_report(results: dict[str, dict[str, Path]]) -> p
 
 
 def save_experiment_comparison_report(comparison: pd.DataFrame, name: str) -> Path:
-    output_path = RESULT_DIR / "governance" / f"{name}_comparison_summary.csv"
+    output_path = RESULT_DIR / "governance" / f"{name}_comparison_summary{run_suffix()}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(output_path, index=False, encoding="utf-8-sig")
     return output_path
@@ -476,6 +521,17 @@ def parse_args():
     parser.add_argument("--end-date", type=str, default=GOVERNANCE_END_DATE)
     parser.add_argument("--max-days", type=int, default=None)
     parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=SAFETY_PROXY_MODE)
+    parser.add_argument(
+        "--governance-control-mode",
+        choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
+        default="normal",
+        help="Governance control switch for stop-mode experiments.",
+    )
+    parser.add_argument(
+        "--disable-alpha-collapse-exit",
+        action="store_true",
+        help="Record alpha-collapse exit as paper diagnostics but do not execute alpha_collapse_consensus sells.",
+    )
     parser.add_argument("--experiment-plan", type=str, help="Path to experiment plan JSON file")
     parser.add_argument("--list-variants", action="store_true", help="List all governance variants")
     parser.add_argument("--list-bundles", action="store_true", help="List all alpha bundles")
@@ -557,6 +613,8 @@ def main():
             end_date=args.end_date,
             max_days=args.max_days,
             safety_proxy_mode=args.safety_proxy_mode,
+            governance_control_mode=args.governance_control_mode,
+            alpha_collapse_exit_enabled=not bool(args.disable_alpha_collapse_exit),
         )
         return
 

@@ -11,15 +11,21 @@ from functions.decision_council.contracts import DecisionContext
 ORDER_PRIORITIES = {
     "safety_deleveraging": 0,
     "qualification_exit": 1,
+    "hard_stop_exit": 1,
     "alpha_collapse_consensus": 2,
     "trend_break_exit": 3,
     "profit_giveback_exit": 3,
     "post_entry_failure_exit": 3,
+    "signal_failure_exit": 3,
+    "stale_time_exit": 3,
+    "stale_time_reduce": 4,
     "volume_distribution_exit": 4,
     "replacement_opportunity_exit": 4,
     "single_name_risk_trim": 5,
     "normal_sell": 4,
     "normal_buy": 5,
+    "force_deploy_diversify_buy": 5,
+    "force_deploy_defensive_buy": 6,
 }
 ORDER_COLUMNS = [
     "decision_id",
@@ -32,6 +38,32 @@ ORDER_COLUMNS = [
     "reason",
     "priority",
     "pending_policy",
+    "position_state",
+    "position_exit_reason",
+    "add_layer",
+    "add_allowed",
+    "add_block_reason",
+    "entry_matrix_score",
+    "entry_alpha_score",
+    "entry_timing_score",
+    "entry_liquidity_score",
+    "alpha_quality_score",
+    "surge_capture_score",
+    "follow_through_score",
+    "exhaustion_score",
+    "entry_success_probability",
+    "entry_size_tier",
+    "planned_entry_lots",
+    "empirical_distribution_score",
+    "final_entry_score",
+    "tail_risk_proxy",
+    "trend_direction_score",
+    "peak_decay_score",
+    "profit_protection_pressure",
+    "dynamic_giveback_limit",
+    "future_loss_risk_score",
+    "downtrend_decay_score",
+    "post_entry_failure_score",
 ]
 
 
@@ -71,6 +103,8 @@ class RulesBasedPresidentPolicy:
             if symbol not in candidate_index.index or symbol in context.pending_locked_symbols:
                 continue
             row = candidate_index.loc[symbol]
+            if bool(row.get("exit_state", False)):
+                continue
             if bool(row["alpha_collapse_exit"]):
                 continue
             if (
@@ -82,6 +116,11 @@ class RulesBasedPresidentPolicy:
         ranked_symbols = eligible.loc[
             (eligible["candidate_rank"] <= int(context.entry_rank_limit))
             & eligible.get("entry_confirmed", pd.Series(True, index=eligible.index)).fillna(False).astype(bool)
+            & ~eligible.get("cooldown_active", pd.Series(False, index=eligible.index)).fillna(False).astype(bool)
+            & ~eligible.get("exit_state", pd.Series(False, index=eligible.index)).fillna(False).astype(bool)
+            & ~eligible.get("position_state", pd.Series("", index=eligible.index)).astype(str).str.lower().isin(
+                {"blocked", "cooldown", "exiting", "protecting_profit"}
+            )
         ].sort_values(["primary_score", "symbol"], ascending=[False, True])["symbol"].tolist()
         selected_symbols = list(dict.fromkeys(held_symbols))
         for symbol in ranked_symbols:
@@ -149,6 +188,37 @@ class RulesBasedPresidentPolicy:
             "entry_evidence_grade",
             "entry_confirmed",
             "entry_block_reason",
+            "entry_matrix_score",
+            "entry_alpha_score",
+            "entry_timing_score",
+            "entry_liquidity_score",
+            "alpha_quality_score",
+            "surge_capture_score",
+            "follow_through_score",
+            "exhaustion_score",
+            "entry_success_probability",
+            "entry_size_tier",
+            "planned_entry_lots",
+            "downtrend_decay_score",
+            "post_entry_failure_score",
+            "entry_quality_tier",
+            "candidate_pool_flag",
+            "watchlist_flag",
+            "direct_buy_flag",
+            "trend_stability_score",
+            "volume_health_score",
+            "drawdown_quality_score",
+            "position_state",
+            "exit_state",
+            "position_exit_reason",
+            "paper_exit_reason",
+            "paper_exit_state",
+            "cooldown_active",
+            "paper_cooldown_active",
+            "cooldown_until",
+            "add_allowed",
+            "add_block_reason",
+            "add_layer",
             "orderflow_candidate_score",
             "reversal_entry_score",
             "breakout_gate_score",
@@ -159,8 +229,7 @@ class RulesBasedPresidentPolicy:
             "orderflow_candidate_pass",
             "reversal_confirm_pass",
             "breakout_gate_pass",
-            "breakout_probability_bucket_pass",
-            "probability_bucket_mode",
+            "paper_alpha_collapse_exit",
         ]
         plan = allocated.copy()
         if not plan.empty:
@@ -202,6 +271,37 @@ class RulesBasedPresidentPolicy:
                     "entry_evidence_grade": pd.NA,
                     "entry_confirmed": pd.NA,
                     "entry_block_reason": "pending_locked",
+                    "entry_matrix_score": pd.NA,
+                    "entry_alpha_score": pd.NA,
+                    "entry_timing_score": pd.NA,
+                    "entry_liquidity_score": pd.NA,
+                    "alpha_quality_score": pd.NA,
+                    "surge_capture_score": pd.NA,
+                    "follow_through_score": pd.NA,
+                    "exhaustion_score": pd.NA,
+                    "entry_success_probability": pd.NA,
+                    "entry_size_tier": pd.NA,
+                    "planned_entry_lots": pd.NA,
+                    "downtrend_decay_score": pd.NA,
+                    "post_entry_failure_score": pd.NA,
+                    "entry_quality_tier": pd.NA,
+                    "candidate_pool_flag": pd.NA,
+                    "watchlist_flag": pd.NA,
+                    "direct_buy_flag": pd.NA,
+                    "trend_stability_score": pd.NA,
+                    "volume_health_score": pd.NA,
+                    "drawdown_quality_score": pd.NA,
+                    "position_state": "pending_locked",
+                    "exit_state": False,
+                    "position_exit_reason": "",
+                    "paper_exit_reason": "",
+                    "paper_exit_state": False,
+                    "cooldown_active": False,
+                    "paper_cooldown_active": False,
+                    "cooldown_until": pd.NA,
+                    "add_allowed": False,
+                    "add_block_reason": "pending_locked",
+                    "add_layer": pd.NA,
                     "orderflow_candidate_score": pd.NA,
                     "reversal_entry_score": pd.NA,
                     "breakout_gate_score": pd.NA,
@@ -212,8 +312,7 @@ class RulesBasedPresidentPolicy:
                     "orderflow_candidate_pass": pd.NA,
                     "reversal_confirm_pass": pd.NA,
                     "breakout_gate_pass": pd.NA,
-                    "breakout_probability_bucket_pass": pd.NA,
-                    "probability_bucket_mode": pd.NA,
+                    "paper_alpha_collapse_exit": pd.NA,
                 }
             )
         if locked_rows and plan.empty:
@@ -236,6 +335,7 @@ class RulesBasedPresidentPolicy:
         symbols = sorted(set(current) | set(target_weights))
         safety_shortfall = max(sum(current.values()) - float(safety_cap), 0.0)
         rows = []
+        sell_symbols = set()
         normal_turnover = 0.0
         total_drift = sum(abs(target_weights.get(symbol, 0.0) - current.get(symbol, 0.0)) for symbol in symbols)
         candidate_index = eligible.set_index("symbol", drop=False)
@@ -257,7 +357,9 @@ class RulesBasedPresidentPolicy:
             if remaining_safety_shortfall <= 1e-12:
                 break
             sell_weight = min(float(old), remaining_safety_shortfall)
-            rows.append(self._order_row(context, symbol, old, old - sell_weight, "safety_deleveraging"))
+            row = candidate_index.loc[symbol] if symbol in candidate_index.index else None
+            rows.append(self._order_row(context, symbol, old, old - sell_weight, "safety_deleveraging", row))
+            sell_symbols.add(symbol)
             safety_sold_symbols.add(symbol)
             remaining_safety_shortfall -= sell_weight
         for symbol in symbols:
@@ -265,11 +367,26 @@ class RulesBasedPresidentPolicy:
                 continue
             old = current.get(symbol, 0.0)
             new = target_weights.get(symbol, 0.0)
+            row = candidate_index.loc[symbol] if symbol in candidate_index.index else None
+            if old > 1e-12 and row is not None and bool(row.get("stale_time_reduce", False)):
+                new = min(float(new), float(old) * 0.50)
             delta = new - old
             if abs(delta) <= 1e-12:
                 continue
-            row = candidate_index.loc[symbol] if symbol in candidate_index.index else None
             reason = _order_reason(symbol, delta, row, context, replacement_edge, exit_mode=self.exit_mode)
+            is_confirmed_entry_buy = (
+                delta > 0
+                and old <= 1e-12
+                and row is not None
+                and bool(row.get("entry_confirmed", False))
+                and str(row.get("entry_size_tier", "")).strip().lower() in {
+                    "diversify_1_lot",
+                    "starter_1_lot",
+                    "starter_2_lot",
+                    "starter_strong",
+                }
+                and str(row.get("position_state", "")).strip().lower() in {"building", "strong_building", "holding", "watching"}
+            )
             is_catchup_buy = (
                 delta > 0
                 and context.catchup_allowed
@@ -279,16 +396,31 @@ class RulesBasedPresidentPolicy:
             )
             is_forced_sell = delta < 0 and reason in {
                 "qualification_exit",
+                "hard_stop_exit",
                 "alpha_collapse_consensus",
                 "profit_giveback_exit",
                 "post_entry_failure_exit",
+                "signal_failure_exit",
+                "stale_time_exit",
+                "stale_time_reduce",
             }
             if not is_forced_sell:
-                if not context.allow_normal_rebalance and not is_catchup_buy:
+                if not context.allow_normal_rebalance and not is_catchup_buy and not is_confirmed_entry_buy:
                     continue
                 if delta > 0 and safety_shortfall > 1e-12:
                     continue
-                if delta > 0 and context.transition_only:
+                if delta > 0 and symbol in sell_symbols:
+                    continue
+                if delta > 0 and context.transition_only and not is_confirmed_entry_buy:
+                    continue
+                if delta > 0 and row is not None and str(row.get("position_state", "")).strip().lower() in {
+                    "protecting_profit",
+                    "exiting",
+                    "cooldown",
+                    "blocked",
+                }:
+                    continue
+                if delta > 0 and old > 1e-12 and row is not None and not bool(row.get("add_allowed", False)):
                     continue
                 if delta < 0 and int(context.holding_days.get(symbol, 0)) < int(context.minimum_holding_days):
                     continue
@@ -298,6 +430,8 @@ class RulesBasedPresidentPolicy:
                 new = old + delta
                 if is_catchup_buy:
                     budget_limit = float(context.turnover_budget) + float(context.catchup_buy_budget)
+                elif is_confirmed_entry_buy:
+                    budget_limit = max(float(context.turnover_budget), abs(float(delta)))
                 else:
                     budget_limit = float(context.turnover_budget)
                 allowed = max(budget_limit - normal_turnover, 0.0)
@@ -307,7 +441,9 @@ class RulesBasedPresidentPolicy:
                     delta = allowed if delta > 0 else -allowed
                     new = old + delta
                 normal_turnover += abs(delta)
-            rows.append(self._order_row(context, symbol, old, new, reason))
+            if delta < 0:
+                sell_symbols.add(symbol)
+            rows.append(self._order_row(context, symbol, old, new, reason, row))
         orders = pd.DataFrame(rows, columns=ORDER_COLUMNS)
         planned_safety_sell_weight = float(
             -orders.loc[orders.get("reason", pd.Series(dtype=object)) == "safety_deleveraging", "delta_weight"].sum()
@@ -334,8 +470,9 @@ class RulesBasedPresidentPolicy:
         }
 
     @staticmethod
-    def _order_row(context, symbol, old, new, reason):
+    def _order_row(context, symbol, old, new, reason, candidate_row=None):
         delta = float(new) - float(old)
+        get = candidate_row.get if candidate_row is not None else lambda key, default=None: default
         return {
             "decision_id": context.decision_id,
             "execution_date": pd.Timestamp(context.decision_date) + pd.offsets.BDay(1),
@@ -347,6 +484,32 @@ class RulesBasedPresidentPolicy:
             "reason": reason,
             "priority": ORDER_PRIORITIES[reason],
             "pending_policy": "daily_expiry" if delta > 0 else "persistent_sell_intent",
+            "position_state": get("position_state", ""),
+            "position_exit_reason": get("position_exit_reason", ""),
+            "add_layer": get("add_layer", pd.NA),
+            "add_allowed": bool(get("add_allowed", False)),
+            "add_block_reason": get("add_block_reason", ""),
+            "entry_matrix_score": get("entry_matrix_score", pd.NA),
+            "entry_alpha_score": get("entry_alpha_score", pd.NA),
+            "entry_timing_score": get("entry_timing_score", pd.NA),
+            "entry_liquidity_score": get("entry_liquidity_score", pd.NA),
+            "alpha_quality_score": get("alpha_quality_score", pd.NA),
+            "surge_capture_score": get("surge_capture_score", pd.NA),
+            "follow_through_score": get("follow_through_score", pd.NA),
+            "exhaustion_score": get("exhaustion_score", pd.NA),
+            "entry_success_probability": get("entry_success_probability", pd.NA),
+            "entry_size_tier": get("entry_size_tier", ""),
+            "planned_entry_lots": get("planned_entry_lots", pd.NA),
+            "empirical_distribution_score": get("empirical_distribution_score", pd.NA),
+            "final_entry_score": get("final_entry_score", pd.NA),
+            "tail_risk_proxy": get("tail_risk_proxy", pd.NA),
+            "trend_direction_score": get("trend_direction_score", pd.NA),
+            "peak_decay_score": get("peak_decay_score", pd.NA),
+            "profit_protection_pressure": get("profit_protection_pressure", pd.NA),
+            "dynamic_giveback_limit": get("dynamic_giveback_limit", pd.NA),
+            "future_loss_risk_score": get("future_loss_risk_score", pd.NA),
+            "downtrend_decay_score": get("downtrend_decay_score", pd.NA),
+            "post_entry_failure_score": get("post_entry_failure_score", pd.NA),
         }
 
 
@@ -394,6 +557,13 @@ def _apply_policy_risk_hard_gate(allocated: pd.DataFrame, *, current_weights, di
 def _order_reason(symbol, delta, candidate_row, context, replacement_edge: float = 0.0, exit_mode: str = "full"):
     if delta < 0 and symbol in context.hard_qualification_symbols:
         return "qualification_exit"
+    if delta < 0 and candidate_row is not None and bool(candidate_row.get("exit_state", False)):
+        exit_reason = str(candidate_row.get("position_exit_reason", "") or "").strip()
+        if exit_reason in ORDER_PRIORITIES:
+            return exit_reason
+        return "normal_sell"
+    if delta < 0 and candidate_row is not None and bool(candidate_row.get("stale_time_reduce", False)):
+        return "stale_time_reduce"
     if delta < 0 and candidate_row is not None and bool(candidate_row.get("alpha_collapse_exit", False)):
         return "alpha_collapse_consensus"
     mode = str(exit_mode or "observe_complex_exit").lower()
@@ -418,12 +588,13 @@ def _best_replacement_edge(eligible: pd.DataFrame, held_symbols: set[str]) -> fl
     if eligible is None or eligible.empty or "symbol" not in eligible.columns:
         return 0.0
     data = eligible[~eligible["symbol"].astype(str).isin(held_symbols)].copy()
-    if data.empty or "expected_edge_10d" not in data.columns:
+    if data.empty:
         return 0.0
-    edge = pd.to_numeric(data["expected_edge_10d"], errors="coerce").dropna()
-    if edge.empty:
+    score_col = "entry_matrix_score" if "entry_matrix_score" in data.columns else "expected_edge_10d"
+    score = pd.to_numeric(data.get(score_col), errors="coerce").dropna()
+    if score.empty:
         return 0.0
-    return float(edge.quantile(0.90))
+    return float(score.quantile(0.90))
 
 
 def _replacement_opportunity_exit(candidate_row, replacement_edge: float) -> bool:
@@ -436,13 +607,15 @@ def _replacement_opportunity_exit(candidate_row, replacement_edge: float) -> boo
     giveback = _safe_row_float(candidate_row, "position_giveback_from_peak", 0.0)
     mfe = _safe_row_float(candidate_row, "position_mfe", 0.0)
     return bool(
-        (edge_gap >= 0.004 and alpha_percentile < 0.55)
-        or (edge_gap >= 0.002 and mfe >= 0.06 and giveback >= 0.35)
+        (edge_gap >= 0.12 and alpha_percentile < 0.55)
+        or (edge_gap >= 0.08 and mfe >= 0.06 and giveback >= 0.35)
     )
 
 
 def _hold_edge_after_lifecycle_penalty(candidate_row) -> float:
-    edge = _safe_row_float(candidate_row, "conservative_expected_edge_10d", None)
+    edge = _safe_row_float(candidate_row, "entry_matrix_score", None)
+    if edge is None:
+        edge = _safe_row_float(candidate_row, "conservative_expected_edge_10d", None)
     if edge is None:
         edge = _safe_row_float(candidate_row, "expected_edge_10d", 0.0)
     giveback = _safe_row_float(candidate_row, "position_giveback_from_peak", 0.0)

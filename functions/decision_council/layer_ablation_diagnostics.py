@@ -47,7 +47,7 @@ def build_layer_ablation_diagnostics(
     for universe_name in universe_names:
         universe_root = result_root / "governance" / universe_name
         for variant_name, alpha_bundle, suite_step in suite_steps:
-            run_dir = universe_root / variant_name / alpha_bundle / suite_id
+            run_dir = _resolve_suite_run_dir(universe_root / variant_name / alpha_bundle, suite_id)
             context = {
                 "suite_id": suite_id,
                 "suite_step": suite_step,
@@ -87,6 +87,24 @@ def build_layer_ablation_diagnostics(
     saved.update(_save_plots(summary, payoff, calibration, risk, modules, increments, output_dir, suite_id))
     saved["report"] = _save_markdown_report(summary, increments, problems, saved, output_dir / f"layer_ablation_diagnostic_report_{suite_id}.md")
     return saved
+
+
+def _resolve_suite_run_dir(bundle_root: Path, suite_id: str) -> Path:
+    direct = bundle_root / suite_id
+    if (direct / "governance_strategy_summary.csv").exists():
+        return direct
+    if direct.exists():
+        candidates = list(direct.rglob("governance_strategy_summary.csv"))
+        if candidates:
+            return max(candidates, key=lambda path: path.stat().st_mtime).parent
+    if bundle_root.exists():
+        candidates = [
+            path for path in bundle_root.rglob("governance_strategy_summary.csv")
+            if suite_id in path.parts
+        ]
+        if candidates:
+            return max(candidates, key=lambda path: path.stat().st_mtime).parent
+    return direct
 
 
 def _summary_row(run_dir: Path, context: dict) -> dict:

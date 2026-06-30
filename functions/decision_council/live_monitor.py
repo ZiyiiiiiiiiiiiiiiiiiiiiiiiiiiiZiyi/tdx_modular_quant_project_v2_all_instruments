@@ -34,6 +34,8 @@ class GovernanceLiveMonitor:
         self._state_path = None
         self._write_failures = 0
         self._write_counter = 0
+        self._run_id = ""
+        self._last_day_index = -1
         self._start_browser_monitor()
 
     @property
@@ -43,11 +45,14 @@ class GovernanceLiveMonitor:
     def start_session(self, *, title: str, total_days: int, initial_nav: float) -> None:
         if self._closed:
             return
+        self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
+        self._last_day_index = -1
         self.total_days = max(int(total_days), 1)
         self.initial_nav = max(float(initial_nav), 1e-12)
         self._write_state(
             {
                 "command": "session",
+                "run_id": self._run_id,
                 "title": str(title),
                 "total_days": self.total_days,
                 "initial_nav": self.initial_nav,
@@ -72,13 +77,17 @@ class GovernanceLiveMonitor:
             return
         if not ((day_index + 1) % self.refresh_every_days == 0 or day_index + 1 >= self.total_days):
             return
+        self._last_day_index = max(self._last_day_index, int(day_index))
+        progress_pct = min((self._last_day_index + 1) / max(self.total_days, 1) * 100.0, 100.0)
         self._write_state(
             {
                 "command": "update",
+                "run_id": self._run_id,
                 "date": str(date)[:10],
                 "exposure": dict(exposure),
                 "day_index": int(day_index),
                 "total_days": self.total_days,
+                "progress_pct": progress_pct,
                 "initial_nav": self.initial_nav,
                 "holdings": list(holdings or []),
                 "monitor_state": dict(monitor_state or {}),
@@ -88,9 +97,16 @@ class GovernanceLiveMonitor:
     def finish(self, message: str | None = None) -> None:
         if self._closed:
             return
+        completed_days = max(self._last_day_index + 1, 0)
+        progress_pct = min(completed_days / max(self.total_days, 1) * 100.0, 100.0)
         self._write_state(
             {
                 "command": "finish",
+                "run_id": self._run_id,
+                "day_index": self._last_day_index,
+                "total_days": self.total_days,
+                "progress_pct": progress_pct,
+                "completed": completed_days >= self.total_days,
                 "message": message or "回测完成。窗口会保持打开，关闭浏览器标签即可。",
             }
         )

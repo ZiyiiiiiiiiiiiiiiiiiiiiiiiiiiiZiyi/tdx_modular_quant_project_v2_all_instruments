@@ -114,7 +114,7 @@ def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFram
         if column not in data.columns:
             data[column] = np.nan
         data[column] = pd.to_numeric(data[column], errors="coerce")
-    for column in ["entry_confirmed", "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass", "breakout_probability_bucket_pass"]:
+    for column in ["entry_confirmed", "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass"]:
         if column not in data.columns:
             data[column] = False
         data[column] = data[column].fillna(False).astype(bool)
@@ -131,7 +131,6 @@ def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFram
                 "orderflow_pass_count": int(group["orderflow_candidate_pass"].sum()),
                 "reversal_pass_count": int(group["reversal_confirm_pass"].sum()),
                 "breakout_pass_count": int(group["breakout_gate_pass"].sum()),
-                "breakout_probability_bucket_pass_count": int(group["breakout_probability_bucket_pass"].sum()),
                 "avg_orderflow_candidate_score": _safe_mean(source["orderflow_candidate_score"]),
                 "avg_reversal_entry_score": _safe_mean(source["reversal_entry_score"]),
                 "avg_breakout_gate_score": _safe_mean(source["breakout_gate_score"]),
@@ -205,8 +204,8 @@ def build_strategy_validation_matrix(reports: dict[str, pd.DataFrame]) -> pd.Dat
     if not cal10.empty:
         weighted_ece = float(pd.to_numeric(cal10.get("ece_weighted"), errors="coerce").fillna(0.0).sum())
         best_lower = float(pd.to_numeric(cal10.get("wilson_lower_95"), errors="coerce").max())
-        rows.append(_gate_row("entry_probability_calibration", weighted_ece <= 0.06 and best_lower >= 0.48, weighted_ece, "<=0.06 ECE and best Wilson lower >=0.48"))
-        rows.append(_gate_row("entry_probability_lower_bound", best_lower >= 0.50, best_lower, ">=0.50 for full-exposure authorization"))
+        rows.append(_gate_row("entry_probability_calibration", weighted_ece <= 0.06 and best_lower >= 0.48, weighted_ece, "diagnostic only: <=0.06 ECE and best Wilson lower >=0.48"))
+        rows.append(_gate_row("entry_probability_lower_bound", best_lower >= 0.50, best_lower, "diagnostic only: >=0.50 lower-bound reference"))
     else:
         rows.append(_gate_row("entry_probability_calibration", False, np.nan, "missing calibration report"))
 

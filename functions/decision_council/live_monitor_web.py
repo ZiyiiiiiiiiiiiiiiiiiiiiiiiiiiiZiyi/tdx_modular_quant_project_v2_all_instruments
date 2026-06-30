@@ -225,7 +225,7 @@ HTML = """<!doctype html>
         </div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>当前持仓 90 日价格路径（相对价格，不是入场盈亏）</h3>
+        <h3>当前持仓 180 日价格路径（点标买入日期；上方显示入场收益）</h3>
         <div class="chart-wrap">
           <canvas id="holdingPathChart" class="compact" width="900" height="260"></canvas>
         </div>
@@ -289,7 +289,7 @@ HTML = """<!doctype html>
         <h3>持仓生命周期</h3>
         <div class="section">
           <table class="list-table">
-            <thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>最大有利</th><th>最大不利</th><th>回吐</th><th>警报</th></tr></thead>
+            <thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>MFE</th><th>MAE</th><th>回吐</th><th>趋势</th><th>峰衰</th><th>亏损风险</th><th>状态</th><th>警报</th></tr></thead>
             <tbody id="lifecycleBody"></tbody>
           </table>
         </div>
@@ -300,6 +300,36 @@ HTML = """<!doctype html>
 
   <script>
     const metricDefs = [
+      ["closed_trade_win_rate", "平仓胜率"],
+      ["realized_pnl", "已实现盈亏"],
+      ["gross_profit", "已平仓总盈利"],
+      ["gross_loss", "已平仓总亏损"],
+      ["profit_factor", "利润因子"],
+      ["control_exit_count", "控制卖出次数"],
+      ["control_avoided_loss", "控制节省亏损"],
+      ["hard_stop_avoided_loss", "硬止损节省亏损"],
+      ["alpha_collapse_avoided_loss", "Alpha塌陷节省亏损"],
+      ["safety_deleveraging_avoided_loss", "安全降仓节省亏损"],
+      ["retail_upgraded_to_one_lot_count", "小资金一手提升"],
+      ["retail_lot_cash_insufficient_count", "买不起一手"],
+      ["retail_state_block_count", "状态拦截买单"],
+      ["surge_candidate_count", "急涨候选"],
+      ["strong_starter_count", "强启动候选"],
+      ["starter_2_lot_count", "两手首买候选"],
+      ["diversify_1_lot_count", "分散补足候选"],
+      ["exhaustion_block_count", "衰竭拦截"],
+      ["empirical_distribution_score_mean", "经验分布均分"],
+      ["tail_risk_proxy_mean", "尾部风险均值"],
+      ["trend_direction_score_mean", "趋势方向均值"],
+      ["peak_decay_score_mean", "峰值衰退均值"],
+      ["future_loss_risk_score_mean", "未来亏损风险"],
+      ["target_holding_count", "目标持仓数"],
+      ["holding_shortfall_count", "持仓不足数"],
+      ["idle_cash_ratio", "闲置现金比例"],
+      ["defensive_eligible_count", "防守候选数"],
+      ["downtrend_decay_count", "阴跌风险"],
+      ["protecting_profit_count", "利润保护持仓"],
+      ["buy_sell_conflict_cooldown_days", "买卖冲突冷却天数"],
       ["total_return", "账户收益"],
       ["current_drawdown", "当前回撤"],
       ["account_max_drawdown", "账户最大回撤"],
@@ -341,6 +371,8 @@ HTML = """<!doctype html>
     let moduleHistory = [];
     let totalDays = 1;
     let initialNav = 1.0;
+    let activeRunId = "";
+    let lastProgressPct = 0;
 
     function fmtPct(v) {
       return Number.isFinite(v) ? `${(v * 100).toFixed(2)}%` : "--";
@@ -527,7 +559,7 @@ HTML = """<!doctype html>
         ctx.fillText("等待 Alpha 因子权重数据...", 24, 32);
         return;
       }
-      const left = 58, right = w - 170, top = 24, bottom = h - 32;
+      const left = 58, right = w - 250, top = 24, bottom = h - 32;
       const latest = factorHistory[factorHistory.length - 1].weights || [];
       const topFactors = latest
         .slice()
@@ -600,7 +632,7 @@ HTML = """<!doctype html>
         ctx.fillText("等待 Alpha 模块权重数据...", 24, 32);
         return;
       }
-      const left = 58, right = w - 170, top = 24, bottom = h - 32;
+      const left = 58, right = w - 28, top = 58, bottom = h - 32;
       const latest = moduleHistory[moduleHistory.length - 1].weights || [];
       const modules = latest.map(x => String(x.factor_module)).slice(0, 8);
       const values = [];
@@ -658,7 +690,8 @@ HTML = """<!doctype html>
         ctx.fillText("暂无有效持仓路径。", 24, 32);
         return;
       }
-      const left = 58, right = w - 170, top = 24, bottom = h - 32;
+      const left = 58, right = w - 28, top = 58, bottom = h - 32;
+      const palette = ["#147a54", "#b3403a", "#2c7fb8", "#d4a84f", "#8a5a44", "#465a7a"];
       const allValues = [];
       let maxLen = 0;
       for (const path of usable) {
@@ -668,6 +701,19 @@ HTML = """<!doctype html>
       const maxVal = Math.max(...allValues, 1.02);
       const minVal = Math.min(...allValues, 0.98);
       const span = Math.max(maxVal - minVal, 1e-12);
+
+      usable.forEach((path, idx) => {
+        const last = Number(path.points[path.points.length - 1].value || 1);
+        const entryRet = Number(path.unrealized_return);
+        const entryText = Number.isFinite(entryRet) ? ` 入场${fmtPct(entryRet)}` : "";
+        const entryDate = path.entry_date ? ` ${String(path.entry_date).slice(5)}` : "";
+        const labelX = left + (idx % 3) * 260;
+        const labelY = 18 + Math.floor(idx / 3) * 18;
+        ctx.fillStyle = palette[idx % palette.length];
+        ctx.font = "11px Microsoft YaHei UI";
+        ctx.fillText(`${String(path.symbol).slice(0, 12)} 180日${fmtPct(last - 1)}${entryText}${entryDate}`, labelX, labelY);
+      });
+
       ctx.strokeStyle = "#d6cfbd";
       for (let i = 0; i <= 4; i++) {
         const y = top + (bottom - top) * i / 4;
@@ -684,22 +730,30 @@ HTML = """<!doctype html>
       ctx.lineTo(right, baselineY);
       ctx.stroke();
       ctx.setLineDash([]);
-      const palette = ["#147a54", "#b3403a", "#2c7fb8", "#d4a84f", "#8a5a44", "#465a7a"];
+
       usable.forEach((path, idx) => {
         ctx.strokeStyle = palette[idx % palette.length];
         ctx.lineWidth = 2;
         ctx.beginPath();
+        let entryPointXY = null;
         path.points.forEach((point, i) => {
           const v = Number(point.value || 0);
           const x = maxLen <= 1 ? left : left + (right - left) * i / (maxLen - 1);
           const y = bottom - (v - minVal) / span * (bottom - top);
           if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          if (Number(path.entry_index) === i) entryPointXY = {x, y};
         });
         ctx.stroke();
-        const last = Number(path.points[path.points.length - 1].value || 1);
-        ctx.fillStyle = palette[idx % palette.length];
-        ctx.font = "11px Consolas";
-        ctx.fillText(`${String(path.symbol).slice(0, 12)} ${fmtPct(last - 1)}`, right + 10, top + 15 + idx * 18);
+        if (entryPointXY) {
+          const entryDateLabel = path.entry_date ? String(path.entry_date).slice(5) : "";
+          ctx.fillStyle = palette[idx % palette.length];
+          ctx.beginPath();
+          ctx.arc(entryPointXY.x, entryPointXY.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#173f35";
+          ctx.font = "10px Microsoft YaHei UI";
+          ctx.fillText(`买入 ${entryDateLabel}`, entryPointXY.x + 5, entryPointXY.y - 5);
+        }
       });
       ctx.fillStyle = "#8b8578";
       ctx.font = "11px Consolas";
@@ -710,6 +764,8 @@ HTML = """<!doctype html>
     function renderState(payload) {
       const cmd = String(payload.command || "update");
       if (cmd === "session") {
+        activeRunId = String(payload.run_id || "");
+        lastProgressPct = 0;
         totalDays = Math.max(Number(payload.total_days || 1), 1);
         initialNav = Math.max(Number(payload.initial_nav || 1.0), 1e-12);
         history = [];
@@ -721,6 +777,13 @@ HTML = """<!doctype html>
         return;
       }
       if (cmd === "finish") {
+        const payloadRunId = String(payload.run_id || "");
+        if (activeRunId && payloadRunId && payloadRunId !== activeRunId) return;
+        const progress = Number.isFinite(Number(payload.progress_pct)) ? Number(payload.progress_pct) : lastProgressPct;
+        lastProgressPct = Math.max(lastProgressPct, Math.min(Math.max(progress, 0), 100));
+        document.getElementById("status").textContent = payload.message || "已完成。";
+        document.getElementById("progressBar").style.width = `${lastProgressPct.toFixed(1)}%`;
+        return;
         document.getElementById("status").textContent = payload.message || "已完成。";
         document.getElementById("progressBar").style.width = "100%";
         return;
@@ -730,6 +793,9 @@ HTML = """<!doctype html>
         return;
       }
       if (cmd !== "update") return;
+      const payloadRunId = String(payload.run_id || "");
+      if (activeRunId && payloadRunId && payloadRunId !== activeRunId) return;
+      if (!activeRunId && payloadRunId) activeRunId = payloadRunId;
 
       const exposure = payload.exposure || {};
       const ms = payload.monitor_state || {};
@@ -823,13 +889,47 @@ HTML = """<!doctype html>
       setMetric("cash_drag", fmtPct(cashDrag), -cashDrag);
       setMetric("buy_accuracy_5d", fmtPct(Number(ms.trailing_buy_accuracy_5d)), Number(ms.trailing_buy_accuracy_5d || 0) - 0.5);
       setMetric("sell_accuracy_5d", fmtPct(Number(ms.trailing_sell_accuracy_5d)), Number(ms.trailing_sell_accuracy_5d || 0) - 0.5);
+      setMetric("closed_trade_win_rate", fmtPct(Number(ms.closed_trade_win_rate)), Number(ms.closed_trade_win_rate || 0) - 0.5);
+      setMetric("realized_pnl", fmtMoney(Number(ms.realized_pnl || 0)), Number(ms.realized_pnl || 0));
+      setMetric("gross_profit", fmtMoney(Number(ms.gross_profit || 0)), Number(ms.gross_profit || 0));
+      setMetric("gross_loss", fmtMoney(Number(ms.gross_loss || 0)), Number(ms.gross_loss || 0));
+      setMetric("profit_factor", fmtNum(Number(ms.profit_factor), 2), Number(ms.profit_factor || 0) - 1.0);
+      setMetric("control_exit_count", String(Number(ms.control_exit_count || 0)), Number(ms.control_exit_count || 0));
+      setMetric("control_avoided_loss", fmtMoney(Number(ms.avoided_loss_to_window_low || 0)), Number(ms.avoided_loss_to_window_low || 0));
+      setMetric("hard_stop_avoided_loss", fmtMoney(Number(ms.hard_stop_avoided_loss_to_window_low || 0)), Number(ms.hard_stop_avoided_loss_to_window_low || 0));
+      setMetric("alpha_collapse_avoided_loss", fmtMoney(Number(ms.alpha_collapse_avoided_loss_to_window_low || 0)), Number(ms.alpha_collapse_avoided_loss_to_window_low || 0));
+      setMetric("safety_deleveraging_avoided_loss", fmtMoney(Number(ms.safety_deleveraging_avoided_loss_to_window_low || 0)), Number(ms.safety_deleveraging_avoided_loss_to_window_low || 0));
+      setMetric("retail_upgraded_to_one_lot_count", String(Number(ms.retail_upgraded_to_one_lot_count || 0)), Number(ms.retail_upgraded_to_one_lot_count || 0));
+      setMetric("retail_lot_cash_insufficient_count", String(Number(ms.retail_lot_cash_insufficient_count || 0)), -Number(ms.retail_lot_cash_insufficient_count || 0));
+      setMetric("retail_state_block_count", String(Number(ms.retail_state_block_count || 0)), -Number(ms.retail_state_block_count || 0));
+      setMetric("surge_candidate_count", String(Number(ms.surge_candidate_count || 0)), Number(ms.surge_candidate_count || 0));
+      setMetric("strong_starter_count", String(Number(ms.strong_starter_count || 0)), Number(ms.strong_starter_count || 0));
+      setMetric("starter_2_lot_count", String(Number(ms.starter_2_lot_count || 0)), Number(ms.starter_2_lot_count || 0));
+      setMetric("diversify_1_lot_count", String(Number(ms.diversify_1_lot_count || 0)), Number(ms.diversify_1_lot_count || 0));
+      setMetric("exhaustion_block_count", String(Number(ms.exhaustion_block_count || 0)), -Number(ms.exhaustion_block_count || 0));
+      setMetric("empirical_distribution_score_mean", fmtNum(Number(ms.empirical_distribution_score_mean), 3), Number(ms.empirical_distribution_score_mean || 0) - 0.5);
+      setMetric("tail_risk_proxy_mean", fmtNum(Number(ms.tail_risk_proxy_mean), 3), 0.5 - Number(ms.tail_risk_proxy_mean || 0));
+      setMetric("trend_direction_score_mean", fmtNum(Number(ms.trend_direction_score_mean), 3), Number(ms.trend_direction_score_mean || 0) - 0.5);
+      setMetric("peak_decay_score_mean", fmtNum(Number(ms.peak_decay_score_mean), 3), 0.5 - Number(ms.peak_decay_score_mean || 0));
+      setMetric("future_loss_risk_score_mean", fmtNum(Number(ms.future_loss_risk_score_mean), 3), 0.5 - Number(ms.future_loss_risk_score_mean || 0));
+      setMetric("target_holding_count", String(Number(ms.target_holding_count || 0)), 0);
+      setMetric("holding_shortfall_count", String(Number(ms.holding_shortfall_count || 0)), -Number(ms.holding_shortfall_count || 0));
+      setMetric("idle_cash_ratio", fmtPct(Number(ms.idle_cash_ratio)), -Number(ms.idle_cash_ratio || 0));
+      setMetric("defensive_eligible_count", String(Number(ms.defensive_eligible_count || 0)), Number(ms.defensive_eligible_count || 0));
+      setMetric("downtrend_decay_count", String(Number(ms.downtrend_decay_count || 0)), -Number(ms.downtrend_decay_count || 0));
+      setMetric("protecting_profit_count", String(Number(ms.protecting_profit_count || 0)), Number(ms.protecting_profit_count || 0));
+      setMetric("buy_sell_conflict_cooldown_days", String(Number(ms.buy_sell_conflict_cooldown_days || 0)), -Number(ms.buy_sell_conflict_cooldown_days || 0));
       setMetric("candidate_count", String(Number(ms.candidate_count || 0)), 0);
       setMetric("confirmed_count", String(Number(ms.entry_confirmed_count || 0)), Number(ms.entry_confirmed_count || 0));
       setMetric("order_count", String(Number(ms.order_count || 0)), 0);
       setMetric("lifecycle_alerts", String(Number(ms.lifecycle_alert_count || 0)), -Number(ms.lifecycle_alert_count || 0));
       setMetric("pending_orders", String(Number(ms.pending_order_count || 0)), 0);
 
-      const progress = Math.min((dayIndex + 1) / totalDays * 100, 100);
+      const payloadProgress = Number(payload.progress_pct);
+      const progress = Number.isFinite(payloadProgress)
+        ? Math.min(Math.max(payloadProgress, 0), 100)
+        : Math.min((dayIndex + 1) / totalDays * 100, 100);
+      lastProgressPct = progress;
       document.getElementById("progressBar").style.width = `${progress.toFixed(1)}%`;
       document.getElementById("status").textContent = `${String(payload.date || "").slice(0,10)} | ${dayIndex + 1}/${totalDays} | ${progress.toFixed(1)}%`;
 
@@ -874,7 +974,6 @@ HTML = """<!doctype html>
         `订单流通过数          : ${String(ms.orderflow_candidate_pass_count ?? 0)}`,
         `反转通过数            : ${String(ms.reversal_confirm_pass_count ?? 0)}`,
         `突破通过数            : ${String(ms.breakout_gate_pass_count ?? 0)}`,
-        `突破60-65桶通过数     : ${String(ms.breakout_probability_bucket_pass_count ?? 0)}`,
         `订单流均分            : ${fmtNum(Number(ms.orderflow_candidate_score_mean), 3)}`,
         `反转均分              : ${fmtNum(Number(ms.reversal_entry_score_mean), 3)}`,
         `突破均分              : ${fmtNum(Number(ms.breakout_gate_score_mean), 3)}`,
@@ -882,6 +981,24 @@ HTML = """<!doctype html>
         `模块候选均分          : ${fmtNum(Number(ms.module_candidate_score_mean), 3)}`,
         `模块买入均分          : ${fmtNum(Number(ms.module_entry_score_mean), 3)}`,
         `模块持有均分          : ${fmtNum(Number(ms.module_hold_score_mean), 3)}`,
+        `总公式-Alpha均分       : ${fmtNum(Number(ms.entry_alpha_score_mean), 3)}`,
+        `总公式-择时均分        : ${fmtNum(Number(ms.entry_timing_score_mean), 3)}`,
+        `总公式-流动性均分      : ${fmtNum(Number(ms.entry_liquidity_score_mean), 3)}`,
+        `总公式-矩阵均分        : ${fmtNum(Number(ms.entry_matrix_score_mean), 3)}`,
+        `股票质量均分          : ${fmtNum(Number(ms.alpha_quality_score_mean), 3)}`,
+        `急涨捕捉均分          : ${fmtNum(Number(ms.surge_capture_score_mean), 3)}`,
+        `承接确认均分          : ${fmtNum(Number(ms.follow_through_score_mean), 3)}`,
+        `冲高衰竭均分          : ${fmtNum(Number(ms.exhaustion_score_mean), 3)}`,
+        `入场成功概率均分      : ${fmtPct(Number(ms.entry_success_probability_mean || 0))}`,
+        `阴跌衰减均分          : ${fmtNum(Number(ms.downtrend_decay_score_mean), 3)}`,
+        `买后失败均分          : ${fmtNum(Number(ms.post_entry_failure_score_mean), 3)}`,
+        `急涨候选数量          : ${String(ms.surge_candidate_count ?? 0)}`,
+        `强启动候选数量        : ${String(ms.strong_starter_count ?? 0)}`,
+        `两手首买候选数量      : ${String(ms.starter_2_lot_count ?? 0)}`,
+        `衰竭拦截数量          : ${String(ms.exhaustion_block_count ?? 0)}`,
+        `阴跌风险数量          : ${String(ms.downtrend_decay_count ?? 0)}`,
+        `利润保护持仓          : ${String(ms.protecting_profit_count ?? 0)}`,
+        `买卖冲突冷却天数      : ${String(ms.buy_sell_conflict_cooldown_days ?? 0)}`,
         `买入5日准确率         : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
         `授权10日胜率均值      : ${fmtPct(Number(ms.authorization_p_win_10d_mean || 0))}`,
         `授权10日优势均值      : ${fmtPct(Number(ms.authorization_expected_edge_10d_mean || 0))}`,
@@ -960,7 +1077,8 @@ HTML = """<!doctype html>
       lifecycleBody.innerHTML = "";
       const lifecycleRows = (ms.holding_lifecycle_preview || []).slice(0, 12);
       for (const item of lifecycleRows) {
-        const alert = item.profit_giveback_flag ? "利润回吐" : item.post_entry_failure_flag ? "入场失败" : "";
+        const alert = item.position_exit_reason ? String(item.position_exit_reason) : item.profit_giveback_flag ? "利润回吐" : item.post_entry_failure_flag ? "入场失败" : "";
+        const stateText = `${String(item.position_state || "--")}${item.add_allowed ? " / 可补仓" : ""}`;
         const tr = document.createElement("tr");
         tr.innerHTML = [
           `<td>${String(item.symbol || "")}</td>`,
@@ -969,16 +1087,20 @@ HTML = """<!doctype html>
           `<td>${fmtPct(Number(item.mfe || 0))}</td>`,
           `<td>${fmtPct(Number(item.mae || 0))}</td>`,
           `<td>${fmtPct(Number(item.giveback_from_peak || 0))}</td>`,
+          `<td>${fmtNum(Number(item.trend_direction_score || 0), 2)}</td>`,
+          `<td>${fmtNum(Number(item.peak_decay_score || 0), 2)}</td>`,
+          `<td>${fmtNum(Number(item.future_loss_risk_score || 0), 2)}</td>`,
+          `<td>${stateText}</td>`,
           `<td style="color:${alert ? "#b3403a" : "#173f35"}">${alert || "正常"}</td>`
         ].join("");
         lifecycleBody.appendChild(tr);
       }
-      if (!lifecycleRows.length) lifecycleBody.innerHTML = `<tr><td colspan="7">暂无持仓生命周期记录。</td></tr>`;
+      if (!lifecycleRows.length) lifecycleBody.innerHTML = `<tr><td colspan="11">暂无持仓生命周期记录。</td></tr>`;
 
-      const candidateLines = [`候选股票前列（${Number(ms.candidate_count || 0)}）`, "", "代码         分数     分位   5日预期 候选 买入 突破 趋势 拦截原因"];
+      const candidateLines = [`候选股票前列（${Number(ms.candidate_count || 0)}）`, "", "代码         分数     矩阵   状态       5日预期 候选 买入 突破 趋势 拦截原因"];
       for (const item of (ms.candidate_preview || [])) {
         candidateLines.push(
-          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.alpha_percentile || 0),2).padStart(6)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.module_candidate_score || 0),2).padStart(6)} ${fmtNum(Number(item.module_entry_score || 0),2).padStart(5)} ${fmtNum(Number(item.breakout_gate_score || 0),2).padStart(5)} ${fmtNum(Number(item.trend_hold_score || 0),2).padStart(5)} ${String(item.entry_block_reason || "").slice(0,18)}`
+          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.entry_matrix_score || 0),2).padStart(6)} ${String(item.position_state || "--").slice(0,10).padEnd(10)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.module_candidate_score || 0),2).padStart(6)} ${fmtNum(Number(item.module_entry_score || 0),2).padStart(5)} ${fmtNum(Number(item.breakout_gate_score || 0),2).padStart(5)} ${fmtNum(Number(item.trend_hold_score || 0),2).padStart(5)} ${String(item.entry_block_reason || item.add_block_reason || "").slice(0,18)}`
         );
       }
       if ((ms.candidate_preview || []).length === 0) candidateLines.push("暂无候选预览。");

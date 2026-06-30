@@ -32,6 +32,8 @@ def save_governance_diagnostic_plots(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    visual_output = output / "visual_exports"
+    visual_output.mkdir(parents=True, exist_ok=True)
     saved = {}
     if not daily_result.empty:
         path = output / "governance_performance_risk.png"
@@ -44,6 +46,11 @@ def save_governance_diagnostic_plots(
         path = output / "governance_benchmark_exposure_attribution.png"
         if _plot_benchmark_exposure_attribution(plt, attribution_ledger, path):
             saved["governance_benchmark_exposure_attribution_plot"] = path
+        account_png = visual_output / "account_vs_top30_benchmark.png"
+        account_gif = visual_output / "account_vs_top30_benchmark.gif"
+        account_saved = _plot_account_vs_benchmark_export(plt, attribution_ledger, account_png, account_gif)
+        if account_saved is not None:
+            saved["governance_account_vs_top30_benchmark_export"] = account_saved
     if bucket_attribution is not None and not bucket_attribution.empty:
         path = output / "governance_bucket_attribution.png"
         if _plot_bucket_attribution(plt, bucket_attribution, path):
@@ -68,13 +75,19 @@ def save_governance_diagnostic_plots(
         path = output / "governance_top_holdings_latest.png"
         if _plot_top_holdings_latest(plt, holdings_ledger, path):
             saved["governance_top_holdings_latest_plot"] = path
-        animation_path = output / "governance_selected_holdings_90d.gif"
-        static_path = output / "governance_selected_holdings_90d.png"
-        saved_path = _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, animation_path, static_path)
+        animation_path = visual_output / "holding_price_paths_180d.gif"
+        static_path = visual_output / "holding_price_paths_180d.png"
+        saved_path = _plot_selected_holdings_180d(plt, holdings_ledger, feature_data, animation_path, static_path)
         if saved_path is not None:
-            key = "governance_selected_holdings_90d_animation" if saved_path.suffix.lower() == ".gif" else "governance_selected_holdings_90d_plot"
+            key = "governance_selected_holdings_180d_animation" if saved_path.suffix.lower() == ".gif" else "governance_selected_holdings_180d_plot"
             saved[key] = saved_path
     return saved
+
+
+def _safe_savefig(fig, output_path, *, dpi=220, bbox_inches="tight"):
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
 
 
 def _plot_performance_risk(plt, daily_result, output_path):
@@ -147,7 +160,7 @@ def _plot_performance_risk(plt, daily_result, output_path):
     sharpe_axis.set_ylabel("20D rolling Sharpe")
     axes[2].grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -179,7 +192,7 @@ def _plot_capital_allocation(plt, daily_result, output_path):
     axes[1].legend(loc="best")
     axes[1].grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -201,7 +214,7 @@ def _plot_model_scores(plt, reputation_ledger, output_path):
         axis.grid(alpha=0.25)
         axis.legend(loc="best")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -239,7 +252,7 @@ def _plot_safety_points(plt, daily_result, safety_ledger, output_path):
     axes[1].legend(loc="best")
     axes[1].grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -323,7 +336,7 @@ def _plot_decision_accuracy(plt, execution_ledger, feature_data, output_path) ->
         tick.set_ha("right")
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -359,7 +372,7 @@ def _plot_top_holdings_latest(plt, holdings_ledger, output_path) -> bool:
     axes[1].grid(alpha=0.25, axis="x")
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -411,7 +424,7 @@ def _plot_benchmark_exposure_attribution(plt, attribution_ledger, output_path) -
     axes[2].grid(alpha=0.25)
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -446,7 +459,7 @@ def _plot_bucket_attribution(plt, bucket_attribution, output_path) -> bool:
         axis.set_title(f"{dimension} | {preferred_metric}")
         axis.grid(alpha=0.25, axis="x")
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
 
@@ -489,12 +502,12 @@ def _plot_factor_module_weights(plt, factor_weight_ledger, output_path) -> bool:
     axes[1].legend(loc="best")
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return True
 
 
-def _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, gif_path, png_path) -> Path | None:
+def _plot_selected_holdings_180d(plt, holdings_ledger, feature_data, gif_path, png_path) -> Path | None:
     latest = holdings_ledger.copy()
     latest["date"] = pd.to_datetime(latest["date"], errors="coerce")
     latest["market_value"] = pd.to_numeric(latest.get("market_value"), errors="coerce")
@@ -516,7 +529,7 @@ def _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, gif_path, pn
     prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
     close_col = "close_nominal" if "close_nominal" in prices.columns else "close"
     prices[close_col] = pd.to_numeric(prices[close_col], errors="coerce")
-    start_date = latest_date - pd.Timedelta(days=120)
+    start_date = latest_date - pd.Timedelta(days=270)
     prices = prices[
         prices["symbol"].astype(str).isin(symbols)
         & prices["date"].between(start_date, latest_date)
@@ -525,29 +538,55 @@ def _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, gif_path, pn
         return None
 
     pivot = prices.pivot_table(index="date", columns="symbol", values=close_col, aggfunc="last").sort_index().ffill()
-    pivot = pivot.tail(90)
+    pivot = pivot.tail(180)
     if len(pivot) < 2:
         return None
     normalized = pivot / pivot.iloc[0].replace(0.0, np.nan)
+    latest_rows = (
+        latest[latest["date"].eq(latest_date)]
+        .sort_values("market_value", ascending=False)
+        .drop_duplicates("symbol", keep="first")
+        .set_index("symbol")
+    )
 
-    fig, axis = plt.subplots(figsize=(14, 7))
+    fig, axis = plt.subplots(figsize=(15, 8))
     palette = ["#147a54", "#b3403a", "#2c7fb8", "#d4a84f", "#8a5a44", "#465a7a"]
     for idx, column in enumerate(normalized.columns):
-        axis.plot(normalized.index, normalized[column], linewidth=1.4, color=palette[idx % len(palette)], label=str(column))
+        color = palette[idx % len(palette)]
+        row = latest_rows.loc[column] if column in latest_rows.index else pd.Series(dtype=object)
+        entry_date = pd.to_datetime(row.get("entry_date"), errors="coerce")
+        unrealized_return = pd.to_numeric(pd.Series([row.get("unrealized_return")]), errors="coerce").iloc[0]
+        entry_suffix = f" entry {unrealized_return:.2%}" if pd.notna(unrealized_return) else ""
+        axis.plot(normalized.index, normalized[column], linewidth=1.4, color=color, label=f"{column}{entry_suffix}")
+        if pd.notna(entry_date):
+            entry_positions = normalized.index[normalized.index >= pd.Timestamp(entry_date)]
+            if len(entry_positions) > 0:
+                marker_date = entry_positions[0]
+                marker_value = normalized.at[marker_date, column]
+                if pd.notna(marker_value):
+                    axis.scatter([marker_date], [marker_value], color=color, s=36, zorder=4)
+                    axis.annotate(
+                        pd.Timestamp(entry_date).strftime("%m-%d"),
+                        xy=(marker_date, marker_value),
+                        xytext=(4, 6),
+                        textcoords="offset points",
+                        fontsize=8,
+                        color=color,
+                    )
     axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
-    axis.set_title(f"Latest holdings 90 trading-day normalized price paths ({latest_date.date()})")
+    axis.set_title(f"Latest holdings 180 trading-day normalized price paths ({latest_date.date()})")
     axis.set_ylabel("Normalized close")
-    axis.legend(loc="best", ncol=3)
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=3, fontsize=8)
     axis.grid(alpha=0.25)
     fig.tight_layout()
-    fig.savefig(png_path, dpi=220, bbox_inches="tight")
+    _safe_savefig(fig, png_path, dpi=220, bbox_inches="tight")
 
     try:
-        from matplotlib.animation import FuncAnimation, PillowWriter
+        from matplotlib.animation import PillowWriter
 
         axis.clear()
         axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
-        axis.set_title(f"Latest holdings 90 trading-day normalized price paths ({latest_date.date()})")
+        axis.set_title(f"Latest holdings 180 trading-day normalized price paths ({latest_date.date()})")
         axis.set_ylabel("Normalized close")
         axis.grid(alpha=0.25)
         lines = []
@@ -559,16 +598,80 @@ def _plot_selected_holdings_90d(plt, holdings_ledger, feature_data, gif_path, pn
         pad = max((y_max - y_min) * 0.08, 0.02)
         axis.set_ylim(y_min - pad, y_max + pad)
         axis.set_xlim(normalized.index.min(), normalized.index.max())
-        axis.legend(loc="best", ncol=3)
+        axis.legend(loc="upper center", bbox_to_anchor=(0.5, 1.18), ncol=3, fontsize=8)
+        fig.tight_layout()
+        writer = PillowWriter(fps=7)
+        Path(gif_path).parent.mkdir(parents=True, exist_ok=True)
+        with writer.saving(fig, str(gif_path), dpi=110):
+            for frame in range(len(normalized)):
+                frame_data = normalized.iloc[: frame + 1]
+                for column, line in lines:
+                    line.set_data(frame_data.index, frame_data[column])
+                writer.grab_frame()
+        plt.close(fig)
+        return gif_path
+    except Exception:
+        plt.close(fig)
+        return png_path
 
-        def update(frame):
-            frame_data = normalized.iloc[: frame + 1]
-            for column, line in lines:
-                line.set_data(frame_data.index, frame_data[column])
-            return [line for _, line in lines]
 
-        anim = FuncAnimation(fig, update, frames=len(normalized), interval=160, blit=False)
-        anim.save(gif_path, writer=PillowWriter(fps=7))
+def _plot_account_vs_benchmark_export(plt, attribution_ledger, png_path, gif_path) -> Path | None:
+    data = attribution_ledger.copy()
+    data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
+    for column in ["account_net_value", "benchmark_net_value", "excess_net_value", "actual_exposure"]:
+        data[column] = pd.to_numeric(data.get(column, pd.Series(dtype=float)), errors="coerce")
+    data = data.dropna(subset=["date", "account_net_value", "benchmark_net_value"]).sort_values("date")
+    if len(data) < 2:
+        return None
+    fig, axis = plt.subplots(figsize=(15, 7))
+    axis.plot(data["date"], data["account_net_value"], label="Account NAV", color="#147a54", linewidth=1.5)
+    axis.plot(data["date"], data["benchmark_net_value"], label="Top strength 30% benchmark", color="#b3403a", linewidth=1.2)
+    axis.plot(data["date"], data["excess_net_value"], label="Excess NAV", color="#d4a84f", linewidth=1.0)
+    axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
+    axis.set_title("Account vs top strength 30% benchmark")
+    axis.set_ylabel("Net value")
+    axis.legend(loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=3, fontsize=8)
+    axis.grid(alpha=0.25)
+    fig.tight_layout()
+    _safe_savefig(fig, png_path, dpi=220, bbox_inches="tight")
+
+    try:
+        from matplotlib.animation import PillowWriter
+
+        axis.clear()
+        axis.axhline(1.0, color="#666666", linestyle="--", linewidth=0.8)
+        axis.set_title("Account vs top strength 30% benchmark")
+        axis.set_ylabel("Net value")
+        axis.grid(alpha=0.25)
+        series = [
+            ("account_net_value", "Account NAV", "#147a54", 1.5),
+            ("benchmark_net_value", "Top strength 30% benchmark", "#b3403a", 1.2),
+            ("excess_net_value", "Excess NAV", "#d4a84f", 1.0),
+        ]
+        lines = []
+        for column, label, color, width in series:
+            (line,) = axis.plot([], [], label=label, color=color, linewidth=width)
+            lines.append((column, line))
+        values = data[[column for column, _, _, _ in series]].to_numpy(dtype=float)
+        y_min = float(np.nanmin(values))
+        y_max = float(np.nanmax(values))
+        pad = max((y_max - y_min) * 0.08, 0.03)
+        axis.set_ylim(y_min - pad, y_max + pad)
+        axis.set_xlim(data["date"].min(), data["date"].max())
+        axis.legend(loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=3, fontsize=8)
+        fig.tight_layout()
+        writer = PillowWriter(fps=8)
+        Path(gif_path).parent.mkdir(parents=True, exist_ok=True)
+        step = max(len(data) // 180, 1)
+        frame_indexes = list(range(0, len(data), step))
+        if frame_indexes[-1] != len(data) - 1:
+            frame_indexes.append(len(data) - 1)
+        with writer.saving(fig, str(gif_path), dpi=110):
+            for frame in frame_indexes:
+                frame_data = data.iloc[: frame + 1]
+                for column, line in lines:
+                    line.set_data(frame_data["date"], frame_data[column])
+                writer.grab_frame()
         plt.close(fig)
         return gif_path
     except Exception:

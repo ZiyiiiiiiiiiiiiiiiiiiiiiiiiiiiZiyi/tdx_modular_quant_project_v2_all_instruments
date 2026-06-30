@@ -71,7 +71,6 @@ class GovernanceVariantRegistry:
                     "selection_weight_mode": "role_balanced",
                     "regime_overlay_mode": "conservative",
                     "risk_hard_gate_enabled": True,
-                    "probability_bucket_mode": "breakout_high_confidence",
                 },
             )
         )

@@ -9,10 +9,11 @@ import pandas as pd
 
 from config import PROCESSED_DIR, REPORT_DIR
 from functions.decision_council.position_management import evaluate_index_constituent_coverage
+from functions.output_naming import run_suffix
 
 
 INDEX_CONSTITUENTS_PARQUET = PROCESSED_DIR / "index_constituents.parquet"
-INDEX_UNIVERSE_QUALITY_CSV = REPORT_DIR / "index_universe_quality_report.csv"
+INDEX_UNIVERSE_QUALITY_CSV = REPORT_DIR / f"index_universe_quality_report{run_suffix()}.csv"
 
 TARGET_INDEX_POOLS = {
     "hs300": {"index_code": "000300", "index_name": "沪深300"},
