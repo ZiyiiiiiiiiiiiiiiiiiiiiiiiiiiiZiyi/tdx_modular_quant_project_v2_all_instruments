@@ -7,6 +7,7 @@ they later pass the governance admission process.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -113,8 +114,14 @@ CANDIDATE_FACTOR_SPECS: tuple[CandidateFactorSpec, ...] = (
 )
 
 
-ULTRA_GRID_FACTOR_TARGET_COUNT = 5200
-MATRIX_FACTOR_TARGET_COUNT = 4800
+CANDIDATE_FACTOR_TARGET_COUNT = 7000
+ULTRA_GRID_FACTOR_TARGET_COUNT = 12000
+MATRIX_FACTOR_TARGET_COUNT = CANDIDATE_FACTOR_TARGET_COUNT
+HISTORICAL_GRID_JUDGE_SUMMARY = Path(
+    "results/decision_council/fast_factor_judge/"
+    "hs300_csi500_a500_strict/run20260701_201606_233579/fast_factor_summary.csv"
+)
+ADMITTED_FACTOR_VERDICTS = {"promote_candidate", "watchlist"}
 
 
 def _ultra_base_signal_defs() -> list[dict]:
@@ -215,6 +222,30 @@ def _build_ultra_grid_recipes(target_count: int = ULTRA_GRID_FACTOR_TARGET_COUNT
     return recipes
 
 
+def _filter_rejected_grid_recipes(recipes: list[dict]) -> list[dict]:
+    """Drop grid factors already rejected by the historical factor judge."""
+    path = HISTORICAL_GRID_JUDGE_SUMMARY
+    if not path.exists():
+        return recipes
+    try:
+        judged = pd.read_csv(path, usecols=["factor_name", "verdict"])
+    except Exception:
+        return recipes
+    if judged.empty or "factor_name" not in judged.columns or "verdict" not in judged.columns:
+        return recipes
+    judged["factor_name"] = judged["factor_name"].astype(str)
+    grid_judged = judged[judged["factor_name"].str.startswith("candidate_grid_", na=False)].copy()
+    if grid_judged.empty:
+        return recipes
+    admitted = set(
+        grid_judged.loc[
+            grid_judged["verdict"].astype(str).isin(ADMITTED_FACTOR_VERDICTS),
+            "factor_name",
+        ].astype(str)
+    )
+    return [recipe for recipe in recipes if str(recipe.get("factor_name", "")) in admitted]
+
+
 def _build_matrix_factor_recipes(target_count: int = MATRIX_FACTOR_TARGET_COUNT) -> list[dict]:
     base_defs = _ultra_base_signal_defs()
     recipes: list[dict] = []
@@ -262,8 +293,12 @@ def _build_matrix_factor_recipes(target_count: int = MATRIX_FACTOR_TARGET_COUNT)
 
 
 BASE_CANDIDATE_FACTOR_SPECS = CANDIDATE_FACTOR_SPECS
-ULTRA_GRID_FACTOR_RECIPES = tuple(_build_ultra_grid_recipes())
-MATRIX_FACTOR_RECIPES = tuple(_build_matrix_factor_recipes())
+ULTRA_GRID_FACTOR_RECIPES = tuple(_filter_rejected_grid_recipes(_build_ultra_grid_recipes()))
+_matrix_target_count = max(
+    int(CANDIDATE_FACTOR_TARGET_COUNT) - len(BASE_CANDIDATE_FACTOR_SPECS) - len(ULTRA_GRID_FACTOR_RECIPES),
+    0,
+)
+MATRIX_FACTOR_RECIPES = tuple(_build_matrix_factor_recipes(_matrix_target_count))
 ULTRA_GRID_FACTOR_SPECS = tuple(
     CandidateFactorSpec(
         recipe["factor_name"],
@@ -282,7 +317,9 @@ MATRIX_FACTOR_SPECS = tuple(
     )
     for recipe in MATRIX_FACTOR_RECIPES
 )
-CANDIDATE_FACTOR_SPECS = BASE_CANDIDATE_FACTOR_SPECS + ULTRA_GRID_FACTOR_SPECS + MATRIX_FACTOR_SPECS
+CANDIDATE_FACTOR_SPECS = (
+    BASE_CANDIDATE_FACTOR_SPECS + ULTRA_GRID_FACTOR_SPECS + MATRIX_FACTOR_SPECS
+)[: int(CANDIDATE_FACTOR_TARGET_COUNT)]
 
 
 def candidate_factor_columns() -> list[str]:

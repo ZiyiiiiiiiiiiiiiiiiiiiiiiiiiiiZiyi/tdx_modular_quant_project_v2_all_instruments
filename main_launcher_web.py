@@ -299,7 +299,7 @@ RUN_HTML = """<!doctype html>
         </div>
         <div class="field">
           <label for="fast_factor_max_count">快速因子审判数量</label>
-          <input type="number" id="fast_factor_max_count" min="1" step="100" value="10000" placeholder="10000=全矩阵候选；留空=全部注册池">
+          <input type="number" id="fast_factor_max_count" min="1" step="100" value="7000" placeholder="7000=去掉不合格grid后的全矩阵候选；留空=全部注册池">
         </div>
       </div>
       <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>

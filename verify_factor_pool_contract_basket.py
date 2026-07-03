@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
+
 from functions.decision_council.governance_smoke_runner import run_contract_basket_smoke
 from functions.factors.factor_candidate_pool import CANDIDATE_FACTOR_SPECS
 
@@ -14,13 +16,27 @@ SUMMARY_PATH = Path(
 
 
 def main() -> int:
-    if len(CANDIDATE_FACTOR_SPECS) < 10000:
-        print(f"[FAIL] candidate factor count below 10000: {len(CANDIDATE_FACTOR_SPECS)}")
+    if len(CANDIDATE_FACTOR_SPECS) != 7000:
+        print(f"[FAIL] candidate factor count should be 7000: {len(CANDIDATE_FACTOR_SPECS)}")
         return 1
     print(f"[PASS] candidate factor count={len(CANDIDATE_FACTOR_SPECS)}")
     if not SUMMARY_PATH.exists():
         print(f"[SKIP] historical fast factor summary not found: {SUMMARY_PATH}")
         return 0
+    summary = pd.read_csv(SUMMARY_PATH)
+    rejected_grid = set(
+        summary.loc[
+            summary["factor_name"].astype(str).str.startswith("candidate_grid_", na=False)
+            & summary["verdict"].astype(str).eq("reject_or_rework"),
+            "factor_name",
+        ].astype(str)
+    )
+    registered = {spec.factor_name for spec in CANDIDATE_FACTOR_SPECS}
+    leaked = registered & rejected_grid
+    if leaked:
+        print(f"[FAIL] rejected grid factors leaked back into registry: {len(leaked)}")
+        return 1
+    print("[PASS] rejected historical grid factors excluded")
     result = run_contract_basket_smoke(
         SUMMARY_PATH,
         output_dir="reports/verify_factor_pool_contract_basket",
