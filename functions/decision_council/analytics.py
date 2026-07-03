@@ -187,6 +187,30 @@ def build_factor_state_ledger(factor_weight_ledger: pd.DataFrame | None) -> pd.D
 
 def factor_module(model_name: str) -> str:
     name = str(model_name).lower()
+    if name.startswith("candidate_grid_rank_ratio__"):
+        return "grid_ratio"
+    if name.startswith("candidate_grid_rank_spread__"):
+        return "grid_rank_spread"
+    if name.startswith("candidate_grid_rank_product__"):
+        return "grid_rank_interaction"
+    if name.startswith("candidate_grid_rank_gate_"):
+        return "grid_conditional"
+    if name.startswith("candidate_grid_rank_mean__"):
+        return "grid_rank_blend"
+    if name.startswith("candidate_grid_base_rank__size"):
+        return "grid_size"
+    if name.startswith("candidate_grid_base_rank__rev"):
+        return "grid_reversal"
+    if name.startswith("candidate_grid_base_rank__vol") or name.startswith("candidate_grid_base_rank__downvol"):
+        return "grid_volatility"
+    if name.startswith("candidate_grid_base_rank__drawdown"):
+        return "grid_risk"
+    if name.startswith("candidate_size_"):
+        return "size"
+    if name.startswith("candidate_idiosyncratic_vol") or name.startswith("candidate_max_drawdown"):
+        return "risk"
+    if name.startswith("candidate_volatility") or name.startswith("candidate_downside_volatility"):
+        return "volatility"
     if "orderflow" in name or "volume" in name or "close_strength" in name:
         return "flow_close"
     if "limit" in name or "event" in name or "holiday" in name:

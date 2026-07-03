@@ -50,6 +50,7 @@ class GovernanceLedgerBundle:
         saved = {}
         for ledger_name, filename in LEDGER_FILENAMES.items():
             path = output / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
             self.frame(ledger_name).to_csv(path, index=False, encoding="utf-8-sig")
             saved[ledger_name] = path
         return saved

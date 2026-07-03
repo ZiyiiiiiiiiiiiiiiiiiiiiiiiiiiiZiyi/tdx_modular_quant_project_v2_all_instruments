@@ -176,6 +176,10 @@ def build_strategy_report(
             "top1_weight",
             "top5_weight_sum",
             "effective_n",
+            "research_gate_status",
+            "research_gate_fail_count",
+            "factor_validation_pass_count",
+            "latest_portfolio_constraint_pass",
             "degradation_count",
             "degradation_flags",
         ]
@@ -201,6 +205,10 @@ def build_strategy_report(
     if governance_summary is not None and not governance_summary.empty:
         lines.extend(["", "## Governance Summary"])
         lines.extend(_governance_summary_lines(governance_summary))
+    governance_research_sections = _governance_research_report_lines()
+    if governance_research_sections:
+        lines.extend(["", "## Governance Research Gates"])
+        lines.extend(governance_research_sections)
 
     if regime_breakdown_df is not None and not regime_breakdown_df.empty:
         lines.extend(["", "## Market Regime Breakdown", regime_breakdown_df.to_markdown(index=False)])
@@ -266,6 +274,10 @@ def _normalize_summary(frame):
         "top1_weight": pd.NA,
         "top5_weight_sum": pd.NA,
         "effective_n": pd.NA,
+        "research_gate_status": "unknown",
+        "research_gate_fail_count": pd.NA,
+        "factor_validation_pass_count": pd.NA,
+        "latest_portfolio_constraint_pass": pd.NA,
     }
     for key, value in defaults.items():
         if key not in data.columns:
@@ -441,6 +453,99 @@ def _load_governance_summary():
             return pd.DataFrame()
         path = max(candidates, key=lambda item: item.stat().st_mtime)
     return pd.read_csv(path)
+
+
+def _load_latest_governance_report(filename: str) -> pd.DataFrame:
+    root = Path(GOVERNANCE_SUMMARY_CSV).parent
+    candidates = [path for path in root.rglob(filename) if "_archive" not in path.parts]
+    candidates.extend([path for path in root.rglob(filename.replace(".csv", "_run*.csv")) if "_archive" not in path.parts])
+    if not candidates:
+        return pd.DataFrame()
+    path = max(candidates, key=lambda item: item.stat().st_mtime)
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _governance_research_report_lines():
+    lines = []
+    gate = _load_latest_governance_report("governance_research_gate_report.csv")
+    if not gate.empty:
+        cols = [col for col in ["gate_name", "pass_flag", "value", "threshold", "severity", "reason", "overall_status"] if col in gate.columns]
+        lines.extend(["### Research Admission Gate", gate.loc[:, cols].to_markdown(index=False), ""])
+    validation = _load_latest_governance_report("governance_factor_validation_report.csv")
+    if not validation.empty:
+        lines.extend(_factor_validation_summary_lines(validation))
+    constraints = _load_latest_governance_report("governance_portfolio_constraint_report.csv")
+    if not constraints.empty:
+        latest = constraints.tail(1).copy()
+        cols = [
+            col for col in [
+                "date",
+                "account_effective_n",
+                "top1_account_weight",
+                "top5_account_weight_sum",
+                "constraint_pass",
+                "fail_reasons",
+                "research_valid",
+            ]
+            if col in latest.columns
+        ]
+        lines.extend(["", "### Latest Portfolio Constraints", latest.loc[:, cols].to_markdown(index=False)])
+    entry_gate = _load_latest_governance_report("governance_entry_gate_policy.csv")
+    if not entry_gate.empty:
+        cols = [
+            col for col in [
+                "regime_name",
+                "prediction_bucket",
+                "sample_count",
+                "wilson_lower_95",
+                "expectancy_10d",
+                "forward_excess_10d",
+                "allow_buy",
+                "max_entry_lots",
+                "reason",
+            ]
+            if col in entry_gate.columns
+        ]
+        lines.extend(["", "### Entry Calibration Policy", entry_gate.loc[:, cols].head(12).to_markdown(index=False)])
+    return lines
+
+
+def _factor_validation_summary_lines(validation: pd.DataFrame):
+    data = validation.copy()
+    data["pass_flag"] = data.get("pass_flag", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+    data["ic_ir"] = pd.to_numeric(data.get("ic_ir"), errors="coerce")
+    data["top_bottom_spread"] = pd.to_numeric(data.get("top_bottom_spread"), errors="coerce")
+    passed = data[data["pass_flag"]].sort_values(["ic_ir", "top_bottom_spread"], ascending=[False, False]).head(10)
+    failed = data[~data["pass_flag"]].copy()
+    failed["_fail_weight"] = failed.get("fail_reasons", pd.Series("", index=failed.index)).fillna("").astype(str).str.count(r"\|") + 1
+    failed = failed.sort_values(["_fail_weight", "ic_ir"], ascending=[False, True]).head(10)
+    cols = [
+        col for col in [
+            "factor_name",
+            "module",
+            "candidate_pool",
+            "horizon_days",
+            "coverage_ratio",
+            "rank_ic_mean",
+            "ic_ir",
+            "rank_ic_positive_ratio",
+            "top_bottom_spread",
+            "sample_count",
+            "pass_flag",
+            "fail_reasons",
+        ]
+        if col in data.columns
+    ]
+    lines = ["### Factor Validation Summary"]
+    lines.append(f"- Factor-horizon passes: `{int(data['pass_flag'].sum())}` / `{len(data)}`")
+    if not passed.empty:
+        lines.extend(["", "#### Top Effective Factors", passed.loc[:, cols].to_markdown(index=False)])
+    if not failed.empty:
+        lines.extend(["", "#### Top Failed Factors", failed.loc[:, cols].to_markdown(index=False)])
+    return lines
 
 
 def _build_governance_notes(governance_summary):

@@ -169,6 +169,33 @@ RUN_HTML = """<!doctype html>
       color: var(--muted);
       min-height: 20px;
     }
+    .progress-box {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fffef9;
+    }
+    .progress-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .progress-track {
+      height: 12px;
+      background: #e8e1d2;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #173f35;
+      transition: width 0.3s ease;
+    }
     @media (max-width: 720px) {
       .wrap {
         margin: 12px;
@@ -192,6 +219,7 @@ RUN_HTML = """<!doctype html>
       <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite">增强模块诊断：一次运行核心基线、简单止盈止损、趋势/反转/订单流/突破模块、减模块测试、市场状态、校准诊断、复杂退出和主线对照。</label>
       <label class="item"><input type="checkbox" id="governance_layer_validation">层验证线：紧凑 8 因子等权测试，关闭声誉/影子组合和市场状态叠加，保留安全模块。用于先判断基础信号有没有边际收益。</label>
       <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
+      <label class="item recommended"><input type="checkbox" id="fast_factor_judge">快速因子审判：只读现有特征和股票池，计算 IC/分层/换手成本/冗余，不跑状态机、不下单、不跑完整回测。</label>
 
       <div class="hint">
         当前建议：先运行“增强模块诊断”。<br>
@@ -250,6 +278,14 @@ RUN_HTML = """<!doctype html>
           </select>
         </div>
         <div class="field">
+          <label for="governance_alpha_bundle">治理主线因子包</label>
+          <select id="governance_alpha_bundle">
+            <option value="diversified_pre_screen_bundle_v2" selected>diversified_pre_screen_bundle_v2 - 24 candidate diversified alpha</option>
+            <option value="pre_screen_promote_bundle">7月2号预筛产品化包（28个 cand 因子）</option>
+            <option value="formal_defensive_bundle">旧正式因子防守复核包</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="start_month">开始月份</label>
           <input type="month" id="start_month" value="2021-01">
         </div>
@@ -282,6 +318,7 @@ RUN_HTML = """<!doctype html>
       <div class="actions">
         <div>
           <button class="primary" onclick="submitSelected()">运行所选任务</button>
+          <button class="primary" onclick="submitFastFactorJudge()">只运行快速因子审判</button>
           <button class="primary" onclick="submitDiagnosticSuite()">只运行增强诊断</button>
           <button class="secondary" onclick="submitLayerSuiteOnly()">只运行层消融套件</button>
           <button class="secondary" onclick="submitAll()">运行全部任务</button>
@@ -289,6 +326,14 @@ RUN_HTML = """<!doctype html>
         <button class="ghost" onclick="cancelLaunch()">取消</button>
       </div>
       <div id="status"></div>
+      <div class="progress-box">
+        <div class="progress-line">
+          <span id="progress_title">Progress: waiting for task</span>
+          <span id="progress_percent">0%</span>
+        </div>
+        <div class="progress-track"><div class="progress-fill" id="progress_fill"></div></div>
+        <div class="mini" id="progress_detail">Step: -; ETA: -</div>
+      </div>
     </div>
   </div>
   <script>
@@ -301,6 +346,7 @@ RUN_HTML = """<!doctype html>
         });
         capitalProfile.value = "small_capital_branch";
       }
+      startProgressPolling();
     });
     function currentProfile() {
       const node = document.querySelector('input[name="profile"]:checked');
@@ -340,7 +386,9 @@ RUN_HTML = """<!doctype html>
       const alphaCollapseExitEnabled = alphaCollapseExitNode ? alphaCollapseExitNode.checked : true;
       const controlModeNode = document.getElementById("governance_control_mode");
       const controlMode = controlModeNode ? controlModeNode.value : "normal";
-      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite");
+      const alphaBundleNode = document.getElementById("governance_alpha_bundle");
+      const alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
+      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge");
       if (touchesGovernance && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
       }
@@ -354,6 +402,7 @@ RUN_HTML = """<!doctype html>
         max_days: maxDays,
         shadow_portfolios: shadowPortfolios,
         control_mode: controlMode,
+        alpha_bundle: alphaBundle,
         alpha_collapse_exit_enabled: alphaCollapseExitEnabled
       };
     }
@@ -368,12 +417,50 @@ RUN_HTML = """<!doctype html>
       const result = await response.json();
       status.textContent = result.message || "已提交。";
       if (response.ok) {
-        setTimeout(() => window.close(), 400);
+        startProgressPolling();
       }
+    }
+    function formatDuration(seconds) {
+      if (seconds === null || seconds === undefined || seconds === "") return "-";
+      const n = Number(seconds);
+      if (!Number.isFinite(n)) return "-";
+      if (n < 60) return `${Math.max(0, Math.round(n))}s`;
+      const minutes = Math.floor(n / 60);
+      const rest = Math.round(n % 60);
+      if (minutes < 60) return `${minutes}m ${rest}s`;
+      const hours = Math.floor(minutes / 60);
+      return `${hours}h ${minutes % 60}m`;
+    }
+    async function loadProgressOnce() {
+      const response = await fetch("/api/progress");
+      const data = await response.json();
+      const percent = Number(data.percent || 0);
+      document.getElementById("progress_title").textContent = `${data.task_name || "task"} | ${data.status || "idle"} | ${data.message || ""}`;
+      document.getElementById("progress_percent").textContent = `${percent.toFixed(1)}%`;
+      document.getElementById("progress_fill").style.width = `${Math.max(0, Math.min(percent, 100))}%`;
+      const countText = data.current && data.total ? `; count: ${data.current}/${data.total}` : "";
+      document.getElementById("progress_detail").textContent = `Step: ${data.step || "-"}${countText}; detail: ${data.detail || "-"}; elapsed: ${formatDuration(data.elapsed_seconds)}; ETA: ${formatDuration(data.eta_seconds)}`;
+      return data;
+    }
+    let progressTimer = null;
+    function startProgressPolling() {
+      if (progressTimer) clearInterval(progressTimer);
+      loadProgressOnce().catch(() => {});
+      progressTimer = setInterval(async () => {
+        try {
+          const data = await loadProgressOnce();
+          if (["complete", "failed"].includes(String(data.status || ""))) {
+            clearInterval(progressTimer);
+            progressTimer = null;
+          }
+        } catch (err) {
+          document.getElementById("progress_detail").textContent = `Progress read failed: ${err.message || err}`;
+        }
+      }, 2000);
     }
     async function submitSelected() {
       const tasks = [];
-      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite"].forEach((id) => {
+      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge"].forEach((id) => {
         const node = document.getElementById(id);
         if (node && node.checked) tasks.push(id);
       });
@@ -406,8 +493,20 @@ RUN_HTML = """<!doctype html>
         document.getElementById("status").textContent = err.message || String(err);
       }
     }
+    async function submitFastFactorJudge() {
+      const tasks = ["fast_factor_judge"];
+      const shadowNode = document.getElementById("shadow_portfolios");
+      if (shadowNode) shadowNode.checked = false;
+      const node = document.getElementById("fast_factor_judge");
+      if (node) node.checked = true;
+      try {
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: false});
+      } catch (err) {
+        document.getElementById("status").textContent = err.message || String(err);
+      }
+    }
     async function submitAll() {
-      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite"];
+      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge"];
       if (!window.confirm("运行全部任务会启动主策略流水线、治理主线、主线复核、层验证和完整增强诊断，耗时可能很长。确认继续吗？")) {
         document.getElementById("status").textContent = "已取消运行全部任务。";
         return;
@@ -627,6 +726,17 @@ RESULTS_HTML = """<!doctype html>
         <div class="card"><div class="name">硬止损节省</div><div class="value" id="hard_stop_avoided_loss">-</div></div>
         <div class="card"><div class="name">Alpha塌陷节省</div><div class="value" id="alpha_collapse_avoided_loss">-</div></div>
         <div class="card"><div class="name">安全降仓节省</div><div class="value" id="safety_deleveraging_avoided_loss">-</div></div>
+        <div class="card"><div class="name">Research Gate</div><div class="value" id="research_gate_status">-</div></div>
+        <div class="card"><div class="name">Gate Fails</div><div class="value" id="research_gate_fail_count">-</div></div>
+        <div class="card"><div class="name">Alpha Diversity</div><div class="value" id="alpha_diversification_pass">-</div></div>
+        <div class="card"><div class="name">Range Grid Share</div><div class="value" id="range_grid_weight_share">-</div></div>
+        <div class="card"><div class="name">Redundancy Ratio</div><div class="value" id="redundancy_flag_ratio">-</div></div>
+        <div class="card"><div class="name">Trading Evidence</div><div class="value" id="has_trading_evidence">-</div></div>
+        <div class="card"><div class="name">Factor Passes</div><div class="value" id="factor_validation_pass_count">-</div></div>
+        <div class="card"><div class="name">Portfolio Constraint</div><div class="value" id="portfolio_constraint_pass">-</div></div>
+        <div class="card"><div class="name">Effective N</div><div class="value" id="account_effective_n">-</div></div>
+        <div class="card"><div class="name">Top1 Weight</div><div class="value" id="top1_account_weight">-</div></div>
+        <div class="card"><div class="name">Top5 Weight</div><div class="value" id="top5_account_weight_sum">-</div></div>
       </div>
     </div>
 
@@ -693,9 +803,47 @@ RESULTS_HTML = """<!doctype html>
       if (!Number.isFinite(n)) return "-";
       return n.toFixed(3);
     }
+    function textValue(value) {
+      if (value === null || value === undefined || value === "") return "-";
+      return String(value);
+    }
+    function boolText(value) {
+      if (value === null || value === undefined || value === "") return "-";
+      if (value === true || value === "True" || value === "true" || value === "1" || value === 1) return "PASS";
+      if (value === false || value === "False" || value === "false" || value === "0" || value === 0) return "FAIL";
+      return String(value);
+    }
     function signedClass(value) {
       const n = Number(value || 0);
       return n > 0 ? "pos" : (n < 0 ? "neg" : "");
+    }
+    function setText(id, value, cls = "") {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = value;
+      el.className = "value " + cls;
+    }
+    function updateResearchSummary(summary) {
+      summary = summary || {};
+      const gateStatus = textValue(summary.research_gate_status);
+      const gateClass = gateStatus === "research_ready" ? "pos" : (gateStatus === "blocked" ? "neg" : "");
+      const constraintText = boolText(summary.latest_portfolio_constraint_pass);
+      const constraintClass = constraintText === "PASS" ? "pos" : (constraintText === "FAIL" ? "neg" : "");
+      const alphaText = boolText(summary.alpha_diversification_pass);
+      const alphaClass = alphaText === "PASS" ? "pos" : (alphaText === "FAIL" ? "neg" : "");
+      const evidenceText = boolText(summary.has_trading_evidence);
+      const evidenceClass = evidenceText === "PASS" ? "pos" : (evidenceText === "FAIL" ? "neg" : "");
+      setText("research_gate_status", gateStatus, gateClass);
+      setText("research_gate_fail_count", textValue(summary.research_gate_fail_count), Number(summary.research_gate_fail_count || 0) > 0 ? "neg" : "");
+      setText("alpha_diversification_pass", alphaText, alphaClass);
+      setText("range_grid_weight_share", pct(summary.range_grid_weight_share), Number(summary.range_grid_weight_share || 0) > 0.35 ? "neg" : "");
+      setText("redundancy_flag_ratio", pct(summary.redundancy_flag_ratio), Number(summary.redundancy_flag_ratio || 0) > 0.40 ? "neg" : "");
+      setText("has_trading_evidence", evidenceText, evidenceClass);
+      setText("factor_validation_pass_count", textValue(summary.factor_validation_pass_count));
+      setText("portfolio_constraint_pass", constraintText, constraintClass);
+      setText("account_effective_n", num(summary.account_effective_n));
+      setText("top1_account_weight", pct(summary.top1_account_weight));
+      setText("top5_account_weight_sum", pct(summary.top5_account_weight_sum));
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (ch) => ({
@@ -766,6 +914,7 @@ RESULTS_HTML = """<!doctype html>
       document.getElementById("alpha_collapse_avoided_loss").className = "value " + signedClass(data.summary.alpha_collapse_avoided_loss_to_window_low);
       document.getElementById("safety_deleveraging_avoided_loss").textContent = money(data.summary.safety_deleveraging_avoided_loss_to_window_low);
       document.getElementById("safety_deleveraging_avoided_loss").className = "value " + signedClass(data.summary.safety_deleveraging_avoided_loss_to_window_low);
+      updateResearchSummary(data.summary || {});
       renderStockRows(data.stock_summary || []);
       renderClosedRows(data.closed_trades || []);
       renderOpenRows(data.open_positions || []);
@@ -862,6 +1011,7 @@ RESULTS_HTML = """<!doctype html>
         document.getElementById("alpha_collapse_avoided_loss").className = "value " + signedClass(data.summary.alpha_collapse_avoided_loss_to_window_low);
         document.getElementById("safety_deleveraging_avoided_loss").textContent = money(data.summary.safety_deleveraging_avoided_loss_to_window_low);
         document.getElementById("safety_deleveraging_avoided_loss").className = "value " + signedClass(data.summary.safety_deleveraging_avoided_loss_to_window_low);
+        updateResearchSummary(data.summary || {});
         renderStockRows(data.stock_summary || []);
         renderClosedRows(data.closed_trades || []);
         renderOpenRows(data.open_positions || []);
@@ -998,11 +1148,32 @@ def _discover_result_runs() -> list[dict]:
         run_dir = trade_path.parent
         open_path = run_dir / "governance_open_positions.csv"
         summary_path = run_dir / "governance_trade_pair_summary.csv"
+        strategy_summary_path = run_dir / "governance_strategy_summary.csv"
+        research_gate_path = run_dir / "governance_research_gate_report.csv"
+        alpha_diversification_path = run_dir / "governance_alpha_diversification_report.csv"
+        trading_evidence_path = run_dir / "governance_trading_evidence_report.csv"
+        factor_validation_path = run_dir / "governance_factor_validation_report.csv"
+        portfolio_constraint_path = run_dir / "governance_portfolio_constraint_report.csv"
         control_loss_path = run_dir / "governance_control_avoided_loss_summary.csv"
         trade_rel = trade_path.relative_to(results_dir).as_posix()
         strategy, profile = _governance_result_identity(run_dir, results_dir)
         modified = max(
-            [path.stat().st_mtime for path in [trade_path, open_path, summary_path, control_loss_path] if path.exists()],
+            [
+                path.stat().st_mtime
+                for path in [
+                    trade_path,
+                    open_path,
+                    summary_path,
+                    strategy_summary_path,
+                    research_gate_path,
+                    alpha_diversification_path,
+                    trading_evidence_path,
+                    factor_validation_path,
+                    portfolio_constraint_path,
+                    control_loss_path,
+                ]
+                if path.exists()
+            ],
             default=trade_path.stat().st_mtime,
         )
         runs.append(
@@ -1017,6 +1188,41 @@ def _discover_result_runs() -> list[dict]:
                 "open_rel": open_path.relative_to(results_dir).as_posix() if open_path.exists() else "",
                 "trade_file": trade_path.name,
                 "open_file": open_path.name if open_path.exists() else "",
+                "metrics_file": summary_path.name if summary_path.exists() else "",
+                "modified": modified,
+                "modified_time": _format_timestamp(modified),
+            }
+        )
+    for manifest_path in results_dir.rglob("fast_factor_judge_manifest.csv"):
+        if "_archive" in manifest_path.relative_to(results_dir).parts:
+            continue
+        run_dir = manifest_path.parent
+        summary_path = run_dir / "fast_factor_summary.csv"
+        validation_path = run_dir / "fast_factor_validation_report.csv"
+        report_path = run_dir / "fast_factor_judge_report.md"
+        manifest_rel = manifest_path.relative_to(results_dir).as_posix()
+        strategy, profile = _fast_factor_judge_identity(run_dir, results_dir)
+        modified = max(
+            [
+                path.stat().st_mtime
+                for path in [manifest_path, summary_path, validation_path, report_path]
+                if path.exists()
+            ],
+            default=manifest_path.stat().st_mtime,
+        )
+        runs.append(
+            {
+                "key": quote(manifest_rel, safe=""),
+                "result_ref": manifest_rel,
+                "result_stem": manifest_rel,
+                "strategy": strategy,
+                "profile": profile,
+                "kind": "fast_factor_judge",
+                "trade_rel": "",
+                "open_rel": "",
+                "manifest_rel": manifest_rel,
+                "trade_file": "",
+                "open_file": "",
                 "metrics_file": summary_path.name if summary_path.exists() else "",
                 "modified": modified,
                 "modified_time": _format_timestamp(modified),
@@ -1042,6 +1248,18 @@ def _governance_result_identity(run_dir: Path, results_dir: Path) -> tuple[str, 
     if len(rel_parts) >= 4:
         return f"{rel_parts[-3]} / {rel_parts[-2]}", f"治理 | {rel_parts[-1]}"
     return run_dir.name, "治理结果"
+
+def _fast_factor_judge_identity(run_dir: Path, results_dir: Path) -> tuple[str, str]:
+    try:
+        rel_parts = run_dir.relative_to(results_dir).parts
+    except Exception:
+        rel_parts = run_dir.parts
+    if "fast_factor_judge" in rel_parts:
+        index = rel_parts.index("fast_factor_judge")
+        universe = rel_parts[index + 1] if len(rel_parts) > index + 1 else "unknown_universe"
+        run_name = rel_parts[index + 2] if len(rel_parts) > index + 2 else run_dir.name
+        return "快速因子审判", f"{universe} | {run_name}"
+    return "快速因子审判", run_dir.name
 
 
 def _format_timestamp(timestamp: float) -> str:
@@ -1089,12 +1307,24 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
 
     run = available[result_ref]
     results_dir = _results_dir()
+    if run.get("kind") == "fast_factor_judge":
+        return _fast_factor_judge_detail(run, results_dir), 200
     trade_rows = _read_csv_rows(results_dir / run.get("trade_rel", ""))
     open_rows = _read_csv_rows(results_dir / run.get("open_rel", "")) if run.get("open_rel") else []
     control_loss_rows = []
+    governance_research_rows = {}
     if run.get("kind") == "governance" and run.get("trade_rel"):
-        control_loss_path = (results_dir / run["trade_rel"]).parent / "governance_control_avoided_loss_summary.csv"
+        run_dir = (results_dir / run["trade_rel"]).parent
+        control_loss_path = run_dir / "governance_control_avoided_loss_summary.csv"
         control_loss_rows = _read_csv_rows(control_loss_path)
+        governance_research_rows = {
+            "strategy_summary": _read_csv_rows(run_dir / "governance_strategy_summary.csv"),
+            "research_gate": _read_csv_rows(run_dir / "governance_research_gate_report.csv"),
+            "alpha_diversification": _read_csv_rows(run_dir / "governance_alpha_diversification_report.csv"),
+            "trading_evidence": _read_csv_rows(run_dir / "governance_trading_evidence_report.csv"),
+            "factor_validation": _read_csv_rows(run_dir / "governance_factor_validation_report.csv"),
+            "portfolio_constraints": _read_csv_rows(run_dir / "governance_portfolio_constraint_report.csv"),
+        }
     latest_holding_by_symbol: dict[str, dict] = {}
     if run.get("kind") == "governance" and run.get("trade_rel"):
         holding_path = (results_dir / run["trade_rel"]).parent / "governance_holdings_ledger.csv"
@@ -1202,6 +1432,7 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
     payoff_ratio = (avg_win / abs(avg_loss)) if avg_win is not None and avg_loss and avg_loss < 0.0 else None
     profit_factor = (gross_profit / abs(gross_loss)) if gross_loss < 0.0 else None
     control_loss_summary = _control_loss_summary_from_rows(control_loss_rows)
+    governance_research_summary = _governance_research_summary_from_rows(governance_research_rows)
     summary = {
         "realized_trade_count": int(realized_trade_count),
         "winning_trade_count": int(winning_trade_count),
@@ -1219,6 +1450,7 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
         "profit_factor": profit_factor,
         "open_position_count": len(open_positions),
         **control_loss_summary,
+        **governance_research_summary,
     }
     return {
         "run": run,
@@ -1227,6 +1459,61 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
         "closed_trades": closed_trades,
         "open_positions": open_positions,
     }, 200
+
+
+def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
+    manifest_path = results_dir / run.get("manifest_rel", "")
+    run_dir = manifest_path.parent
+    manifest_rows = _read_csv_rows(manifest_path)
+    summary_rows = _read_csv_rows(run_dir / "fast_factor_summary.csv")
+    validation_rows = _read_csv_rows(run_dir / "fast_factor_validation_report.csv")
+    manifest = manifest_rows[0] if manifest_rows else {}
+    verdict_counts: dict[str, int] = {}
+    for row in summary_rows:
+        verdict = str(row.get("verdict", "")).strip() or "unknown"
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+    pass_count = sum(1 for row in validation_rows if _safe_optional_bool(row.get("pass_flag")) is True)
+    summary = {
+        "realized_trade_count": 0,
+        "winning_trade_count": 0,
+        "losing_trade_count": 0,
+        "trade_win_rate": None,
+        "realized_pnl_amount": 0.0,
+        "unrealized_pnl_amount": 0.0,
+        "gross_profit": 0.0,
+        "gross_loss": 0.0,
+        "avg_win": None,
+        "avg_loss": None,
+        "payoff_ratio": None,
+        "profit_factor": None,
+        "open_position_count": 0,
+        "control_exit_count": 0,
+        "control_avoided_loss_to_window_low": 0.0,
+        "control_avoided_loss_to_window_end": 0.0,
+        "hard_stop_avoided_loss_to_window_low": 0.0,
+        "alpha_collapse_avoided_loss_to_window_low": 0.0,
+        "safety_deleveraging_avoided_loss_to_window_low": 0.0,
+        "research_gate_status": "fast_factor_judge",
+        "research_gate_fail_count": verdict_counts.get("reject_or_rework", 0),
+        "factor_validation_pass_count": pass_count,
+        "latest_portfolio_constraint_pass": None,
+        "account_effective_n": _safe_optional_float(manifest.get("symbol_count")),
+        "top1_account_weight": None,
+        "top5_account_weight_sum": None,
+        "promote_candidate_count": verdict_counts.get("promote_candidate", 0),
+        "watchlist_count": verdict_counts.get("watchlist", 0),
+        "reject_or_rework_count": verdict_counts.get("reject_or_rework", 0),
+        "row_count": _safe_optional_int(manifest.get("row_count")),
+        "analysis_start_date": manifest.get("analysis_start_date") or manifest.get("start_date"),
+        "analysis_end_date": manifest.get("analysis_end_date") or manifest.get("end_date"),
+    }
+    return {
+        "run": run,
+        "summary": summary,
+        "stock_summary": [],
+        "closed_trades": [],
+        "open_positions": [],
+    }
 
 
 def _empty_stock_bucket(symbol: str) -> dict:
@@ -1269,6 +1556,91 @@ def _control_loss_summary_from_rows(rows: list[dict]) -> dict:
         elif reason == "safety_deleveraging":
             summary["safety_deleveraging_avoided_loss_to_window_low"] += low
     return summary
+
+
+def _governance_research_summary_from_rows(rows_by_report: dict[str, list[dict]]) -> dict:
+    summary = {
+        "research_gate_status": "unknown",
+        "research_gate_fail_count": None,
+        "alpha_diversification_pass": None,
+        "range_grid_weight_share": None,
+        "redundancy_flag_ratio": None,
+        "max_pairwise_rank_corr": None,
+        "alpha_block_reasons": "",
+        "has_trading_evidence": None,
+        "trading_evidence_block_reason": "",
+        "trading_evidence_avg_exposure": None,
+        "factor_validation_pass_count": None,
+        "latest_portfolio_constraint_pass": None,
+        "account_effective_n": None,
+        "top1_account_weight": None,
+        "top5_account_weight_sum": None,
+    }
+    if not rows_by_report:
+        return summary
+
+    strategy_rows = rows_by_report.get("strategy_summary") or []
+    strategy_row = strategy_rows[0] if strategy_rows else {}
+    if strategy_row:
+        summary["research_gate_status"] = str(strategy_row.get("research_gate_status") or "unknown")
+        summary["research_gate_fail_count"] = _safe_optional_int(strategy_row.get("research_gate_fail_count"))
+        summary["factor_validation_pass_count"] = _safe_optional_int(strategy_row.get("factor_validation_pass_count"))
+        summary["latest_portfolio_constraint_pass"] = _safe_optional_bool(strategy_row.get("latest_portfolio_constraint_pass"))
+
+    gate_rows = rows_by_report.get("research_gate") or []
+    if gate_rows:
+        status_values = [str(row.get("overall_status", "")).strip() for row in gate_rows if str(row.get("overall_status", "")).strip()]
+        if status_values and summary["research_gate_status"] == "unknown":
+            summary["research_gate_status"] = status_values[-1]
+        if summary["research_gate_fail_count"] is None:
+            summary["research_gate_fail_count"] = sum(1 for row in gate_rows if _safe_optional_bool(row.get("pass_flag")) is False)
+
+    alpha_rows = rows_by_report.get("alpha_diversification") or []
+    if alpha_rows:
+        latest_alpha = alpha_rows[-1]
+        summary["alpha_diversification_pass"] = _safe_optional_bool(latest_alpha.get("pass_flag"))
+        summary["range_grid_weight_share"] = _safe_optional_float(latest_alpha.get("range_grid_weight_share"))
+        summary["redundancy_flag_ratio"] = _safe_optional_float(latest_alpha.get("redundancy_flag_ratio"))
+        summary["max_pairwise_rank_corr"] = _safe_optional_float(latest_alpha.get("max_pairwise_rank_corr"))
+        summary["alpha_block_reasons"] = str(latest_alpha.get("block_reasons") or "")
+
+    evidence_rows = rows_by_report.get("trading_evidence") or []
+    if evidence_rows:
+        latest_evidence = evidence_rows[-1]
+        summary["has_trading_evidence"] = _safe_optional_bool(latest_evidence.get("has_trading_evidence"))
+        summary["trading_evidence_block_reason"] = str(latest_evidence.get("block_reason") or "")
+        summary["trading_evidence_avg_exposure"] = _safe_optional_float(latest_evidence.get("avg_actual_exposure"))
+
+    validation_rows = rows_by_report.get("factor_validation") or []
+    if validation_rows and summary["factor_validation_pass_count"] is None:
+        summary["factor_validation_pass_count"] = sum(1 for row in validation_rows if _safe_optional_bool(row.get("pass_flag")) is True)
+
+    constraint_rows = rows_by_report.get("portfolio_constraints") or []
+    if constraint_rows:
+        latest = sorted(constraint_rows, key=lambda row: _date_text(row.get("date")))[-1]
+        if summary["latest_portfolio_constraint_pass"] is None:
+            summary["latest_portfolio_constraint_pass"] = _safe_optional_bool(latest.get("constraint_pass"))
+        summary["account_effective_n"] = _safe_optional_float(latest.get("account_effective_n"))
+        summary["top1_account_weight"] = _safe_optional_float(latest.get("top1_account_weight"))
+        summary["top5_account_weight_sum"] = _safe_optional_float(latest.get("top5_account_weight_sum"))
+
+    return summary
+
+
+def _safe_optional_int(value):
+    number = _safe_optional_float(value)
+    return int(number) if number is not None else None
+
+
+def _safe_optional_bool(value):
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "pass", "passed"}:
+        return True
+    if text in {"false", "0", "no", "n", "fail", "failed"}:
+        return False
+    return None
 
 
 def _stock_status(bucket: dict) -> str:
@@ -1324,6 +1696,14 @@ def main(argv: list[str]) -> int:
                 except Exception as exc:
                     _json_response(self, {"message": f"读取盈亏明细失败：{exc}"}, status=500)
                 return
+            if parsed.path == "/api/progress":
+                try:
+                    from functions.runtime_progress import read_progress
+
+                    _json_response(self, read_progress())
+                except Exception as exc:
+                    _json_response(self, {"status": "unknown", "message": f"progress read failed: {exc}"}, status=500)
+                return
             if parsed.path == "/favicon.ico":
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
@@ -1346,7 +1726,10 @@ def main(argv: list[str]) -> int:
             _write_selection(state_path, payload if isinstance(payload, dict) else {})
             _json_response(self, {"message": "选择已记录，可以关闭本页面。"})
             stop_event.set()
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            task_payload = payload if isinstance(payload, dict) else {}
+            tasks = task_payload.get("tasks") if isinstance(task_payload, dict) else []
+            if not tasks:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         def log_message(self, format, *args):
             return

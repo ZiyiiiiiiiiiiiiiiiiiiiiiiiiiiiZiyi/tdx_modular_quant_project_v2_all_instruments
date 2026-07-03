@@ -16,6 +16,7 @@ from config import (
     GOVERNANCE_ALPHA_MODEL_FEATURES,
     GOVERNANCE_ALPHA_MODELS,
     GOVERNANCE_ALLOWED_INSTRUMENT_TYPES,
+    GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS,
     GOVERNANCE_DEFAULT_TOP_N,
     GOVERNANCE_DEFAULT_TURNOVER_BUDGET,
     GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION,
@@ -50,6 +51,8 @@ from config import (
     GOVERNANCE_HARD_STOP_COOLDOWN_DAYS,
     GOVERNANCE_LAYER_ADD_GAPS,
     GOVERNANCE_LAYER_WEIGHTS,
+    GOVERNANCE_ADD_MIN_FACTOR_CONVICTION,
+    GOVERNANCE_ADD_MIN_SIGNAL_RETENTION,
     GOVERNANCE_MAX_ADD_LAYERS_LARGE,
     GOVERNANCE_MAX_ADD_LAYERS_RETAIL_20K,
     GOVERNANCE_MAX_POSITION_WEIGHT,
@@ -64,9 +67,16 @@ from config import (
     GOVERNANCE_PROFIT_PROTECT_TRIGGER_3,
     GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS,
     GOVERNANCE_PROFIT_TAKE_COOLDOWN_DAYS,
+    GOVERNANCE_POST_ENTRY_FAILURE_EARLY_DAYS,
+    GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_SCORE,
+    GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_THRESHOLDS,
     GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE,
+    GOVERNANCE_RISK_CONTRIBUTION_SCORE_PENALTY,
     GOVERNANCE_SIGNAL_FAILURE_COOLDOWN_DAYS,
+    GOVERNANCE_STALE_EXIT_MAX_MFE,
     GOVERNANCE_STALE_EXIT_DAYS,
+    GOVERNANCE_STALE_EXIT_MIN_ALPHA_DROP,
+    GOVERNANCE_STALE_EXIT_MIN_LIQUIDITY_DECAY,
     GOVERNANCE_STALE_REDUCE_DAYS,
     GOVERNANCE_STALE_WATCH_DAYS,
     GOVERNANCE_INITIAL_TRANSITION_DAYS,
@@ -106,6 +116,7 @@ from functions.decision_council.fast_shadow import FastShadowPortfolioRunner
 from functions.decision_council.leakage import validate_governance_split
 from functions.decision_council.market_regime_policy import MarketRegimePolicy
 from functions.decision_council.proposals import build_daily_candidates
+from functions.decision_council.candidate_factor_cache import attach_pre_screen_candidate_factor_cache
 from functions.decision_council.plots import save_governance_diagnostic_plots
 from functions.decision_council.policy import ORDER_COLUMNS, ORDER_PRIORITIES
 from functions.decision_council.quality_reports import build_governance_quality_reports
@@ -254,6 +265,13 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "future_loss_risk_score",
     "downtrend_decay_score",
     "post_entry_failure_score",
+    "early_post_entry_failure_exit",
+    "factor_conviction_score",
+    "signal_retention_score",
+    "alpha_quality_drop_from_entry",
+    "liquidity_decay_score",
+    "risk_contribution_penalty",
+    "risk_adjusted_primary_score",
 ]
 
 
@@ -638,6 +656,7 @@ class GovernanceBacktestRunner:
             confirmation_mode="factor_only" if self.governance_control_mode in {"factor_only", "safe_factor_only"} else self.entry_confirmation_mode,
             capital_usage_mode=self.capital_usage_mode,
         )
+        candidates = self._apply_candidate_risk_penalty(candidates, exposure=exposure)
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
         candidates = self._apply_position_state_constraints(candidates, date=date, exposure=exposure)
         candidates = self._apply_optional_exit_controls(candidates)
@@ -646,7 +665,7 @@ class GovernanceBacktestRunner:
             daily=daily,
             risk_level=risk_level,
             structural_regime_level=structural_regime_level,
-            stock_candidate_count=int(candidates.get("entry_confirmed", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()),
+            stock_candidate_count=int(_state_machine_entry_mask(candidates).sum()),
         )
         self._record_entry_formula_and_retail_rank(date=date, candidates=candidates, daily=daily, exposure=exposure)
         self.entry_calibrator.schedule_candidates(
@@ -672,7 +691,7 @@ class GovernanceBacktestRunner:
         safety_exposure_cap = float(pd.to_numeric(pd.Series([safety_row.get("exposure_cap", 1.0)]), errors="coerce").fillna(1.0).iloc[0])
         regime_name = getattr(regime_params, "regime_name", structural_regime_level) if regime_params is not None else structural_regime_level
         liquidity_stress = float(pd.to_numeric(pd.Series([safety_row.get("market_liquidity_stress_ratio", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        qualified_entry_count = int(candidates.get("entry_confirmed", pd.Series(dtype=bool)).fillna(False).astype(bool).sum())
+        qualified_entry_count = int(_state_machine_entry_mask(candidates).sum())
         trailing_buy_accuracy_5d = self._trailing_trade_accuracy(date, side="buy", horizon_days=5, lookback_trades=60)
         exposure_authorization = _authorize_exposure_by_regime(
             regime_name=regime_name,
@@ -1156,6 +1175,11 @@ class GovernanceBacktestRunner:
             contribution = pd.DataFrame()
 
         rows = []
+        if str(self.selection_weight_mode).lower() == "factor_judged":
+            weights = {
+                model_name: float(GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS.get(model_name, 0.0))
+                for model_name in self.alpha_models
+            }
         total_weight = max(sum(float(value) for value in weights.values()), 1e-12)
         for model_name in self.alpha_models:
             weight = float(weights.get(model_name, 1.0))
@@ -1661,6 +1685,7 @@ class GovernanceBacktestRunner:
             holding_days = int(self.holding_days.get(symbol, 0))
             unrealized = _safe_float(row.get("position_unrealized_return"), default=0.0)
             mfe = _safe_float(row.get("position_mfe"), default=0.0)
+            mae = _safe_float(row.get("position_mae"), default=0.0)
             giveback = _safe_float(row.get("position_giveback_from_peak"), default=0.0)
             entry_score = _safe_float(row.get("entry_matrix_score"), default=0.0)
             alpha_quality_score = _safe_float(row.get("alpha_quality_score"), default=entry_score)
@@ -1681,6 +1706,20 @@ class GovernanceBacktestRunner:
             peak_decay_score = _safe_float(row.get("peak_decay_score"), default=0.0)
             orderflow_score = _safe_float(row.get("orderflow_candidate_score"), default=0.50)
             orderflow_decay_score = max(0.55 - orderflow_score, 0.0) / 0.55
+            liquidity_decay_score = max(0.55 - volume_score, 0.0) / 0.55
+            factor_conviction_score = _clip01(
+                0.35 * alpha_quality_score
+                + 0.25 * entry_success_probability
+                + 0.20 * trend_score
+                + 0.10 * volume_score
+                + 0.10 * final_entry_score
+            )
+            signal_retention_score = _clip01(
+                0.35 * (1.0 - min(alpha_quality_drop_from_entry / 0.20, 1.0))
+                + 0.25 * trend_score
+                + 0.20 * volume_score
+                + 0.20 * orderflow_score
+            )
             dynamic_giveback_limit = _dynamic_giveback_limit(
                 mfe=mfe,
                 trend_direction_score=trend_direction_score,
@@ -1750,8 +1789,47 @@ class GovernanceBacktestRunner:
                 and downtrend_score >= float(GOVERNANCE_DOWNTREND_DECAY_EXIT)
                 and follow_through_score < 0.45
             )
-            stale_reduce = bool(is_held and holding_days >= int(GOVERNANCE_STALE_REDUCE_DAYS) and unrealized <= 0.0)
-            stale_exit = bool(is_held and holding_days >= int(GOVERNANCE_STALE_EXIT_DAYS) and unrealized <= 0.0)
+            stale_failure_context = bool(
+                is_held
+                and mfe <= float(GOVERNANCE_STALE_EXIT_MAX_MFE)
+                and alpha_quality_drop_from_entry >= float(GOVERNANCE_STALE_EXIT_MIN_ALPHA_DROP)
+                and liquidity_decay_score >= float(GOVERNANCE_STALE_EXIT_MIN_LIQUIDITY_DECAY)
+            )
+            stale_reduce = bool(
+                stale_failure_context
+                and holding_days >= int(GOVERNANCE_STALE_REDUCE_DAYS)
+                and unrealized <= 0.0
+            )
+            stale_exit = bool(
+                stale_failure_context
+                and holding_days >= int(GOVERNANCE_STALE_EXIT_DAYS)
+                and unrealized <= 0.0
+            )
+            early_threshold = None
+            threshold_pairs = tuple(GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_THRESHOLDS or ())
+            if threshold_pairs:
+                for day_threshold, score_threshold in sorted(
+                    ((int(day), float(score)) for day, score in threshold_pairs),
+                    reverse=True,
+                ):
+                    if holding_days >= day_threshold:
+                        early_threshold = score_threshold
+                        break
+            else:
+                early_failure_days = tuple(int(day) for day in GOVERNANCE_POST_ENTRY_FAILURE_EARLY_DAYS)
+                if holding_days >= min(early_failure_days or (3,)):
+                    early_threshold = float(GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_SCORE)
+            early_post_entry_failure = bool(
+                is_held
+                and early_threshold is not None
+                and post_entry_failure_score >= float(early_threshold)
+                and (
+                    mfe <= 0.02
+                    or mae <= -0.025
+                    or alpha_quality_drop_from_entry >= 0.12
+                    or downtrend_score >= 0.55
+                )
+            )
 
             exit_reason = ""
             if hard_stop:
@@ -1760,7 +1838,7 @@ class GovernanceBacktestRunner:
                 exit_reason = "profit_giveback_exit"
             elif peak_decay_exit:
                 exit_reason = "profit_giveback_exit"
-            elif bool(row.get("post_entry_failure_exit", False)):
+            elif early_post_entry_failure or bool(row.get("post_entry_failure_exit", False)):
                 exit_reason = "post_entry_failure_exit"
             elif downtrend_exit:
                 exit_reason = "signal_failure_exit"
@@ -1804,6 +1882,10 @@ class GovernanceBacktestRunner:
                     add_block_reason = "post_entry_failure_risk"
                 elif alpha_quality_score < 0.68:
                     add_block_reason = "alpha_quality_low"
+                elif factor_conviction_score < float(GOVERNANCE_ADD_MIN_FACTOR_CONVICTION):
+                    add_block_reason = "factor_conviction_low"
+                elif signal_retention_score < float(GOVERNANCE_ADD_MIN_SIGNAL_RETENTION):
+                    add_block_reason = "signal_retention_low"
                 elif trend_score < 0.40:
                     add_block_reason = "trend_stability_low"
                 elif volume_score < 0.40:
@@ -1832,7 +1914,7 @@ class GovernanceBacktestRunner:
             elif str(row.get("entry_size_tier", "")).strip().lower() == "starter_strong":
                 position_state = "strong_building"
             elif (
-                str(row.get("entry_size_tier", "")).strip().lower() in {"starter_1_lot", "starter_2_lot", "diversify_1_lot"}
+                str(row.get("entry_size_tier", "")).strip().lower() in {"basket_1_lot", "starter_1_lot", "starter_2_lot", "diversify_1_lot"}
                 and bool(row.get("entry_confirmed", False))
             ):
                 position_state = "building"
@@ -1852,7 +1934,7 @@ class GovernanceBacktestRunner:
 
             layer_index = min(max(next_layer - 1, 0), len(layer_weights) - 1)
             add_budget = float(layer_weights[layer_index]) * float(GOVERNANCE_MAX_POSITION_WEIGHT) if add_allowed else 0.0
-            post_entry_failure = bool(row.get("post_entry_failure_exit", False))
+            post_entry_failure = bool(early_post_entry_failure or row.get("post_entry_failure_exit", False))
             updates = {
                 "position_state": position_state,
                 "exit_state": exit_state,
@@ -1892,6 +1974,7 @@ class GovernanceBacktestRunner:
                 "paper_stale_time_reduce": stale_reduce,
                 "stale_time_exit": stale_exit and self._control_enabled("stale_exit"),
                 "paper_stale_time_exit": stale_exit,
+                "early_post_entry_failure_exit": early_post_entry_failure,
                 "alpha_quality_score": alpha_quality_score,
                 "surge_capture_score": surge_score,
                 "follow_through_score": follow_through_score,
@@ -1905,6 +1988,11 @@ class GovernanceBacktestRunner:
                 "profit_protection_pressure": profit_protection_pressure,
                 "dynamic_giveback_limit": dynamic_giveback_limit,
                 "future_loss_risk_score": future_loss_risk_score,
+                "factor_conviction_score": factor_conviction_score,
+                "signal_retention_score": signal_retention_score,
+                "liquidity_decay_score": liquidity_decay_score,
+                "risk_contribution_penalty": row.get("risk_contribution_penalty", 0.0),
+                "risk_adjusted_primary_score": row.get("risk_adjusted_primary_score", row.get("primary_score", pd.NA)),
                 "entry_size_tier": row.get("entry_size_tier", ""),
                 "planned_entry_lots": row.get("planned_entry_lots", pd.NA),
                 "entry_alpha_quality_at_buy": entry_alpha_quality_at_buy if is_held else pd.NA,
@@ -1936,6 +2024,47 @@ class GovernanceBacktestRunner:
                 }
             )
         self.position_state_rows.extend(state_rows)
+        return data
+
+    def _apply_candidate_risk_penalty(self, candidates: pd.DataFrame, *, exposure: dict) -> pd.DataFrame:
+        if candidates is None or candidates.empty:
+            return candidates
+        data = candidates.copy()
+        if "primary_score" not in data.columns:
+            return data
+        nominal_nav = max(float(exposure.get("nominal_nav", 0.0) or 0.0), 1e-12)
+        current_weights = {
+            str(row.get("symbol", "")): float(row.get("market_value", 0.0) or 0.0) / nominal_nav
+            for row in getattr(self, "_last_position_mark_rows", []) or []
+        }
+        primary = pd.to_numeric(data["primary_score"], errors="coerce")
+        account_weight = data["symbol"].astype(str).map(lambda symbol: float(current_weights.get(symbol, 0.0) or 0.0))
+        price_col = "close_nominal" if "close_nominal" in data.columns else "close"
+        price = pd.to_numeric(data.get(price_col, pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0).clip(lower=0.0)
+        planned_lots = pd.to_numeric(data.get("planned_entry_lots", pd.Series(0.0, index=data.index)), errors="coerce").fillna(0.0)
+        buy_intent = (
+            data.get("entry_confirmed", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+            | data.get("direct_buy_flag", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+            | data.get("surge_buy_flag", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+        )
+        planned_lots = planned_lots.where(planned_lots > 0.0, 1.0).where(buy_intent, 0.0)
+        prospective_entry_weight = (price * float(MIN_LOT_SIZE) * planned_lots) / nominal_nav
+        projected_weight = account_weight + prospective_entry_weight
+        single_cap = float(self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT) or GOVERNANCE_MAX_POSITION_WEIGHT)
+        research_cap = float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION)
+        soft_cap = max(min(single_cap, research_cap), 1e-12)
+        penalty = ((projected_weight / soft_cap) - 1.0).clip(lower=0.0, upper=2.0) * float(GOVERNANCE_RISK_CONTRIBUTION_SCORE_PENALTY)
+        state = data.get("position_state", pd.Series("", index=data.index)).astype(str).str.lower()
+        add_or_build = state.isin(["adding", "building", "strong_building"])
+        penalty = penalty.where(add_or_build | buy_intent | account_weight.gt(0.0), 0.0)
+        data["raw_primary_score"] = primary
+        data["risk_contribution_pre_trade_weight"] = account_weight
+        data["risk_contribution_projected_weight"] = projected_weight
+        data["risk_contribution_penalty"] = penalty
+        data["risk_adjusted_primary_score"] = primary - penalty
+        data["primary_score"] = data["risk_adjusted_primary_score"]
+        data = data.sort_values(["primary_score", "symbol"], ascending=[False, True]).reset_index(drop=True)
+        data["candidate_rank"] = range(1, len(data) + 1)
         return data
 
     def _expire_position_cooldowns(self, date) -> None:
@@ -2036,13 +2165,13 @@ class GovernanceBacktestRunner:
 
         data = candidates.copy()
         data["symbol"] = data["symbol"].astype(str)
-        confirmed = data.get("entry_confirmed", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+        confirmed = _state_machine_entry_mask(data)
         tier = data.get("entry_size_tier", pd.Series("", index=data.index)).astype(str).str.lower()
         state = data.get("position_state", pd.Series("", index=data.index)).astype(str).str.lower()
         locked_symbols = {str(symbol) for symbol in self.engine.pending_orders.locked_symbols()}
         data = data[
             confirmed
-            & tier.isin(["diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"])
+            & tier.isin(["basket_1_lot", "diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"])
             & state.isin(["building", "strong_building", "holding", "watching"])
             & ~data["symbol"].isin(existing_symbols | buy_symbols | sell_symbols | locked_symbols)
         ].copy()
@@ -3088,7 +3217,8 @@ class GovernanceBacktestRunner:
 
         if initial_shares >= float(MIN_LOT_SIZE):
             return initial_shares, "unchanged", ""
-        if strategy_target_notional <= 0.0 and not (force_deploy and tier in {"diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"}):
+        one_lot_tiers = {"basket_1_lot", "diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"}
+        if strategy_target_notional <= 0.0 and not (force_deploy and tier in one_lot_tiers) and tier != "basket_1_lot":
             return 0.0, "blocked", "target_notional_zero"
         if entry_score < min_entry_score:
             return 0.0, "blocked", "entry_matrix_score"
@@ -3680,6 +3810,7 @@ class GovernanceBacktestRunner:
         )
         for name, frame in extra.items():
             path = self.output_dir / f"{name}.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
             frame.to_csv(path, index=False, encoding="utf-8-sig")
             saved[name] = path
         governance_summary = self._build_governance_summary(
@@ -3912,8 +4043,23 @@ class GovernanceBacktestRunner:
         rolling_beat = quality_reports.get("governance_rolling_beat_report", pd.DataFrame())
         validation = quality_reports.get("governance_strategy_validation_matrix", pd.DataFrame())
         rebound_diagnostics = quality_reports.get("governance_rebound_entry_diagnostics", pd.DataFrame())
+        research_gate = quality_reports.get("governance_research_gate_report", pd.DataFrame())
+        factor_validation = quality_reports.get("governance_factor_validation_report", pd.DataFrame())
+        portfolio_constraints = quality_reports.get("governance_portfolio_constraint_report", pd.DataFrame())
         trade_summary = trade_pair_summary.copy() if trade_pair_summary is not None else pd.DataFrame()
         trade_row = trade_summary.iloc[0].to_dict() if not trade_summary.empty else {}
+        executions = execution_ledger.copy() if execution_ledger is not None else pd.DataFrame()
+        if not executions.empty:
+            reasons = executions.get("reason", pd.Series("", index=executions.index)).fillna("").astype(str)
+            sides = executions.get("side", pd.Series("", index=executions.index)).fillna("").astype(str).str.lower()
+            filled = executions.get("execution_status", pd.Series("", index=executions.index)).fillna("").astype(str).str.lower().eq("filled")
+            defensive_force_mask = reasons.str.contains("force_deploy_defensive", case=False, regex=False)
+            alpha_buy_mask = sides.eq("buy") & ~defensive_force_mask
+            defensive_force_trade_count = int((filled & defensive_force_mask).sum())
+            alpha_driven_trade_count = int((filled & alpha_buy_mask).sum())
+        else:
+            defensive_force_trade_count = 0
+            alpha_driven_trade_count = 0
         closed_trade_count = int(_safe_float(trade_row.get("realized_trade_count"), default=0.0))
         closed_trade_win_rate = _safe_float(trade_row.get("closed_trade_win_rate"), default=float("nan"))
         realized_pnl = _safe_float(trade_row.get("realized_pnl"), default=0.0)
@@ -3948,6 +4094,10 @@ class GovernanceBacktestRunner:
         capacity_10x_passed = _capacity_passed(capacity, multiplier=10)
         validation_gate_pass_ratio = _validation_pass_ratio(validation)
         validation_gate_fail_count = _validation_fail_count(validation)
+        research_gate_status = _research_gate_status(research_gate)
+        research_gate_fail_count = _research_gate_fail_count(research_gate)
+        factor_validation_pass_count = _safe_count_true(factor_validation.get("pass_flag"))
+        latest_constraint_pass = _latest_bool(portfolio_constraints.get("constraint_pass"))
         return pd.DataFrame(
             [
                 {
@@ -3998,6 +4148,16 @@ class GovernanceBacktestRunner:
                     "payoff_ratio": payoff_ratio,
                     "profit_factor": profit_factor,
                     "open_position_count": open_position_count,
+                    "alpha_driven_trade_count": alpha_driven_trade_count,
+                    "force_deploy_defensive_trade_count": defensive_force_trade_count,
+                    "force_deploy_result_is_alpha_evidence": bool(
+                        self.capital_usage_mode != GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
+                    ),
+                    "force_deploy_interpretation": (
+                        "normal capital mode; account result may be evaluated as strategy evidence subject to gates"
+                        if self.capital_usage_mode != GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
+                        else "force_deploy is an execution pressure test; defensive-sleeve trades are not alpha evidence"
+                    ),
                     "pnl_by_sell_reason": pnl_by_sell_reason_text,
                     "control_exit_count": control_loss_summary["control_exit_count"],
                     "control_avoided_loss_to_window_low": control_loss_summary["avoided_loss_to_window_low"],
@@ -4025,6 +4185,10 @@ class GovernanceBacktestRunner:
                     "capacity_10x_passed": capacity_10x_passed,
                     "validation_gate_pass_ratio": validation_gate_pass_ratio,
                     "validation_gate_fail_count": validation_gate_fail_count,
+                    "research_gate_status": research_gate_status,
+                    "research_gate_fail_count": research_gate_fail_count,
+                    "factor_validation_pass_count": factor_validation_pass_count,
+                    "latest_portfolio_constraint_pass": latest_constraint_pass,
                     "high_exposure_research_gate": bool(
                         closed_trade_count >= int(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_TRADES)
                         and pd.notna(profit_factor)
@@ -4165,6 +4329,7 @@ def run_governance_backtest(
     alpha_collapse_exit_enabled: bool = True,
 ) -> dict[str, Path]:
     from functions.decision_council.policy import RulesBasedPresidentPolicy
+    from functions.alpha_bundles import ALPHA_BUNDLE_REGISTRY
 
     # Deprecated compatibility only. Probability-bucket logic was removed from
     # the strategy path, but older interactive launchers/notebook state may still
@@ -4185,22 +4350,49 @@ def run_governance_backtest(
     if allowed_instrument_types:
         load_instrument_types = tuple(dict.fromkeys((*allowed_instrument_types, "etf_fund")))
         filters.append(("instrument_type", "in", list(load_instrument_types)))
+    alpha_models = (
+        tuple(ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(alpha_bundle))
+        if alpha_bundle
+        else tuple(GOVERNANCE_ALPHA_MODELS)
+    )
     try:
         import pyarrow.parquet as pq
 
         available_columns = set(pq.read_schema(feature_path).names)
     except Exception:
         available_columns = set(_governance_feature_columns())
+    generated_candidate_columns = {
+        GOVERNANCE_ALPHA_MODEL_FEATURES[name]
+        for name in alpha_models
+        if name in GOVERNANCE_ALPHA_MODEL_FEATURES
+        and GOVERNANCE_ALPHA_MODEL_FEATURES[name].startswith("cand_")
+        and GOVERNANCE_ALPHA_MODEL_FEATURES[name] not in available_columns
+    }
+    load_columns = list(_governance_feature_columns())
     features = pd.read_parquet(
         feature_path,
-        columns=[column for column in _governance_feature_columns() if column in available_columns],
+        columns=[column for column in dict.fromkeys(load_columns) if column in available_columns],
         filters=filters or None,
     )
+    if generated_candidate_columns:
+        cache_start = effective_start - pd.Timedelta(days=GOVERNANCE_PRELOAD_CALENDAR_DAYS) if effective_start is not None else features["date"].min()
+        cache_end = effective_end if effective_end is not None else features["date"].max()
+        features = attach_pre_screen_candidate_factor_cache(
+            features,
+            start_date=cache_start,
+            end_date=cache_end,
+            alpha_models=alpha_models,
+            feature_path=Path(feature_path),
+        )
+        still_missing = sorted(generated_candidate_columns - set(features.columns))
+        if still_missing:
+            raise ValueError(f"Candidate factor cache did not provide required columns: {still_missing}")
     features = _prepare_features(features, copy=False)
     runner = GovernanceBacktestRunner(
         features,
         initial_cash=float(initial_cash),
         output_dir=output_dir,
+        alpha_models=alpha_models,
         safety_proxy_mode=safety_proxy_mode,
         data_fingerprints={"feature_daily_parquet": file_fingerprint(feature_path)},
         policy=RulesBasedPresidentPolicy(
@@ -4805,6 +4997,29 @@ def _validation_fail_count(validation: pd.DataFrame) -> int:
     return int((~values).sum())
 
 
+def _research_gate_status(research_gate: pd.DataFrame) -> str:
+    if research_gate is None or research_gate.empty or "overall_status" not in research_gate.columns:
+        return "unknown"
+    values = research_gate["overall_status"].dropna().astype(str)
+    return values.iloc[-1] if not values.empty else "unknown"
+
+
+def _research_gate_fail_count(research_gate: pd.DataFrame) -> int:
+    if research_gate is None or research_gate.empty or "pass_flag" not in research_gate.columns:
+        return 0
+    passed = research_gate["pass_flag"].fillna(False).astype(bool)
+    return int((~passed).sum())
+
+
+def _latest_bool(values) -> bool:
+    if values is None:
+        return False
+    series = pd.Series(values).dropna()
+    if series.empty:
+        return False
+    return bool(series.iloc[-1])
+
+
 def _safe_float(value, default=0.0) -> float:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").dropna()
     if numeric.empty:
@@ -4881,6 +5096,17 @@ def _normalize_capital_usage_mode(value) -> str:
     if mode not in {"allow_cash", GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY}:
         return GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT
     return mode
+
+
+def _state_machine_entry_mask(candidates: pd.DataFrame) -> pd.Series:
+    """Confirmed entry mask that also honors the alpha role-diversity gate."""
+    if candidates is None or candidates.empty:
+        return pd.Series(dtype=bool)
+    confirmed = candidates.get("entry_confirmed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+    if "state_machine_role_pass" not in candidates.columns:
+        return confirmed
+    role_pass = candidates["state_machine_role_pass"].fillna(False).astype(bool)
+    return confirmed & role_pass
 
 
 def _best_bucket(bucket_frame: pd.DataFrame, dimension: str, metric: str) -> str:
@@ -5084,6 +5310,9 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
     ret5 = pd.to_numeric(candidates.get("ret_5", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     ret20 = pd.to_numeric(candidates.get("ret_20", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     close_to_ma20 = pd.to_numeric(candidates.get("close_to_ma20", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
+    mfe = pd.to_numeric(candidates.get("position_mfe", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
+    mae = pd.to_numeric(candidates.get("position_mae", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
+    downtrend_decay = pd.to_numeric(candidates.get("downtrend_decay_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     flow_count = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
     holding_days = pd.to_numeric(candidates.get("position_holding_days", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
     alpha_collapse = (
@@ -5098,13 +5327,19 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
     ).clip(0.0, 1.0)
     orderflow_bad = flow_count.le(1).astype(float)
     loss_bad = ((-unrealized - 0.015) / 0.055).clip(0.0, 1.0)
+    poor_excursion = (
+        mfe.lt(0.02).astype(float) * 0.45
+        + ((-mae - 0.02) / 0.08).clip(0.0, 1.0) * 0.35
+        + downtrend_decay.clip(0.0, 1.0) * 0.20
+    ).clip(0.0, 1.0)
     stale_bad = ((holding_days - 6.0) / 14.0).clip(0.0, 1.0)
     score = (
-        0.30 * loss_bad
+        0.25 * loss_bad
         + 0.25 * alpha_collapse
-        + 0.20 * orderflow_bad
+        + 0.20 * poor_excursion
+        + 0.15 * orderflow_bad
         + 0.15 * trend_weak
-        + 0.10 * stale_bad
+        + 0.05 * stale_bad
     ).clip(0.0, 1.0)
     return score.where(watch | holding_days.ge(3), 0.0)
 

@@ -1,0 +1,100 @@
+"""Verify productized pre-screen candidate factor cache and governance loading."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+
+from config import (
+    GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS,
+    GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS,
+)
+from functions.alpha_bundles import ALPHA_BUNDLE_REGISTRY
+from functions.decision_council.candidate_factor_cache import (
+    build_pre_screen_candidate_factor_cache,
+    candidate_factor_cache_paths,
+    load_pre_screen_candidate_factor_cache,
+    pre_screen_candidate_raw_columns,
+)
+from functions.decision_council.runner import run_governance_backtest
+
+
+def _expect(condition: bool, message: str, failures: list[str]) -> None:
+    if not condition:
+        failures.append(message)
+
+
+def main() -> int:
+    failures: list[str] = []
+    target_start = pd.Timestamp("2021-01-04")
+    target_end = pd.Timestamp("2021-01-08")
+    cache_start = target_start - pd.Timedelta(days=int(GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS) + 90)
+    cache_end = target_end
+    models = ALPHA_BUNDLE_REGISTRY.get_alpha_model_names("pre_screen_promote_bundle")
+    raw_columns = pre_screen_candidate_raw_columns(models)
+
+    parquet_path, manifest_path = build_pre_screen_candidate_factor_cache(
+        cache_start,
+        cache_end,
+        alpha_models=models,
+        allowed_instrument_types=("stock",),
+        symbol_scope="all",
+    )
+    _expect(parquet_path.exists(), "candidate cache parquet should exist", failures)
+    _expect(manifest_path.exists(), "candidate cache manifest should exist", failures)
+
+    cache = load_pre_screen_candidate_factor_cache(
+        target_start - pd.Timedelta(days=60),
+        target_end,
+        alpha_models=models,
+    )
+    _expect(not cache.empty, "candidate cache slice should not be empty", failures)
+    _expect(set(raw_columns).issubset(cache.columns), "candidate cache should contain all selected raw columns", failures)
+    _expect(len(models) == len(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS) == 28, "pre-screen bundle should contain fixed 28 models", failures)
+
+    saved = run_governance_backtest(
+        output_dir=Path("results") / "pre_screen_promote_cache_verify",
+        start_date=str(target_start.date()),
+        end_date=str(target_start.date()),
+        max_days=1,
+        alpha_bundle="pre_screen_promote_bundle",
+        universe_name="cache_verify_quality_fallback",
+        universe_mode="quality_fallback",
+        require_constituents=False,
+        allow_fallback=True,
+        allowed_instrument_types=("stock",),
+        enable_shadow_portfolios=False,
+        show_live_monitor=False,
+    )
+    required = {
+        "governance_daily_result",
+        "governance_factor_registry_snapshot",
+        "governance_factor_validation_report",
+        "governance_strategy_summary",
+    }
+    _expect(required.issubset(saved), "governance run should save key outputs", failures)
+    if "governance_factor_registry_snapshot" in saved:
+        registry = pd.read_csv(saved["governance_factor_registry_snapshot"])
+        _expect(
+            set(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS).issubset(set(registry.get("factor_name", pd.Series(dtype=str)).astype(str))),
+            "factor registry snapshot should include selected pre-screen factors",
+            failures,
+        )
+
+    expected_path, expected_manifest = candidate_factor_cache_paths(cache_start, cache_end)
+    _expect(parquet_path == expected_path, "cache path should be deterministic", failures)
+    _expect(manifest_path == expected_manifest, "manifest path should be deterministic", failures)
+
+    if failures:
+        print("Pre-screen candidate cache verification failed.")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+    print("Pre-screen candidate cache verification passed.")
+    print(f"cache_parquet={parquet_path}")
+    print(f"cache_manifest={manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

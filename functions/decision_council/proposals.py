@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 
 from config import (
     ENABLE_BUY_QUALITY_FILTERS,
@@ -12,10 +13,16 @@ from config import (
     GOVERNANCE_ALLOWED_INSTRUMENT_TYPES,
     GOVERNANCE_ALPHA_MODEL_FEATURES,
     GOVERNANCE_ALPHA_MODELS,
+    GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP,
+    GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS,
+    GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS,
+    GOVERNANCE_FACTOR_JUDGED_MIN_WEIGHT,
+    GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE,
     GOVERNANCE_MIN_DAILY_AMOUNT,
     STRATEGY_MIN_SCORE_PERCENTILE,
 )
 from functions.decision_council.alpha import alpha_collapse_symbols, combine_alpha_proposals
+from functions.decision_council.analytics import factor_module
 from functions.investable_universe import active_index_members, load_index_constituents
 
 
@@ -229,6 +236,7 @@ def build_rule_alpha_proposals(
     *,
     reputation_weights: dict[str, float] | None = None,
     model_names=GOVERNANCE_ALPHA_MODELS,
+    factor_judged: bool = False,
 ) -> pd.DataFrame:
     """Build deterministic proposal rows without pretending they are trained ML outputs."""
     reputation_weights = reputation_weights or {}
@@ -241,6 +249,9 @@ def build_rule_alpha_proposals(
         if feature_col not in data.columns:
             continue
         score = pd.to_numeric(data[feature_col], errors="coerce")
+        if factor_judged:
+            direction = float(GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS.get(model_name, 1.0))
+            score = score * (-1.0 if direction < 0.0 else 1.0)
         volatility = pd.to_numeric(data.get("volatility_20"), errors="coerce").fillna(0.0)
         non_null_abs_score = score.abs().dropna()
         scale = non_null_abs_score.median() if not non_null_abs_score.empty else 1.0
@@ -252,7 +263,11 @@ def build_rule_alpha_proposals(
                 "model_name": model_name,
                 "predicted_return_5d": predicted,
                 "prediction_std": volatility.clip(lower=0.001),
-                "reputation_weight": float(reputation_weights.get(model_name, 1.0)),
+                "reputation_weight": _effective_alpha_weight(
+                    model_name,
+                    reputation_weights=reputation_weights,
+                    factor_judged=factor_judged,
+                ),
             }
         )
         rows.append(part)
@@ -318,10 +333,12 @@ def build_daily_candidates(
         daily_features,
         reputation_weights=reputation_weights,
         model_names=model_names,
+        factor_judged=str(selection_weight_mode or "").strip().lower() == "factor_judged",
     )
     if proposals.empty:
         return _empty_candidates(), proposals
     combined = combine_alpha_proposals(proposals)
+    combined = _attach_state_machine_alpha_evidence(combined, proposals)
     collapses = alpha_collapse_symbols(proposals, combined, holding_days or {})
     source = daily_features.copy()
     keep = [
@@ -399,7 +416,10 @@ def build_daily_candidates(
     
     candidates = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
     selection_mode = str(selection_weight_mode or "reputation_weighted").strip().lower()
-    if selection_mode == "role_balanced":
+    if selection_mode == "factor_judged":
+        candidates["primary_score"] = pd.to_numeric(candidates["alpha_percentile"], errors="coerce")
+        candidates["score_authority"] = "factor_judged_alpha_ensemble"
+    elif selection_mode == "role_balanced":
         candidates["role_balanced_score"] = _role_balanced_selection_score(candidates)
         candidates["primary_score"] = candidates["role_balanced_score"]
         candidates["score_authority"] = "role_balanced_orderflow_reversal_breakout_trend"
@@ -430,6 +450,228 @@ def build_daily_candidates(
             | candidates["symbol"].astype(str).isin(held)
         ]
     return candidates.reset_index(drop=True), proposals
+
+
+def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.DataFrame) -> pd.DataFrame:
+    """Attach per-symbol diversity evidence used by the president state machine.
+
+    This is intentionally computed from active model votes, not from the raw
+    bundle list. A symbol cannot pass merely because the configured bundle is
+    diverse; it must have live support from multiple modules/families on the day.
+    """
+    output = combined.copy()
+    defaults = {
+        "alpha_active_model_count": 0,
+        "alpha_active_module_count": 0,
+        "alpha_active_family_count": 0,
+        "alpha_max_active_module_share": 1.0,
+        "alpha_range_grid_vote_share": 1.0,
+        "entry_alpha_vote_count": 0,
+        "timing_filter_vote_count": 0,
+        "risk_override_vote_count": 0,
+        "liquidity_guard_vote_count": 0,
+        "hold_validation_vote_count": 0,
+        "sell_trigger_vote_count": 0,
+        "state_machine_role_pass": False,
+        "state_machine_role_block_reason": "alpha_evidence_missing",
+    }
+    for column, value in defaults.items():
+        output[column] = value
+    if proposals is None or proposals.empty or "symbol" not in proposals.columns:
+        return output
+
+    gate = dict(GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE)
+    if not bool(gate.get("enabled", True)):
+        output["state_machine_role_pass"] = True
+        output["state_machine_role_block_reason"] = "disabled"
+        return output
+
+    data = proposals.copy()
+    data["symbol"] = data["symbol"].astype(str)
+    data["model_name"] = data["model_name"].astype(str)
+    data["predicted_return_5d"] = pd.to_numeric(data["predicted_return_5d"], errors="coerce")
+    data["reputation_weight"] = pd.to_numeric(data.get("reputation_weight"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    data["alpha_percentile_model"] = data.groupby("model_name")["predicted_return_5d"].rank(pct=True)
+    active_floor = float(gate.get("active_model_percentile", 0.55))
+    active = data[
+        data["predicted_return_5d"].gt(0.0)
+        & data["reputation_weight"].gt(0.0)
+        & data["alpha_percentile_model"].ge(active_floor)
+    ].copy()
+    if active.empty:
+        return output
+
+    active["factor_module"] = active["model_name"].map(factor_module)
+    active["factor_family"] = active["model_name"].map(_state_machine_factor_family)
+    active["vote_weight"] = active["reputation_weight"].clip(lower=0.0)
+
+    rows = []
+    for symbol, group in active.groupby("symbol", sort=False):
+        modules = group["factor_module"].astype(str)
+        families = group["factor_family"].astype(str)
+        total_weight = max(float(group["vote_weight"].sum()), 1e-12)
+        module_share = group.groupby("factor_module")["vote_weight"].sum() / total_weight
+        roles = _role_vote_counts(group)
+        max_share = float(module_share.max()) if not module_share.empty else 1.0
+        range_grid_share = float(module_share.get("range_grid", 0.0))
+        block_reasons = []
+        if int(modules.nunique()) < int(gate.get("min_active_modules", 3)):
+            block_reasons.append("active_modules_below_min")
+        if int(families.nunique()) < int(gate.get("min_active_families", 3)):
+            block_reasons.append("active_families_below_min")
+        if max_share > float(gate.get("max_active_module_share", 0.70)):
+            block_reasons.append("active_module_share_above_cap")
+        if range_grid_share > float(gate.get("max_range_grid_vote_share", 0.35)):
+            block_reasons.append("range_grid_vote_share_above_cap")
+        if int(roles["entry_alpha_vote_count"]) < int(gate.get("min_entry_alpha_votes", 1)):
+            block_reasons.append("entry_alpha_votes_below_min")
+        if int(roles["timing_filter_vote_count"]) < int(gate.get("min_timing_filter_votes", 1)):
+            block_reasons.append("timing_filter_votes_below_min")
+        risk_or_liquidity = int(roles["risk_override_vote_count"]) + int(roles["liquidity_guard_vote_count"])
+        if risk_or_liquidity < int(gate.get("min_risk_or_liquidity_votes", 1)):
+            block_reasons.append("risk_or_liquidity_votes_below_min")
+        if int(roles["hold_validation_vote_count"]) < int(gate.get("min_hold_validation_votes", 0)):
+            block_reasons.append("hold_validation_votes_below_min")
+        if int(roles["sell_trigger_vote_count"]) < int(gate.get("min_sell_trigger_votes", 0)):
+            block_reasons.append("sell_trigger_votes_below_min")
+        rows.append(
+            {
+                "symbol": str(symbol),
+                "alpha_active_model_count": int(group["model_name"].nunique()),
+                "alpha_active_module_count": int(modules.nunique()),
+                "alpha_active_family_count": int(families.nunique()),
+                "alpha_max_active_module_share": max_share,
+                "alpha_range_grid_vote_share": range_grid_share,
+                **roles,
+                "state_machine_role_pass": not block_reasons,
+                "state_machine_role_block_reason": "|".join(block_reasons) if block_reasons else "passed",
+            }
+        )
+    evidence = pd.DataFrame(rows)
+    return output.drop(columns=list(defaults), errors="ignore").merge(evidence, on="symbol", how="left").assign(
+        alpha_active_model_count=lambda frame: pd.to_numeric(frame["alpha_active_model_count"], errors="coerce").fillna(0).astype(int),
+        alpha_active_module_count=lambda frame: pd.to_numeric(frame["alpha_active_module_count"], errors="coerce").fillna(0).astype(int),
+        alpha_active_family_count=lambda frame: pd.to_numeric(frame["alpha_active_family_count"], errors="coerce").fillna(0).astype(int),
+        alpha_max_active_module_share=lambda frame: pd.to_numeric(frame["alpha_max_active_module_share"], errors="coerce").fillna(1.0),
+        alpha_range_grid_vote_share=lambda frame: pd.to_numeric(frame["alpha_range_grid_vote_share"], errors="coerce").fillna(1.0),
+        entry_alpha_vote_count=lambda frame: pd.to_numeric(frame["entry_alpha_vote_count"], errors="coerce").fillna(0).astype(int),
+        timing_filter_vote_count=lambda frame: pd.to_numeric(frame["timing_filter_vote_count"], errors="coerce").fillna(0).astype(int),
+        risk_override_vote_count=lambda frame: pd.to_numeric(frame["risk_override_vote_count"], errors="coerce").fillna(0).astype(int),
+        liquidity_guard_vote_count=lambda frame: pd.to_numeric(frame["liquidity_guard_vote_count"], errors="coerce").fillna(0).astype(int),
+        hold_validation_vote_count=lambda frame: pd.to_numeric(frame["hold_validation_vote_count"], errors="coerce").fillna(0).astype(int),
+        sell_trigger_vote_count=lambda frame: pd.to_numeric(frame["sell_trigger_vote_count"], errors="coerce").fillna(0).astype(int),
+        state_machine_role_pass=lambda frame: pd.Series(
+            np.where(frame["state_machine_role_pass"].notna(), frame["state_machine_role_pass"], False),
+            index=frame.index,
+        ).astype(bool),
+        state_machine_role_block_reason=lambda frame: frame["state_machine_role_block_reason"].fillna("alpha_evidence_missing").astype(str),
+    )
+
+
+def _role_vote_counts(group: pd.DataFrame) -> dict[str, int]:
+    counts = {
+        "entry_alpha_vote_count": 0,
+        "timing_filter_vote_count": 0,
+        "risk_override_vote_count": 0,
+        "liquidity_guard_vote_count": 0,
+        "hold_validation_vote_count": 0,
+        "sell_trigger_vote_count": 0,
+    }
+    for model_name in group["model_name"].dropna().astype(str).unique():
+        roles = GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP.get(model_name)
+        if not roles:
+            module = factor_module(model_name)
+            roles = _default_roles_for_module(module)
+        role_set = {str(role) for role in roles}
+        if "entry_alpha" in role_set:
+            counts["entry_alpha_vote_count"] += 1
+        if "timing_filter" in role_set:
+            counts["timing_filter_vote_count"] += 1
+        if "risk_override" in role_set:
+            counts["risk_override_vote_count"] += 1
+        if "liquidity_guard" in role_set:
+            counts["liquidity_guard_vote_count"] += 1
+        if "hold_validation" in role_set:
+            counts["hold_validation_vote_count"] += 1
+        if "sell_trigger" in role_set:
+            counts["sell_trigger_vote_count"] += 1
+    return counts
+
+
+def _default_roles_for_module(module: str) -> tuple[str, ...]:
+    module = str(module).lower()
+    if module in {"flow_close"}:
+        return ("entry_alpha", "timing_filter", "liquidity_guard")
+    if module in {"trend"}:
+        return ("entry_alpha", "hold_validation")
+    if module in {"reversal_pullback", "range_grid"}:
+        return ("entry_alpha", "timing_filter")
+    if module in {"defensive"}:
+        return ("risk_override", "hold_validation")
+    if module in {"event_limit"}:
+        return ("entry_alpha", "sell_trigger")
+    return ("entry_alpha",)
+
+
+def _state_machine_factor_family(model_name: str) -> str:
+    name = str(model_name).lower()
+    if name.startswith("candidate_grid_rank_ratio__rev") and "amihud" in name:
+        return "rev_amihud_ratio_grid"
+    if name.startswith("candidate_grid_rank_spread__rev") and "amihud" in name:
+        return "rev_amihud_spread_grid"
+    if name.startswith("candidate_grid_rank_product__ret") and "__rev_" in name:
+        return "ret_reversal_interaction_grid"
+    if name.startswith("candidate_grid_rank_product__rev") and "__rev_" in name:
+        return "reversal_interaction_grid"
+    if name.startswith("candidate_grid_rank_product__rev") and "__size_" in name:
+        return "rev_size_interaction_grid"
+    if name.startswith("candidate_grid_rank_gate_hi__ret") and "__size_" in name:
+        return "ret_size_conditional_grid"
+    if name.startswith("candidate_grid_rank_gate_hi__rev") and "__size_" in name:
+        return "rev_size_conditional_grid"
+    if name.startswith("candidate_grid_rank_mean__rev") and "__rev_" in name:
+        return "short_medium_reversal_blend_grid"
+    if name.startswith("candidate_grid_base_rank__rev"):
+        return "single_reversal_grid"
+    if name.startswith("candidate_grid_base_rank__vol"):
+        return "single_volatility_grid"
+    if name.startswith("candidate_grid_base_rank__downvol"):
+        return "single_downside_volatility_grid"
+    if name.startswith("candidate_size_") or name.startswith("candidate_grid_base_rank__size"):
+        return "size_style"
+    if name.startswith("candidate_idiosyncratic_vol"):
+        return "idiosyncratic_volatility_defense"
+    if name.startswith("candidate_downside_volatility"):
+        return "downside_volatility_defense"
+    if "size_total" in name or "size_float" in name:
+        return "size_conditioned_grid"
+    if "volatility" in name or "vol_neg" in name or "idiosyncratic_vol" in name:
+        return "volatility_defense"
+    if "orderflow" in name or "volume" in name or "close_strength" in name:
+        return "flow_close"
+    if "limit" in name or "event" in name or "holiday" in name:
+        return "event_limit"
+    if "momentum" in name or "macd" in name or "breakout" in name or "ma_" in name:
+        return "trend"
+    if "reversal" in name or "decline" in name or "oversold" in name or "pullback" in name:
+        return "reversal_pullback"
+    tokens = name.split("__")
+    return tokens[0] if tokens else name
+
+
+def _effective_alpha_weight(
+    model_name: str,
+    *,
+    reputation_weights: dict[str, float],
+    factor_judged: bool,
+) -> float:
+    base_weight = float(reputation_weights.get(model_name, 1.0))
+    if not factor_judged:
+        return base_weight
+    judged_weight = float(GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS.get(model_name, 0.0))
+    if judged_weight <= float(GOVERNANCE_FACTOR_JUDGED_MIN_WEIGHT):
+        return 0.0
+    return max(base_weight, 0.0) * judged_weight
 
 
 def _role_balanced_selection_score(candidates: pd.DataFrame) -> pd.Series:

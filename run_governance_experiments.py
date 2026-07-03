@@ -37,7 +37,10 @@ from config import (
     FEATURE_DAILY_PARQUET,
     GOVERNANCE_ALPHA_MODEL_FEATURES,
     GOVERNANCE_END_DATE,
+    GOVERNANCE_FACTOR_JUDGE_RUN_ID,
     GOVERNANCE_INITIAL_CASH,
+    GOVERNANCE_OUTPUT_DIR,
+    GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID,
     GOVERNANCE_START_DATE,
     RESULT_DIR,
     SAFETY_PROXY_MODE,
@@ -58,6 +61,9 @@ from functions.alpha_bundles import (
     ALPHA_BUNDLE_REGISTRY,
     get_alpha_bundle_spec,
     list_active_alpha_bundles,
+)
+from functions.decision_council.candidate_factor_cache import (
+    attach_pre_screen_candidate_factor_cache,
 )
 from functions.decision_council.runner import (
     GovernanceBacktestRunner,
@@ -136,6 +142,43 @@ def _normalize_governance_control_mode(value) -> str:
     return mode
 
 
+def _latest_factor_judge_run_id(universe_name: str) -> str:
+    base = GOVERNANCE_OUTPUT_DIR / "fast_factor_judge" / str(universe_name)
+    if not base.exists():
+        return ""
+    runs = [
+        path for path in base.iterdir()
+        if path.is_dir() and (path / "fast_factor_judge_manifest.csv").exists()
+    ]
+    if not runs:
+        return ""
+    return max(runs, key=lambda path: path.stat().st_mtime).name
+
+
+def _factor_judge_config_status(universe_name: str, *, alpha_bundle: str | None = None) -> dict:
+    configured_source = (
+        GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID
+        if str(alpha_bundle or "").strip() == "pre_screen_promote_bundle"
+        else GOVERNANCE_FACTOR_JUDGE_RUN_ID
+    )
+    configured = str(configured_source or "").strip()
+    latest = _latest_factor_judge_run_id(universe_name)
+    stale = bool(configured and latest and configured != latest)
+    status = {
+        "configured_factor_judge_run_id": configured,
+        "latest_factor_judge_run_id": latest,
+        "factor_judge_config_status": "stale_factor_judge_config" if stale else "current_or_unavailable",
+        "stale_factor_judge_config": stale,
+    }
+    if stale:
+        print(
+            "[WARN] stale_factor_judge_config: "
+            f"configured_factor_judge_run_id={configured}, latest={latest}, universe={universe_name}, "
+            f"alpha_bundle={alpha_bundle or ''}"
+        )
+    return status
+
+
 def _read_feature_schema_columns() -> set[str]:
     try:
         import pyarrow.parquet as pq
@@ -170,6 +213,21 @@ def _ensure_governance_feature_columns(required_columns: set[str]) -> set[str]:
     return available_columns
 
 
+def _candidate_generated_feature_columns(alpha_models: tuple[str, ...]) -> set[str]:
+    """Return candidate factor columns generated at runtime, not stored in parquet."""
+    available_columns = _read_feature_schema_columns()
+    columns = {
+        GOVERNANCE_ALPHA_MODEL_FEATURES[name]
+        for name in alpha_models
+        if name in GOVERNANCE_ALPHA_MODEL_FEATURES
+    }
+    return {
+        column
+        for column in columns
+        if column.startswith("cand_") and column not in available_columns
+    }
+
+
 def _load_governance_features(
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
@@ -186,11 +244,16 @@ def _load_governance_features(
         load_instrument_types = tuple(dict.fromkeys((*allowed_instrument_types, "etf_fund")))
         filters.append(("instrument_type", "in", list(load_instrument_types)))
     alpha_feature_columns = set(GOVERNANCE_ALPHA_MODEL_FEATURES.values())
+    generated_candidate_columns = _candidate_generated_feature_columns(alpha_models)
     required_columns = [
         column for column in _governance_feature_columns()
         if column not in alpha_feature_columns
     ]
-    required_columns.extend(GOVERNANCE_ALPHA_MODEL_FEATURES[name] for name in alpha_models)
+    required_columns.extend(
+        GOVERNANCE_ALPHA_MODEL_FEATURES[name]
+        for name in alpha_models
+        if GOVERNANCE_ALPHA_MODEL_FEATURES[name] not in generated_candidate_columns
+    )
     required_columns = list(dict.fromkeys(required_columns))
     mandatory_columns = {
         "date",
@@ -201,7 +264,11 @@ def _load_governance_features(
         "amount",
         "volatility_20",
     }
-    mandatory_columns.update(GOVERNANCE_ALPHA_MODEL_FEATURES[name] for name in alpha_models)
+    mandatory_columns.update(
+        GOVERNANCE_ALPHA_MODEL_FEATURES[name]
+        for name in alpha_models
+        if GOVERNANCE_ALPHA_MODEL_FEATURES[name] not in generated_candidate_columns
+    )
     available_columns = _ensure_governance_feature_columns(mandatory_columns)
     required_columns = [column for column in required_columns if column in available_columns]
     data = pd.read_parquet(
@@ -209,6 +276,17 @@ def _load_governance_features(
         columns=required_columns,
         filters=filters,
     )
+    if generated_candidate_columns:
+        data = attach_pre_screen_candidate_factor_cache(
+            data,
+            start_date=start_date - pd.Timedelta(days=60),
+            end_date=end_date,
+            alpha_models=alpha_models,
+            feature_path=FEATURE_DAILY_PARQUET,
+        )
+        still_missing = sorted(generated_candidate_columns - set(data.columns))
+        if still_missing:
+            raise ValueError(f"Candidate factor cache did not provide required columns: {still_missing}")
     for column in ("instrument_type", "index_pool_codes"):
         if column in data.columns:
             data[column] = data[column].astype("category")
@@ -239,6 +317,7 @@ def run_single_experiment(
     variant_spec = get_governance_variant_spec(variant_name)
     bundle_spec = get_alpha_bundle_spec(alpha_bundle)
     universe_spec = get_universe_spec(universe_name)
+    factor_judge_status = _factor_judge_config_status(universe_name, alpha_bundle=alpha_bundle)
 
     output_dir = build_output_path(variant_name, alpha_bundle, universe_name)
     if _is_small_capital_profile(capital_profile):
@@ -351,6 +430,7 @@ def run_single_experiment(
         "low_memory": low_memory,
         "initial_cash": float(initial_cash),
         "max_positions": max_positions,
+        **factor_judge_status,
     }
     metadata_path = output_dir / "experiment_metadata.json"
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

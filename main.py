@@ -330,6 +330,7 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Skip existing low-memory selections/backtests.")
     parser.add_argument("--skip-data-steps", action="store_true", help="In low-memory mode, skip convert/clean/features and use saved feature parquet.")
     parser.add_argument("--governance", action="store_true", help="Run the phase-one daily decision-council backtest.")
+    parser.add_argument("--fast-factor-judge", action="store_true", help="Run the fast read-only factor judge without governance state machine.")
     parser.add_argument("--governance-start-date", default=CLI_GOVERNANCE_START_DATE)
     parser.add_argument("--governance-end-date", default=CLI_GOVERNANCE_END_DATE)
     parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS)
@@ -396,6 +397,12 @@ def parse_args():
         choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
         default="normal",
         help="Governance control switch for stop-mode experiments.",
+    )
+    parser.add_argument(
+        "--governance-alpha-bundle",
+        choices=["formal_defensive_bundle", "pre_screen_promote_bundle", "diversified_pre_screen_bundle_v2"],
+        default="diversified_pre_screen_bundle_v2",
+        help="Alpha bundle used by governance mainline review.",
     )
     parser.add_argument(
         "--disable-alpha-collapse-exit",
@@ -1054,6 +1061,7 @@ def _run_single_governance_variant(
     capital_profile: dict | None = None,
     governance_control_mode: str = "normal",
     alpha_collapse_exit_enabled: bool = True,
+    alpha_bundle: str | None = None,
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
     from functions.decision_council.runner import run_governance_backtest
@@ -1064,7 +1072,8 @@ def _run_single_governance_variant(
     capital_profile = capital_profile or get_backtest_capital_profile(DEFAULT_BACKTEST_CAPITAL_PROFILE)
     selected_universe_name = universe_name or variant_spec.universe_name
     universe_spec = get_universe_spec(selected_universe_name)
-    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / variant_spec.alpha_bundle
+    selected_alpha_bundle = str(alpha_bundle or variant_spec.alpha_bundle)
+    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / selected_alpha_bundle
     if _is_small_capital_profile(capital_profile):
         output_dir = output_dir / "small_capital_branch"
     control_mode = _governance_control_mode_from_args(argparse.Namespace(governance_control_mode=governance_control_mode))
@@ -1090,7 +1099,7 @@ def _run_single_governance_variant(
         output_dir=output_dir,
         universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
-        alpha_bundle=variant_spec.alpha_bundle,
+        alpha_bundle=selected_alpha_bundle,
         registry_version=REGISTRY_FRAMEWORK_VERSION,
         target_index_codes=tuple(universe_spec.target_index_codes),
         require_constituents=universe_spec.require_constituents,
@@ -1203,6 +1212,7 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         "governance_mainline_review",
         "governance_layer_validation",
         "governance_layer_ablation_suite",
+        "fast_factor_judge",
     }
     if not any(task in governance_tasks for task in tasks):
         return runtime_args
@@ -1240,6 +1250,9 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         runtime_args.governance_control_mode = control_mode
     if "alpha_collapse_exit_enabled" in governance:
         runtime_args.disable_alpha_collapse_exit = not bool(governance.get("alpha_collapse_exit_enabled"))
+    alpha_bundle = str(governance.get("alpha_bundle", "")).strip()
+    if alpha_bundle:
+        runtime_args.governance_alpha_bundle = alpha_bundle
     backtest = selection.get("backtest", {}) if isinstance(selection, dict) else {}
     if isinstance(backtest, dict):
         capital_profile = str(backtest.get("capital_profile", "")).strip()
@@ -1294,7 +1307,10 @@ def run_governance_mainline_review_from_main(args):
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
     capital_profile = _capital_profile_from_args(args)
     variant_name = "rules_based_president"
-    alpha_bundle = "president_core_bundle"
+    alpha_bundle = str(
+        getattr(args, "governance_alpha_bundle", "diversified_pre_screen_bundle_v2")
+        or "diversified_pre_screen_bundle_v2"
+    )
     shared_live_monitor = None
     if not args.no_live_monitor:
         shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
@@ -1319,7 +1335,7 @@ def run_governance_mainline_review_from_main(args):
             governance_control_mode=_governance_control_mode_from_args(args),
             alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
         )
-    report_path, comparison_path = build_report()
+    report_path, comparison_path = build_report(alpha_bundle=alpha_bundle)
     print(f"Saved review report: {report_path}")
     print(f"Saved comparison csv: {comparison_path}")
 
@@ -1372,7 +1388,7 @@ LAYER_ABLATION_SUITE = (
     ("governance_core_plus_regime", "validation_core_bundle", "10_core_plus_regime"),
     ("governance_core_plus_probability", "validation_core_bundle", "11_core_plus_probability"),
     ("governance_core_plus_complex_exit", "validation_core_bundle", "12_core_plus_complex_exit"),
-    ("governance_full_mainline_control", "president_core_bundle", "13_full_mainline_control"),
+    ("governance_full_mainline_control", "formal_defensive_bundle", "13_full_mainline_control"),
 )
 
 
@@ -1461,6 +1477,56 @@ def run_governance_layer_ablation_suite_from_main(args):
         print(f"Saved layer diagnostic {name}: {path}")
 
 
+def run_fast_factor_judge_from_main(args):
+    """Run fast read-only factor judgement for selected governance universes."""
+    from functions.decision_council.fast_factor_judge import FAST_FACTOR_FULL_HORIZONS, FAST_FACTOR_QUICK_HORIZONS, run_fast_factor_judge
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    selected_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    saved_runs = []
+    reset_progress(task_name="fast_factor_judge", total=len(selected_universes), message="starting fast factor judge")
+    try:
+        for universe_index, universe_name in enumerate(selected_universes, start=1):
+            print(f"Running fast factor judge universe: {universe_name}")
+            judge_max_days = getattr(args, "governance_max_days", None)
+            if judge_max_days is not None and int(judge_max_days) <= 0:
+                judge_max_days = None
+            large_pool_horizons = FAST_FACTOR_FULL_HORIZONS if judge_max_days is None else FAST_FACTOR_QUICK_HORIZONS
+            print(f"Fast factor judge window max_days={judge_max_days}, large_pool_horizons={large_pool_horizons}")
+
+            def _progress(payload, *, index=universe_index, total_universes=len(selected_universes), universe=universe_name):
+                inner_percent = float(payload.get("percent", 0.0) or 0.0)
+                total_percent = ((index - 1) + inner_percent / 100.0) / max(total_universes, 1) * 100.0
+                write_progress(
+                    task_name="fast_factor_judge",
+                    status="running",
+                    percent=total_percent,
+                    current=payload.get("current"),
+                    total=payload.get("total"),
+                    step=str(payload.get("step", "")),
+                    message=f"{universe}: {payload.get('message', '')}",
+                    detail=str(payload.get("detail", "")),
+                )
+
+            saved = run_fast_factor_judge(
+                universe_name=universe_name,
+                start_date=getattr(args, "governance_start_date", None),
+                end_date=getattr(args, "governance_end_date", None),
+                max_days=judge_max_days,
+                progress_callback=_progress,
+                large_pool_horizons=large_pool_horizons,
+            )
+            saved_runs.append(saved)
+            print("Fast factor judge saved:")
+            for name, path in sorted(saved.items()):
+                print(f"  {name}: {path}")
+        complete_progress(task_name="fast_factor_judge", message="fast factor judge complete")
+    except Exception as exc:
+        fail_progress(task_name="fast_factor_judge", message=str(exc))
+        raise
+    return saved_runs
+
+
 def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
     runtime_args = argparse.Namespace(**vars(args))
     profile = str(profile_name or "full").strip().lower()
@@ -1469,6 +1535,7 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
         "governance_mainline_review",
         "governance_layer_validation",
         "governance_layer_ablation_suite",
+        "fast_factor_judge",
     }
     touches_governance = any(task in governance_tasks for task in tasks)
 
@@ -1545,12 +1612,38 @@ def launch_interactive_main_menu():
 
 
 def run_interactive_selection(selection, args):
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
     reset_run_timestamp()
     tasks = [] if not selection else selection.get("tasks", [])
     profile = "full" if not selection else selection.get("profile", "full")
     if not tasks:
         print("Interactive launcher cancelled.")
         return
+    reset_progress(task_name="interactive_task_suite", total=len(tasks), message="starting selected tasks")
+
+    def _mark_task(task_name: str, task_index: int, status: str = "running"):
+        write_progress(
+            task_name="interactive_task_suite",
+            status=status,
+            percent=(task_index - 1) / max(len(tasks), 1) * 100.0,
+            current=task_index,
+            total=len(tasks),
+            step=task_name,
+            message=f"running task {task_index}/{len(tasks)}: {task_name}",
+        )
+
+    def _finish_task(task_name: str, task_index: int):
+        write_progress(
+            task_name="interactive_task_suite",
+            status="running",
+            percent=task_index / max(len(tasks), 1) * 100.0,
+            current=task_index,
+            total=len(tasks),
+            step=task_name,
+            message=f"finished task {task_index}/{len(tasks)}: {task_name}",
+        )
+
     if selection.get("sanitized_task_note"):
         print(f"Interactive task sanitization: {selection.get('sanitized_task_note')}")
     print(f"Interactive selected tasks: {tasks}")
@@ -1564,6 +1657,7 @@ def run_interactive_selection(selection, args):
         or "governance_mainline_review" in tasks
         or "governance_layer_validation" in tasks
         or "governance_layer_ablation_suite" in tasks
+        or "fast_factor_judge" in tasks
     ):
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         runtime_args.governance_universes = selected_universes
@@ -1575,30 +1669,57 @@ def run_interactive_selection(selection, args):
             f"max_days={runtime_args.governance_max_days}"
         )
 
-    if "main_pipeline" in tasks:
-        main(runtime_args)
-    if "governance_active" in tasks:
-        selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
-        capital_profile = _capital_profile_from_args(runtime_args)
-        _run_single_governance_variant(
-            "rules_based_president",
-            start_date=runtime_args.governance_start_date,
-            end_date=runtime_args.governance_end_date,
-            max_days=runtime_args.governance_max_days,
-            safety_proxy_mode=runtime_args.safety_proxy_mode,
-            universe_name=selected_universes[0],
-            enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
-            show_live_monitor=not runtime_args.no_live_monitor,
-            capital_profile=capital_profile,
-            governance_control_mode=_governance_control_mode_from_args(runtime_args),
-            alpha_collapse_exit_enabled=not bool(getattr(runtime_args, "disable_alpha_collapse_exit", False)),
-        )
-    if "governance_mainline_review" in tasks:
-        run_governance_mainline_review_from_main(runtime_args)
-    if "governance_layer_validation" in tasks:
-        run_governance_layer_validation_from_main(runtime_args)
-    if "governance_layer_ablation_suite" in tasks:
-        run_governance_layer_ablation_suite_from_main(runtime_args)
+    try:
+        task_counter = 0
+        if "main_pipeline" in tasks:
+            task_counter += 1
+            _mark_task("main_pipeline", task_counter)
+            main(runtime_args)
+            _finish_task("main_pipeline", task_counter)
+        if "governance_active" in tasks:
+            task_counter += 1
+            _mark_task("governance_active", task_counter)
+            selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
+            capital_profile = _capital_profile_from_args(runtime_args)
+            _run_single_governance_variant(
+                "rules_based_president",
+                start_date=runtime_args.governance_start_date,
+                end_date=runtime_args.governance_end_date,
+                max_days=runtime_args.governance_max_days,
+                safety_proxy_mode=runtime_args.safety_proxy_mode,
+                universe_name=selected_universes[0],
+                enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
+                show_live_monitor=not runtime_args.no_live_monitor,
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(runtime_args),
+                alpha_collapse_exit_enabled=not bool(getattr(runtime_args, "disable_alpha_collapse_exit", False)),
+                alpha_bundle=getattr(runtime_args, "governance_alpha_bundle", None),
+            )
+            _finish_task("governance_active", task_counter)
+        if "governance_mainline_review" in tasks:
+            task_counter += 1
+            _mark_task("governance_mainline_review", task_counter)
+            run_governance_mainline_review_from_main(runtime_args)
+            _finish_task("governance_mainline_review", task_counter)
+        if "governance_layer_validation" in tasks:
+            task_counter += 1
+            _mark_task("governance_layer_validation", task_counter)
+            run_governance_layer_validation_from_main(runtime_args)
+            _finish_task("governance_layer_validation", task_counter)
+        if "governance_layer_ablation_suite" in tasks:
+            task_counter += 1
+            _mark_task("governance_layer_ablation_suite", task_counter)
+            run_governance_layer_ablation_suite_from_main(runtime_args)
+            _finish_task("governance_layer_ablation_suite", task_counter)
+        if "fast_factor_judge" in tasks:
+            task_counter += 1
+            _mark_task("fast_factor_judge", task_counter)
+            run_fast_factor_judge_from_main(runtime_args)
+            _finish_task("fast_factor_judge", task_counter)
+        complete_progress(task_name="interactive_task_suite", message="selected tasks complete")
+    except Exception as exc:
+        fail_progress(task_name="interactive_task_suite", message=str(exc))
+        raise
 
 
 def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
@@ -2022,6 +2143,8 @@ if __name__ == "__main__":
             run_auto_completion()
         elif cli_args.registry_suite:
             run_registry_suite(cli_args)
+        elif cli_args.fast_factor_judge:
+            run_fast_factor_judge_from_main(cli_args)
         elif cli_args.governance:
             selected_universes = _normalize_governance_universes(getattr(cli_args, "governance_universes", None))
             capital_profile = _capital_profile_from_args(cli_args)
@@ -2037,6 +2160,7 @@ if __name__ == "__main__":
                 capital_profile=capital_profile,
                 governance_control_mode=_governance_control_mode_from_args(cli_args),
                 alpha_collapse_exit_enabled=not bool(getattr(cli_args, "disable_alpha_collapse_exit", False)),
+                alpha_bundle=getattr(cli_args, "governance_alpha_bundle", None),
             )
         elif cli_args.low_memory:
             run_low_memory(cli_args)

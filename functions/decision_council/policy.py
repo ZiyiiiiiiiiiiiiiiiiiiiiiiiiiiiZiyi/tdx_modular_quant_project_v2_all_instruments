@@ -64,6 +64,17 @@ ORDER_COLUMNS = [
     "future_loss_risk_score",
     "downtrend_decay_score",
     "post_entry_failure_score",
+    "alpha_active_model_count",
+    "alpha_active_module_count",
+    "alpha_active_family_count",
+    "alpha_max_active_module_share",
+    "alpha_range_grid_vote_share",
+    "entry_alpha_vote_count",
+    "timing_filter_vote_count",
+    "risk_override_vote_count",
+    "liquidity_guard_vote_count",
+    "state_machine_role_pass",
+    "state_machine_role_block_reason",
 ]
 
 
@@ -116,6 +127,7 @@ class RulesBasedPresidentPolicy:
         ranked_symbols = eligible.loc[
             (eligible["candidate_rank"] <= int(context.entry_rank_limit))
             & eligible.get("entry_confirmed", pd.Series(True, index=eligible.index)).fillna(False).astype(bool)
+            & eligible.apply(_state_machine_role_gate_pass, axis=1)
             & ~eligible.get("cooldown_active", pd.Series(False, index=eligible.index)).fillna(False).astype(bool)
             & ~eligible.get("exit_state", pd.Series(False, index=eligible.index)).fillna(False).astype(bool)
             & ~eligible.get("position_state", pd.Series("", index=eligible.index)).astype(str).str.lower().isin(
@@ -226,6 +238,19 @@ class RulesBasedPresidentPolicy:
             "module_candidate_score",
             "module_entry_score",
             "module_hold_score",
+            "alpha_active_model_count",
+            "alpha_active_module_count",
+            "alpha_active_family_count",
+            "alpha_max_active_module_share",
+            "alpha_range_grid_vote_share",
+            "entry_alpha_vote_count",
+            "timing_filter_vote_count",
+            "risk_override_vote_count",
+            "liquidity_guard_vote_count",
+            "hold_validation_vote_count",
+            "sell_trigger_vote_count",
+            "state_machine_role_pass",
+            "state_machine_role_block_reason",
             "orderflow_candidate_pass",
             "reversal_confirm_pass",
             "breakout_gate_pass",
@@ -309,6 +334,19 @@ class RulesBasedPresidentPolicy:
                     "module_candidate_score": pd.NA,
                     "module_entry_score": pd.NA,
                     "module_hold_score": pd.NA,
+                    "alpha_active_model_count": pd.NA,
+                    "alpha_active_module_count": pd.NA,
+                    "alpha_active_family_count": pd.NA,
+                    "alpha_max_active_module_share": pd.NA,
+                    "alpha_range_grid_vote_share": pd.NA,
+                    "entry_alpha_vote_count": pd.NA,
+                    "timing_filter_vote_count": pd.NA,
+                    "risk_override_vote_count": pd.NA,
+                    "liquidity_guard_vote_count": pd.NA,
+                    "hold_validation_vote_count": pd.NA,
+                    "sell_trigger_vote_count": pd.NA,
+                    "state_machine_role_pass": False,
+                    "state_machine_role_block_reason": "pending_locked",
                     "orderflow_candidate_pass": pd.NA,
                     "reversal_confirm_pass": pd.NA,
                     "breakout_gate_pass": pd.NA,
@@ -379,7 +417,9 @@ class RulesBasedPresidentPolicy:
                 and old <= 1e-12
                 and row is not None
                 and bool(row.get("entry_confirmed", False))
+                and _state_machine_role_gate_pass(row)
                 and str(row.get("entry_size_tier", "")).strip().lower() in {
+                    "basket_1_lot",
                     "diversify_1_lot",
                     "starter_1_lot",
                     "starter_2_lot",
@@ -419,6 +459,8 @@ class RulesBasedPresidentPolicy:
                     "cooldown",
                     "blocked",
                 }:
+                    continue
+                if delta > 0 and old <= 1e-12 and row is not None and not _state_machine_role_gate_pass(row):
                     continue
                 if delta > 0 and old > 1e-12 and row is not None and not bool(row.get("add_allowed", False)):
                     continue
@@ -510,6 +552,19 @@ class RulesBasedPresidentPolicy:
             "future_loss_risk_score": get("future_loss_risk_score", pd.NA),
             "downtrend_decay_score": get("downtrend_decay_score", pd.NA),
             "post_entry_failure_score": get("post_entry_failure_score", pd.NA),
+            "alpha_active_model_count": get("alpha_active_model_count", pd.NA),
+            "alpha_active_module_count": get("alpha_active_module_count", pd.NA),
+            "alpha_active_family_count": get("alpha_active_family_count", pd.NA),
+            "alpha_max_active_module_share": get("alpha_max_active_module_share", pd.NA),
+            "alpha_range_grid_vote_share": get("alpha_range_grid_vote_share", pd.NA),
+            "entry_alpha_vote_count": get("entry_alpha_vote_count", pd.NA),
+            "timing_filter_vote_count": get("timing_filter_vote_count", pd.NA),
+            "risk_override_vote_count": get("risk_override_vote_count", pd.NA),
+            "liquidity_guard_vote_count": get("liquidity_guard_vote_count", pd.NA),
+            "hold_validation_vote_count": get("hold_validation_vote_count", pd.NA),
+            "sell_trigger_vote_count": get("sell_trigger_vote_count", pd.NA),
+            "state_machine_role_pass": bool(get("state_machine_role_pass", False)),
+            "state_machine_role_block_reason": get("state_machine_role_block_reason", ""),
         }
 
 
@@ -528,6 +583,17 @@ def _prepare_candidates(candidates):
         ordered = data.sort_values(["primary_score", "symbol"], ascending=[False, True]).index
         data.loc[ordered, "candidate_rank"] = range(1, len(data) + 1)
     return data
+
+
+def _state_machine_role_gate_pass(candidate_row) -> bool:
+    if candidate_row is None:
+        return False
+    if "state_machine_role_pass" not in candidate_row:
+        return True
+    value = candidate_row.get("state_machine_role_pass", False)
+    if pd.isna(value):
+        return False
+    return bool(value)
 
 
 def _apply_policy_risk_hard_gate(allocated: pd.DataFrame, *, current_weights, diagnostics: dict) -> tuple[pd.DataFrame, dict]:
@@ -591,7 +657,8 @@ def _best_replacement_edge(eligible: pd.DataFrame, held_symbols: set[str]) -> fl
     if data.empty:
         return 0.0
     score_col = "entry_matrix_score" if "entry_matrix_score" in data.columns else "expected_edge_10d"
-    score = pd.to_numeric(data.get(score_col), errors="coerce").dropna()
+    score_source = data[score_col] if score_col in data.columns else pd.Series(0.0, index=data.index)
+    score = pd.to_numeric(score_source, errors="coerce").dropna()
     if score.empty:
         return 0.0
     return float(score.quantile(0.90))

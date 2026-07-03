@@ -88,6 +88,20 @@ def check_file_exists(path: Path, label: str, failures: list[str]):
     return False
 
 
+def check_report_exists(path: Path, label: str, failures: list[str], pattern: str):
+    if path.exists():
+        print(f"[PASS] {label}: {path}")
+        return True
+    candidates = sorted(path.parent.glob(pattern), key=lambda item: item.stat().st_mtime, reverse=True)
+    if candidates:
+        latest = candidates[0]
+        print(f"[PASS] {label}: configured path missing, using latest {latest}")
+        return True
+    print(f"[FAIL] {label}: missing {path} and no fallback matching {pattern}")
+    failures.append(f"{label} missing: {path}")
+    return False
+
+
 def check_columns(frame: pd.DataFrame, required_columns: set[str], label: str, failures: list[str]):
     missing = sorted(required_columns - set(frame.columns))
     if not missing:
@@ -104,9 +118,14 @@ def verify_mainline_outputs():
     raw_ok = check_file_exists(RAW_DAILY_PARQUET, "raw parquet", failures)
     clean_ok = check_file_exists(CLEAN_DAILY_PARQUET, "clean parquet", failures)
     feature_ok = check_file_exists(FEATURE_DAILY_PARQUET, "feature parquet", failures)
-    check_file_exists(FEATURE_MEMORY_REPORT_CSV, "feature memory report", failures)
-    check_file_exists(DATA_CONTINUITY_REPORT_CSV, "data continuity report", failures)
-    check_file_exists(ADJUSTMENT_PTI_QUALITY_CSV, "adjustment pti coverage report", failures)
+    check_report_exists(FEATURE_MEMORY_REPORT_CSV, "feature memory report", failures, "feature_memory_report_run*.csv")
+    check_report_exists(DATA_CONTINUITY_REPORT_CSV, "data continuity report", failures, "data_continuity_report_run*.csv")
+    check_report_exists(
+        ADJUSTMENT_PTI_QUALITY_CSV,
+        "adjustment pti coverage report",
+        failures,
+        "adjustment_pti_quality_report_run*.csv",
+    )
 
     if feature_ok:
         feature_df = pd.read_parquet(FEATURE_DAILY_PARQUET, columns=list(REQUIRED_FEATURE_COLUMNS))

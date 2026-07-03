@@ -97,6 +97,7 @@ ENABLE_LEARNING_STRATEGIES = True
 LEARNING_STRATEGY_WHITELIST = None
 ENABLE_PLACEHOLDER_STRATEGIES = False
 ENABLE_QUANTUM_INSPIRED_STRATEGIES = False
+ENABLE_PRE_SCREEN_CANDIDATE_FACTOR_POOL = True
 
 ENABLE_EXPERIMENT_TRACKING = True
 RUN_ID_PREFIX = "run"
@@ -691,6 +692,51 @@ GOVERNANCE_ALPHA_MODEL_FEATURES = {
     "kdj_oversold_cross": "score_kdj_oversold_cross",
     "low_volume_pullback": "score_low_volume_pullback",
     "ml_alpha": "score_ml_alpha",
+    # 2026-07-02 fast judge pre-screen promote factors. These candidate
+    # columns are generated on demand by factor_candidate_pool, so they do not
+    # need to be materialized in the base feature parquet.
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": "cand_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30": "cand_grid_rank_ratio__rev_3__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30": "cand_grid_rank_ratio__rev_2__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20": "cand_grid_rank_ratio__rev_3__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10": "cand_grid_rank_ratio__rev_3__amihud_neg_10",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20": "cand_grid_rank_spread__rev_3__amihud_neg_20",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20": "cand_grid_rank_spread__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg": "cand_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30": "cand_grid_rank_spread__rev_3__amihud_neg_30",
+    "candidate_grid_rank_product__rev_3__size_float_neg": "cand_grid_rank_product__rev_3__size_float_neg",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": "cand_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_product__rev_2__size_total_neg": "cand_grid_rank_product__rev_2__size_total_neg",
+    "candidate_grid_rank_product__rev_2__size_float_neg": "cand_grid_rank_product__rev_2__size_float_neg",
+    "candidate_grid_base_rank__rev_40": "cand_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": "cand_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg": "cand_grid_rank_gate_hi__rev_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg": "cand_grid_rank_gate_hi__ret_3__size_float_neg",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": "cand_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg": "cand_grid_rank_gate_hi__ret_2__size_total_neg",
+    "candidate_grid_base_rank__rev_30": "cand_grid_base_rank__rev_30",
+    "candidate_idiosyncratic_vol_60_neg": "cand_idiosyncratic_vol_60_neg",
+    "candidate_grid_rank_mean__rev_2__rev_40": "cand_grid_rank_mean__rev_2__rev_40",
+    "candidate_grid_rank_mean__rev_3__rev_40": "cand_grid_rank_mean__rev_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90": "cand_grid_base_rank__vol_neg_90",
+    "candidate_grid_rank_mean__ret_3__rev_40": "cand_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_30": "cand_grid_base_rank__vol_neg_30",
+    "candidate_volatility_60_neg": "cand_volatility_60_neg",
+    "candidate_volatility_20_neg": "cand_volatility_20_neg",
+    "candidate_size_total_cap_neg": "cand_size_total_cap_neg",
+    "candidate_size_float_cap_neg": "cand_size_float_cap_neg",
+    "candidate_grid_base_rank__size_total_neg": "cand_grid_base_rank__size_total_neg",
+    "candidate_grid_base_rank__size_float_neg": "cand_grid_base_rank__size_float_neg",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_10": "cand_grid_rank_ratio__rev_2__amihud_neg_10",
+    "candidate_grid_rank_product__ret_3__rev_40": "cand_grid_rank_product__ret_3__rev_40",
+    "candidate_grid_rank_product__rev_3__rev_40": "cand_grid_rank_product__rev_3__rev_40",
+    "candidate_grid_rank_gate_hi__rev_3__size_float_neg": "cand_grid_rank_gate_hi__rev_3__size_float_neg",
+    "candidate_grid_rank_mean__rev_1__rev_40": "cand_grid_rank_mean__rev_1__rev_40",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": "cand_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": "cand_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_base_rank__vol_neg_60": "cand_grid_base_rank__vol_neg_60",
+    "candidate_grid_base_rank__downvol_neg_60": "cand_grid_base_rank__downvol_neg_60",
+    "candidate_downside_volatility_60_neg": "cand_downside_volatility_60_neg",
     # Fundamental factors
     "value": "score_value",
     "quality": "score_quality",
@@ -698,6 +744,199 @@ GOVERNANCE_ALPHA_MODEL_FEATURES = {
     "fundamental": "score_fundamental",
 }
 GOVERNANCE_ALPHA_MODELS = tuple(GOVERNANCE_ALPHA_MODEL_FEATURES)
+GOVERNANCE_FACTOR_JUDGE_RUN_ID = "run20260701_201606_233579"
+GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID = "run20260701_201606_233579"
+GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS = (
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30",
+    "candidate_grid_rank_product__rev_3__size_float_neg",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_product__rev_2__size_total_neg",
+    "candidate_grid_rank_product__rev_2__size_float_neg",
+    "candidate_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg",
+    "candidate_grid_base_rank__rev_30",
+    "candidate_idiosyncratic_vol_60_neg",
+    "candidate_grid_rank_mean__rev_2__rev_40",
+    "candidate_grid_rank_mean__rev_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90",
+    "candidate_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_30",
+    "candidate_volatility_60_neg",
+    "candidate_volatility_20_neg",
+)
+GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY = {
+    "judge_run_id": GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID,
+    "source_pool": "486 promote_candidate + 114 watchlist from the 2026-07-02 fast judge",
+    "selected_count": len(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS),
+    "watchlist_policy": "observe_only_until_rejudged",
+    "style_only_policy": "size and grid_size are observed as style exposure, not traded as standalone alpha",
+    "indispensable_exceptions": (),
+}
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_DIR = PROCESSED_DIR / "candidate_factor_cache"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_BUNDLE = "pre_screen_promote_bundle"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_VERSION = "pre_screen_promote_v1_20260702"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS = 260
+GOVERNANCE_PRE_SCREEN_FACTOR_ROLE_WEIGHTS = {
+    "liquidity_reversal_entry": {
+        "state_machine_target": "entry_alpha_and_timing",
+        "weight": 0.46,
+        "models": (
+            "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_30",
+            "candidate_grid_rank_ratio__rev_2__amihud_neg_30",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_20",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_10",
+            "candidate_grid_rank_spread__rev_3__amihud_neg_20",
+            "candidate_grid_rank_spread__rev_2__amihud_neg_20",
+            "candidate_grid_rank_spread__rev_3__amihud_neg_30",
+            "candidate_grid_rank_spread__rev_2__amihud_neg_30",
+        ),
+    },
+    "size_conditioned_reversal": {
+        "state_machine_target": "candidate_sort_and_risk_penalty_context",
+        "weight": 0.28,
+        "models": (
+            "candidate_grid_rank_product__rev_3__size_total_neg",
+            "candidate_grid_rank_product__rev_3__size_float_neg",
+            "candidate_grid_rank_product__rev_2__size_total_neg",
+            "candidate_grid_rank_product__rev_2__size_float_neg",
+            "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+            "candidate_grid_rank_gate_hi__rev_3__size_total_neg",
+            "candidate_grid_rank_gate_hi__ret_3__size_float_neg",
+            "candidate_grid_rank_gate_hi__rev_2__size_total_neg",
+            "candidate_grid_rank_gate_hi__ret_2__size_total_neg",
+        ),
+    },
+    "medium_reversal_blend": {
+        "state_machine_target": "signal_retention_and_stale_exit_context",
+        "weight": 0.16,
+        "models": (
+            "candidate_grid_base_rank__rev_40",
+            "candidate_grid_base_rank__rev_30",
+            "candidate_grid_rank_mean__rev_2__rev_40",
+            "candidate_grid_rank_mean__rev_3__rev_40",
+            "candidate_grid_rank_mean__ret_3__rev_40",
+        ),
+    },
+    "volatility_defense": {
+        "state_machine_target": "risk_filter_and_add_block_context",
+        "weight": 0.10,
+        "models": (
+            "candidate_idiosyncratic_vol_60_neg",
+            "candidate_grid_base_rank__vol_neg_90",
+            "candidate_grid_base_rank__vol_neg_30",
+            "candidate_volatility_60_neg",
+            "candidate_volatility_20_neg",
+        ),
+    },
+}
+GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS = {
+    # 2026-07-01 fast judge result: no formal factor passed admission.
+    # These weights are intentionally defensive: keep only the less-bad and
+    # interpretable signals for a mainline re-test, while suppressing missing,
+    # redundant, negative-direction, or high-turnover factors.
+    "limit_up_follow": 0.45,
+    "mean_reversion": 0.35,
+    "rsi_reversal": 0.30,
+    "macd_trend": 0.25,
+    "orderflow_amount_shock": 0.20,
+    "grid_trading": 0.18,
+    "consecutive_decline_rebound": 0.12,
+    "kdj_oversold_cross": 0.10,
+    "alpha_hedge": 0.08,
+    "event_driven": 0.08,
+    "mom_lowvol": 0.05,
+    "ma_break": 0.05,
+    "momentum_20": 0.05,
+    "orderflow_efficiency": 0.04,
+    "orderflow_accumulation": 0.04,
+    "orderflow_close_drive": 0.03,
+    "eod_close_strength": 0.03,
+    "price_volume_breakout": 0.03,
+    "turtle_breakout": 0.02,
+    "macd_cross": 0.02,
+    "ma_cross": 0.02,
+    "holiday_effect": 0.01,
+    "low_volume_pullback": 0.01,
+    "ml_alpha": 0.0,
+    "value": 0.0,
+    "quality": 0.0,
+    "growth": 0.0,
+    "fundamental": 0.0,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": 0.1200,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30": 0.1190,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30": 0.1190,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20": 0.1184,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10": 0.1142,
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20": 0.1118,
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20": 0.1112,
+    "candidate_grid_rank_product__rev_3__size_total_neg": 0.1094,
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30": 0.1072,
+    "candidate_grid_rank_product__rev_3__size_float_neg": 0.1072,
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": 0.1067,
+    "candidate_grid_rank_product__rev_2__size_total_neg": 0.1056,
+    "candidate_grid_rank_product__rev_2__size_float_neg": 0.1047,
+    "candidate_grid_base_rank__rev_40": 0.1022,
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": 0.0856,
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg": 0.0838,
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg": 0.0836,
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": 0.0828,
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg": 0.0821,
+    "candidate_grid_base_rank__rev_30": 0.0799,
+    "candidate_idiosyncratic_vol_60_neg": 0.0642,
+    "candidate_grid_rank_mean__rev_2__rev_40": 0.0588,
+    "candidate_grid_rank_mean__rev_3__rev_40": 0.0580,
+    "candidate_grid_base_rank__vol_neg_90": 0.0521,
+    "candidate_grid_rank_mean__ret_3__rev_40": 0.0515,
+    "candidate_grid_base_rank__vol_neg_30": 0.0488,
+    "candidate_volatility_60_neg": 0.0434,
+    "candidate_volatility_20_neg": 0.0392,
+    "candidate_size_total_cap_neg": 0.1200,
+    "candidate_size_float_cap_neg": 0.1100,
+    "candidate_grid_base_rank__size_total_neg": 0.1150,
+    "candidate_grid_base_rank__size_float_neg": 0.1050,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_10": 0.1000,
+    "candidate_grid_rank_product__ret_3__rev_40": 0.0880,
+    "candidate_grid_rank_product__rev_3__rev_40": 0.0840,
+    "candidate_grid_rank_gate_hi__rev_3__size_float_neg": 0.0820,
+    "candidate_grid_rank_mean__rev_1__rev_40": 0.0780,
+    "candidate_grid_base_rank__vol_neg_60": 0.0740,
+    "candidate_grid_base_rank__downvol_neg_60": 0.0700,
+    "candidate_downside_volatility_60_neg": 0.0660,
+}
+GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS = {
+    # Negative rank-IC names from the 2026-07-01 judge are treated as inverse
+    # signals when still retained at a small diagnostic weight.
+    "grid_trading": -1.0,
+    "alpha_hedge": -1.0,
+    "event_driven": -1.0,
+    "mom_lowvol": -1.0,
+    "ma_break": -1.0,
+    "momentum_20": -1.0,
+    "orderflow_efficiency": -1.0,
+    "orderflow_accumulation": -1.0,
+    "orderflow_close_drive": -1.0,
+    "eod_close_strength": -1.0,
+    "price_volume_breakout": -1.0,
+    "turtle_breakout": -1.0,
+    "macd_cross": -1.0,
+    "ma_cross": -1.0,
+    "holiday_effect": -1.0,
+    "low_volume_pullback": -1.0,
+}
+GOVERNANCE_FACTOR_JUDGED_MIN_WEIGHT = 0.01
 GOVERNANCE_ALPHA_CANDIDATE_LIMIT = 200
 GOVERNANCE_DEFAULT_TOP_N = 20
 GOVERNANCE_ENTRY_RANK_LIMIT = 20
@@ -783,6 +1022,74 @@ GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION = 0.35
 GOVERNANCE_HIGH_EXPOSURE_MIN_ACTUAL_TARGET_RATIO = 0.60
 GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL = 0.0
 
+# Governance research diagnostics and admission gates. These are report-layer
+# thresholds first; trading behavior should only consume them after a separate
+# validation pass.
+GOVERNANCE_FACTOR_MIN_COVERAGE = 0.60
+GOVERNANCE_FACTOR_MIN_ABS_RANK_IC = 0.015
+GOVERNANCE_FACTOR_MIN_IC_IR = 0.20
+GOVERNANCE_FACTOR_MIN_RANK_IC_POSITIVE_RATIO = 0.52
+GOVERNANCE_FACTOR_MIN_TOP_BOTTOM_SPREAD_10D = 0.0
+GOVERNANCE_FACTOR_MIN_SAMPLE_COUNT = 500
+GOVERNANCE_CLUSTER_MAX_WEIGHT = 0.25
+GOVERNANCE_ENTRY_CALIBRATION_MIN_BUCKET_SAMPLES = 30
+GOVERNANCE_ENTRY_CALIBRATION_MIN_WILSON_LOWER = 0.48
+GOVERNANCE_ENTRY_CALIBRATION_MIN_EXPECTANCY_10D = 0.0
+GOVERNANCE_ENTRY_CALIBRATION_MAX_OVERCONFIDENCE_GAP = 0.10
+GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N = 5.0
+GOVERNANCE_RESEARCH_MAX_TOP1_ACCOUNT_WEIGHT = 0.25
+GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM = 0.80
+GOVERNANCE_INDUSTRY_MAX_WEIGHT = 0.30
+GOVERNANCE_SINGLE_SYMBOL_MAX_WEIGHT_RESEARCH = 0.20
+GOVERNANCE_ALPHA_DIVERSIFICATION_RULES = {
+    "max_module_weight_share": 0.35,
+    "max_module_factor_count": 6,
+    "max_family_count": 2,
+    "max_pairwise_rank_corr": 0.85,
+    "max_redundancy_flag_ratio": 0.40,
+    "min_distinct_modules": 4,
+    "min_distinct_families": 6,
+    "range_grid_max_weight_share": 0.35,
+}
+GOVERNANCE_STATE_MACHINE_ROLE_REQUIREMENTS = {
+    "entry_alpha": {"min_modules": 3, "max_single_module_share": 0.35},
+    "timing_filter": {"min_modules": 2},
+    "hold_validation": {"min_modules": 2},
+    "sell_trigger": {"min_modules": 2},
+    "risk_override": {"min_modules": 2},
+}
+GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2 = (
+    "candidate_size_total_cap_neg",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90",
+)
+GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP = {
+    "candidate_size_total_cap_neg": ("style_balance", "risk_override"),
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": ("entry_alpha", "timing_filter", "liquidity_filter"),
+    "candidate_grid_rank_product__rev_3__size_total_neg": ("style_balance", "entry_alpha"),
+    "candidate_grid_base_rank__rev_40": ("entry_alpha", "timing_filter", "hold_validation"),
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": ("entry_alpha", "timing_filter", "style_balance"),
+    "candidate_grid_rank_mean__ret_3__rev_40": ("entry_alpha", "timing_filter", "hold_validation"),
+    "candidate_grid_base_rank__vol_neg_90": ("risk_override", "style_balance", "hold_validation", "sell_trigger"),
+}
+GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE = {
+    "enabled": True,
+    "min_active_modules": 3,
+    "min_active_families": 3,
+    "max_active_module_share": 0.70,
+    "max_range_grid_vote_share": 0.35,
+    "min_entry_alpha_votes": 1,
+    "min_timing_filter_votes": 1,
+    "min_risk_or_liquidity_votes": 1,
+    "min_hold_validation_votes": 1,
+    "min_sell_trigger_votes": 1,
+    "active_model_percentile": 0.55,
+}
+
 # Governance position-state controls. These values are deliberately conservative:
 # they allow fast first buys on strong matrix evidence, but prevent naked averaging
 # down after an exit decision has already won the priority contest.
@@ -817,6 +1124,14 @@ GOVERNANCE_DIVERSIFY_ENTRY_TIMING_MIN = 0.52
 GOVERNANCE_DIVERSIFY_FOLLOW_THROUGH_MIN = 0.50
 GOVERNANCE_DIVERSIFY_EXHAUSTION_MAX = 0.55
 GOVERNANCE_DIVERSIFY_DOWNTREND_MAX = 0.55
+GOVERNANCE_BASKET_ENTRY_ENABLED = True
+GOVERNANCE_BASKET_ENTRY_MIN_FINAL_SCORE_PCT = 0.94
+GOVERNANCE_BASKET_ENTRY_MIN_MATRIX_SCORE_PCT = 0.88
+GOVERNANCE_BASKET_ENTRY_MIN_ALPHA_QUALITY_PCT = 0.55
+GOVERNANCE_BASKET_ENTRY_MIN_TIMING_PCT = 0.55
+GOVERNANCE_BASKET_ENTRY_MIN_FOLLOW_THROUGH = 0.48
+GOVERNANCE_BASKET_ENTRY_MAX_EXHAUSTION = 0.58
+GOVERNANCE_BASKET_ENTRY_MAX_DOWNTREND = 0.58
 GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL = 0.95
 GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_WEAK = 0.55
 GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_HIGH = 0.35
@@ -833,6 +1148,13 @@ GOVERNANCE_DEFENSIVE_SLEEVE_ASSETS = {
 GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK = 0.55
 GOVERNANCE_DOWNTREND_DECAY_EXIT = 0.75
 GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE = 0.70
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_SCORE = 0.62
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_DAYS = (3, 5, 8)
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_THRESHOLDS = (
+    (3, 0.68),
+    (5, 0.62),
+    (8, 0.58),
+)
 GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS = 3
 GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS = 20
 # Hard-stop is a profit-protection stop, not an entry-failure stop. It only arms
@@ -851,6 +1173,9 @@ GOVERNANCE_PROFIT_GIVEBACK_3 = 0.25
 GOVERNANCE_STALE_WATCH_DAYS = 10
 GOVERNANCE_STALE_REDUCE_DAYS = 20
 GOVERNANCE_STALE_EXIT_DAYS = 30
+GOVERNANCE_STALE_EXIT_MIN_ALPHA_DROP = 0.10
+GOVERNANCE_STALE_EXIT_MIN_LIQUIDITY_DECAY = 0.20
+GOVERNANCE_STALE_EXIT_MAX_MFE = 0.03
 GOVERNANCE_HARD_STOP_COOLDOWN_DAYS = 10
 GOVERNANCE_PROFIT_TAKE_COOLDOWN_DAYS = 3
 GOVERNANCE_SIGNAL_FAILURE_COOLDOWN_DAYS = 5
@@ -858,6 +1183,9 @@ GOVERNANCE_LAYER_ADD_GAPS = (-0.03, -0.06)
 GOVERNANCE_LAYER_WEIGHTS = (0.40, 0.30, 0.20, 0.10)
 GOVERNANCE_MAX_ADD_LAYERS_RETAIL_20K = 3
 GOVERNANCE_MAX_ADD_LAYERS_LARGE = 4
+GOVERNANCE_ADD_MIN_FACTOR_CONVICTION = 0.60
+GOVERNANCE_ADD_MIN_SIGNAL_RETENTION = 0.55
+GOVERNANCE_RISK_CONTRIBUTION_SCORE_PENALTY = 0.20
 
 # Position-management P0 contract defaults. These values define the first
 # conservative Kelly implementation and are intentionally explicit because the
@@ -1001,7 +1329,7 @@ REGISTRY_COMPARISON_REPORT_CSV = dated_artifact_path(REPORT_DIR / "registry_comp
 
 # Default registry selections (can be overridden by CLI or experiment plan)
 DEFAULT_UNIVERSE_NAME = "hs300_csi500_a500_strict"
-DEFAULT_ALPHA_BUNDLE = "president_core_bundle"
+DEFAULT_ALPHA_BUNDLE = "formal_defensive_bundle"
 DEFAULT_GOVERNANCE_VARIANT = "rules_based_president"
 
 # Experiment output structure: results/governance/{universe}/{variant}/{bundle}/

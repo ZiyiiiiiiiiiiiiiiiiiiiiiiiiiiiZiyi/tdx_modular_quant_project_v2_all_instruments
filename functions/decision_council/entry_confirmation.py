@@ -22,6 +22,14 @@ from config import (
     GOVERNANCE_ALPHA_QUALITY_STARTER_1,
     GOVERNANCE_ALPHA_QUALITY_STARTER_2,
     GOVERNANCE_ALPHA_QUALITY_STRONG_STARTER,
+    GOVERNANCE_BASKET_ENTRY_ENABLED,
+    GOVERNANCE_BASKET_ENTRY_MAX_DOWNTREND,
+    GOVERNANCE_BASKET_ENTRY_MAX_EXHAUSTION,
+    GOVERNANCE_BASKET_ENTRY_MIN_ALPHA_QUALITY_PCT,
+    GOVERNANCE_BASKET_ENTRY_MIN_FINAL_SCORE_PCT,
+    GOVERNANCE_BASKET_ENTRY_MIN_FOLLOW_THROUGH,
+    GOVERNANCE_BASKET_ENTRY_MIN_MATRIX_SCORE_PCT,
+    GOVERNANCE_BASKET_ENTRY_MIN_TIMING_PCT,
     GOVERNANCE_DIVERSIFY_ALPHA_QUALITY_MIN,
     GOVERNANCE_DIVERSIFY_DOWNTREND_MAX,
     GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN,
@@ -501,6 +509,7 @@ def apply_entry_confirmation(
         + 0.20 * data["empirical_distribution_score"]
         + 0.10 * (1.0 - data["downtrend_decay_score"])
     ).clip(0.0, 1.0)
+    data["final_entry_score_percentile"] = data["final_entry_score"].rank(pct=True).fillna(0.0)
     starter_1 = (
         data["entry_matrix_score"].ge(float(GOVERNANCE_ENTRY_MATRIX_STARTER_1))
         & data["alpha_quality_score"].ge(float(GOVERNANCE_ALPHA_QUALITY_STARTER_1))
@@ -541,9 +550,25 @@ def apply_entry_confirmation(
         & data["exhaustion_score"].lt(float(GOVERNANCE_DIVERSIFY_EXHAUSTION_MAX))
         & data["downtrend_decay_score"].lt(float(GOVERNANCE_DIVERSIFY_DOWNTREND_MAX))
     )
+    role_pass = data.get("state_machine_role_pass", pd.Series(True, index=data.index)).fillna(False).astype(bool)
+    basket_entry = (
+        bool(GOVERNANCE_BASKET_ENTRY_ENABLED)
+        & role_pass
+        & data["final_entry_score_percentile"].ge(float(GOVERNANCE_BASKET_ENTRY_MIN_FINAL_SCORE_PCT))
+        & data["entry_matrix_percentile"].ge(float(GOVERNANCE_BASKET_ENTRY_MIN_MATRIX_SCORE_PCT))
+        & data["alpha_quality_percentile"].ge(float(GOVERNANCE_BASKET_ENTRY_MIN_ALPHA_QUALITY_PCT))
+        & data["entry_timing_percentile"].ge(float(GOVERNANCE_BASKET_ENTRY_MIN_TIMING_PCT))
+        & data["follow_through_score"].ge(float(GOVERNANCE_BASKET_ENTRY_MIN_FOLLOW_THROUGH))
+        & data["exhaustion_score"].lt(float(GOVERNANCE_BASKET_ENTRY_MAX_EXHAUSTION))
+        & data["downtrend_decay_score"].lt(float(GOVERNANCE_BASKET_ENTRY_MAX_DOWNTREND))
+        & checks["liquidity_confirmation"].astype(bool)
+        & checks["volatility_confirmation"].astype(bool)
+        & ~risk_blocks_new_buy.astype(bool)
+    )
     data["entry_size_tier"] = (
         pd.Series("blocked", index=data.index)
         .mask(data["entry_matrix_score"].ge(float(GOVERNANCE_ENTRY_MATRIX_WATCH_THRESHOLD)), "watching")
+        .mask(basket_entry, "basket_1_lot")
         .mask(diversify_1, "diversify_1_lot")
         .mask(starter_1, "starter_1_lot")
         .mask(starter_2, "starter_2_lot")
@@ -552,6 +577,7 @@ def apply_entry_confirmation(
     )
     data["planned_entry_lots"] = (
         pd.Series(0.0, index=data.index)
+        .mask(basket_entry, 1.0)
         .mask(diversify_1, 1.0)
         .mask(starter_1, 1.0)
         .mask(starter_2, 2.0)
@@ -594,6 +620,7 @@ def apply_entry_confirmation(
             starter_1.astype(bool)
             | starter_2.astype(bool)
             | strong_starter.astype(bool)
+            | basket_entry.astype(bool)
             | strong_matrix_confirm.astype(bool)
             | surge_matrix_confirm.astype(bool)
             | (force_deploy and diversify_1.astype(bool))

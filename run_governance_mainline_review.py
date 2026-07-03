@@ -12,7 +12,7 @@ from run_governance_experiments import run_single_experiment
 
 REVIEW_UNIVERSES = ("hs300_csi500_a500_strict", "hs300_strict")
 VARIANT_NAME = "rules_based_president"
-ALPHA_BUNDLE = "president_core_bundle"
+ALPHA_BUNDLE = "diversified_pre_screen_bundle_v2"
 
 
 def parse_args():
@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--start-date", default=GOVERNANCE_START_DATE)
     parser.add_argument("--end-date", default=GOVERNANCE_END_DATE)
     parser.add_argument("--max-days", type=int, default=None)
+    parser.add_argument("--alpha-bundle", default=ALPHA_BUNDLE)
     parser.add_argument("--no-live-monitor", action="store_true", help="Disable the per-universe live popup monitor.")
     return parser.parse_args()
 
@@ -48,14 +49,14 @@ def main() -> None:
         print("=" * 72)
         run_single_experiment(
             variant_name=VARIANT_NAME,
-            alpha_bundle=ALPHA_BUNDLE,
+            alpha_bundle=args.alpha_bundle,
             universe_name=universe_name,
             start_date=args.start_date,
             end_date=args.end_date,
             max_days=args.max_days,
             show_live_monitor=not args.no_live_monitor,
         )
-    report_path, comparison_path = build_report()
+    report_path, comparison_path = build_report(alpha_bundle=args.alpha_bundle)
     print(f"Saved review report: {report_path}")
     print(f"Saved comparison csv: {comparison_path}")
     _show_completion_popup(report_path, comparison_path)
