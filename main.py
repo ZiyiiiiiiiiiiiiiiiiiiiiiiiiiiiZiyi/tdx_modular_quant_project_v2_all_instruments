@@ -331,6 +331,12 @@ def parse_args():
     parser.add_argument("--skip-data-steps", action="store_true", help="In low-memory mode, skip convert/clean/features and use saved feature parquet.")
     parser.add_argument("--governance", action="store_true", help="Run the phase-one daily decision-council backtest.")
     parser.add_argument("--fast-factor-judge", action="store_true", help="Run the fast read-only factor judge without governance state machine.")
+    parser.add_argument(
+        "--fast-factor-max-count",
+        type=int,
+        default=None,
+        help="Optional cap for fast factor judge registry size. Leave empty to use the full registered pool.",
+    )
     parser.add_argument("--governance-start-date", default=CLI_GOVERNANCE_START_DATE)
     parser.add_argument("--governance-end-date", default=CLI_GOVERNANCE_END_DATE)
     parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS)
@@ -1243,6 +1249,12 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         if max_days_int <= 0:
             raise ValueError("Governance max trading days must be positive.")
         runtime_args.governance_max_days = max_days_int
+    fast_factor_max_count = governance.get("fast_factor_max_count")
+    if fast_factor_max_count is not None and str(fast_factor_max_count).strip():
+        fast_factor_max_count_int = int(str(fast_factor_max_count).strip())
+        if fast_factor_max_count_int <= 0:
+            raise ValueError("Fast factor max count must be positive.")
+        runtime_args.fast_factor_max_count = fast_factor_max_count_int
     if "shadow_portfolios" in governance:
         runtime_args.governance_shadow_portfolios = bool(governance.get("shadow_portfolios"))
     control_mode = str(governance.get("control_mode", "")).strip()
@@ -1514,6 +1526,7 @@ def run_fast_factor_judge_from_main(args):
                 end_date=getattr(args, "governance_end_date", None),
                 max_days=judge_max_days,
                 progress_callback=_progress,
+                max_factor_count=getattr(args, "fast_factor_max_count", None),
                 large_pool_horizons=large_pool_horizons,
             )
             saved_runs.append(saved)

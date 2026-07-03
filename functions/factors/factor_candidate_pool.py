@@ -114,6 +114,7 @@ CANDIDATE_FACTOR_SPECS: tuple[CandidateFactorSpec, ...] = (
 
 
 ULTRA_GRID_FACTOR_TARGET_COUNT = 5200
+MATRIX_FACTOR_TARGET_COUNT = 4800
 
 
 def _ultra_base_signal_defs() -> list[dict]:
@@ -145,6 +146,28 @@ def _ultra_base_signal_defs() -> list[dict]:
             {"key": "size_total_neg", "module": "grid_size"},
             {"key": "value_proxy", "module": "grid_value_proxy"},
             {"key": "quality_proxy", "module": "grid_quality_proxy"},
+            {"key": "macd_hist_12_26_9", "module": "macd"},
+            {"key": "macd_cross_strength_12_26_9", "module": "macd"},
+            {"key": "rsi_6_reversal", "module": "rsi_reversal"},
+            {"key": "rsi_14_reversal", "module": "rsi_reversal"},
+            {"key": "turtle_breakout_20", "module": "turtle_breakout"},
+            {"key": "turtle_breakout_55", "module": "turtle_breakout"},
+            {"key": "close_volume_ratio_20", "module": "close_volume_ratio"},
+            {"key": "large_order_proxy_20", "module": "large_orders"},
+            {"key": "low_noise_60", "module": "low_noise"},
+            {"key": "barra_beta_60_neg", "module": "barra_beta"},
+            {"key": "barra_size_neg", "module": "barra_size"},
+            {"key": "barra_value_proxy", "module": "barra_value"},
+            {"key": "valuation_pe_proxy_neg", "module": "valuation"},
+            {"key": "valuation_pb_proxy_neg", "module": "valuation"},
+            {"key": "profitability_proxy", "module": "profitability"},
+            {"key": "growth_proxy", "module": "growth"},
+            {"key": "cashflow_proxy", "module": "cashflow"},
+            {"key": "earnings_surprise_proxy", "module": "earnings_surprise"},
+            {"key": "analyst_update_proxy", "module": "analyst_update"},
+            {"key": "sentiment_proxy", "module": "sentiment"},
+            {"key": "supply_chain_proxy", "module": "supply_chain"},
+            {"key": "social_heat_proxy", "module": "social"},
         ]
     )
     return defs
@@ -192,8 +215,55 @@ def _build_ultra_grid_recipes(target_count: int = ULTRA_GRID_FACTOR_TARGET_COUNT
     return recipes
 
 
+def _build_matrix_factor_recipes(target_count: int = MATRIX_FACTOR_TARGET_COUNT) -> list[dict]:
+    base_defs = _ultra_base_signal_defs()
+    recipes: list[dict] = []
+    for base in base_defs:
+        key = base["key"]
+        recipes.append(
+            {
+                "kind": "base_rank",
+                "a": key,
+                "b": "",
+                "raw_column": f"cand_matrix_base_rank__{key}",
+                "factor_name": f"candidate_matrix_base_rank__{key}",
+                "module": base["module"].removeprefix("grid_"),
+            }
+        )
+    pair_ops = (
+        ("rank_mean", "blend"),
+        ("rank_spread", "spread"),
+        ("rank_product", "interaction"),
+        ("rank_gate_hi", "conditional"),
+        ("rank_gate_lo", "conditional"),
+    )
+    for i, left in enumerate(base_defs):
+        for right in base_defs[i + 1 :]:
+            left_module = str(left["module"]).removeprefix("grid_")
+            right_module = str(right["module"]).removeprefix("grid_")
+            if left_module == right_module:
+                continue
+            module = f"{left_module}_{right_module}"
+            for op, family in pair_ops:
+                raw = f"cand_matrix_{op}__{left['key']}__{right['key']}"
+                recipes.append(
+                    {
+                        "kind": op,
+                        "a": left["key"],
+                        "b": right["key"],
+                        "raw_column": raw,
+                        "factor_name": raw.replace("cand_", "candidate_"),
+                        "module": f"{family}:{module}",
+                    }
+                )
+                if len(recipes) >= int(target_count):
+                    return recipes
+    return recipes
+
+
 BASE_CANDIDATE_FACTOR_SPECS = CANDIDATE_FACTOR_SPECS
 ULTRA_GRID_FACTOR_RECIPES = tuple(_build_ultra_grid_recipes())
+MATRIX_FACTOR_RECIPES = tuple(_build_matrix_factor_recipes())
 ULTRA_GRID_FACTOR_SPECS = tuple(
     CandidateFactorSpec(
         recipe["factor_name"],
@@ -203,7 +273,16 @@ ULTRA_GRID_FACTOR_SPECS = tuple(
     )
     for recipe in ULTRA_GRID_FACTOR_RECIPES
 )
-CANDIDATE_FACTOR_SPECS = BASE_CANDIDATE_FACTOR_SPECS + ULTRA_GRID_FACTOR_SPECS
+MATRIX_FACTOR_SPECS = tuple(
+    CandidateFactorSpec(
+        recipe["factor_name"],
+        recipe["raw_column"],
+        recipe["module"],
+        direction="higher_better",
+    )
+    for recipe in MATRIX_FACTOR_RECIPES
+)
+CANDIDATE_FACTOR_SPECS = BASE_CANDIDATE_FACTOR_SPECS + ULTRA_GRID_FACTOR_SPECS + MATRIX_FACTOR_SPECS
 
 
 def candidate_factor_columns() -> list[str]:
@@ -293,6 +372,20 @@ def append_candidate_factors(
             )
         if include_ultra_grid:
             frame = _append_ultra_grid_factors(
+                frame,
+                close=close,
+                open_=open_,
+                high=high,
+                low=low,
+                amount=amount,
+                volume=volume,
+                ret_1=ret_1,
+                float_cap=safe_float_cap,
+                total_cap=safe_total_cap,
+                close_col=close_col,
+                include_columns=include_set,
+            )
+            frame = _append_matrix_factors(
                 frame,
                 close=close,
                 open_=open_,
@@ -431,11 +524,96 @@ def append_candidate_factors(
             close_col=close_col,
             include_columns=include_set,
         )
+        frame = _append_matrix_factors(
+            frame,
+            close=close,
+            open_=open_,
+            high=high,
+            low=low,
+            amount=amount,
+            volume=volume,
+            ret_1=ret_1,
+            float_cap=safe_float_cap,
+            total_cap=safe_total_cap,
+            close_col=close_col,
+            include_columns=include_set,
+        )
 
     temp_cols = [col for col in frame.columns if col.startswith("_cand_")]
     if temp_cols:
         frame = frame.drop(columns=temp_cols)
     return frame
+
+
+def _append_matrix_factors(
+    frame: pd.DataFrame,
+    *,
+    close: pd.Series,
+    open_: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    amount: pd.Series,
+    volume: pd.Series,
+    ret_1: pd.Series,
+    float_cap: pd.Series,
+    total_cap: pd.Series,
+    close_col: str,
+    include_columns: set[str] | None = None,
+) -> pd.DataFrame:
+    if not MATRIX_FACTOR_RECIPES:
+        return frame
+    recipes = [
+        recipe for recipe in MATRIX_FACTOR_RECIPES
+        if include_columns is None or recipe["raw_column"] in include_columns
+    ]
+    if not recipes:
+        return frame
+    required_signals = {recipe["a"] for recipe in recipes}
+    required_signals.update(recipe["b"] for recipe in recipes if recipe.get("b"))
+    base = _build_ultra_base_signals(
+        frame,
+        close=close,
+        open_=open_,
+        high=high,
+        low=low,
+        amount=amount,
+        volume=volume,
+        ret_1=ret_1,
+        float_cap=float_cap,
+        total_cap=total_cap,
+        close_col=close_col,
+        required_signals=required_signals,
+    )
+    generated: dict[str, pd.Series] = {}
+    for recipe in recipes:
+        a = base.get(recipe["a"])
+        if a is None:
+            continue
+        ar = _rank_by_date(a, frame["date"]).astype("float32")
+        kind = recipe["kind"]
+        if kind == "base_rank":
+            value = ar
+        else:
+            b = base.get(recipe["b"])
+            if b is None:
+                continue
+            br = _rank_by_date(b, frame["date"]).astype("float32")
+            if kind == "rank_mean":
+                value = (ar + br) * 0.5
+            elif kind == "rank_spread":
+                value = ar - br
+            elif kind == "rank_product":
+                value = ar * br
+            elif kind == "rank_gate_hi":
+                value = ar.where(br >= 0.60, 0.0)
+            elif kind == "rank_gate_lo":
+                value = ar.where(br <= 0.40, 0.0)
+            else:
+                continue
+        generated[recipe["raw_column"]] = pd.to_numeric(value, errors="coerce").astype("float32")
+    if not generated:
+        return frame
+    return pd.concat([frame, pd.DataFrame(generated, index=frame.index)], axis=1)
 
 
 def _append_ultra_grid_factors(
@@ -605,6 +783,73 @@ def _build_ultra_base_signals(
         signals["value_proxy"] = -(close / float_cap.replace(0.0, np.nan))
     if not required or "quality_proxy" in required:
         signals["quality_proxy"] = signals.get("drawdown_neg_60", pd.Series(np.nan, index=frame.index)) + signals.get("vol_neg_60", pd.Series(np.nan, index=frame.index))
+    if not required or "macd_hist_12_26_9" in required or "macd_cross_strength_12_26_9" in required:
+        ema12 = grouped[close_col].transform(lambda s: s.ewm(span=12, adjust=False, min_periods=12).mean()) if close_col in frame.columns else pd.Series(np.nan, index=frame.index)
+        ema26 = grouped[close_col].transform(lambda s: s.ewm(span=26, adjust=False, min_periods=26).mean()) if close_col in frame.columns else pd.Series(np.nan, index=frame.index)
+        dif = ema12 - ema26
+        dea = dif.groupby(frame["symbol"], sort=False).transform(lambda s: s.ewm(span=9, adjust=False, min_periods=9).mean())
+        macd_hist = dif - dea
+        if not required or "macd_hist_12_26_9" in required:
+            signals["macd_hist_12_26_9"] = macd_hist / close.replace(0.0, np.nan)
+        if not required or "macd_cross_strength_12_26_9" in required:
+            signals["macd_cross_strength_12_26_9"] = (macd_hist - macd_hist.groupby(frame["symbol"], sort=False).shift(1)) / close.replace(0.0, np.nan)
+    for window in (6, 14):
+        key = f"rsi_{window}_reversal"
+        if required and key not in required:
+            continue
+        gain = ret_1.clip(lower=0.0)
+        loss = (-ret_1.clip(upper=0.0)).replace(0.0, np.nan)
+        avg_gain = grouped_apply(gain, frame, window, "mean")
+        avg_loss = grouped_apply(loss, frame, window, "mean")
+        rsi = 100.0 - 100.0 / (1.0 + avg_gain / avg_loss.replace(0.0, np.nan))
+        signals[key] = (50.0 - rsi) / 50.0
+    for window in (20, 55):
+        key = f"turtle_breakout_{window}"
+        if required and key not in required:
+            continue
+        high_roll = grouped[close_col].transform(lambda s, w=window: s.shift(1).rolling(w, min_periods=w).max()) if close_col in frame.columns else pd.Series(np.nan, index=frame.index)
+        low_roll = grouped[close_col].transform(lambda s, w=window: s.shift(1).rolling(w, min_periods=w).min()) if close_col in frame.columns else pd.Series(np.nan, index=frame.index)
+        signals[key] = (close - high_roll) / (high_roll - low_roll).replace(0.0, np.nan)
+    if not required or "close_volume_ratio_20" in required:
+        close_strength = ((close - low) / (high - low).replace(0.0, np.nan)).clip(0.0, 1.0)
+        signals["close_volume_ratio_20"] = grouped_apply(volume * close_strength, frame, 20, "mean") / grouped_apply(volume, frame, 20, "mean").replace(0.0, np.nan)
+    if not required or "large_order_proxy_20" in required:
+        signed_turnover = amount * np.sign(ret_1.fillna(0.0))
+        signals["large_order_proxy_20"] = grouped_apply(signed_turnover, frame, 20, "sum") / grouped_apply(amount, frame, 20, "sum").replace(0.0, np.nan)
+    if not required or "low_noise_60" in required:
+        trend_abs = _num(frame.get("ret_60", grouped[close_col].pct_change(60, fill_method=None) if close_col in frame.columns else pd.Series(np.nan, index=frame.index))).abs()
+        noise = _rolling_std(ret_1, frame, 60).abs()
+        signals["low_noise_60"] = trend_abs / (noise + 1e-6)
+    if not required or "barra_beta_60_neg" in required:
+        market_ret = ret_1.groupby(frame["date"], sort=False).transform("mean")
+        signals["barra_beta_60_neg"] = -_rolling_beta(ret_1, market_ret, frame, 60)
+    if not required or "barra_size_neg" in required:
+        signals["barra_size_neg"] = -np.log1p(total_cap)
+    if not required or "barra_value_proxy" in required:
+        signals["barra_value_proxy"] = -(close / total_cap.replace(0.0, np.nan))
+    if not required or "valuation_pe_proxy_neg" in required:
+        pe = _num(frame.get("pe_ttm", frame.get("pe", pd.Series(np.nan, index=frame.index))))
+        signals["valuation_pe_proxy_neg"] = -pe.where(pe > 0.0)
+    if not required or "valuation_pb_proxy_neg" in required:
+        pb = _num(frame.get("pb", frame.get("pb_lf", pd.Series(np.nan, index=frame.index))))
+        signals["valuation_pb_proxy_neg"] = -pb.where(pb > 0.0)
+    if not required or "profitability_proxy" in required:
+        signals["profitability_proxy"] = _num(frame.get("roe", frame.get("gross_margin", pd.Series(np.nan, index=frame.index))))
+    if not required or "growth_proxy" in required:
+        signals["growth_proxy"] = _num(frame.get("revenue_yoy", frame.get("profit_yoy", pd.Series(np.nan, index=frame.index))))
+    if not required or "cashflow_proxy" in required:
+        free_cashflow = _num(frame.get("free_cashflow", frame.get("net_operate_cashflow", pd.Series(np.nan, index=frame.index))))
+        signals["cashflow_proxy"] = free_cashflow / total_cap.replace(0.0, np.nan)
+    if not required or "earnings_surprise_proxy" in required:
+        signals["earnings_surprise_proxy"] = _num(frame.get("earnings_surprise", frame.get("profit_yoy", pd.Series(np.nan, index=frame.index))))
+    if not required or "analyst_update_proxy" in required:
+        signals["analyst_update_proxy"] = _num(frame.get("analyst_forecast_revision", frame.get("forecast_np_revision", pd.Series(np.nan, index=frame.index))))
+    if not required or "sentiment_proxy" in required:
+        signals["sentiment_proxy"] = _num(frame.get("news_sentiment", pd.Series(np.nan, index=frame.index)))
+    if not required or "supply_chain_proxy" in required:
+        signals["supply_chain_proxy"] = _num(frame.get("supply_chain_prosperity", pd.Series(np.nan, index=frame.index)))
+    if not required or "social_heat_proxy" in required:
+        signals["social_heat_proxy"] = _num(frame.get("social_discussion_heat", pd.Series(np.nan, index=frame.index)))
     return signals
 
 

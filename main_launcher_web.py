@@ -297,6 +297,10 @@ RUN_HTML = """<!doctype html>
           <label for="max_days">最多交易日，可选</label>
           <input type="number" id="max_days" min="1" step="1" placeholder="留空=使用完整选择区间">
         </div>
+        <div class="field">
+          <label for="fast_factor_max_count">快速因子审判数量</label>
+          <input type="number" id="fast_factor_max_count" min="1" step="100" value="10000" placeholder="10000=全矩阵候选；留空=全部注册池">
+        </div>
       </div>
       <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>
       <label class="item"><input type="checkbox" id="shadow_portfolios">启用单因子影子组合：非常慢的诊断模式。普通全历史复核建议关闭。</label>
@@ -381,6 +385,8 @@ RUN_HTML = """<!doctype html>
       const startMonth = document.getElementById("start_month").value;
       const endMonth = document.getElementById("end_month").value;
       const maxDays = document.getElementById("max_days").value.trim();
+      const fastFactorMaxCountNode = document.getElementById("fast_factor_max_count");
+      const fastFactorMaxCount = fastFactorMaxCountNode ? fastFactorMaxCountNode.value.trim() : "";
       const shadowPortfolios = document.getElementById("shadow_portfolios").checked;
       const alphaCollapseExitNode = document.getElementById("alpha_collapse_exit_enabled");
       const alphaCollapseExitEnabled = alphaCollapseExitNode ? alphaCollapseExitNode.checked : true;
@@ -400,6 +406,7 @@ RUN_HTML = """<!doctype html>
         start_month: startMonth,
         end_month: endMonth,
         max_days: maxDays,
+        fast_factor_max_count: fastFactorMaxCount,
         shadow_portfolios: shadowPortfolios,
         control_mode: controlMode,
         alpha_bundle: alphaBundle,
@@ -1467,6 +1474,8 @@ def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
     manifest_rows = _read_csv_rows(manifest_path)
     summary_rows = _read_csv_rows(run_dir / "fast_factor_summary.csv")
     validation_rows = _read_csv_rows(run_dir / "fast_factor_validation_report.csv")
+    contract_rows = _read_csv_rows(run_dir / "factor_pool_contract.csv")
+    role_rows = _read_csv_rows(run_dir / "factor_role_coverage.csv")
     manifest = manifest_rows[0] if manifest_rows else {}
     verdict_counts: dict[str, int] = {}
     for row in summary_rows:
@@ -1503,6 +1512,8 @@ def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
         "promote_candidate_count": verdict_counts.get("promote_candidate", 0),
         "watchlist_count": verdict_counts.get("watchlist", 0),
         "reject_or_rework_count": verdict_counts.get("reject_or_rework", 0),
+        "factor_contract_count": len(contract_rows),
+        "factor_role_count": len(role_rows),
         "row_count": _safe_optional_int(manifest.get("row_count")),
         "analysis_start_date": manifest.get("analysis_start_date") or manifest.get("start_date"),
         "analysis_end_date": manifest.get("analysis_end_date") or manifest.get("end_date"),
@@ -1511,6 +1522,8 @@ def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
         "run": run,
         "summary": summary,
         "stock_summary": [],
+        "factor_role_coverage": role_rows[:50],
+        "factor_pool_contract": contract_rows[:200],
         "closed_trades": [],
         "open_positions": [],
     }

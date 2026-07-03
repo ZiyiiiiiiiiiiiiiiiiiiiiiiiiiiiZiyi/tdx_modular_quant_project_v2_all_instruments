@@ -23,6 +23,7 @@ from config import (
 )
 from functions.decision_council.factor_registry import build_factor_registry
 from functions.decision_council.factor_validation import build_factor_research_reports
+from functions.decision_council.factor_pool_contract import build_role_coverage_report, load_factor_pool_contract
 from functions.factors.factor_candidate_pool import append_candidate_factors
 from functions.investable_universe import UniverseFilterConfig, filter_investable_universe, load_index_constituents
 from functions.universe_registry import get_universe_spec
@@ -133,6 +134,14 @@ def run_fast_factor_judge(
         path = output / f"{name}.csv"
         frame.to_csv(path, index=False, encoding="utf-8-sig")
         saved[name] = path
+    contract = load_factor_pool_contract(saved["fast_factor_summary"])
+    role_coverage = build_role_coverage_report(contract)
+    contract_path = output / "factor_pool_contract.csv"
+    role_path = output / "factor_role_coverage.csv"
+    contract.to_csv(contract_path, index=False, encoding="utf-8-sig")
+    role_coverage.to_csv(role_path, index=False, encoding="utf-8-sig")
+    saved["factor_pool_contract"] = contract_path
+    saved["factor_role_coverage"] = role_path
     report_path = output / "fast_factor_judge_report.md"
     report_path.write_text(render_fast_factor_judge_markdown(reports), encoding="utf-8")
     saved["fast_factor_judge_report"] = report_path
@@ -150,6 +159,7 @@ def build_fast_factor_summary(validation: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "candidate_pool",
         "factor_name",
+        "raw_column",
         "module",
         "best_horizon_days",
         "pass_count",
@@ -188,6 +198,7 @@ def build_fast_factor_summary(validation: pd.DataFrame) -> pd.DataFrame:
             {
                 "candidate_pool": best.get("candidate_pool", "unknown"),
                 "factor_name": factor_name,
+                "raw_column": best.get("raw_column", ""),
                 "module": best.get("module", "unknown"),
                 "best_horizon_days": _safe_int(best.get("horizon_days"), default=0),
                 "pass_count": pass_count,
