@@ -220,6 +220,8 @@ RUN_HTML = """<!doctype html>
       <label class="item"><input type="checkbox" id="governance_layer_validation">层验证线：紧凑 8 因子等权测试，关闭声誉/影子组合和市场状态叠加，保留安全模块。用于先判断基础信号有没有边际收益。</label>
       <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
       <label class="item recommended"><input type="checkbox" id="fast_factor_judge">快速因子审判：只读现有特征和股票池，计算 IC/分层/换手成本/冗余，不跑状态机、不下单、不跑完整回测。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_appeal_judge">因子申诉审判：对 RSI、基本面、事件和另类代理等被旧门槛误杀的非 grid 因子单独复核。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_cabinet">因子柜生成：从 486+114 和申诉审判结果中按模块、家族、角色、近亲关系生成状态机固定因子矩阵。</label>
 
       <div class="hint">
         当前建议：先运行“增强模块诊断”。<br>
@@ -323,6 +325,7 @@ RUN_HTML = """<!doctype html>
         <div>
           <button class="primary" onclick="submitSelected()">运行所选任务</button>
           <button class="primary" onclick="submitFastFactorJudge()">只运行快速因子审判</button>
+          <button class="primary" onclick="submitFactorCabinetFlow()">只构建因子柜</button>
           <button class="primary" onclick="submitDiagnosticSuite()">只运行增强诊断</button>
           <button class="secondary" onclick="submitLayerSuiteOnly()">只运行层消融套件</button>
           <button class="secondary" onclick="submitAll()">运行全部任务</button>
@@ -394,7 +397,7 @@ RUN_HTML = """<!doctype html>
       const controlMode = controlModeNode ? controlModeNode.value : "normal";
       const alphaBundleNode = document.getElementById("governance_alpha_bundle");
       const alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
-      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge");
+      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet");
       if (touchesGovernance && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
       }
@@ -467,7 +470,7 @@ RUN_HTML = """<!doctype html>
     }
     async function submitSelected() {
       const tasks = [];
-      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge"].forEach((id) => {
+      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet"].forEach((id) => {
         const node = document.getElementById(id);
         if (node && node.checked) tasks.push(id);
       });
@@ -512,8 +515,22 @@ RUN_HTML = """<!doctype html>
         document.getElementById("status").textContent = err.message || String(err);
       }
     }
+    async function submitFactorCabinetFlow() {
+      const tasks = ["factor_appeal_judge", "factor_cabinet"];
+      const shadowNode = document.getElementById("shadow_portfolios");
+      if (shadowNode) shadowNode.checked = false;
+      ["factor_appeal_judge", "factor_cabinet"].forEach((id) => {
+        const node = document.getElementById(id);
+        if (node) node.checked = true;
+      });
+      try {
+        await sendPayload({tasks, profile: currentProfile(), backtest: backtestParams(), governance: governanceParams(tasks), allow_multi_task: true});
+      } catch (err) {
+        document.getElementById("status").textContent = err.message || String(err);
+      }
+    }
     async function submitAll() {
-      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge"];
+      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet"];
       if (!window.confirm("运行全部任务会启动主策略流水线、治理主线、主线复核、层验证和完整增强诊断，耗时可能很长。确认继续吗？")) {
         document.getElementById("status").textContent = "已取消运行全部任务。";
         return;

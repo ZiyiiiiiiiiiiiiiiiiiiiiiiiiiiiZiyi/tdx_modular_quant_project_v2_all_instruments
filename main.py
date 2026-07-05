@@ -331,6 +331,8 @@ def parse_args():
     parser.add_argument("--skip-data-steps", action="store_true", help="In low-memory mode, skip convert/clean/features and use saved feature parquet.")
     parser.add_argument("--governance", action="store_true", help="Run the phase-one daily decision-council backtest.")
     parser.add_argument("--fast-factor-judge", action="store_true", help="Run the fast read-only factor judge without governance state machine.")
+    parser.add_argument("--factor-appeal-judge", action="store_true", help="Run the v2 factor appeal judge against the latest strict v1 judge output.")
+    parser.add_argument("--factor-cabinet", action="store_true", help="Build the state-machine factor cabinet from v1/v2 judged factors.")
     parser.add_argument(
         "--fast-factor-max-count",
         type=int,
@@ -1219,6 +1221,8 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         "governance_layer_validation",
         "governance_layer_ablation_suite",
         "fast_factor_judge",
+        "factor_appeal_judge",
+        "factor_cabinet",
     }
     if not any(task in governance_tasks for task in tasks):
         return runtime_args
@@ -1540,6 +1544,44 @@ def run_fast_factor_judge_from_main(args):
     return saved_runs
 
 
+def run_factor_appeal_judge_from_main(args):
+    """Run the v2 factor appeal judge for timing/fundamental/event proxy families."""
+    from functions.decision_council.factor_appeal_judge import run_factor_appeal_judge
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    reset_progress(task_name="factor_appeal_judge", total=1, message="starting factor appeal judge")
+    try:
+        saved = run_factor_appeal_judge(
+            max_days=getattr(args, "governance_max_days", None),
+        )
+        print("Factor appeal judge saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_appeal_judge", message="factor appeal judge complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_appeal_judge", message=str(exc))
+        raise
+
+
+def run_factor_cabinet_from_main(args):
+    """Build the final factor cabinet consumed by state-machine input adapters."""
+    from functions.factor_selection.factor_cabinet_builder import build_factor_cabinet
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    reset_progress(task_name="factor_cabinet", total=1, message="starting factor cabinet build")
+    try:
+        saved = build_factor_cabinet()
+        print("Factor cabinet saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_cabinet", message="factor cabinet build complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_cabinet", message=str(exc))
+        raise
+
+
 def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
     runtime_args = argparse.Namespace(**vars(args))
     profile = str(profile_name or "full").strip().lower()
@@ -1549,6 +1591,8 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
         "governance_layer_validation",
         "governance_layer_ablation_suite",
         "fast_factor_judge",
+        "factor_appeal_judge",
+        "factor_cabinet",
     }
     touches_governance = any(task in governance_tasks for task in tasks)
 
@@ -1671,6 +1715,8 @@ def run_interactive_selection(selection, args):
         or "governance_layer_validation" in tasks
         or "governance_layer_ablation_suite" in tasks
         or "fast_factor_judge" in tasks
+        or "factor_appeal_judge" in tasks
+        or "factor_cabinet" in tasks
     ):
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         runtime_args.governance_universes = selected_universes
@@ -1729,6 +1775,16 @@ def run_interactive_selection(selection, args):
             _mark_task("fast_factor_judge", task_counter)
             run_fast_factor_judge_from_main(runtime_args)
             _finish_task("fast_factor_judge", task_counter)
+        if "factor_appeal_judge" in tasks:
+            task_counter += 1
+            _mark_task("factor_appeal_judge", task_counter)
+            run_factor_appeal_judge_from_main(runtime_args)
+            _finish_task("factor_appeal_judge", task_counter)
+        if "factor_cabinet" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet", task_counter)
+            run_factor_cabinet_from_main(runtime_args)
+            _finish_task("factor_cabinet", task_counter)
         complete_progress(task_name="interactive_task_suite", message="selected tasks complete")
     except Exception as exc:
         fail_progress(task_name="interactive_task_suite", message=str(exc))
@@ -2158,6 +2214,10 @@ if __name__ == "__main__":
             run_registry_suite(cli_args)
         elif cli_args.fast_factor_judge:
             run_fast_factor_judge_from_main(cli_args)
+        elif cli_args.factor_appeal_judge:
+            run_factor_appeal_judge_from_main(cli_args)
+        elif cli_args.factor_cabinet:
+            run_factor_cabinet_from_main(cli_args)
         elif cli_args.governance:
             selected_universes = _normalize_governance_universes(getattr(cli_args, "governance_universes", None))
             capital_profile = _capital_profile_from_args(cli_args)
