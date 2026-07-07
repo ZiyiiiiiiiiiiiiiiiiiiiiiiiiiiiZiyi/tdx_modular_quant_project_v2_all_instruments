@@ -65,6 +65,12 @@ from functions.alpha_bundles import (
 from functions.decision_council.candidate_factor_cache import (
     attach_pre_screen_candidate_factor_cache,
 )
+from functions.decision_council.factor_source import (
+    FACTOR_SOURCE_LEGACY,
+    LEGACY_GOVERNANCE_ALPHA_BUNDLE,
+    install_factor_source_model_map,
+    resolve_factor_source,
+)
 from functions.decision_council.runner import (
     GovernanceBacktestRunner,
     _governance_feature_columns,
@@ -312,14 +318,30 @@ def run_single_experiment(
     capital_profile: dict | None = None,
     governance_control_mode: str = "normal",
     alpha_collapse_exit_enabled: bool = True,
+    factor_source: str = FACTOR_SOURCE_LEGACY,
+    factor_cabinet_run_id: str = "",
+    factor_cabinet_path: str = "",
 ) -> dict[str, Path]:
     """运行单个治理实验"""
     variant_spec = get_governance_variant_spec(variant_name)
-    bundle_spec = get_alpha_bundle_spec(alpha_bundle)
     universe_spec = get_universe_spec(universe_name)
-    factor_judge_status = _factor_judge_config_status(universe_name, alpha_bundle=alpha_bundle)
+    factor_spec = resolve_factor_source(
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+        alpha_bundle=alpha_bundle,
+    )
+    if factor_spec.uses_factor_cabinet:
+        install_factor_source_model_map(factor_spec)
+        effective_alpha_bundle = f"factor_cabinet_{factor_spec.factor_cabinet_run_id}"
+        alpha_models = factor_spec.alpha_models
+    else:
+        effective_alpha_bundle = LEGACY_GOVERNANCE_ALPHA_BUNDLE
+        get_alpha_bundle_spec(effective_alpha_bundle)
+        alpha_models = ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(effective_alpha_bundle)
+    factor_judge_status = _factor_judge_config_status(universe_name, alpha_bundle=effective_alpha_bundle)
 
-    output_dir = build_output_path(variant_name, alpha_bundle, universe_name)
+    output_dir = build_output_path(variant_name, effective_alpha_bundle, universe_name)
     if _is_small_capital_profile(capital_profile):
         output_dir = output_dir / "small_capital_branch"
     control_mode = _normalize_governance_control_mode(governance_control_mode)
@@ -337,12 +359,12 @@ def run_single_experiment(
     print(f"\n{'=' * 60}")
     print("Running experiment:")
     print(f"  Variant: {variant_name}")
-    print(f"  Alpha Bundle: {alpha_bundle}")
+    print(f"  Alpha Bundle: {effective_alpha_bundle}")
+    print(f"  Factor Source: {factor_spec.factor_source}")
+    print(f"  Factor Cabinet Run ID: {factor_spec.factor_cabinet_run_id}")
     print(f"  Universe: {universe_name}")
     print(f"  Output: {output_dir}")
     print("=" * 60)
-
-    alpha_models = ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(alpha_bundle)
 
     # Load and normalize only the columns needed by this bundle.
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE)
@@ -409,7 +431,15 @@ def run_single_experiment(
     # Save experiment metadata
     metadata = {
         "variant_name": variant_name,
-        "alpha_bundle": alpha_bundle,
+        "alpha_bundle": effective_alpha_bundle,
+        "legacy_alpha_bundle": LEGACY_GOVERNANCE_ALPHA_BUNDLE if factor_spec.factor_source == FACTOR_SOURCE_LEGACY else "",
+        "factor_source": factor_spec.factor_source,
+        "factor_cabinet_run_id": factor_spec.factor_cabinet_run_id,
+        "factor_cabinet_path": factor_spec.factor_cabinet_path,
+        "factor_count": factor_spec.factor_count,
+        "role_distribution": factor_spec.role_distribution or {},
+        "strict_entry_alpha_count": factor_spec.strict_entry_alpha_count,
+        "proxy_entry_alpha_count": factor_spec.proxy_entry_alpha_count,
         "universe_name": universe_name,
         "start_date": str(effective_start),
         "end_date": str(effective_end),
@@ -612,6 +642,13 @@ def parse_args():
         action="store_true",
         help="Record alpha-collapse exit as paper diagnostics but do not execute alpha_collapse_consensus sells.",
     )
+    parser.add_argument(
+        "--factor-source",
+        choices=["legacy_bundle", "latest_factor_cabinet", "selected_factor_cabinet"],
+        default="legacy_bundle",
+    )
+    parser.add_argument("--factor-cabinet-run-id", default="")
+    parser.add_argument("--factor-cabinet-path", default="")
     parser.add_argument("--experiment-plan", type=str, help="Path to experiment plan JSON file")
     parser.add_argument("--list-variants", action="store_true", help="List all governance variants")
     parser.add_argument("--list-bundles", action="store_true", help="List all alpha bundles")
@@ -695,6 +732,9 @@ def main():
             safety_proxy_mode=args.safety_proxy_mode,
             governance_control_mode=args.governance_control_mode,
             alpha_collapse_exit_enabled=not bool(args.disable_alpha_collapse_exit),
+            factor_source=args.factor_source,
+            factor_cabinet_run_id=args.factor_cabinet_run_id,
+            factor_cabinet_path=args.factor_cabinet_path,
         )
         return
 

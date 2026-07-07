@@ -555,6 +555,12 @@ def _build_governance_notes(governance_summary):
     return [
         (
             f"Variant={row.get('governance_variant', '')}, safety_proxy_mode={row.get('safety_proxy_mode', '')}, "
+            f"factor_source={row.get('factor_source', '')}, "
+            f"factor_cabinet_run_id={row.get('factor_cabinet_run_id', '')}, "
+            f"factor_cabinet_path={row.get('factor_cabinet_path', '')}, "
+            f"factor_count={row.get('factor_count', '')}, "
+            f"strict_entry_alpha_count={row.get('strict_entry_alpha_count', '')}, "
+            f"proxy_entry_alpha_count={row.get('proxy_entry_alpha_count', '')}, "
             f"exposure_cap_mode={row.get('exposure_cap_mode', '')}, "
             f"safety_agent_enabled={_display_text(row.get('safety_agent_enabled'), default='blocked_or_unavailable')}, "
             f"reputation_enabled={_display_text(row.get('reputation_enabled'), default='blocked_or_unavailable')}, "

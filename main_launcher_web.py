@@ -5,6 +5,7 @@ This avoids Tk/Spyder event-loop conflicts by using the system browser.
 from __future__ import annotations
 
 import csv
+import html
 import json
 import socket
 import sys
@@ -13,6 +14,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+
+from functions.decision_council.factor_source import list_factor_cabinet_runs
 
 
 TRADE_PAIR_PREFIX = "backtest_trade_pairs_"
@@ -282,9 +285,23 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="governance_alpha_bundle">治理主线因子包</label>
           <select id="governance_alpha_bundle">
-            <option value="diversified_pre_screen_bundle_v2" selected>diversified_pre_screen_bundle_v2 - 24 candidate diversified alpha</option>
+            <option value="diversified_pre_screen_bundle_v2" selected>legacy: diversified_pre_screen_bundle_v2 - 24 candidate diversified alpha</option>
             <option value="pre_screen_promote_bundle">7月2号预筛产品化包（28个 cand 因子）</option>
             <option value="formal_defensive_bundle">旧正式因子防守复核包</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="governance_factor_source">治理主线因子来源</label>
+          <select id="governance_factor_source">
+            <option value="legacy_bundle" selected>legacy_bundle - 旧治理因子包</option>
+            <option value="latest_factor_cabinet">latest_factor_cabinet - 自动使用最新 factor_cabinet</option>
+            <option value="selected_factor_cabinet">selected_factor_cabinet - 手动选择 factor_cabinet run_id</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="factor_cabinet_run_id">因子柜选择</label>
+          <select id="factor_cabinet_run_id">
+            __FACTOR_CABINET_OPTIONS__
           </select>
         </div>
         <div class="field">
@@ -397,6 +414,11 @@ RUN_HTML = """<!doctype html>
       const controlMode = controlModeNode ? controlModeNode.value : "normal";
       const alphaBundleNode = document.getElementById("governance_alpha_bundle");
       const alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
+      const factorSourceNode = document.getElementById("governance_factor_source");
+      const factorSource = factorSourceNode ? factorSourceNode.value : "legacy_bundle";
+      const cabinetNode = document.getElementById("factor_cabinet_run_id");
+      const cabinetRunId = cabinetNode ? cabinetNode.value : "";
+      const cabinetPath = cabinetNode && cabinetNode.selectedOptions.length ? (cabinetNode.selectedOptions[0].dataset.path || "") : "";
       const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet");
       if (touchesGovernance && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
@@ -413,6 +435,9 @@ RUN_HTML = """<!doctype html>
         shadow_portfolios: shadowPortfolios,
         control_mode: controlMode,
         alpha_bundle: alphaBundle,
+        factor_source: factorSource,
+        factor_cabinet_run_id: cabinetRunId,
+        factor_cabinet_path: cabinetPath,
         alpha_collapse_exit_enabled: alphaCollapseExitEnabled
       };
     }
@@ -425,7 +450,10 @@ RUN_HTML = """<!doctype html>
         body: JSON.stringify(payload)
       });
       const result = await response.json();
-      status.textContent = result.message || "已提交。";
+      const governance = payload && payload.governance ? payload.governance : {};
+      const sourceText = governance.factor_source ? ` factor_source=${governance.factor_source}` : "";
+      const runText = governance.factor_cabinet_run_id ? ` factor_cabinet_run_id=${governance.factor_cabinet_run_id}` : "";
+      status.textContent = (result.message || "已提交。") + sourceText + runText;
       if (response.ok) {
         startProgressPolling();
       }
@@ -1107,6 +1135,34 @@ def _html_response(handler: BaseHTTPRequestHandler, body_text: str) -> None:
     handler.wfile.write(data)
 
 
+def _render_factor_cabinet_options() -> str:
+    rows = list_factor_cabinet_runs()
+    if not rows:
+        return '<option value="" data-path="">未找到 results/factor_cabinet 下的 factor_cabinet.json</option>'
+    options = []
+    for index, row in enumerate(rows):
+        run_id = str(row.get("run_id") or "")
+        label = (
+            f"{run_id} - {int(row.get('factor_count') or 0)} factors; "
+            f"strict_entry_alpha={int(row.get('strict_entry_alpha_count') or 0)}, "
+            f"proxy_entry_alpha={int(row.get('proxy_entry_alpha_count') or 0)}, "
+            f"timing_filter={int(row.get('timing_filter_count') or 0)}, "
+            f"risk_override={int(row.get('risk_override_count') or 0)}, "
+            f"liquidity_filter={int(row.get('liquidity_filter_count') or 0)}, "
+            f"hold_validation={int(row.get('hold_validation_count') or 0)}"
+        )
+        selected = " selected" if index == 0 else ""
+        options.append(
+            f'<option value="{html.escape(run_id)}" data-path="{html.escape(str(row.get("path") or ""))}"{selected}>'
+            f"{html.escape(label)}</option>"
+        )
+    return "\n".join(options)
+
+
+def _render_run_html() -> str:
+    return RUN_HTML.replace("__FACTOR_CABINET_OPTIONS__", _render_factor_cabinet_options())
+
+
 def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
     handler.send_response(302)
     handler.send_header("Location", location)
@@ -1707,7 +1763,7 @@ def main(argv: list[str]) -> int:
                 _redirect(self, "/run")
                 return
             if parsed.path == "/run":
-                _html_response(self, RUN_HTML)
+                _html_response(self, _render_run_html())
                 return
             if parsed.path == "/results":
                 _html_response(self, RESULTS_HTML)

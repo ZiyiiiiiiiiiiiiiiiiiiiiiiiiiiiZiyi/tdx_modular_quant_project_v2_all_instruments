@@ -1366,7 +1366,7 @@ def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
                 "hold_validation_allowed": "hold_validation" in configured_roles,
                 "sell_trigger_allowed": "sell_trigger" in configured_roles,
                 "risk_override_allowed": "risk_override" in configured_roles,
-                "role_rationale": "configured diversified_pre_screen_bundle_v2 state-machine roles: "
+                "role_rationale": "configured governance factor source state-machine roles: "
                 + "|".join(configured_roles),
             }
         rows.append(

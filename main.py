@@ -413,6 +413,14 @@ def parse_args():
         help="Alpha bundle used by governance mainline review.",
     )
     parser.add_argument(
+        "--factor-source",
+        choices=["legacy_bundle", "latest_factor_cabinet", "selected_factor_cabinet"],
+        default="legacy_bundle",
+        help="Governance mainline factor source.",
+    )
+    parser.add_argument("--factor-cabinet-run-id", default="", help="Factor cabinet run_id for selected_factor_cabinet.")
+    parser.add_argument("--factor-cabinet-path", default="", help="Explicit factor_cabinet.json path.")
+    parser.add_argument(
         "--disable-alpha-collapse-exit",
         action="store_true",
         help="Record alpha-collapse exit as paper diagnostics but do not execute alpha_collapse_consensus sells.",
@@ -1070,8 +1078,12 @@ def _run_single_governance_variant(
     governance_control_mode: str = "normal",
     alpha_collapse_exit_enabled: bool = True,
     alpha_bundle: str | None = None,
+    factor_source: str = "legacy_bundle",
+    factor_cabinet_run_id: str = "",
+    factor_cabinet_path: str = "",
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
+    from functions.decision_council.factor_source import resolve_factor_source
     from functions.decision_council.runner import run_governance_backtest
     from functions.governance_variant_registry import get_governance_variant_spec
     from functions.universe_registry import get_universe_spec
@@ -1081,7 +1093,18 @@ def _run_single_governance_variant(
     selected_universe_name = universe_name or variant_spec.universe_name
     universe_spec = get_universe_spec(selected_universe_name)
     selected_alpha_bundle = str(alpha_bundle or variant_spec.alpha_bundle)
-    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / selected_alpha_bundle
+    factor_spec = resolve_factor_source(
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+        alpha_bundle=selected_alpha_bundle,
+    )
+    output_alpha_bundle = (
+        f"factor_cabinet_{factor_spec.factor_cabinet_run_id}"
+        if factor_spec.uses_factor_cabinet
+        else selected_alpha_bundle
+    )
+    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / output_alpha_bundle
     if _is_small_capital_profile(capital_profile):
         output_dir = output_dir / "small_capital_branch"
     control_mode = _governance_control_mode_from_args(argparse.Namespace(governance_control_mode=governance_control_mode))
@@ -1108,6 +1131,9 @@ def _run_single_governance_variant(
         universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
         alpha_bundle=selected_alpha_bundle,
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
         registry_version=REGISTRY_FRAMEWORK_VERSION,
         target_index_codes=tuple(universe_spec.target_index_codes),
         require_constituents=universe_spec.require_constituents,
@@ -1269,6 +1295,15 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
     alpha_bundle = str(governance.get("alpha_bundle", "")).strip()
     if alpha_bundle:
         runtime_args.governance_alpha_bundle = alpha_bundle
+    factor_source = str(governance.get("factor_source", "")).strip()
+    if factor_source:
+        runtime_args.factor_source = factor_source
+    factor_cabinet_run_id = str(governance.get("factor_cabinet_run_id", "")).strip()
+    if factor_cabinet_run_id:
+        runtime_args.factor_cabinet_run_id = factor_cabinet_run_id
+    factor_cabinet_path = str(governance.get("factor_cabinet_path", "")).strip()
+    if factor_cabinet_path:
+        runtime_args.factor_cabinet_path = factor_cabinet_path
     backtest = selection.get("backtest", {}) if isinstance(selection, dict) else {}
     if isinstance(backtest, dict):
         capital_profile = str(backtest.get("capital_profile", "")).strip()
@@ -1327,6 +1362,9 @@ def run_governance_mainline_review_from_main(args):
         getattr(args, "governance_alpha_bundle", "diversified_pre_screen_bundle_v2")
         or "diversified_pre_screen_bundle_v2"
     )
+    factor_source = getattr(args, "factor_source", "legacy_bundle")
+    factor_cabinet_run_id = getattr(args, "factor_cabinet_run_id", "")
+    factor_cabinet_path = getattr(args, "factor_cabinet_path", "")
     shared_live_monitor = None
     if not args.no_live_monitor:
         shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
@@ -1350,8 +1388,16 @@ def run_governance_mainline_review_from_main(args):
             capital_profile=capital_profile,
             governance_control_mode=_governance_control_mode_from_args(args),
             alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
+            factor_source=factor_source,
+            factor_cabinet_run_id=factor_cabinet_run_id,
+            factor_cabinet_path=factor_cabinet_path,
         )
-    report_path, comparison_path = build_report(alpha_bundle=alpha_bundle)
+    report_path, comparison_path = build_report(
+        alpha_bundle=alpha_bundle,
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+    )
     print(f"Saved review report: {report_path}")
     print(f"Saved comparison csv: {comparison_path}")
 
@@ -1753,6 +1799,9 @@ def run_interactive_selection(selection, args):
                 governance_control_mode=_governance_control_mode_from_args(runtime_args),
                 alpha_collapse_exit_enabled=not bool(getattr(runtime_args, "disable_alpha_collapse_exit", False)),
                 alpha_bundle=getattr(runtime_args, "governance_alpha_bundle", None),
+                factor_source=getattr(runtime_args, "factor_source", "legacy_bundle"),
+                factor_cabinet_run_id=getattr(runtime_args, "factor_cabinet_run_id", ""),
+                factor_cabinet_path=getattr(runtime_args, "factor_cabinet_path", ""),
             )
             _finish_task("governance_active", task_counter)
         if "governance_mainline_review" in tasks:
@@ -2234,6 +2283,9 @@ if __name__ == "__main__":
                 governance_control_mode=_governance_control_mode_from_args(cli_args),
                 alpha_collapse_exit_enabled=not bool(getattr(cli_args, "disable_alpha_collapse_exit", False)),
                 alpha_bundle=getattr(cli_args, "governance_alpha_bundle", None),
+                factor_source=getattr(cli_args, "factor_source", "legacy_bundle"),
+                factor_cabinet_run_id=getattr(cli_args, "factor_cabinet_run_id", ""),
+                factor_cabinet_path=getattr(cli_args, "factor_cabinet_path", ""),
             )
         elif cli_args.low_memory:
             run_low_memory(cli_args)

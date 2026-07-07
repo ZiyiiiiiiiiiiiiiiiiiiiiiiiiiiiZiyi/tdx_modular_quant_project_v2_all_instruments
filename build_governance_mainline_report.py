@@ -11,6 +11,11 @@ from config import DEFAULT_ALPHA_BUNDLE, DEFAULT_GOVERNANCE_VARIANT, REPORT_DIR
 from functions.data_integrity import build_data_integrity_report
 from functions.decision_council.ml_metrics import compute_all_metrics
 from functions.formal_admission import build_formal_admission_report
+from functions.decision_council.factor_source import (
+    FACTOR_SOURCE_LEGACY,
+    LEGACY_GOVERNANCE_ALPHA_BUNDLE,
+    resolve_factor_source,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -201,9 +206,26 @@ def _recommendation_lines(blocked: pd.DataFrame) -> list[str]:
     return lines
 
 
-def build_report(*, alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE) -> tuple[Path, Path]:
+def build_report(
+    *,
+    alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE,
+    factor_source: str = FACTOR_SOURCE_LEGACY,
+    factor_cabinet_run_id: str = "",
+    factor_cabinet_path: str = "",
+) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    universe_rows = _load_universe_rows(alpha_bundle=alpha_bundle)
+    factor_spec = resolve_factor_source(
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+        alpha_bundle=alpha_bundle,
+    )
+    effective_alpha_bundle = (
+        f"factor_cabinet_{factor_spec.factor_cabinet_run_id}"
+        if factor_spec.uses_factor_cabinet
+        else LEGACY_GOVERNANCE_ALPHA_BUNDLE
+    )
+    universe_rows = _load_universe_rows(alpha_bundle=effective_alpha_bundle)
     comparison_path = OUTPUT_DIR / "governance_mainline_review_summary.csv"
     universe_rows.to_csv(comparison_path, index=False, encoding="utf-8-sig")
     history_dir = OUTPUT_DIR / "governance_mainline_history"
@@ -224,7 +246,14 @@ def build_report(*, alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE) -> tuple[Pa
         "",
         "## Mainline Decision",
         f"- Variant: `{DEFAULT_GOVERNANCE_VARIANT}`",
-        f"- Alpha bundle: `{alpha_bundle}`",
+        f"- Alpha bundle: `{effective_alpha_bundle}`",
+        f"- Factor source: `{factor_spec.factor_source}`",
+        f"- Factor cabinet run id: `{factor_spec.factor_cabinet_run_id}`",
+        f"- Factor cabinet path: `{factor_spec.factor_cabinet_path}`",
+        f"- Factor count: `{factor_spec.factor_count}`",
+        f"- Role distribution: `{factor_spec.role_distribution or {}}`",
+        f"- Strict entry alpha count: `{factor_spec.strict_entry_alpha_count}`",
+        f"- Proxy entry alpha count: `{factor_spec.proxy_entry_alpha_count}`",
         "- Review scope: `hs300_csi500_a500_strict` and `hs300_strict` only",
         "- Universe note: `CSI500` remains the intended second-layer pool because it adds a distinct mid-cap constituent set instead of duplicating the `HS300/CSI300` large-cap exposure.",
         "",
@@ -239,6 +268,13 @@ def build_report(*, alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE) -> tuple[Pa
                 "universe_name",
                 "run_id",
                 "capital_usage_mode",
+                "factor_source",
+                "factor_cabinet_run_id",
+                "factor_cabinet_path",
+                "factor_count",
+                "role_distribution",
+                "strict_entry_alpha_count",
+                "proxy_entry_alpha_count",
                 "found_output_dir",
                 "date_window",
                 "total_return",
