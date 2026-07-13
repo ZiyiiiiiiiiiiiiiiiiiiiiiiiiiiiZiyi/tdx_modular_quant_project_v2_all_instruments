@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +10,27 @@ from functions.decision_council.live_monitor_dashboard import HTML
 from functions.decision_council.live_monitor_web import HTML as SERVED_HTML
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _legacy_html() -> str:
+    source = (ROOT / "functions/decision_council/live_monitor_web.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "HTML" for target in node.targets):
+            if isinstance(node.value.value, str):
+                return node.value.value
+    raise AssertionError("legacy monitor HTML template not found")
+
+
+def _object_fields(html: str, object_name: str) -> set[str]:
+    return set(re.findall(rf"\b{re.escape(object_name)}\.([A-Za-z_][A-Za-z0-9_]*)", html))
+
+
+def _metric_keys(html: str, start: str, end: str) -> set[str]:
+    section = html.split(start, 1)[1].split(end, 1)[0]
+    return set(re.findall(r'''\[\s*["']([a-z][a-z0-9_]*)["']\s*,\s*["']''', section))
 
 
 def main() -> None:
@@ -38,6 +61,13 @@ def main() -> None:
         assert token in HTML, token
     assert "radial-gradient" not in HTML
     assert "border-radius: 14px" not in HTML
+    legacy_html = _legacy_html()
+    for object_name in ("ms", "exposure", "payload"):
+        missing = _object_fields(legacy_html, object_name) - _object_fields(HTML, object_name)
+        assert not missing, f"new monitor dropped {object_name} fields: {sorted(missing)}"
+    legacy_metrics = _metric_keys(legacy_html, "const metricDefs", "const metricsRoot")
+    new_metrics = _metric_keys(HTML, "const KPI_DEFS", "const metricValues")
+    assert not legacy_metrics - new_metrics, f"new monitor dropped metrics: {sorted(legacy_metrics - new_metrics)}"
     direct_import = subprocess.run(
         [sys.executable, "functions/decision_council/live_monitor_web.py"],
         cwd=ROOT,
