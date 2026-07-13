@@ -11,65 +11,160 @@ from config import DEFAULT_ALPHA_BUNDLE, DEFAULT_GOVERNANCE_VARIANT, REPORT_DIR
 from functions.data_integrity import build_data_integrity_report
 from functions.decision_council.ml_metrics import compute_all_metrics
 from functions.formal_admission import build_formal_admission_report
+from functions.decision_council.factor_source import (
+    FACTOR_SOURCE_LEGACY,
+    LEGACY_GOVERNANCE_ALPHA_BUNDLE,
+    factor_source_output_label,
+    resolve_factor_source,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = REPORT_DIR
 REVIEW_UNIVERSES = ("hs300_csi500_a500_strict", "hs300_strict")
+DEFAULT_REVIEW_ALPHA_BUNDLE = "diversified_pre_screen_bundle_v2"
 
 
-def _summary_path(universe_name: str) -> Path:
+def _legacy_summary_path(universe_name: str, *, alpha_bundle: str) -> Path:
     return (
         PROJECT_DIR
         / "results"
         / "governance"
         / universe_name
         / DEFAULT_GOVERNANCE_VARIANT
-        / DEFAULT_ALPHA_BUNDLE
+        / alpha_bundle
         / "governance_strategy_summary.csv"
     )
 
 
-def _daily_path(universe_name: str) -> Path:
+def _alpha_bundle_dir(universe_name: str, *, alpha_bundle: str) -> Path:
     return (
         PROJECT_DIR
         / "results"
         / "governance"
         / universe_name
         / DEFAULT_GOVERNANCE_VARIANT
-        / DEFAULT_ALPHA_BUNDLE
-        / "governance_daily_result.csv"
+        / alpha_bundle
     )
 
 
-def _output_dir(universe_name: str) -> Path:
-    return (
-        PROJECT_DIR
-        / "results"
-        / "governance"
-        / universe_name
-        / DEFAULT_GOVERNANCE_VARIANT
-        / DEFAULT_ALPHA_BUNDLE
-    )
+def _candidate_summary_paths(universe_name: str, *, alpha_bundle: str) -> list[Path]:
+    base = _alpha_bundle_dir(universe_name, alpha_bundle=alpha_bundle)
+    paths: list[Path] = []
+    legacy = _legacy_summary_path(universe_name, alpha_bundle=alpha_bundle)
+    if legacy.exists():
+        paths.append(legacy)
+    if base.exists():
+        paths.extend(sorted(base.glob("**/governance_strategy_summary.csv")))
+    unique: dict[str, Path] = {}
+    for path in paths:
+        unique[str(path.resolve())] = path
+    return list(unique.values())
 
 
-def _load_universe_rows() -> pd.DataFrame:
+def _read_capital_usage_mode(output_dir: Path, summary: pd.DataFrame) -> str:
+    if "capital_usage_mode" in summary.columns:
+        values = summary["capital_usage_mode"].dropna().astype(str)
+        if not values.empty:
+            return values.iloc[-1]
+    daily_path = output_dir / "governance_daily_result.csv"
+    if daily_path.exists() and daily_path.stat().st_size > 5:
+        try:
+            daily = pd.read_csv(daily_path, usecols=lambda column: column in {"capital_usage_mode"})
+            values = daily.get("capital_usage_mode", pd.Series(dtype=str)).dropna().astype(str)
+            if not values.empty:
+                return values.iloc[-1]
+        except Exception:
+            pass
+    path_text = str(output_dir).lower()
+    if "force" in path_text:
+        return "force_deploy"
+    if "cashok" in path_text:
+        return "allow_cash"
+    return "unknown"
+
+
+def _run_id_from_output_dir(output_dir: Path) -> str:
+    for part in reversed(output_dir.parts):
+        if str(part).startswith("run"):
+            return str(part)
+    return "legacy"
+
+
+def _load_universe_rows(*, alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE) -> pd.DataFrame:
     rows = []
     for universe_name in REVIEW_UNIVERSES:
-        summary_path = _summary_path(universe_name)
-        if not summary_path.exists():
-            rows.append({"universe_name": universe_name, "status": "missing_results"})
+        expected_dir = _alpha_bundle_dir(universe_name, alpha_bundle=alpha_bundle)
+        summary_paths = _candidate_summary_paths(universe_name, alpha_bundle=alpha_bundle)
+        if not summary_paths:
+            rows.append(
+                {
+                    "universe_name": universe_name,
+                    "alpha_bundle": alpha_bundle,
+                    "status": "missing_results",
+                    "expected_search_dir": str(expected_dir),
+                    "found_output_dir": "",
+                    "run_id": "",
+                    "capital_usage_mode": "",
+                }
+            )
             continue
-        summary = pd.read_csv(summary_path)
-        if summary.empty:
-            rows.append({"universe_name": universe_name, "status": "empty_summary"})
-            continue
-        row = summary.iloc[0].to_dict()
-        row["universe_name"] = universe_name
-        row["status"] = "completed"
-        row.update(compute_all_metrics(_output_dir(universe_name)))
-        rows.append(row)
-    return pd.DataFrame(rows)
+        for summary_path in summary_paths:
+            output_dir = summary_path.parent
+            try:
+                summary = pd.read_csv(summary_path)
+            except Exception as exc:
+                rows.append(
+                    {
+                        "universe_name": universe_name,
+                        "alpha_bundle": alpha_bundle,
+                        "status": "read_error",
+                        "error": str(exc),
+                        "expected_search_dir": str(expected_dir),
+                        "found_output_dir": str(output_dir),
+                        "run_id": _run_id_from_output_dir(output_dir),
+                    }
+                )
+                continue
+            if summary.empty:
+                rows.append(
+                    {
+                        "universe_name": universe_name,
+                        "alpha_bundle": alpha_bundle,
+                        "status": "empty_summary",
+                        "expected_search_dir": str(expected_dir),
+                        "found_output_dir": str(output_dir),
+                        "run_id": _run_id_from_output_dir(output_dir),
+                    }
+                )
+                continue
+            row = summary.iloc[0].to_dict()
+            row["universe_name"] = universe_name
+            row["alpha_bundle"] = str(row.get("alpha_bundle") or alpha_bundle)
+            row["status"] = "completed"
+            row["expected_search_dir"] = str(expected_dir)
+            row["found_output_dir"] = str(output_dir)
+            row["run_id"] = _run_id_from_output_dir(output_dir)
+            row["capital_usage_mode"] = _read_capital_usage_mode(output_dir, summary)
+            row["_output_mtime"] = summary_path.stat().st_mtime
+            row.update(compute_all_metrics(output_dir))
+            rows.append(row)
+    frame = pd.DataFrame(rows)
+    if frame.empty or "status" not in frame.columns:
+        return frame
+    completed = frame[frame["status"].astype(str).eq("completed")].copy()
+    other = frame[~frame["status"].astype(str).eq("completed")].copy()
+    if completed.empty:
+        return frame
+    completed["trading_days"] = pd.to_numeric(completed.get("trading_days"), errors="coerce").fillna(0.0)
+    completed["_output_mtime"] = pd.to_numeric(completed.get("_output_mtime"), errors="coerce").fillna(0.0)
+    completed = (
+        completed.sort_values(["universe_name", "capital_usage_mode", "trading_days", "_output_mtime"])
+        .groupby(["universe_name", "capital_usage_mode"], as_index=False, dropna=False)
+        .tail(1)
+    )
+    result = pd.concat([completed, other], ignore_index=True, sort=False)
+    return result.drop(columns=["_output_mtime"], errors="ignore")
 
 
 def _load_safety_failure_messages() -> list[str]:
@@ -112,9 +207,22 @@ def _recommendation_lines(blocked: pd.DataFrame) -> list[str]:
     return lines
 
 
-def build_report() -> tuple[Path, Path]:
+def build_report(
+    *,
+    alpha_bundle: str = DEFAULT_REVIEW_ALPHA_BUNDLE,
+    factor_source: str = FACTOR_SOURCE_LEGACY,
+    factor_cabinet_run_id: str = "",
+    factor_cabinet_path: str = "",
+) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    universe_rows = _load_universe_rows()
+    factor_spec = resolve_factor_source(
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+        alpha_bundle=alpha_bundle,
+    )
+    effective_alpha_bundle = factor_source_output_label(factor_spec)
+    universe_rows = _load_universe_rows(alpha_bundle=effective_alpha_bundle)
     comparison_path = OUTPUT_DIR / "governance_mainline_review_summary.csv"
     universe_rows.to_csv(comparison_path, index=False, encoding="utf-8-sig")
     history_dir = OUTPUT_DIR / "governance_mainline_history"
@@ -135,7 +243,14 @@ def build_report() -> tuple[Path, Path]:
         "",
         "## Mainline Decision",
         f"- Variant: `{DEFAULT_GOVERNANCE_VARIANT}`",
-        f"- Alpha bundle: `{DEFAULT_ALPHA_BUNDLE}`",
+        f"- Alpha bundle: `{effective_alpha_bundle}`",
+        f"- Factor source: `{factor_spec.factor_source}`",
+        f"- Factor cabinet run id: `{factor_spec.factor_cabinet_run_id}`",
+        f"- Factor cabinet path: `{factor_spec.factor_cabinet_path}`",
+        f"- Factor count: `{factor_spec.factor_count}`",
+        f"- Role distribution: `{factor_spec.role_distribution or {}}`",
+        f"- Strict entry alpha count: `{factor_spec.strict_entry_alpha_count}`",
+        f"- Proxy entry alpha count: `{factor_spec.proxy_entry_alpha_count}`",
         "- Review scope: `hs300_csi500_a500_strict` and `hs300_strict` only",
         "- Universe note: `CSI500` remains the intended second-layer pool because it adds a distinct mid-cap constituent set instead of duplicating the `HS300/CSI300` large-cap exposure.",
         "",
@@ -148,6 +263,16 @@ def build_report() -> tuple[Path, Path]:
             column
             for column in [
                 "universe_name",
+                "run_id",
+                "capital_usage_mode",
+                "factor_source",
+                "factor_cabinet_run_id",
+                "factor_cabinet_path",
+                "factor_count",
+                "role_distribution",
+                "strict_entry_alpha_count",
+                "proxy_entry_alpha_count",
+                "found_output_dir",
                 "date_window",
                 "total_return",
                 "annual_return",
@@ -164,6 +289,10 @@ def build_report() -> tuple[Path, Path]:
                 "trading_freeze_trigger_count",
                 "emergency_deleveraging_trigger_count",
                 "portfolio_exposure_cap",
+                "research_gate_status",
+                "research_gate_fail_count",
+                "alpha_driven_trade_count",
+                "force_deploy_defensive_trade_count",
             ]
             if column in completed.columns
         ]

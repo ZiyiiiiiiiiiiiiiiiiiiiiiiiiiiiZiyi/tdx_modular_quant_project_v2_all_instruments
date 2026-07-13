@@ -125,6 +125,7 @@ from functions.pipeline_cache import (
     mark_step_completed,
     should_skip_step,
 )
+from functions.output_naming import dated_run_dir, reset_run_timestamp, run_suffix
 from functions.progress import progress_iter
 from functions.governance import build_research_status, print_runtime_disclosure
 from functions.report_utils import print_project_status
@@ -329,6 +330,39 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Skip existing low-memory selections/backtests.")
     parser.add_argument("--skip-data-steps", action="store_true", help="In low-memory mode, skip convert/clean/features and use saved feature parquet.")
     parser.add_argument("--governance", action="store_true", help="Run the phase-one daily decision-council backtest.")
+    parser.add_argument("--fast-factor-judge", action="store_true", help="Run the fast read-only factor judge without governance state machine.")
+    parser.add_argument("--factor-appeal-judge", action="store_true", help="Run the v2 factor appeal judge against the latest strict v1 judge output.")
+    parser.add_argument("--factor-cabinet", action="store_true", help="Build the state-machine factor cabinet from v1/v2 judged factors.")
+    parser.add_argument("--factor-cabinet-feature-cache", action="store_true", help="Build/materialize factor_cabinet generated feature cache.")
+    parser.add_argument("--factor-cabinet-gap-report", action="store_true", help="Audit factor_cabinet role, family, redundancy, and cache overlap gaps.")
+    parser.add_argument("--factor-cabinet-prune", action="store_true", help="Prune an existing factor_cabinet without adding factors.")
+    parser.add_argument(
+        "--orderflow-parameter-research",
+        action="store_true",
+        help="Run bounded order-flow proxy and sparse-breakout parameter research.",
+    )
+    parser.add_argument(
+        "--pit-level1-audit",
+        action="store_true",
+        help="Audit Level-1 PIT table availability and fail-closed readiness.",
+    )
+    parser.add_argument(
+        "--registered-mainline-v2-suite",
+        action="store_true",
+        help="Run the four pre-registered production_v1/mainline_v2 comparisons.",
+    )
+    parser.add_argument(
+        "--research-max-runtime-seconds",
+        type=float,
+        default=1800.0,
+        help="Cooperative time limit for bounded research tasks.",
+    )
+    parser.add_argument(
+        "--fast-factor-max-count",
+        type=int,
+        default=None,
+        help="Optional cap for fast factor judge registry size. Leave empty to use the full registered pool.",
+    )
     parser.add_argument("--governance-start-date", default=CLI_GOVERNANCE_START_DATE)
     parser.add_argument("--governance-end-date", default=CLI_GOVERNANCE_END_DATE)
     parser.add_argument("--governance-max-days", type=int, default=CLI_GOVERNANCE_MAX_DAYS)
@@ -380,9 +414,52 @@ def parse_args():
         help="Override minimum cash buffer kept out of buys.",
     )
     parser.add_argument(
+        "--capital-usage-mode",
+        choices=["allow_cash", "force_deploy"],
+        default=None,
+        help="allow_cash permits idle cash; force_deploy tries to fill diversified/defensive sleeves before holding cash.",
+    )
+    parser.add_argument(
         "--governance-variant",
         choices=list_governance_variant_names(),
         default=CLI_MAIN_GOVERNANCE_VARIANT,
+    )
+    parser.add_argument(
+        "--governance-control-mode",
+        choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
+        default="normal",
+        help="Governance control switch for stop-mode experiments.",
+    )
+    parser.add_argument(
+        "--governance-alpha-bundle",
+        choices=["formal_defensive_bundle", "pre_screen_promote_bundle", "diversified_pre_screen_bundle_v2"],
+        default="diversified_pre_screen_bundle_v2",
+        help="Alpha bundle used by governance mainline review.",
+    )
+    parser.add_argument(
+        "--factor-source",
+        choices=["legacy_bundle", "latest_factor_cabinet", "selected_factor_cabinet"],
+        default="legacy_bundle",
+        help="Governance mainline factor source.",
+    )
+    parser.add_argument("--factor-cabinet-run-id", default="", help="Factor cabinet run_id for selected_factor_cabinet.")
+    parser.add_argument("--factor-cabinet-path", default="", help="Explicit factor_cabinet.json path.")
+    parser.add_argument(
+        "--strategy-logic-version",
+        choices=["production_v1", "mainline_v2"],
+        default="production_v1",
+        help="Versioned governance decision logic; v2 outputs are isolated from production_v1.",
+    )
+    parser.add_argument(
+        "--pit-mode",
+        choices=["off", "research", "formal"],
+        default="research",
+        help="PIT policy: research records degradation; formal fails closed when tables are missing.",
+    )
+    parser.add_argument(
+        "--disable-alpha-collapse-exit",
+        action="store_true",
+        help="Record alpha-collapse exit as paper diagnostics but do not execute alpha_collapse_consensus sells.",
     )
     parser.add_argument("--registry-suite", action="store_true", help="Run the main strategy pipeline and governance main version sequentially.")
     return parser.parse_args()
@@ -481,7 +558,7 @@ def _build_strategy_signature():
         ],
     }
     outputs = [PROCESSED_DIR / f"{name}.parquet" for name in strategy_names]
-    outputs.extend(REPORT_DIR / f"strategy_selection_summary_{name}.csv" for name in strategy_names)
+    outputs.extend(REPORT_DIR / f"strategy_selection_summary_{name}{run_suffix()}.csv" for name in strategy_names)
     return build_signature(payload), outputs
 
 
@@ -495,11 +572,40 @@ def _capital_profile_from_args(args):
             else "__profile_default__"
         ),
         min_cash_buffer=getattr(args, "min_cash_buffer", None),
+        capital_usage_mode=getattr(args, "capital_usage_mode", None),
     )
 
 
+def _is_small_capital_profile(capital_profile: dict | None) -> bool:
+    profile = dict(capital_profile or {})
+    return (
+        profile.get("name") == "small_capital_branch"
+        or profile.get("base_profile") == "small_capital_branch"
+        or bool(profile.get("retail_lot_adapter", False))
+    )
+
+
+def _governance_control_mode_from_args(args) -> str:
+    mode = str(getattr(args, "governance_control_mode", "normal") or "normal").strip().lower()
+    aliases = {
+        "default": "normal",
+        "full": "normal",
+        "factor": "factor_only",
+        "stop": "factor_only",
+        "stop_mode": "factor_only",
+        "paper": "paper_controls",
+        "safe_factor": "safe_factor_only",
+        "safe_stop": "safe_factor_only",
+    }
+    mode = aliases.get(mode, mode)
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    if mode not in allowed:
+        raise ValueError(f"Invalid governance control mode: {mode}. Available: {sorted(allowed)}")
+    return mode
+
+
 def _backtest_summary_path(capital_profile_name: str) -> Path:
-    return RESULT_DIR / f"backtest_strategy_summary{backtest_profile_suffix(capital_profile_name)}.csv"
+    return RESULT_DIR / f"backtest_strategy_summary{backtest_profile_suffix(capital_profile_name)}{run_suffix()}.csv"
 
 
 def _build_backtest_signature(strategy_names, capital_profile):
@@ -524,18 +630,19 @@ def _build_backtest_signature(strategy_names, capital_profile):
             code_file_fingerprint("functions/execution/trade_pairing.py"),
         ],
     }
+    dated_suffix = f"{suffix}{run_suffix()}"
     outputs = [_backtest_summary_path(capital_profile["name"])]
     for name in strategy_names:
         outputs.extend(
             [
-                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_daily_result_{name}{suffix}.parquet",
-                RESULT_DIR / f"backtest_metrics_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_holdings_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_orders_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_trade_pairs_{name}{suffix}.csv",
-                RESULT_DIR / f"backtest_open_positions_{name}{suffix}.csv",
-                RESULT_DIR / f"equity_curve_{name}{suffix}.png",
+                RESULT_DIR / f"backtest_daily_result_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_daily_result_{name}{dated_suffix}.parquet",
+                RESULT_DIR / f"backtest_metrics_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_holdings_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_orders_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_trade_pairs_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"backtest_open_positions_{name}{dated_suffix}.csv",
+                RESULT_DIR / f"equity_curve_{name}{dated_suffix}.png",
             ]
         )
     learning_strategy_names = [
@@ -543,7 +650,7 @@ def _build_backtest_signature(strategy_names, capital_profile):
         if name.startswith("classic_ml_") or name.startswith("quantum_inspired_")
     ]
     for name in learning_strategy_names:
-        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}{suffix}.csv")
+        outputs.append(RESULT_DIR / f"backtest_learning_metadata_{name}{dated_suffix}.csv")
     return build_signature(payload), outputs
 
 
@@ -828,7 +935,7 @@ def run_low_memory(args):
                     stage="Backtest",
                     detail="Waiting to start",
                 )
-                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}{backtest_profile_suffix(capital_profile['name'])}.csv"
+                metrics_path = RESULT_DIR / f"backtest_metrics_{strategy_name}{backtest_profile_suffix(capital_profile['name'])}{run_suffix()}.csv"
                 if args.resume and metrics_path.exists():
                     print(f"Skip existing backtest: {strategy_name}")
                     progress_window.update(
@@ -1003,16 +1110,48 @@ def _run_single_governance_variant(
     universe_name: str | None = None,
     enable_shadow_portfolios: bool = True,
     show_live_monitor: bool = True,
+    capital_profile: dict | None = None,
+    governance_control_mode: str = "normal",
+    alpha_collapse_exit_enabled: bool = True,
+    alpha_bundle: str | None = None,
+    factor_source: str = "legacy_bundle",
+    factor_cabinet_run_id: str = "",
+    factor_cabinet_path: str = "",
+    strategy_logic_version: str = "production_v1",
+    pit_mode: str = "research",
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
+    from functions.decision_council.factor_source import factor_source_output_label, resolve_factor_source
     from functions.decision_council.runner import run_governance_backtest
     from functions.governance_variant_registry import get_governance_variant_spec
     from functions.universe_registry import get_universe_spec
 
     variant_spec = get_governance_variant_spec(variant_name)
+    capital_profile = capital_profile or get_backtest_capital_profile(DEFAULT_BACKTEST_CAPITAL_PROFILE)
     selected_universe_name = universe_name or variant_spec.universe_name
     universe_spec = get_universe_spec(selected_universe_name)
-    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / variant_spec.alpha_bundle
+    selected_alpha_bundle = str(alpha_bundle or variant_spec.alpha_bundle)
+    factor_spec = resolve_factor_source(
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+        alpha_bundle=selected_alpha_bundle,
+    )
+    output_alpha_bundle = factor_source_output_label(factor_spec)
+    output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / output_alpha_bundle
+    if _is_small_capital_profile(capital_profile):
+        output_dir = output_dir / "small_capital_branch"
+    control_mode = _governance_control_mode_from_args(argparse.Namespace(governance_control_mode=governance_control_mode))
+    if control_mode != "normal":
+        control_dir_names = {
+            "factor_only": "ctrl_factor",
+            "safe_factor_only": "ctrl_safe_factor",
+            "paper_controls": "ctrl_paper",
+        }
+        output_dir = output_dir / control_dir_names.get(control_mode, f"ctrl_{control_mode}")
+    if not bool(alpha_collapse_exit_enabled):
+        output_dir = output_dir / "no_alpha_collapse_exit"
+    output_dir = dated_run_dir(output_dir)
     return run_governance_backtest(
         start_date=start_date,
         end_date=end_date,
@@ -1027,11 +1166,13 @@ def _run_single_governance_variant(
         selection_weight_mode=variant_spec.extra.get("selection_weight_mode", "reputation_weighted"),
         regime_overlay_mode=variant_spec.extra.get("regime_overlay_mode", "full"),
         risk_hard_gate_enabled=variant_spec.extra.get("risk_hard_gate_enabled", False),
-        probability_bucket_mode=variant_spec.extra.get("probability_bucket_mode", "default"),
         output_dir=output_dir,
         universe_name=selected_universe_name,
         universe_mode=universe_spec.mode,
-        alpha_bundle=variant_spec.alpha_bundle,
+        alpha_bundle=selected_alpha_bundle,
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
         registry_version=REGISTRY_FRAMEWORK_VERSION,
         target_index_codes=tuple(universe_spec.target_index_codes),
         require_constituents=universe_spec.require_constituents,
@@ -1040,11 +1181,19 @@ def _run_single_governance_variant(
         enable_quality_filters=universe_spec.quality_filter_enabled,
         enable_shadow_portfolios=enable_shadow_portfolios,
         show_live_monitor=show_live_monitor,
+        initial_cash=capital_profile["initial_cash"],
+        max_positions=capital_profile.get("max_positions"),
+        capital_profile=capital_profile,
+        governance_control_mode=control_mode,
+        alpha_collapse_exit_enabled=bool(alpha_collapse_exit_enabled),
+        strategy_logic_version=strategy_logic_version,
+        pit_mode=pit_mode,
     )
 
 
 def run_registry_suite(args):
     selected_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     main()
     _run_single_governance_variant(
         "rules_based_president",
@@ -1055,6 +1204,11 @@ def run_registry_suite(args):
         universe_name=selected_universes[0],
         enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
         show_live_monitor=not args.no_live_monitor,
+        capital_profile=capital_profile,
+        governance_control_mode=_governance_control_mode_from_args(args),
+        alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
+        strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+        pit_mode=getattr(args, "pit_mode", "research"),
     )
 
 
@@ -1135,6 +1289,15 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         "governance_mainline_review",
         "governance_layer_validation",
         "governance_layer_ablation_suite",
+        "fast_factor_judge",
+        "factor_appeal_judge",
+        "factor_cabinet",
+        "factor_cabinet_prune",
+        "factor_cabinet_gap_report",
+        "factor_cabinet_feature_cache",
+        "orderflow_parameter_research",
+        "pit_level1_audit",
+        "registered_mainline_v2_suite",
     }
     if not any(task in governance_tasks for task in tasks):
         return runtime_args
@@ -1165,8 +1328,63 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         if max_days_int <= 0:
             raise ValueError("Governance max trading days must be positive.")
         runtime_args.governance_max_days = max_days_int
+    fast_factor_max_count = governance.get("fast_factor_max_count")
+    if fast_factor_max_count is not None and str(fast_factor_max_count).strip():
+        fast_factor_max_count_int = int(str(fast_factor_max_count).strip())
+        if fast_factor_max_count_int <= 0:
+            raise ValueError("Fast factor max count must be positive.")
+        runtime_args.fast_factor_max_count = fast_factor_max_count_int
     if "shadow_portfolios" in governance:
         runtime_args.governance_shadow_portfolios = bool(governance.get("shadow_portfolios"))
+    control_mode = str(governance.get("control_mode", "")).strip()
+    if control_mode:
+        runtime_args.governance_control_mode = control_mode
+    if "alpha_collapse_exit_enabled" in governance:
+        runtime_args.disable_alpha_collapse_exit = not bool(governance.get("alpha_collapse_exit_enabled"))
+    alpha_bundle = str(governance.get("alpha_bundle", "")).strip()
+    if alpha_bundle:
+        runtime_args.governance_alpha_bundle = alpha_bundle
+    factor_source = str(governance.get("factor_source", "")).strip()
+    if factor_source:
+        runtime_args.factor_source = factor_source
+    factor_cabinet_run_id = str(governance.get("factor_cabinet_run_id", "")).strip()
+    if factor_cabinet_run_id:
+        runtime_args.factor_cabinet_run_id = factor_cabinet_run_id
+    factor_cabinet_path = str(governance.get("factor_cabinet_path", "")).strip()
+    if factor_cabinet_path:
+        runtime_args.factor_cabinet_path = factor_cabinet_path
+    strategy_logic_version = str(governance.get("strategy_logic_version", "")).strip()
+    if strategy_logic_version:
+        runtime_args.strategy_logic_version = strategy_logic_version
+    pit_mode = str(governance.get("pit_mode", "")).strip()
+    if pit_mode:
+        if pit_mode not in {"off", "research", "formal"}:
+            raise ValueError(f"Invalid PIT mode: {pit_mode}")
+        runtime_args.pit_mode = pit_mode
+    max_runtime = governance.get("research_max_runtime_seconds")
+    if max_runtime is not None and str(max_runtime).strip():
+        max_runtime_value = float(max_runtime)
+        if max_runtime_value <= 0:
+            raise ValueError("Research runtime limit must be positive.")
+        runtime_args.research_max_runtime_seconds = max_runtime_value
+    backtest = selection.get("backtest", {}) if isinstance(selection, dict) else {}
+    if isinstance(backtest, dict):
+        capital_profile = str(backtest.get("capital_profile", "")).strip()
+        if capital_profile:
+            runtime_args.capital_profile = capital_profile
+        initial_cash = str(backtest.get("initial_cash", "")).strip()
+        max_positions = str(backtest.get("max_positions", "")).strip()
+        min_cash_buffer = str(backtest.get("min_cash_buffer", "")).strip()
+        capital_usage_mode = str(backtest.get("capital_usage_mode", "")).strip()
+        if initial_cash:
+            runtime_args.initial_cash = float(initial_cash)
+        if max_positions:
+            runtime_args.max_positions = int(max_positions)
+        if min_cash_buffer:
+            runtime_args.min_cash_buffer = float(min_cash_buffer)
+        if capital_usage_mode:
+            runtime_args.capital_usage_mode = capital_usage_mode
+    _capital_profile_from_args(runtime_args)
     return runtime_args
 
 
@@ -1181,12 +1399,15 @@ def _apply_interactive_backtest_params(args, selection: dict):
     initial_cash = str(backtest.get("initial_cash", "")).strip()
     max_positions = str(backtest.get("max_positions", "")).strip()
     min_cash_buffer = str(backtest.get("min_cash_buffer", "")).strip()
+    capital_usage_mode = str(backtest.get("capital_usage_mode", "")).strip()
     if initial_cash:
         runtime_args.initial_cash = float(initial_cash)
     if max_positions:
         runtime_args.max_positions = int(max_positions)
     if min_cash_buffer:
         runtime_args.min_cash_buffer = float(min_cash_buffer)
+    if capital_usage_mode:
+        runtime_args.capital_usage_mode = capital_usage_mode
     _capital_profile_from_args(runtime_args)
     return runtime_args
 
@@ -1195,19 +1416,51 @@ def run_governance_mainline_review_from_main(args):
     """Run the two-universe governance review flow from the main launcher."""
     from build_governance_mainline_report import build_report
     from functions.decision_council.live_monitor import GovernanceLiveMonitor
+    from functions.runtime_progress import write_progress
     from run_governance_experiments import run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     variant_name = "rules_based_president"
-    alpha_bundle = "president_core_bundle"
+    alpha_bundle = str(
+        getattr(args, "governance_alpha_bundle", "diversified_pre_screen_bundle_v2")
+        or "diversified_pre_screen_bundle_v2"
+    )
+    factor_source = getattr(args, "factor_source", "legacy_bundle")
+    factor_cabinet_run_id = getattr(args, "factor_cabinet_run_id", "")
+    factor_cabinet_path = getattr(args, "factor_cabinet_path", "")
     shared_live_monitor = None
     if not args.no_live_monitor:
         shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
 
-    for universe_name in review_universes:
+    total_universes = max(len(review_universes), 1)
+    for universe_index, universe_name in enumerate(review_universes, start=1):
         print("=" * 72)
         print(f"Running mainline review universe: {universe_name}")
         print("=" * 72)
+
+        def _progress(payload, *, index=universe_index, universe=universe_name):
+            local_percent = float(payload.get("percent", 0.0) or 0.0)
+            overall_percent = ((index - 1) + local_percent / 100.0) / total_universes * 100.0
+            step_name = str(payload.get("step", ""))
+            write_progress(
+                task_name="governance_mainline_review",
+                status="complete" if step_name == "complete" and index >= total_universes else "running",
+                percent=overall_percent,
+                current=index,
+                total=total_universes,
+                step=step_name,
+                message=str(payload.get("message", "")),
+                detail=f"universe={universe}; {payload.get('detail', '')}",
+            )
+            if shared_live_monitor is not None and step_name not in {"run_backtest", "process_date", "date_complete"}:
+                shared_live_monitor.report_stage(
+                    step=step_name,
+                    message=str(payload.get("message", "")),
+                    detail=f"universe={universe}; {payload.get('detail', '')}",
+                    progress_pct=overall_percent,
+                )
+
         run_single_experiment(
             variant_name=variant_name,
             alpha_bundle=alpha_bundle,
@@ -1218,28 +1471,96 @@ def run_governance_mainline_review_from_main(args):
             enable_shadow_portfolios=bool(args.governance_shadow_portfolios) if args.governance_shadow_portfolios is not None else True,
             show_live_monitor=not args.no_live_monitor,
             live_monitor=shared_live_monitor,
+            initial_cash=capital_profile["initial_cash"],
+            max_positions=capital_profile.get("max_positions"),
+            capital_profile=capital_profile,
+            governance_control_mode=_governance_control_mode_from_args(args),
+            alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
+            factor_source=factor_source,
+            factor_cabinet_run_id=factor_cabinet_run_id,
+            factor_cabinet_path=factor_cabinet_path,
+            progress_callback=_progress,
+            strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+            pit_mode=getattr(args, "pit_mode", "research"),
         )
-    report_path, comparison_path = build_report()
+    report_path, comparison_path = build_report(
+        alpha_bundle=alpha_bundle,
+        factor_source=factor_source,
+        factor_cabinet_run_id=factor_cabinet_run_id,
+        factor_cabinet_path=factor_cabinet_path,
+    )
     print(f"Saved review report: {report_path}")
     print(f"Saved comparison csv: {comparison_path}")
 
 
 def run_governance_layer_validation_from_main(args):
     """Run a compact governance line that isolates base signal quality."""
+    from functions.decision_council.factor_source import LEGACY_GOVERNANCE_ALPHA_BUNDLE
     from functions.decision_council.live_monitor import GovernanceLiveMonitor
+    from functions.runtime_progress import write_progress
     from run_governance_experiments import run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
     variant_name = "governance_layer_validation"
-    alpha_bundle = "validation_core_bundle"
+    alpha_bundle = LEGACY_GOVERNANCE_ALPHA_BUNDLE
+    factor_source = getattr(args, "factor_source", "legacy_bundle")
+    factor_cabinet_run_id = getattr(args, "factor_cabinet_run_id", "")
+    factor_cabinet_path = getattr(args, "factor_cabinet_path", "")
     shared_live_monitor = None
     if not args.no_live_monitor:
         shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
+        shared_live_monitor.start_session(
+            title="Governance Layer Validation | preparing data",
+            total_days=100,
+            initial_nav=capital_profile["initial_cash"],
+        )
 
-    for universe_name in review_universes:
+    total_universes = max(len(review_universes), 1)
+    for universe_index, universe_name in enumerate(review_universes, start=1):
         print("=" * 72)
         print(f"Running layer validation universe: {universe_name}")
         print("=" * 72)
+
+        def _progress(payload, *, index=universe_index, universe=universe_name):
+            local_percent = float(payload.get("percent", 0.0) or 0.0)
+            overall_percent = ((index - 1) + local_percent / 100.0) / total_universes * 100.0
+            step_name = str(payload.get("step", ""))
+            progress_status = "complete" if step_name == "complete" and index >= total_universes else "running"
+            write_progress(
+                task_name="governance_layer_validation",
+                status=progress_status,
+                percent=overall_percent,
+                current=index,
+                total=total_universes,
+                step=step_name,
+                message=str(payload.get("message", "")),
+                detail=f"universe={universe}; {payload.get('detail', '')}",
+            )
+            if shared_live_monitor is not None:
+                live_stage_steps = {
+                    "resolve_factor_source",
+                    "factor_source_resolved",
+                    "load_features",
+                    "feature_schema",
+                    "read_feature_parquet",
+                    "feature_parquet_loaded",
+                    "attach_candidate_cache",
+                    "candidate_cache_attached",
+                    "features_ready",
+                    "prepare_features",
+                    "build_runner",
+                    "save_metadata",
+                    "complete",
+                }
+                if step_name in live_stage_steps:
+                    shared_live_monitor.report_stage(
+                        step=str(payload.get("step", "")),
+                        message=str(payload.get("message", "")),
+                        detail=f"universe={universe}; {payload.get('detail', '')}",
+                        progress_pct=overall_percent,
+                    )
+
         run_single_experiment(
             variant_name=variant_name,
             alpha_bundle=alpha_bundle,
@@ -1250,6 +1571,17 @@ def run_governance_layer_validation_from_main(args):
             enable_shadow_portfolios=False,
             show_live_monitor=not args.no_live_monitor,
             live_monitor=shared_live_monitor,
+            initial_cash=capital_profile["initial_cash"],
+            max_positions=capital_profile.get("max_positions"),
+            capital_profile=capital_profile,
+            governance_control_mode=_governance_control_mode_from_args(args),
+            alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
+            factor_source=factor_source,
+            factor_cabinet_run_id=factor_cabinet_run_id,
+            factor_cabinet_path=factor_cabinet_path,
+            progress_callback=_progress,
+            strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+            pit_mode=getattr(args, "pit_mode", "research"),
         )
 
 
@@ -1266,8 +1598,41 @@ LAYER_ABLATION_SUITE = (
     ("governance_core_plus_regime", "validation_core_bundle", "10_core_plus_regime"),
     ("governance_core_plus_probability", "validation_core_bundle", "11_core_plus_probability"),
     ("governance_core_plus_complex_exit", "validation_core_bundle", "12_core_plus_complex_exit"),
-    ("governance_full_mainline_control", "president_core_bundle", "13_full_mainline_control"),
+    ("governance_full_mainline_control", "formal_defensive_bundle", "13_full_mainline_control"),
 )
+
+_CABINET_COMPATIBLE_LAYER_ABLATION_STEPS = frozenset({
+    "01_core_base",
+    "10_core_plus_regime",
+    "11_core_plus_probability",
+    "12_core_plus_complex_exit",
+    "13_full_mainline_control",
+})
+
+
+def _layer_ablation_suite_for_factor_source(factor_source: str):
+    """Return only experiments whose differences remain real for this source.
+
+    Legacy diagnostic bundle names do not select subsets of a factor cabinet.
+    Running those rows with a cabinet would silently repeat the same 74-factor
+    input, so cabinet runs keep only variants that change control-layer logic.
+    """
+    source = str(factor_source or "legacy_bundle").strip()
+    if source == "legacy_bundle":
+        raise ValueError(
+            "The enhanced layer-ablation suite cannot run legacy diagnostic bundles: "
+            "legacy_bundle is restricted to diversified_pre_screen_bundle_v2. "
+            "Select latest_factor_cabinet or selected_factor_cabinet."
+        )
+    selected = tuple(
+        row for row in LAYER_ABLATION_SUITE
+        if row[2] in _CABINET_COMPATIBLE_LAYER_ABLATION_STEPS
+    )
+    skipped = tuple(
+        row for row in LAYER_ABLATION_SUITE
+        if row[2] not in _CABINET_COMPATIBLE_LAYER_ABLATION_STEPS
+    )
+    return selected, skipped
 
 
 def run_governance_layer_ablation_suite_from_main(args):
@@ -1277,13 +1642,24 @@ def run_governance_layer_ablation_suite_from_main(args):
     from run_governance_experiments import build_output_path, run_single_experiment
 
     review_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    capital_profile = _capital_profile_from_args(args)
+    factor_source = str(getattr(args, "factor_source", "latest_factor_cabinet") or "latest_factor_cabinet")
+    factor_cabinet_run_id = str(getattr(args, "factor_cabinet_run_id", "") or "")
+    factor_cabinet_path = str(getattr(args, "factor_cabinet_path", "") or "")
+    suite_steps, skipped_steps = _layer_ablation_suite_for_factor_source(factor_source)
+    if skipped_steps:
+        print(
+            "[governance] cabinet layer suite: skipping legacy bundle-only factor ablations | "
+            f"steps={[row[2] for row in skipped_steps]}"
+        )
     suite_id = pd.Timestamp.now().strftime("suite_%Y%m%d_%H%M%S")
     shared_live_monitor = None
     if not args.no_live_monitor:
         shared_live_monitor = GovernanceLiveMonitor(total_days=1, initial_nav=1.0)
     comparison_rows = []
+    diagnostic_run_dirs = {}
     for universe_name in review_universes:
-        for variant_name, alpha_bundle, suite_step in LAYER_ABLATION_SUITE:
+        for variant_name, alpha_bundle, suite_step in suite_steps:
             print("=" * 72)
             print(f"Running enhanced diagnostic step: {suite_step}")
             print(f"  Universe: {universe_name}")
@@ -1301,10 +1677,21 @@ def run_governance_layer_ablation_suite_from_main(args):
                 show_live_monitor=not args.no_live_monitor,
                 live_monitor=shared_live_monitor,
                 output_dir_suffix=suite_id,
+                initial_cash=capital_profile["initial_cash"],
+                max_positions=capital_profile.get("max_positions"),
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(args),
+                alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
+                factor_source=factor_source,
+                factor_cabinet_run_id=factor_cabinet_run_id,
+                factor_cabinet_path=factor_cabinet_path,
+                strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+                pit_mode=getattr(args, "pit_mode", "research"),
             )
             summary_path = saved.get("governance_strategy_summary")
             if summary_path is None:
                 summary_path = build_output_path(variant_name, alpha_bundle, universe_name) / suite_id / "governance_strategy_summary.csv"
+            diagnostic_run_dirs[(universe_name, suite_step)] = Path(summary_path).parent
             try:
                 summary = pd.read_csv(summary_path)
             except Exception:
@@ -1335,18 +1722,341 @@ def run_governance_layer_ablation_suite_from_main(args):
             comparison_rows.append(row)
 
     comparison = pd.DataFrame(comparison_rows)
-    output_path = RESULT_DIR / "governance" / f"layer_ablation_suite_comparison_{suite_id}.csv"
+    output_path = RESULT_DIR / "governance" / f"layer_ablation_suite_comparison_{suite_id}{run_suffix()}.csv"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     comparison.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"Saved layer ablation suite comparison: {output_path}")
     diagnostic_paths = build_layer_ablation_diagnostics(
         suite_id=suite_id,
         universe_names=review_universes,
-        suite_steps=LAYER_ABLATION_SUITE,
+        suite_steps=suite_steps,
         result_dir=RESULT_DIR,
+        run_dirs=diagnostic_run_dirs,
     )
     for name, path in diagnostic_paths.items():
         print(f"Saved layer diagnostic {name}: {path}")
+
+
+def run_fast_factor_judge_from_main(args):
+    """Run fast read-only factor judgement for selected governance universes."""
+    from functions.decision_council.fast_factor_judge import FAST_FACTOR_FULL_HORIZONS, FAST_FACTOR_QUICK_HORIZONS, run_fast_factor_judge
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    selected_universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+    saved_runs = []
+    reset_progress(task_name="fast_factor_judge", total=len(selected_universes), message="starting fast factor judge")
+    try:
+        for universe_index, universe_name in enumerate(selected_universes, start=1):
+            print(f"Running fast factor judge universe: {universe_name}")
+            judge_max_days = getattr(args, "governance_max_days", None)
+            if judge_max_days is not None and int(judge_max_days) <= 0:
+                judge_max_days = None
+            large_pool_horizons = FAST_FACTOR_FULL_HORIZONS if judge_max_days is None else FAST_FACTOR_QUICK_HORIZONS
+            print(f"Fast factor judge window max_days={judge_max_days}, large_pool_horizons={large_pool_horizons}")
+
+            def _progress(payload, *, index=universe_index, total_universes=len(selected_universes), universe=universe_name):
+                inner_percent = float(payload.get("percent", 0.0) or 0.0)
+                total_percent = ((index - 1) + inner_percent / 100.0) / max(total_universes, 1) * 100.0
+                write_progress(
+                    task_name="fast_factor_judge",
+                    status="running",
+                    percent=total_percent,
+                    current=payload.get("current"),
+                    total=payload.get("total"),
+                    step=str(payload.get("step", "")),
+                    message=f"{universe}: {payload.get('message', '')}",
+                    detail=str(payload.get("detail", "")),
+                )
+
+            saved = run_fast_factor_judge(
+                universe_name=universe_name,
+                start_date=getattr(args, "governance_start_date", None),
+                end_date=getattr(args, "governance_end_date", None),
+                max_days=judge_max_days,
+                progress_callback=_progress,
+                max_factor_count=getattr(args, "fast_factor_max_count", None),
+                large_pool_horizons=large_pool_horizons,
+            )
+            saved_runs.append(saved)
+            print("Fast factor judge saved:")
+            for name, path in sorted(saved.items()):
+                print(f"  {name}: {path}")
+        complete_progress(task_name="fast_factor_judge", message="fast factor judge complete")
+    except Exception as exc:
+        fail_progress(task_name="fast_factor_judge", message=str(exc))
+        raise
+    return saved_runs
+
+
+def run_factor_appeal_judge_from_main(args):
+    """Run the v2 factor appeal judge for timing/fundamental/event proxy families."""
+    from functions.decision_council.factor_appeal_judge import run_factor_appeal_judge
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    reset_progress(task_name="factor_appeal_judge", total=1, message="starting factor appeal judge")
+    try:
+        saved = run_factor_appeal_judge(
+            max_days=getattr(args, "governance_max_days", None),
+        )
+        print("Factor appeal judge saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_appeal_judge", message="factor appeal judge complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_appeal_judge", message=str(exc))
+        raise
+
+
+def run_orderflow_parameter_research_from_main(args):
+    """Run bounded executable order-flow proxy and sparse-breakout research."""
+    from functions.decision_council.orderflow_parameter_research import run_orderflow_parameter_research
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    task_name = "orderflow_parameter_research"
+    reset_progress(task_name=task_name, total=1, message="starting bounded orderflow parameter research")
+    try:
+        requested_max_days = getattr(args, "governance_max_days", None)
+        research_max_days = int(requested_max_days) if requested_max_days is not None else 180
+        if requested_max_days is None:
+            print("[orderflow_parameter_research] max_days not set; applying low-memory default max_days=180")
+        saved = run_orderflow_parameter_research(
+            start_date=getattr(args, "governance_start_date", None),
+            end_date=getattr(args, "governance_end_date", None),
+            max_days=research_max_days,
+            max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
+            run_kind="production",
+        )
+        print("Orderflow parameter research saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="orderflow parameter research complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_pit_level1_audit_from_main(args):
+    """Write a bounded PIT availability audit without downloading or inventing data."""
+    from datetime import datetime
+
+    from functions.data.pit_level1_store import pit_store_status, run_pit_preflight
+    from functions.data.pit_source_readiness import audit_existing_pit_sources
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    task_name = "pit_level1_audit"
+    reset_progress(task_name=task_name, total=1, message="auditing PIT Level-1 store")
+    output_dir = RESULT_DIR / "decision_council" / "pit_level1_audit" / datetime.now().strftime(
+        "run%Y%m%d_%H%M%S_%f"
+    )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        status_path = output_dir / "pit_table_status.csv"
+        pit_store_status().to_csv(status_path, index=False, encoding="utf-8-sig")
+        readiness_path = output_dir / "pit_source_readiness.csv"
+        audit_existing_pit_sources().to_csv(readiness_path, index=False, encoding="utf-8-sig")
+        audit_path = output_dir / "pit_runtime_audit.json"
+        run_pit_preflight(mode=getattr(args, "pit_mode", "research"), output_path=audit_path)
+        saved = {
+            "output_dir": output_dir,
+            "table_status": status_path,
+            "source_readiness": readiness_path,
+            "runtime_audit": audit_path,
+        }
+        print("PIT Level-1 audit saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="PIT Level-1 audit complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_registered_mainline_v2_suite_from_main(args):
+    """Run the four fixed v1/v2 comparisons; no dynamic experiment expansion."""
+    from run_governance_experiments import run_registered_mainline_v2_suite
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    task_name = "registered_mainline_v2_suite"
+    reset_progress(task_name=task_name, total=4, message="starting registered mainline v2 suite")
+    try:
+        universes = _normalize_governance_universes(getattr(args, "governance_universes", None))
+        saved = run_registered_mainline_v2_suite(
+            universe_name=universes[0],
+            start_date=getattr(args, "governance_start_date", CLI_GOVERNANCE_START_DATE),
+            end_date=getattr(args, "governance_end_date", CLI_GOVERNANCE_END_DATE),
+            max_days=getattr(args, "governance_max_days", None),
+            factor_source=getattr(args, "factor_source", "latest_factor_cabinet"),
+            factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
+            factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
+            capital_profile=_capital_profile_from_args(args),
+            pit_mode=getattr(args, "pit_mode", "research"),
+            max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
+        )
+        complete_progress(task_name=task_name, message="registered mainline v2 suite complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_factor_cabinet_from_main(args):
+    """Build the final factor cabinet consumed by state-machine input adapters."""
+    from functions.factor_selection.factor_cabinet_builder import build_factor_cabinet
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+
+    reset_progress(task_name="factor_cabinet", total=1, message="starting factor cabinet build")
+    try:
+        saved = build_factor_cabinet(
+            appeal_run_dir=getattr(args, "factor_appeal_run_dir", None),
+        )
+        print("Factor cabinet saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_cabinet", message="factor cabinet build complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_cabinet", message=str(exc))
+        raise
+
+
+def run_factor_cabinet_feature_cache_from_main(args):
+    """Materialize generated candidate features required by a factor_cabinet run."""
+    from functions.decision_council.factor_cabinet_feature_cache import build_factor_cabinet_feature_cache
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    factor_source = getattr(args, "factor_source", "latest_factor_cabinet")
+    if str(factor_source or "").strip() == "legacy_bundle":
+        factor_source = "latest_factor_cabinet"
+    start_date = getattr(args, "governance_start_date", CLI_GOVERNANCE_START_DATE)
+    end_date = getattr(args, "governance_end_date", CLI_GOVERNANCE_END_DATE)
+    reset_progress(
+        task_name="factor_cabinet_feature_cache",
+        total=1,
+        message="starting factor_cabinet feature cache materialization",
+    )
+
+    def _progress(payload):
+        write_progress(
+            task_name="factor_cabinet_feature_cache",
+            status="running",
+            percent=float(payload.get("percent", 0.0) or 0.0),
+            current=1,
+            total=1,
+            step=str(payload.get("step", "")),
+            message=str(payload.get("message", "")),
+            detail=str(payload.get("detail", "")),
+        )
+
+    try:
+        build_factor_cabinet_feature_cache(
+            factor_source=factor_source,
+            factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
+            factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
+            start_date=start_date,
+            end_date=end_date,
+            progress_callback=_progress,
+        )
+        complete_progress(task_name="factor_cabinet_feature_cache", message="factor_cabinet feature cache complete")
+    except Exception as exc:
+        fail_progress(task_name="factor_cabinet_feature_cache", message=str(exc))
+        raise
+
+
+def run_factor_cabinet_gap_report_from_main(args):
+    """Audit factor_cabinet redundancy and missing family coverage."""
+    from functions.decision_council.factor_cabinet_gap_report import build_factor_cabinet_gap_report
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    factor_source = getattr(args, "factor_source", "latest_factor_cabinet")
+    if str(factor_source or "").strip() == "legacy_bundle":
+        factor_source = "latest_factor_cabinet"
+    start_date = getattr(args, "governance_start_date", CLI_GOVERNANCE_START_DATE)
+    end_date = getattr(args, "governance_end_date", CLI_GOVERNANCE_END_DATE)
+    max_days = getattr(args, "governance_max_days", None)
+    if max_days is not None:
+        end_ts = pd.Timestamp(start_date) + pd.Timedelta(days=max(int(max_days), 1) + 30)
+        end_date = min(pd.Timestamp(end_date), end_ts).strftime("%Y-%m-%d")
+    reset_progress(
+        task_name="factor_cabinet_gap_report",
+        total=1,
+        message="starting factor_cabinet gap report",
+    )
+
+    def _progress(payload: dict) -> None:
+        write_progress(
+            task_name="factor_cabinet_gap_report",
+            status="running",
+            percent=float(payload.get("percent", 0.0)),
+            current=0,
+            total=1,
+            step=str(payload.get("step", "")),
+            message=str(payload.get("step", "factor_cabinet gap report")),
+            detail=str(payload.get("detail", "")),
+        )
+
+    try:
+        saved = build_factor_cabinet_gap_report(
+            factor_source=factor_source,
+            factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
+            factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
+            start_date=start_date,
+            end_date=end_date,
+            progress_callback=_progress,
+        )
+        print("Factor cabinet gap report saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_cabinet_gap_report", message="factor cabinet gap report complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_cabinet_gap_report", message=str(exc))
+        raise
+
+
+def run_factor_cabinet_prune_from_main(args):
+    """Prune factor_cabinet redundancy without creating new factors."""
+    from functions.decision_council.factor_cabinet_pruner import build_factor_cabinet_pruned
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    factor_source = getattr(args, "factor_source", "latest_factor_cabinet")
+    if str(factor_source or "").strip() == "legacy_bundle":
+        factor_source = "latest_factor_cabinet"
+    reset_progress(
+        task_name="factor_cabinet_prune",
+        total=1,
+        message="starting factor_cabinet prune",
+    )
+
+    def _progress(payload: dict) -> None:
+        write_progress(
+            task_name="factor_cabinet_prune",
+            status="running",
+            percent=float(payload.get("percent", 0.0)),
+            current=0,
+            total=1,
+            step=str(payload.get("step", "")),
+            message=str(payload.get("step", "factor_cabinet prune")),
+            detail=str(payload.get("detail", "")),
+        )
+
+    try:
+        saved = build_factor_cabinet_pruned(
+            factor_source=factor_source,
+            factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
+            factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
+            progress_callback=_progress,
+        )
+        print("Factor cabinet prune saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name="factor_cabinet_prune", message="factor cabinet prune complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name="factor_cabinet_prune", message=str(exc))
+        raise
 
 
 def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
@@ -1357,6 +2067,12 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
         "governance_mainline_review",
         "governance_layer_validation",
         "governance_layer_ablation_suite",
+        "fast_factor_judge",
+        "factor_appeal_judge",
+        "factor_cabinet",
+        "factor_cabinet_prune",
+        "factor_cabinet_feature_cache",
+        "factor_cabinet_gap_report",
     }
     touches_governance = any(task in governance_tasks for task in tasks)
 
@@ -1433,11 +2149,41 @@ def launch_interactive_main_menu():
 
 
 def run_interactive_selection(selection, args):
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    reset_run_timestamp()
     tasks = [] if not selection else selection.get("tasks", [])
     profile = "full" if not selection else selection.get("profile", "full")
     if not tasks:
         print("Interactive launcher cancelled.")
         return
+    reset_progress(task_name="interactive_task_suite", total=len(tasks), message="starting selected tasks")
+
+    def _mark_task(task_name: str, task_index: int, status: str = "running"):
+        write_progress(
+            task_name="interactive_task_suite",
+            status=status,
+            percent=(task_index - 1) / max(len(tasks), 1) * 100.0,
+            current=task_index,
+            total=len(tasks),
+            step=task_name,
+            message=f"running task {task_index}/{len(tasks)}: {task_name}",
+        )
+
+    def _finish_task(task_name: str, task_index: int):
+        write_progress(
+            task_name="interactive_task_suite",
+            status="running",
+            percent=task_index / max(len(tasks), 1) * 100.0,
+            current=task_index,
+            total=len(tasks),
+            step=task_name,
+            message=f"finished task {task_index}/{len(tasks)}: {task_name}",
+        )
+
+    if selection.get("sanitized_task_note"):
+        print(f"Interactive task sanitization: {selection.get('sanitized_task_note')}")
+    print(f"Interactive selected tasks: {tasks}")
     runtime_args = _apply_interactive_backtest_params(args, selection)
     runtime_args = _apply_interactive_governance_params(runtime_args, selection, tasks)
     runtime_args, profile_name, profile_note = _apply_runtime_profile(runtime_args, profile, tasks)
@@ -1448,6 +2194,15 @@ def run_interactive_selection(selection, args):
         or "governance_mainline_review" in tasks
         or "governance_layer_validation" in tasks
         or "governance_layer_ablation_suite" in tasks
+        or "fast_factor_judge" in tasks
+        or "factor_appeal_judge" in tasks
+        or "factor_cabinet" in tasks
+        or "factor_cabinet_prune" in tasks
+        or "factor_cabinet_feature_cache" in tasks
+        or "factor_cabinet_gap_report" in tasks
+        or "orderflow_parameter_research" in tasks
+        or "pit_level1_audit" in tasks
+        or "registered_mainline_v2_suite" in tasks
     ):
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
         runtime_args.governance_universes = selected_universes
@@ -1459,26 +2214,116 @@ def run_interactive_selection(selection, args):
             f"max_days={runtime_args.governance_max_days}"
         )
 
-    if "main_pipeline" in tasks:
-        main(runtime_args)
-    if "governance_active" in tasks:
-        selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
-        _run_single_governance_variant(
-            "rules_based_president",
-            start_date=runtime_args.governance_start_date,
-            end_date=runtime_args.governance_end_date,
-            max_days=runtime_args.governance_max_days,
-            safety_proxy_mode=runtime_args.safety_proxy_mode,
-            universe_name=selected_universes[0],
-            enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
-            show_live_monitor=not runtime_args.no_live_monitor,
-        )
-    if "governance_mainline_review" in tasks:
-        run_governance_mainline_review_from_main(runtime_args)
-    if "governance_layer_validation" in tasks:
-        run_governance_layer_validation_from_main(runtime_args)
-    if "governance_layer_ablation_suite" in tasks:
-        run_governance_layer_ablation_suite_from_main(runtime_args)
+    try:
+        task_counter = 0
+        latest_appeal_run_dir = None
+        appeal_run_dirs = []
+        if "main_pipeline" in tasks:
+            task_counter += 1
+            _mark_task("main_pipeline", task_counter)
+            main(runtime_args)
+            _finish_task("main_pipeline", task_counter)
+        if "fast_factor_judge" in tasks:
+            task_counter += 1
+            _mark_task("fast_factor_judge", task_counter)
+            run_fast_factor_judge_from_main(runtime_args)
+            _finish_task("fast_factor_judge", task_counter)
+        if "factor_appeal_judge" in tasks:
+            task_counter += 1
+            _mark_task("factor_appeal_judge", task_counter)
+            appeal_saved = run_factor_appeal_judge_from_main(runtime_args)
+            latest_appeal_run_dir = appeal_saved.get("output_dir") if appeal_saved else None
+            if latest_appeal_run_dir:
+                appeal_run_dirs.append(latest_appeal_run_dir)
+            _finish_task("factor_appeal_judge", task_counter)
+        if "orderflow_parameter_research" in tasks:
+            task_counter += 1
+            _mark_task("orderflow_parameter_research", task_counter)
+            orderflow_saved = run_orderflow_parameter_research_from_main(runtime_args)
+            latest_appeal_run_dir = orderflow_saved.get("output_dir") if orderflow_saved else latest_appeal_run_dir
+            if orderflow_saved and orderflow_saved.get("output_dir"):
+                appeal_run_dirs.append(orderflow_saved["output_dir"])
+            _finish_task("orderflow_parameter_research", task_counter)
+        if "factor_cabinet" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet", task_counter)
+            if len(appeal_run_dirs) > 1:
+                from functions.decision_council.factor_appeal_judge import merge_appeal_artifacts
+
+                merged_appeal = merge_appeal_artifacts(appeal_run_dirs)
+                latest_appeal_run_dir = merged_appeal["output_dir"]
+            runtime_args.factor_appeal_run_dir = latest_appeal_run_dir
+            run_factor_cabinet_from_main(runtime_args)
+            _finish_task("factor_cabinet", task_counter)
+        if "factor_cabinet_prune" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet_prune", task_counter)
+            run_factor_cabinet_prune_from_main(runtime_args)
+            _finish_task("factor_cabinet_prune", task_counter)
+        if "factor_cabinet_feature_cache" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet_feature_cache", task_counter)
+            run_factor_cabinet_feature_cache_from_main(runtime_args)
+            _finish_task("factor_cabinet_feature_cache", task_counter)
+        if "factor_cabinet_gap_report" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet_gap_report", task_counter)
+            run_factor_cabinet_gap_report_from_main(runtime_args)
+            _finish_task("factor_cabinet_gap_report", task_counter)
+        if "pit_level1_audit" in tasks:
+            task_counter += 1
+            _mark_task("pit_level1_audit", task_counter)
+            run_pit_level1_audit_from_main(runtime_args)
+            _finish_task("pit_level1_audit", task_counter)
+        if "registered_mainline_v2_suite" in tasks:
+            task_counter += 1
+            _mark_task("registered_mainline_v2_suite", task_counter)
+            run_registered_mainline_v2_suite_from_main(runtime_args)
+            _finish_task("registered_mainline_v2_suite", task_counter)
+        if "governance_active" in tasks:
+            task_counter += 1
+            _mark_task("governance_active", task_counter)
+            selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
+            capital_profile = _capital_profile_from_args(runtime_args)
+            _run_single_governance_variant(
+                "rules_based_president",
+                start_date=runtime_args.governance_start_date,
+                end_date=runtime_args.governance_end_date,
+                max_days=runtime_args.governance_max_days,
+                safety_proxy_mode=runtime_args.safety_proxy_mode,
+                universe_name=selected_universes[0],
+                enable_shadow_portfolios=bool(runtime_args.governance_shadow_portfolios) if runtime_args.governance_shadow_portfolios is not None else True,
+                show_live_monitor=not runtime_args.no_live_monitor,
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(runtime_args),
+                alpha_collapse_exit_enabled=not bool(getattr(runtime_args, "disable_alpha_collapse_exit", False)),
+                alpha_bundle=getattr(runtime_args, "governance_alpha_bundle", None),
+                factor_source=getattr(runtime_args, "factor_source", "legacy_bundle"),
+                factor_cabinet_run_id=getattr(runtime_args, "factor_cabinet_run_id", ""),
+                factor_cabinet_path=getattr(runtime_args, "factor_cabinet_path", ""),
+                strategy_logic_version=getattr(runtime_args, "strategy_logic_version", "production_v1"),
+                pit_mode=getattr(runtime_args, "pit_mode", "research"),
+            )
+            _finish_task("governance_active", task_counter)
+        if "governance_mainline_review" in tasks:
+            task_counter += 1
+            _mark_task("governance_mainline_review", task_counter)
+            run_governance_mainline_review_from_main(runtime_args)
+            _finish_task("governance_mainline_review", task_counter)
+        if "governance_layer_validation" in tasks:
+            task_counter += 1
+            _mark_task("governance_layer_validation", task_counter)
+            run_governance_layer_validation_from_main(runtime_args)
+            _finish_task("governance_layer_validation", task_counter)
+        if "governance_layer_ablation_suite" in tasks:
+            task_counter += 1
+            _mark_task("governance_layer_ablation_suite", task_counter)
+            run_governance_layer_ablation_suite_from_main(runtime_args)
+            _finish_task("governance_layer_ablation_suite", task_counter)
+        complete_progress(task_name="interactive_task_suite", message="selected tasks complete")
+    except Exception as exc:
+        fail_progress(task_name="interactive_task_suite", message=str(exc))
+        raise
 
 
 def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
@@ -1487,11 +2332,14 @@ def _run_pbo_analysis(strategy_names: list[str]) -> dict | None:
 
     strategy_returns = {}
     for name in strategy_names:
-        daily_path = RESULT_DIR / f"backtest_daily_result_{name}.parquet"
-        if not daily_path.exists():
-            daily_path = RESULT_DIR / f"backtest_daily_result_{name}.csv"
-        if not daily_path.exists():
+        candidates = list(RESULT_DIR.glob(f"backtest_daily_result_{name}*{run_suffix()}.parquet"))
+        candidates.extend(RESULT_DIR.glob(f"backtest_daily_result_{name}*{run_suffix()}.csv"))
+        if not candidates:
+            candidates = list(RESULT_DIR.glob(f"backtest_daily_result_{name}*.parquet"))
+            candidates.extend(RESULT_DIR.glob(f"backtest_daily_result_{name}*.csv"))
+        if not candidates:
             continue
+        daily_path = max(candidates, key=lambda path: path.stat().st_mtime)
         try:
             daily = pd.read_parquet(daily_path) if str(daily_path).endswith(".parquet") else pd.read_csv(daily_path)
             if "daily_return" in daily.columns and not daily.empty:
@@ -1553,25 +2401,12 @@ def _save_low_memory_summary(records, capital_profile_name=DEFAULT_BACKTEST_CAPI
     batch_df = pd.DataFrame(records)
     suffix = backtest_profile_suffix(capital_profile_name)
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    output = RESULT_DIR / f"backtest_strategy_summary_batch{suffix}.csv"
-    if output.exists():
-        existing = pd.read_csv(output)
-        if "execution_model_version" in batch_df.columns:
-            current_versions = set(batch_df["execution_model_version"].dropna().astype(str))
-            if "execution_model_version" not in existing.columns:
-                existing = existing.iloc[0:0].copy()
-            else:
-                existing = existing[
-                    existing["execution_model_version"].astype(str).isin(current_versions)
-                ]
-        if not existing.empty:
-            batch_df = pd.concat([existing, batch_df], ignore_index=True)
-        batch_df = batch_df.drop_duplicates(subset=["strategy"], keep="last")
+    output = RESULT_DIR / f"backtest_strategy_summary_batch{suffix}{run_suffix()}.csv"
     summary = build_strategy_summary(batch_df)
     summary.to_csv(output, index=False, encoding="utf-8-sig")
     report_file = save_strategy_report(
         build_strategy_report(summary),
-        RESULT_DIR / f"strategy_diagnostic_report_batch{suffix}.md",
+        RESULT_DIR / f"strategy_diagnostic_report_batch{suffix}{run_suffix()}.md",
     )
     print("Saved low-memory batch summary:", output)
     print("Saved low-memory diagnostic report:", report_file)
@@ -1808,7 +2643,7 @@ def main(args=None):
                     summary_file = _backtest_summary_path(capital_profile["name"])
                     summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
                     report_text = build_strategy_report(summary_df)
-                    report_output = RESULT_DIR / f"strategy_diagnostic_report{backtest_profile_suffix(capital_profile['name'])}.md"
+                    report_output = RESULT_DIR / f"strategy_diagnostic_report{backtest_profile_suffix(capital_profile['name'])}{run_suffix()}.md"
                     report_file = save_strategy_report(report_text, report_output)
                     print_strategy_rankings(summary_df)
                     print("Saved strategy ranking summary:", summary_file)
@@ -1819,7 +2654,7 @@ def main(args=None):
                         from functions.pbo_cscv import pbo_summary_report
                         pbo_result = _run_pbo_analysis(available_strategy_names)
                         if pbo_result is not None:
-                            pbo_report_path = RESULT_DIR / "pbo_overfitting_report.md"
+                            pbo_report_path = RESULT_DIR / f"pbo_overfitting_report{run_suffix()}.md"
                             pbo_report_path.write_text(
                                 pbo_summary_report(pbo_result), encoding="utf-8"
                             )
@@ -1833,7 +2668,7 @@ def main(args=None):
                         from functions.leakage_detector import leakage_audit_report
                         leakage_result = _run_leakage_audit()
                         if leakage_result is not None:
-                            leakage_report_path = RESULT_DIR / "leakage_audit_report.md"
+                            leakage_report_path = RESULT_DIR / f"leakage_audit_report{run_suffix()}.md"
                             leakage_report_path.write_text(
                                 leakage_audit_report(leakage_result), encoding="utf-8"
                             )
@@ -1856,9 +2691,9 @@ def main(args=None):
                         print("\n--- Decision Accuracy Analysis ---")
                         accuracy_results = build_all_strategies_accuracy_report(available_strategy_names)
                         if accuracy_results:
-                            plot_all_accuracy(accuracy_results)
-                            save_accuracy_summary_csv(accuracy_results)
-                            accuracy_md_path = RESULT_DIR / "decision_accuracy_report.md"
+                            plot_all_accuracy(accuracy_results, file_suffix=run_suffix())
+                            save_accuracy_summary_csv(accuracy_results, file_suffix=run_suffix())
+                            accuracy_md_path = RESULT_DIR / f"decision_accuracy_report{run_suffix()}.md"
                             accuracy_md_path.write_text(
                                 accuracy_report_markdown(accuracy_results), encoding="utf-8"
                             )
@@ -1912,8 +2747,27 @@ if __name__ == "__main__":
             run_auto_completion()
         elif cli_args.registry_suite:
             run_registry_suite(cli_args)
+        elif cli_args.fast_factor_judge:
+            run_fast_factor_judge_from_main(cli_args)
+        elif cli_args.factor_appeal_judge:
+            run_factor_appeal_judge_from_main(cli_args)
+        elif cli_args.factor_cabinet:
+            run_factor_cabinet_from_main(cli_args)
+        elif cli_args.factor_cabinet_prune:
+            run_factor_cabinet_prune_from_main(cli_args)
+        elif cli_args.factor_cabinet_feature_cache:
+            run_factor_cabinet_feature_cache_from_main(cli_args)
+        elif cli_args.factor_cabinet_gap_report:
+            run_factor_cabinet_gap_report_from_main(cli_args)
+        elif cli_args.orderflow_parameter_research:
+            run_orderflow_parameter_research_from_main(cli_args)
+        elif cli_args.pit_level1_audit:
+            run_pit_level1_audit_from_main(cli_args)
+        elif cli_args.registered_mainline_v2_suite:
+            run_registered_mainline_v2_suite_from_main(cli_args)
         elif cli_args.governance:
             selected_universes = _normalize_governance_universes(getattr(cli_args, "governance_universes", None))
+            capital_profile = _capital_profile_from_args(cli_args)
             _run_single_governance_variant(
                 cli_args.governance_variant,
                 start_date=cli_args.governance_start_date,
@@ -1923,6 +2777,15 @@ if __name__ == "__main__":
                 universe_name=selected_universes[0],
                 enable_shadow_portfolios=bool(cli_args.governance_shadow_portfolios) if cli_args.governance_shadow_portfolios is not None else True,
                 show_live_monitor=not cli_args.no_live_monitor,
+                capital_profile=capital_profile,
+                governance_control_mode=_governance_control_mode_from_args(cli_args),
+                alpha_collapse_exit_enabled=not bool(getattr(cli_args, "disable_alpha_collapse_exit", False)),
+                strategy_logic_version=getattr(cli_args, "strategy_logic_version", "production_v1"),
+                pit_mode=getattr(cli_args, "pit_mode", "research"),
+                alpha_bundle=getattr(cli_args, "governance_alpha_bundle", None),
+                factor_source=getattr(cli_args, "factor_source", "legacy_bundle"),
+                factor_cabinet_run_id=getattr(cli_args, "factor_cabinet_run_id", ""),
+                factor_cabinet_path=getattr(cli_args, "factor_cabinet_path", ""),
             )
         elif cli_args.low_memory:
             run_low_memory(cli_args)

@@ -3,6 +3,7 @@ import pandas as pd
 
 from config import FEATURE_DAILY_PARQUET, PROCESSED_DIR, REPORT_DIR
 from functions.date_window import assert_date_window, filter_date_window, window_identity
+from functions.output_naming import run_suffix
 
 
 def get_rebalance_dates(df, freq="ME"):
@@ -117,7 +118,7 @@ def run_strategy_selection(
     matching summary report.
     """
     output_file = PROCESSED_DIR / f"{strategy_name}.parquet"
-    summary_file = REPORT_DIR / f"strategy_selection_summary_{strategy_name}.csv"
+    summary_file = REPORT_DIR / f"strategy_selection_summary_{strategy_name}{run_suffix()}.csv"
 
     if df_selection is not None:
         selection = df_selection.copy()

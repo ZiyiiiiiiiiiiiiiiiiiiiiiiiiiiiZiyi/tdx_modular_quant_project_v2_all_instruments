@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
+import time
 
 import pandas as pd
 
@@ -20,6 +22,68 @@ LEDGER_FILENAMES = {
     "shadow_portfolio_ledger": "shadow_portfolio_ledger.csv",
     "leakage_audit_report": "leakage_audit_report.csv",
 }
+
+
+CSV_WRITE_RETRIES = 3
+CSV_WRITE_CHUNK_ROWS = 50_000
+
+
+def write_governance_text(text: str, path: str | Path, *, encoding: str = "utf-8") -> Path:
+    """Write a text artifact with the same retry contract as ledger CSV files."""
+    target = Path(path)
+    last_error: OSError | None = None
+    for attempt in range(1, CSV_WRITE_RETRIES + 1):
+        try:
+            io_target = _windows_extended_path(target)
+            Path(io_target).parent.mkdir(parents=True, exist_ok=True)
+            Path(io_target).write_text(str(text), encoding=encoding)
+            return target
+        except OSError as exc:
+            last_error = exc
+        if attempt < CSV_WRITE_RETRIES:
+            time.sleep(0.5 * attempt)
+    raise RuntimeError(
+        f"Unable to write governance artifact after {CSV_WRITE_RETRIES} attempts: {target}"
+    ) from last_error
+
+
+def write_governance_csv(frame: pd.DataFrame, path: str | Path) -> Path:
+    """Write a run artifact defensively against transient Windows directory races.
+
+    A long backtest must not be discarded because an antivirus, file indexer, or
+    network-backed drive makes the output directory briefly unavailable.  The
+    content and CSV schema are unchanged; only directory creation, chunked
+    serialization, and a short retry are added.
+    """
+    target = Path(path)
+    last_error: OSError | None = None
+    for attempt in range(1, CSV_WRITE_RETRIES + 1):
+        try:
+            io_target = _windows_extended_path(target)
+            Path(io_target).parent.mkdir(parents=True, exist_ok=True)
+            frame.to_csv(
+                io_target,
+                index=False,
+                encoding="utf-8-sig",
+                chunksize=CSV_WRITE_CHUNK_ROWS,
+            )
+            return target
+        except FileNotFoundError as exc:
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        if attempt < CSV_WRITE_RETRIES:
+            time.sleep(0.5 * attempt)
+    raise RuntimeError(
+        f"Unable to write governance artifact after {CSV_WRITE_RETRIES} attempts: {target}"
+    ) from last_error
+
+
+def _windows_extended_path(path: Path) -> str:
+    absolute = str(path.resolve())
+    if os.name == "nt" and len(absolute) >= 248 and not absolute.startswith("\\\\?\\"):
+        return "\\\\?\\" + absolute
+    return absolute
 
 
 @dataclass
@@ -50,6 +114,5 @@ class GovernanceLedgerBundle:
         saved = {}
         for ledger_name, filename in LEDGER_FILENAMES.items():
             path = output / filename
-            self.frame(ledger_name).to_csv(path, index=False, encoding="utf-8-sig")
-            saved[ledger_name] = path
+            saved[ledger_name] = write_governance_csv(self.frame(ledger_name), path)
         return saved

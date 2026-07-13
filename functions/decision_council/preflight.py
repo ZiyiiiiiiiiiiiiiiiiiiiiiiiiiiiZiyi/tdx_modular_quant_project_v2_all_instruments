@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from functions.decision_council.outputs import write_governance_text
+
 from config import (
     ADJUSTED_FEATURE_PRICE_MODE,
     DATA_VERSION,
@@ -127,10 +129,11 @@ def build_environment_manifest(
 
 
 def save_environment_manifest(manifest: dict, output_path=GOVERNANCE_ENVIRONMENT_MANIFEST_JSON) -> Path:
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return output
+    return write_governance_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        output_path,
+        encoding="utf-8",
+    )
 
 
 def _max_true_streak(flags) -> int:

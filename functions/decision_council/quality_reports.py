@@ -11,7 +11,20 @@ import math
 import numpy as np
 import pandas as pd
 
+from config import (
+    GOVERNANCE_ALPHA_DIVERSIFICATION_RULES,
+    GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP,
+    GOVERNANCE_ENTRY_CALIBRATION_MAX_OVERCONFIDENCE_GAP,
+    GOVERNANCE_ENTRY_CALIBRATION_MIN_BUCKET_SAMPLES,
+    GOVERNANCE_ENTRY_CALIBRATION_MIN_EXPECTANCY_10D,
+    GOVERNANCE_ENTRY_CALIBRATION_MIN_WILSON_LOWER,
+    GOVERNANCE_RESEARCH_MAX_TOP1_ACCOUNT_WEIGHT,
+    GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM,
+    GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N,
+    GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS,
+)
 from functions.decision_council.analytics import build_top_strength_benchmark_series, factor_module
+from functions.decision_council.factor_validation import build_factor_research_reports
 
 
 PREDICTION_BUCKETS = [0.0, 0.45, 0.50, 0.55, 0.60, 0.65, 1.0]
@@ -29,11 +42,14 @@ def build_governance_quality_reports(
     daily_result: pd.DataFrame | None = None,
     attribution_ledger: pd.DataFrame | None = None,
     return_pivot: pd.DataFrame | None = None,
+    runtime_context=None,
 ) -> dict[str, pd.DataFrame]:
+    _log_quality_stage("prepare_price_frames")
     close_pivot = _close_pivot(feature_data)
     benchmark_returns = _top_strength_benchmark_forward_returns(feature_data)
     if all(series.empty for series in benchmark_returns.values()):
         benchmark_returns = _benchmark_forward_returns(close_pivot, benchmark_symbol)
+    _log_quality_stage("trade_quality_reports")
     reports = {
         "governance_entry_payoff_report": build_entry_payoff_report(
             execution_ledger=execution_ledger,
@@ -76,17 +92,48 @@ def build_governance_quality_reports(
             ideal_portfolio_plan=ideal_portfolio_plan,
             return_pivot=return_pivot,
         ),
-        "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals),
-        "governance_factor_role_report": build_factor_role_report(alpha_proposals),
+        "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals, runtime_context=runtime_context),
+        "governance_factor_role_report": build_factor_role_report(alpha_proposals, runtime_context=runtime_context),
+        "governance_alpha_diversification_report": build_alpha_diversification_report(alpha_proposals, runtime_context=runtime_context),
+        "governance_trading_evidence_report": build_trading_evidence_report(
+            daily_result=daily_result,
+            execution_ledger=execution_ledger,
+        ),
         "governance_rolling_beat_report": build_rolling_beat_report(attribution_ledger),
         "governance_module_role_summary": build_module_role_summary(ideal_portfolio_plan),
+        "governance_portfolio_constraint_report": build_portfolio_constraint_report(daily_result),
     }
+    _log_quality_stage("factor_research_reports_lightweight")
+    reports.update(
+        build_factor_research_reports(
+            feature_data,
+            horizons=(5, 10),
+            emit_quantile_rows=False,
+            cluster_max_factors=80,
+            max_rows=80_000,
+            include_missing_factors=False,
+        )
+    )
+    _log_quality_stage("strategy_validation_reports")
+    reports["governance_entry_failure_timing_report"] = build_entry_failure_timing_report(
+        execution_ledger=execution_ledger,
+        close_pivot=close_pivot,
+    )
+    reports["governance_entry_gate_policy"] = build_entry_gate_policy_report(
+        reports.get("governance_entry_calibration_report", pd.DataFrame()),
+        reports.get("governance_entry_payoff_by_regime", pd.DataFrame()),
+    )
     reports["governance_rebound_entry_diagnostics"] = build_rebound_entry_diagnostics(
         reports.get("governance_entry_payoff_by_regime", pd.DataFrame()),
         daily_result=daily_result,
     )
     reports["governance_strategy_validation_matrix"] = build_strategy_validation_matrix(reports)
+    reports["governance_research_gate_report"] = build_research_gate_report(reports)
     return reports
+
+
+def _log_quality_stage(stage: str) -> None:
+    print(f"[governance] quality_reports: {stage}", flush=True)
 
 
 def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFrame:
@@ -114,7 +161,7 @@ def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFram
         if column not in data.columns:
             data[column] = np.nan
         data[column] = pd.to_numeric(data[column], errors="coerce")
-    for column in ["entry_confirmed", "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass", "breakout_probability_bucket_pass"]:
+    for column in ["entry_confirmed", "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass"]:
         if column not in data.columns:
             data[column] = False
         data[column] = data[column].fillna(False).astype(bool)
@@ -131,7 +178,6 @@ def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFram
                 "orderflow_pass_count": int(group["orderflow_candidate_pass"].sum()),
                 "reversal_pass_count": int(group["reversal_confirm_pass"].sum()),
                 "breakout_pass_count": int(group["breakout_gate_pass"].sum()),
-                "breakout_probability_bucket_pass_count": int(group["breakout_probability_bucket_pass"].sum()),
                 "avg_orderflow_candidate_score": _safe_mean(source["orderflow_candidate_score"]),
                 "avg_reversal_entry_score": _safe_mean(source["reversal_entry_score"]),
                 "avg_breakout_gate_score": _safe_mean(source["breakout_gate_score"]),
@@ -191,6 +237,350 @@ def build_rebound_entry_diagnostics(payoff_by_regime: pd.DataFrame, *, daily_res
     return pd.DataFrame(rows)
 
 
+def build_portfolio_constraint_report(
+    daily_result: pd.DataFrame | None,
+    *,
+    min_effective_n: float = GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N,
+    max_top1_account_weight: float = GOVERNANCE_RESEARCH_MAX_TOP1_ACCOUNT_WEIGHT,
+    max_top5_account_weight_sum: float = GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM,
+) -> pd.DataFrame:
+    """Audit concentration constraints without changing the portfolio."""
+    columns = [
+        "date",
+        "account_effective_n",
+        "top1_account_weight",
+        "top5_account_weight_sum",
+        "industry_top1_weight",
+        "factor_cluster_top1_weight",
+        "liquidity_bucket_exposure",
+        "holding_count",
+        "actual_exposure",
+        "constraint_pass",
+        "fail_reasons",
+        "research_valid",
+    ]
+    if daily_result is None or daily_result.empty:
+        return pd.DataFrame(columns=columns)
+    data = daily_result.copy()
+    data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
+    numeric_defaults = {
+        "account_effective_n": "effective_n",
+        "top1_account_weight": "top1_weight",
+        "top5_account_weight_sum": "top5_weight_sum",
+        "industry_top1_weight": None,
+        "factor_cluster_top1_weight": None,
+        "liquidity_bucket_exposure": None,
+        "holding_count": None,
+        "actual_exposure": None,
+    }
+    for column, fallback in numeric_defaults.items():
+        if column not in data.columns and fallback and fallback in data.columns:
+            data[column] = data[fallback]
+        data[column] = pd.to_numeric(data.get(column, pd.Series(np.nan, index=data.index)), errors="coerce")
+    rows = []
+    for _, row in data.dropna(subset=["date"]).iterrows():
+        fail_reasons = []
+        if pd.notna(row["account_effective_n"]) and float(row["account_effective_n"]) < float(min_effective_n):
+            fail_reasons.append("effective_n_below_research_min")
+        if pd.notna(row["top1_account_weight"]) and float(row["top1_account_weight"]) > float(max_top1_account_weight):
+            fail_reasons.append("top1_account_weight_above_cap")
+        if pd.notna(row["top5_account_weight_sum"]) and float(row["top5_account_weight_sum"]) > float(max_top5_account_weight_sum):
+            fail_reasons.append("top5_account_weight_sum_above_cap")
+        rows.append(
+            {
+                "date": pd.Timestamp(row["date"]),
+                "account_effective_n": row["account_effective_n"],
+                "top1_account_weight": row["top1_account_weight"],
+                "top5_account_weight_sum": row["top5_account_weight_sum"],
+                "industry_top1_weight": row["industry_top1_weight"],
+                "factor_cluster_top1_weight": row["factor_cluster_top1_weight"],
+                "liquidity_bucket_exposure": row["liquidity_bucket_exposure"],
+                "holding_count": row["holding_count"],
+                "actual_exposure": row["actual_exposure"],
+                "constraint_pass": not fail_reasons,
+                "fail_reasons": "|".join(fail_reasons),
+                "research_valid": not fail_reasons,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_entry_failure_timing_report(
+    *,
+    execution_ledger: pd.DataFrame,
+    close_pivot: pd.DataFrame,
+    failure_threshold: float = -0.035,
+    recovery_threshold: float = 0.015,
+    max_horizon_days: int = 60,
+) -> pd.DataFrame:
+    """Find buys that failed soon after entry and whether exits lagged the signal."""
+    columns = [
+        "symbol",
+        "entry_date",
+        "entry_price",
+        "entry_reason",
+        "entry_matrix_score_at_buy",
+        "alpha_quality_at_buy",
+        "max_profit_before_failure",
+        "max_loss_before_failure",
+        "first_failure_signal_date",
+        "first_failure_score",
+        "actual_exit_date",
+        "exit_reason",
+        "loss_at_first_failure",
+        "loss_at_exit",
+        "delay_days",
+        "avoidable_loss",
+        "should_have_exited_earlier",
+        "diagnosis",
+    ]
+    if execution_ledger is None or execution_ledger.empty or close_pivot.empty:
+        return pd.DataFrame(columns=columns)
+    trades = execution_ledger.copy()
+    trades["trade_date"] = pd.to_datetime(trades.get("trade_date"), errors="coerce")
+    trades["symbol"] = trades.get("symbol", pd.Series("", index=trades.index)).astype(str)
+    trades["side"] = trades.get("side", pd.Series("", index=trades.index)).astype(str).str.lower()
+    trades["price"] = pd.to_numeric(trades.get("price"), errors="coerce")
+    trades = trades.dropna(subset=["trade_date", "symbol", "price"]).sort_values(["symbol", "trade_date"])
+    sells = trades[trades["side"].eq("sell")].copy()
+    rows = []
+    for _, buy in trades[trades["side"].eq("buy")].iterrows():
+        symbol = str(buy["symbol"])
+        if symbol not in close_pivot.columns:
+            continue
+        entry_date = pd.Timestamp(buy["trade_date"])
+        entry_price = float(buy["price"])
+        if entry_price <= 0.0:
+            continue
+        future_sells = sells[(sells["symbol"].eq(symbol)) & (sells["trade_date"] > entry_date)]
+        exit_row = future_sells.iloc[0] if not future_sells.empty else None
+        exit_date = pd.Timestamp(exit_row["trade_date"]) if exit_row is not None else pd.NaT
+        exit_price = float(exit_row["price"]) if exit_row is not None and pd.notna(exit_row["price"]) else np.nan
+        path = close_pivot.loc[close_pivot.index >= entry_date, symbol].dropna().head(int(max_horizon_days) + 1)
+        if exit_row is not None:
+            path = path[path.index <= exit_date]
+        if len(path) < 2:
+            continue
+        rel = path.astype(float) / entry_price - 1.0
+        running_mfe = rel.cummax()
+        failure_mask = (running_mfe < float(recovery_threshold)) & (rel <= float(failure_threshold))
+        if not failure_mask.any():
+            continue
+        first_failure_date = pd.Timestamp(failure_mask[failure_mask].index[0])
+        loss_at_first = float(rel.loc[first_failure_date])
+        loss_at_exit = float(exit_price / entry_price - 1.0) if np.isfinite(exit_price) and exit_price > 0.0 else float(rel.iloc[-1])
+        delay_days = int(max((exit_date - first_failure_date).days, 0)) if pd.notna(exit_date) else pd.NA
+        avoidable_loss = float(loss_at_exit - loss_at_first)
+        should_exit = bool(pd.notna(delay_days) and delay_days >= 3 and avoidable_loss < -0.03)
+        rows.append(
+            {
+                "symbol": symbol,
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "entry_reason": buy.get("reason", ""),
+                "entry_matrix_score_at_buy": buy.get("entry_matrix_score", pd.NA),
+                "alpha_quality_at_buy": buy.get("alpha_quality_score", pd.NA),
+                "max_profit_before_failure": float(rel.loc[:first_failure_date].max()),
+                "max_loss_before_failure": float(rel.loc[:first_failure_date].min()),
+                "first_failure_signal_date": first_failure_date,
+                "first_failure_score": abs(loss_at_first) / abs(float(failure_threshold)) if failure_threshold else np.nan,
+                "actual_exit_date": exit_date,
+                "exit_reason": str(exit_row.get("reason", "")) if exit_row is not None else "",
+                "loss_at_first_failure": loss_at_first,
+                "loss_at_exit": loss_at_exit,
+                "delay_days": delay_days,
+                "avoidable_loss": avoidable_loss,
+                "should_have_exited_earlier": should_exit,
+                "diagnosis": "sell_lag_after_failure" if should_exit else "entry_failed_or_exit_timely",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns).sort_values(["entry_date", "symbol"]).reset_index(drop=True)
+
+
+def build_entry_gate_policy_report(calibration: pd.DataFrame, payoff_by_regime: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Convert calibration buckets into an auditable buy-permission policy table."""
+    columns = [
+        "regime_name",
+        "risk_level",
+        "prediction_bucket",
+        "sample_count",
+        "predicted_p_mean",
+        "realized_win_rate",
+        "wilson_lower_95",
+        "expectancy_10d",
+        "forward_excess_10d",
+        "allow_buy",
+        "max_entry_lots",
+        "reason",
+    ]
+    if calibration is None or calibration.empty:
+        return pd.DataFrame(columns=columns)
+    data = calibration.copy()
+    data["horizon_days"] = pd.to_numeric(data.get("horizon_days"), errors="coerce")
+    data = data[data["horizon_days"].eq(10)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    payoff_lookup = _payoff_lookup_by_regime(payoff_by_regime)
+    rows = []
+    for _, row in data.iterrows():
+        regime_name = str(row.get("regime_name", row.get("regime", "all")) or "all")
+        prediction_bucket = str(row.get("prediction_bucket", row.get("bucket", "all")) or "all")
+        payoff = payoff_lookup.get(regime_name, payoff_lookup.get("all", {}))
+        sample_count = int(_coerce_float(row.get("sample_count", row.get("count", 0)), default=0.0))
+        predicted = _coerce_float(row.get("predicted_p_mean", row.get("predicted_mean", np.nan)))
+        realized = _coerce_float(row.get("realized_win_rate", row.get("actual_win_rate", np.nan)))
+        wilson = _coerce_float(row.get("wilson_lower_95", np.nan))
+        expectancy = _coerce_float(row.get("expectancy_10d", payoff.get("expectancy", np.nan)))
+        excess = _coerce_float(row.get("forward_excess_10d", payoff.get("avg_directional_excess_return", np.nan)))
+        reasons = []
+        allow_buy = True
+        max_lots = 2
+        if sample_count < int(GOVERNANCE_ENTRY_CALIBRATION_MIN_BUCKET_SAMPLES):
+            allow_buy = False
+            max_lots = 0
+            reasons.append("sample_count_below_policy_min")
+        if np.isfinite(wilson) and wilson < float(GOVERNANCE_ENTRY_CALIBRATION_MIN_WILSON_LOWER):
+            allow_buy = False
+            max_lots = 0
+            reasons.append("wilson_lower_below_policy_min")
+        if not np.isfinite(expectancy) or expectancy <= float(GOVERNANCE_ENTRY_CALIBRATION_MIN_EXPECTANCY_10D):
+            allow_buy = False
+            max_lots = 0
+            reasons.append("expectancy_10d_not_positive")
+        if np.isfinite(excess) and excess <= 0.0 and allow_buy:
+            max_lots = min(max_lots, 1)
+            reasons.append("forward_excess_non_positive_limit_to_one_lot")
+        if np.isfinite(realized) and np.isfinite(predicted) and realized < predicted - float(GOVERNANCE_ENTRY_CALIBRATION_MAX_OVERCONFIDENCE_GAP):
+            max_lots = min(max_lots, 1)
+            reasons.append("probability_model_overconfident")
+        rows.append(
+            {
+                "regime_name": regime_name,
+                "risk_level": str(row.get("risk_level", "unknown")),
+                "prediction_bucket": prediction_bucket,
+                "sample_count": sample_count,
+                "predicted_p_mean": predicted,
+                "realized_win_rate": realized,
+                "wilson_lower_95": wilson,
+                "expectancy_10d": expectancy,
+                "forward_excess_10d": excess,
+                "allow_buy": bool(allow_buy),
+                "max_entry_lots": int(max_lots),
+                "reason": "|".join(reasons) if reasons else "passed",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_research_gate_report(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Top-level research readiness gate assembled from existing diagnostics."""
+    rows = []
+    payoff = reports.get("governance_entry_payoff_report", pd.DataFrame())
+    calibration = reports.get("governance_entry_calibration_report", pd.DataFrame())
+    validation = reports.get("governance_factor_validation_report", pd.DataFrame())
+    constraints = reports.get("governance_portfolio_constraint_report", pd.DataFrame())
+    failures = reports.get("governance_entry_failure_timing_report", pd.DataFrame())
+    rolling = reports.get("governance_rolling_beat_report", pd.DataFrame())
+    diversity = reports.get("governance_alpha_diversification_report", pd.DataFrame())
+    trading_evidence = reports.get("governance_trading_evidence_report", pd.DataFrame())
+
+    if trading_evidence is not None and not trading_evidence.empty:
+        evidence = trading_evidence.iloc[-1]
+        has_evidence = bool(evidence.get("has_trading_evidence", False))
+        value = _coerce_float(evidence.get("avg_actual_exposure", np.nan))
+        reason = str(evidence.get("block_reason", ""))
+        rows.append(
+            _research_gate_row(
+                "normal_mode_trading_evidence",
+                has_evidence,
+                value,
+                "closed trades or non-zero average exposure required",
+                reason="passed" if has_evidence else reason or "NO_TRADING_EVIDENCE",
+            )
+        )
+    else:
+        rows.append(
+            _research_gate_row(
+                "normal_mode_trading_evidence",
+                False,
+                np.nan,
+                "required",
+                reason="NO_TRADING_EVIDENCE_REPORT_MISSING",
+            )
+        )
+
+    if diversity is not None and not diversity.empty:
+        latest_diversity = diversity.iloc[-1]
+        passed = bool(latest_diversity.get("pass_flag", False))
+        value = _coerce_float(latest_diversity.get("max_module_weight_share", np.nan))
+        rows.append(
+            _research_gate_row(
+                "alpha_diversification_gate",
+                passed,
+                value,
+                "module/family/redundancy limits",
+                reason="passed" if passed else str(latest_diversity.get("block_reasons", "failed_alpha_diversification_gate")),
+            )
+        )
+    else:
+        rows.append(
+            _research_gate_row(
+                "alpha_diversification_gate",
+                False,
+                np.nan,
+                "required",
+                reason="ALPHA_DIVERSIFICATION_REPORT_MISSING",
+            )
+        )
+
+    buy10 = payoff[
+        pd.to_numeric(payoff.get("horizon_days"), errors="coerce").eq(10)
+        & payoff.get("side", pd.Series(dtype=object)).astype(str).eq("buy")
+    ] if payoff is not None and not payoff.empty else pd.DataFrame()
+    buy_expectancy = _weighted_metric(buy10, "expectancy")
+    rows.append(_research_gate_row("buy_expectancy_10d_positive", buy_expectancy > 0.0, buy_expectancy, "> 0"))
+
+    ece10 = calibration[pd.to_numeric(calibration.get("horizon_days"), errors="coerce").eq(10)] if calibration is not None and not calibration.empty else pd.DataFrame()
+    ece = float(pd.to_numeric(ece10.get("ece_weighted"), errors="coerce").fillna(0.0).sum()) if not ece10.empty else np.nan
+    rows.append(_research_gate_row("entry_calibration_ece", np.isfinite(ece) and ece <= 0.08, ece, "<= 0.08"))
+
+    factor_pass = int(validation.get("pass_flag", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if validation is not None and not validation.empty else 0
+    rows.append(_research_gate_row("factor_validation_pass_count", factor_pass >= 5, factor_pass, ">= 5 factor-horizon passes"))
+
+    if constraints is not None and not constraints.empty:
+        latest = constraints.sort_values("date").iloc[-1]
+        effective_n = _coerce_float(latest.get("account_effective_n", np.nan))
+        top1_weight = _coerce_float(latest.get("top1_account_weight", np.nan))
+        top5_weight = _coerce_float(latest.get("top5_account_weight_sum", np.nan))
+        rows.append(_research_gate_row("latest_account_effective_n", np.isfinite(effective_n) and effective_n >= 5.0, effective_n, ">= 5"))
+        rows.append(_research_gate_row("latest_top1_account_weight", np.isfinite(top1_weight) and top1_weight <= 0.25, top1_weight, "<= 0.25"))
+        rows.append(_research_gate_row("latest_top5_account_weight_sum", np.isfinite(top5_weight) and top5_weight <= 0.80, top5_weight, "<= 0.80"))
+    else:
+        rows.append(_research_gate_row("portfolio_constraints_available", False, np.nan, "required"))
+
+    if failures is not None and not failures.empty:
+        lag_ratio = float(failures.get("should_have_exited_earlier", pd.Series(False, index=failures.index)).fillna(False).astype(bool).mean())
+        rows.append(_research_gate_row("entry_failure_sell_lag_ratio", lag_ratio <= 0.30, lag_ratio, "<= 0.30"))
+    else:
+        rows.append(_research_gate_row("entry_failure_sell_lag_ratio", True, 0.0, "<= 0.30"))
+
+    roll60 = rolling[
+        pd.to_numeric(rolling.get("window_days"), errors="coerce").eq(60)
+        & rolling.get("segment", pd.Series("full", index=rolling.index)).astype(str).eq("full")
+    ] if rolling is not None and not rolling.empty else pd.DataFrame()
+    beat60 = float(pd.to_numeric(roll60.get("account_beat_ratio"), errors="coerce").iloc[0]) if not roll60.empty else np.nan
+    rows.append(_research_gate_row("rolling_60d_beat_ratio", np.isfinite(beat60) and beat60 >= 0.52, beat60, ">= 0.52"))
+
+    result = pd.DataFrame(rows)
+    critical = result["severity"].eq("critical")
+    result["overall_status"] = "research_ready"
+    if (critical & ~result["pass_flag"]).any():
+        result["overall_status"] = "blocked"
+    elif (~result["pass_flag"]).any():
+        result["overall_status"] = "exploratory_only"
+    return result
+
+
 def build_strategy_validation_matrix(reports: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Summarize whether high-exposure deployment evidence is internally consistent."""
     calibration = reports.get("governance_entry_calibration_report", pd.DataFrame())
@@ -205,8 +595,8 @@ def build_strategy_validation_matrix(reports: dict[str, pd.DataFrame]) -> pd.Dat
     if not cal10.empty:
         weighted_ece = float(pd.to_numeric(cal10.get("ece_weighted"), errors="coerce").fillna(0.0).sum())
         best_lower = float(pd.to_numeric(cal10.get("wilson_lower_95"), errors="coerce").max())
-        rows.append(_gate_row("entry_probability_calibration", weighted_ece <= 0.06 and best_lower >= 0.48, weighted_ece, "<=0.06 ECE and best Wilson lower >=0.48"))
-        rows.append(_gate_row("entry_probability_lower_bound", best_lower >= 0.50, best_lower, ">=0.50 for full-exposure authorization"))
+        rows.append(_gate_row("entry_probability_calibration", weighted_ece <= 0.06 and best_lower >= 0.48, weighted_ece, "diagnostic only: <=0.06 ECE and best Wilson lower >=0.48"))
+        rows.append(_gate_row("entry_probability_lower_bound", best_lower >= 0.50, best_lower, "diagnostic only: >=0.50 lower-bound reference"))
     else:
         rows.append(_gate_row("entry_probability_calibration", False, np.nan, "missing calibration report"))
 
@@ -289,6 +679,56 @@ def _gate_row(name: str, passed: bool, observed_value, threshold: str) -> dict:
         "observed_value": observed_value,
         "threshold": str(threshold),
     }
+
+
+def _research_gate_row(
+    name: str,
+    passed: bool,
+    observed_value,
+    threshold: str,
+    severity: str = "critical",
+    reason: str | None = None,
+) -> dict:
+    return {
+        "gate_name": str(name),
+        "pass_flag": bool(passed),
+        "value": observed_value,
+        "threshold": str(threshold),
+        "severity": str(severity),
+        "reason": str(reason) if reason is not None else ("passed" if bool(passed) else "failed_research_gate"),
+    }
+
+
+def _coerce_float(value, default=np.nan) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result
+
+
+def _payoff_lookup_by_regime(payoff_by_regime: pd.DataFrame | None) -> dict[str, dict]:
+    if payoff_by_regime is None or payoff_by_regime.empty:
+        return {}
+    data = payoff_by_regime.copy()
+    data["horizon_days"] = pd.to_numeric(data.get("horizon_days"), errors="coerce")
+    data = data[
+        data["horizon_days"].eq(10)
+        & data.get("side", pd.Series("buy", index=data.index)).astype(str).eq("buy")
+    ].copy()
+    if data.empty:
+        return {}
+    lookup = {}
+    for regime, group in data.groupby(data.get("regime_name", pd.Series("all", index=data.index)).fillna("all").astype(str)):
+        lookup[str(regime)] = {
+            "expectancy": _weighted_metric(group, "expectancy"),
+            "avg_directional_excess_return": _weighted_metric(group, "avg_directional_excess_return"),
+        }
+    lookup["all"] = {
+        "expectancy": _weighted_metric(data, "expectancy"),
+        "avg_directional_excess_return": _weighted_metric(data, "avg_directional_excess_return"),
+    }
+    return lookup
 
 
 def build_rolling_beat_report(attribution_ledger: pd.DataFrame | None, windows=(5, 20, 60, 120, 252)) -> pd.DataFrame:
@@ -468,14 +908,15 @@ def build_selection_funnel_attribution(
         frames.append(ideal)
     if execution_ledger is not None and not execution_ledger.empty:
         executed = execution_ledger[execution_ledger.get("side", "").astype(str).eq("buy")].copy()
-        executed["decision_date"] = pd.to_datetime(executed.get("trade_date"), errors="coerce")
-        executed["symbol"] = executed.get("symbol", pd.Series(dtype=object)).astype(str)
-        executed["layer"] = "executed_buy"
-        frames.append(executed)
+        if not executed.empty:
+            executed["decision_date"] = pd.to_datetime(executed.get("trade_date"), errors="coerce")
+            executed["symbol"] = executed.get("symbol", pd.Series(dtype=object)).astype(str)
+            executed["layer"] = "executed_buy"
+            frames.append(executed)
     if not frames:
         return pd.DataFrame()
     rows = []
-    data = pd.concat(frames, ignore_index=True, sort=False)
+    data = pd.concat([frame.dropna(axis=1, how="all") for frame in frames], ignore_index=True, sort=False)
     for horizon in horizons:
         outcomes = _attach_forward_outcomes(
             data,
@@ -725,6 +1166,7 @@ def build_risk_contribution_ledger(
         if len(valid) < 2:
             continue
         weights = group.set_index("symbol").loc[valid, "ideal_weight"].to_numpy(dtype=float)
+        total_account_exposure = float(max(weights.sum(), 0.0))
         sigma = cov.loc[valid, valid].to_numpy(dtype=float)
         rc = _risk_contribution(weights, sigma)
         marginal = sigma @ weights if weights.size else np.array([])
@@ -738,13 +1180,15 @@ def build_risk_contribution_ledger(
                     "marginal_risk": float(marginal_risk),
                     "risk_contribution_share": float(rc_share),
                     "positive_risk_contribution_share": positive_share,
+                    "account_exposure_scaled_risk_share": positive_share * total_account_exposure,
+                    "total_account_exposure": total_account_exposure,
                     "risk_gate_eligible": bool(float(weight) >= float(min_gate_weight)),
                 }
             )
     return pd.DataFrame(rows)
 
 
-def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int = 200_000) -> pd.DataFrame:
+def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int = 200_000, runtime_context=None) -> pd.DataFrame:
     if alpha_proposals is None or alpha_proposals.empty:
         return pd.DataFrame()
     required = {"decision_date", "symbol", "model_name", "predicted_return_5d"}
@@ -773,14 +1217,185 @@ def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int 
     return _rows_frame(rows, sort_by=["max_abs_rank_corr_to_other"], ascending=False)
 
 
-def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
+def build_alpha_diversification_report(alpha_proposals: pd.DataFrame, runtime_context=None) -> pd.DataFrame:
+    """Gate whether a candidate alpha bundle is diverse enough for trading use."""
+    rules = dict(GOVERNANCE_ALPHA_DIVERSIFICATION_RULES)
+    columns = [
+        "factor_count",
+        "distinct_modules",
+        "distinct_families",
+        "max_module_weight_share",
+        "max_module_factor_count",
+        "max_family_count",
+        "redundancy_flag_ratio",
+        "max_pairwise_rank_corr",
+        "range_grid_weight_share",
+        "pass_flag",
+        "block_reasons",
+    ]
+    if alpha_proposals is None or alpha_proposals.empty or "model_name" not in alpha_proposals.columns:
+        return pd.DataFrame(
+            [{
+                "factor_count": 0,
+                "distinct_modules": 0,
+                "distinct_families": 0,
+                "max_module_weight_share": 0.0,
+                "max_module_factor_count": 0,
+                "max_family_count": 0,
+                "redundancy_flag_ratio": 1.0,
+                "max_pairwise_rank_corr": np.nan,
+                "range_grid_weight_share": 0.0,
+                "pass_flag": False,
+                "block_reasons": "alpha_proposals_missing",
+            }],
+            columns=columns,
+        )
+    models = sorted(alpha_proposals["model_name"].dropna().astype(str).unique().tolist())
+    if not models:
+        return pd.DataFrame(
+            [{
+                "factor_count": 0,
+                "distinct_modules": 0,
+                "distinct_families": 0,
+                "max_module_weight_share": 0.0,
+                "max_module_factor_count": 0,
+                "max_family_count": 0,
+                "redundancy_flag_ratio": 1.0,
+                "max_pairwise_rank_corr": np.nan,
+                "range_grid_weight_share": 0.0,
+                "pass_flag": False,
+                "block_reasons": "alpha_models_missing",
+            }],
+            columns=columns,
+        )
+    module_map = getattr(runtime_context, "module_map", None) or {}
+    family_map = getattr(runtime_context, "family_map", None) or {}
+    modules = pd.Series({model: module_map.get(model, factor_module(model)) for model in models})
+    families = pd.Series({model: family_map.get(model, _factor_family(model)) for model in models})
+    weights = pd.Series(
+        {
+            model: float(GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS.get(model, 1.0))
+            for model in models
+        },
+        dtype=float,
+    ).clip(lower=0.0)
+    if float(weights.sum()) <= 0.0:
+        weights = pd.Series(1.0, index=models, dtype=float)
+    module_counts = modules.value_counts()
+    family_counts = families.value_counts()
+    module_weight_share = weights.groupby(modules).sum() / max(float(weights.sum()), 1e-12)
+    factor_count = int(len(models))
+    max_module_count = int(module_counts.max()) if not module_counts.empty else 0
+    max_family_count = int(family_counts.max()) if not family_counts.empty else 0
+    max_module_share = float(module_weight_share.max()) if not module_weight_share.empty else 0.0
+    range_grid_share = float(module_weight_share.get("range_grid", 0.0))
+
+    redundancy = build_factor_redundancy_report(alpha_proposals, runtime_context=runtime_context)
+    if redundancy.empty:
+        redundancy_ratio = 1.0
+        max_pairwise_corr = np.nan
+    else:
+        redundancy_ratio = float(redundancy.get("redundancy_flag", pd.Series(False, index=redundancy.index)).fillna(False).astype(bool).mean())
+        max_pairwise_corr = _coerce_float(pd.to_numeric(redundancy.get("max_abs_rank_corr_to_other"), errors="coerce").max())
+
+    block_reasons = []
+    if int(module_counts.size) < int(rules["min_distinct_modules"]):
+        block_reasons.append("distinct_modules_below_min")
+    if int(family_counts.size) < int(rules["min_distinct_families"]):
+        block_reasons.append("distinct_families_below_min")
+    if max_module_share > float(rules["max_module_weight_share"]):
+        block_reasons.append("module_weight_share_above_cap")
+    if max_module_count > int(rules["max_module_factor_count"]):
+        block_reasons.append("module_factor_count_above_cap")
+    if max_family_count > int(rules["max_family_count"]):
+        block_reasons.append("family_count_above_cap")
+    if redundancy_ratio > float(rules["max_redundancy_flag_ratio"]):
+        block_reasons.append("redundancy_flag_ratio_above_cap")
+    if np.isfinite(max_pairwise_corr) and max_pairwise_corr > float(rules["max_pairwise_rank_corr"]):
+        block_reasons.append("pairwise_rank_corr_above_cap")
+    if range_grid_share > float(rules["range_grid_max_weight_share"]):
+        block_reasons.append("range_grid_weight_share_above_cap")
+    return pd.DataFrame(
+        [{
+            "factor_count": factor_count,
+            "distinct_modules": int(module_counts.size),
+            "distinct_families": int(family_counts.size),
+            "max_module_weight_share": float(max_module_share),
+            "max_module_factor_count": max_module_count,
+            "max_family_count": max_family_count,
+            "redundancy_flag_ratio": float(redundancy_ratio),
+            "max_pairwise_rank_corr": max_pairwise_corr,
+            "range_grid_weight_share": float(range_grid_share),
+            "pass_flag": not block_reasons,
+            "block_reasons": "|".join(block_reasons) if block_reasons else "passed",
+        }],
+        columns=columns,
+    )
+
+
+def build_trading_evidence_report(
+    *,
+    daily_result: pd.DataFrame | None,
+    execution_ledger: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Detect empty normal-mode runs so zero-return cash stays blocked."""
+    daily = daily_result.copy() if daily_result is not None else pd.DataFrame()
+    execution = execution_ledger.copy() if execution_ledger is not None else pd.DataFrame()
+    avg_exposure = (
+        _coerce_float(pd.to_numeric(daily.get("actual_exposure"), errors="coerce").fillna(0.0).mean(), default=0.0)
+        if not daily.empty and "actual_exposure" in daily.columns
+        else 0.0
+    )
+    max_exposure = (
+        _coerce_float(pd.to_numeric(daily.get("actual_exposure"), errors="coerce").fillna(0.0).max(), default=0.0)
+        if not daily.empty and "actual_exposure" in daily.columns
+        else 0.0
+    )
+    trade_count = int(len(execution)) if execution is not None and not execution.empty else 0
+    filled_count = int(
+        execution.get("execution_status", pd.Series("", index=execution.index))
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .eq("filled")
+        .sum()
+    ) if trade_count else 0
+    has_evidence = bool(filled_count > 0 or avg_exposure > 1e-6 or max_exposure > 1e-6)
+    return pd.DataFrame(
+        [{
+            "trade_count": trade_count,
+            "filled_trade_count": filled_count,
+            "avg_actual_exposure": float(avg_exposure),
+            "max_actual_exposure": float(max_exposure),
+            "has_trading_evidence": has_evidence,
+            "block_reason": "passed" if has_evidence else "NO_TRADING_EVIDENCE",
+        }]
+    )
+
+
+def build_factor_role_report(alpha_proposals: pd.DataFrame, runtime_context=None) -> pd.DataFrame:
     if alpha_proposals is None or alpha_proposals.empty or "model_name" not in alpha_proposals.columns:
         return pd.DataFrame()
     models = sorted(str(name) for name in alpha_proposals["model_name"].dropna().astype(str).unique())
     rows = []
     for model in models:
-        module = factor_module(model)
+        module = (getattr(runtime_context, "module_map", None) or {}).get(model, factor_module(model))
         role = _factor_role(model, module)
+        configured_roles = tuple(
+            str(item)
+            for item in (getattr(runtime_context, "role_map", None) or GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP).get(model, ())
+        )
+        if configured_roles:
+            role = {
+                **role,
+                "primary_role": configured_roles[0],
+                "buy_use_allowed": "entry_alpha" in configured_roles or "timing_filter" in configured_roles,
+                "hold_validation_allowed": "hold_validation" in configured_roles,
+                "sell_trigger_allowed": "sell_trigger" in configured_roles,
+                "risk_override_allowed": "risk_override" in configured_roles,
+                "role_rationale": "configured governance factor source state-machine roles: "
+                + "|".join(configured_roles),
+            }
         rows.append(
             {
                 "model_name": model,
@@ -794,6 +1409,52 @@ def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _factor_family(model_name: str) -> str:
+    name = str(model_name).lower()
+    if name.startswith("candidate_grid_rank_ratio__rev") and "amihud" in name:
+        return "rev_amihud_ratio_grid"
+    if name.startswith("candidate_grid_rank_spread__rev") and "amihud" in name:
+        return "rev_amihud_spread_grid"
+    if name.startswith("candidate_grid_rank_product__ret") and "__rev_" in name:
+        return "ret_reversal_interaction_grid"
+    if name.startswith("candidate_grid_rank_product__rev") and "__rev_" in name:
+        return "reversal_interaction_grid"
+    if name.startswith("candidate_grid_rank_product__rev") and "__size_" in name:
+        return "rev_size_interaction_grid"
+    if name.startswith("candidate_grid_rank_gate_hi__ret") and "__size_" in name:
+        return "ret_size_conditional_grid"
+    if name.startswith("candidate_grid_rank_gate_hi__rev") and "__size_" in name:
+        return "rev_size_conditional_grid"
+    if name.startswith("candidate_grid_rank_mean__rev") and "__rev_" in name:
+        return "short_medium_reversal_blend_grid"
+    if name.startswith("candidate_grid_base_rank__rev"):
+        return "single_reversal_grid"
+    if name.startswith("candidate_grid_base_rank__vol"):
+        return "single_volatility_grid"
+    if name.startswith("candidate_grid_base_rank__downvol"):
+        return "single_downside_volatility_grid"
+    if name.startswith("candidate_size_") or name.startswith("candidate_grid_base_rank__size"):
+        return "size_style"
+    if name.startswith("candidate_idiosyncratic_vol"):
+        return "idiosyncratic_volatility_defense"
+    if name.startswith("candidate_downside_volatility"):
+        return "downside_volatility_defense"
+    if "size_total" in name or "size_float" in name:
+        return "size_conditioned_grid"
+    if "volatility" in name or "vol_neg" in name or "idiosyncratic_vol" in name:
+        return "volatility_defense"
+    if "orderflow" in name or "volume" in name or "close_strength" in name:
+        return "flow_close"
+    if "limit" in name or "event" in name or "holiday" in name:
+        return "event_limit"
+    if "momentum" in name or "macd" in name or "breakout" in name or "ma_" in name:
+        return "trend"
+    if "reversal" in name or "decline" in name or "oversold" in name or "pullback" in name:
+        return "reversal_pullback"
+    tokens = name.split("__")
+    return tokens[0] if tokens else name
 
 
 def _attach_forward_outcomes(

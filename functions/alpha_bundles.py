@@ -27,7 +27,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from config import GOVERNANCE_ALPHA_MODEL_FEATURES
+from config import (
+    GOVERNANCE_ALPHA_MODEL_FEATURES,
+    GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2,
+    GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP,
+    GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY,
+    GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS,
+)
 from functions.alpha_registry import ALPHA_REGISTRY, get_alpha_spec
 
 
@@ -67,7 +73,9 @@ class AlphaBundleSpec:
                 spec = get_alpha_spec(name)
                 columns.append(spec.score_column)
             except KeyError:
-                pass
+                feature_column = GOVERNANCE_ALPHA_MODEL_FEATURES.get(name)
+                if feature_column:
+                    columns.append(feature_column)
         return columns
 
 
@@ -273,6 +281,95 @@ class AlphaBundleRegistry:
             },
         ))
 
+        formal_defensive_alpha_names = [
+            "limit_up_follow",
+            "mean_reversion",
+            "rsi_reversal",
+            "macd_trend",
+            "orderflow_amount_shock",
+            "grid_trading",
+            "consecutive_decline_rebound",
+            "kdj_oversold_cross",
+            "alpha_hedge",
+            "event_driven",
+        ]
+        self.register(AlphaBundleSpec(
+            bundle_name="formal_defensive_bundle",
+            alpha_names=formal_defensive_alpha_names,
+            weighting_scheme="factor_judged",
+            blend_mode="reputation_weighted",
+            description=(
+                "Defensive retest bundle for the legacy formal governance factors. "
+                "The 2026-07-02 large-pool judge rejected all formal factors, so this "
+                "bundle is retained only as a conservative formal-factor control."
+            ),
+            status="active",
+            extra={
+                "purpose": "formal_factor_defensive_control",
+                "judge_run_id": "run20260701_201606_233579",
+                "admission_note": "All governance_formal factors were reject_or_rework in the 2026-07-02 judge.",
+            },
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="judged_core_bundle",
+            alpha_names=formal_defensive_alpha_names,
+            weighting_scheme="factor_judged",
+            blend_mode="reputation_weighted",
+            description=(
+                "Deprecated compatibility alias for formal_defensive_bundle. "
+                "Do not treat this as the 2026-07-02 promote-candidate bundle."
+            ),
+            status="deprecated",
+            extra={
+                "purpose": "compatibility_alias",
+                "replacement_bundle": "formal_defensive_bundle",
+                "judge_run_id": "run20260701_005947_289780",
+                "admission_note": "Compatibility only; use formal_defensive_bundle or pre_screen_promote_bundle explicitly.",
+            },
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="pre_screen_promote_bundle",
+            alpha_names=list(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS),
+            weighting_scheme="factor_judged",
+            blend_mode="reputation_weighted",
+            description=(
+                "2026-07-02 fast-judge promote candidate bundle selected from the "
+                "486 promote + 114 watchlist pool. Non-selected candidates remain "
+                "observe-only until a new judge run promotes them."
+            ),
+            status="active",
+            extra={
+                "purpose": "pre_screen_promote_candidate_mainline_test",
+                "judge_run_id": GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY["judge_run_id"],
+                "selected_count": GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY["selected_count"],
+                "watchlist_policy": GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY["watchlist_policy"],
+                "style_only_policy": GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY["style_only_policy"],
+                "indispensable_exceptions": GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY["indispensable_exceptions"],
+            },
+        ))
+
+        self.register(AlphaBundleSpec(
+            bundle_name="diversified_pre_screen_bundle_v2",
+            alpha_names=list(GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2),
+            weighting_scheme="factor_judged",
+            blend_mode="reputation_weighted",
+            description=(
+                "Tradable diversified v2 bundle: fixed selection from the 486 promote "
+                "+ 114 watchlist pre-screen pool with module, family, correlation, "
+                "and state-machine role constraints. The list is static so normal "
+                "runs do not re-select the 600-candidate pool."
+            ),
+            status="active",
+            extra={
+                "purpose": "tradable_diversified_pre_screen_v2",
+                "source_pool": "486 promote_candidate + 114 watchlist",
+                "role_map": GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP,
+                "admission_note": "Static v2 admission list; validation checks membership and diversity before trading retest.",
+            },
+        ))
+
         self.register(AlphaBundleSpec(
             bundle_name="diagnostic_trend_bundle",
             alpha_names=[
@@ -411,7 +508,7 @@ class AlphaBundleRegistry:
             raise ValueError(f"Alpha bundle '{spec.bundle_name}' already registered")
         # 验证所有alpha因子都已注册
         for alpha_name in spec.alpha_names:
-            if alpha_name not in ALPHA_REGISTRY._specs:
+            if alpha_name not in ALPHA_REGISTRY._specs and alpha_name not in GOVERNANCE_ALPHA_MODEL_FEATURES:
                 raise ValueError(f"Alpha bundle '{spec.bundle_name}' references unknown alpha '{alpha_name}'")
         self._specs[spec.bundle_name] = spec
 

@@ -238,14 +238,8 @@ def _verify_reputation_shadow_and_leakage(failures):
 
 def _verify_runner_and_advanced_policies(failures):
     dates = pd.bdate_range("2024-01-01", periods=32)
-    symbols = [
-        ("sh510300", "etf_fund"),
-        ("sh600000", "stock"),
-        ("sh600001", "stock"),
-        ("sz000001", "stock"),
-        ("sz300001", "stock"),
-        ("sh688001", "stock"),
-    ]
+    symbols = [("sh510300", "etf_fund")]
+    symbols.extend((f"sh600{i:03d}", "stock") for i in range(24))
     rows = []
     for day_index, date in enumerate(dates):
         for symbol_index, (symbol, instrument_type) in enumerate(symbols):
@@ -259,15 +253,34 @@ def _verify_runner_and_advanced_policies(failures):
                     "close": price,
                     "open_nominal": price,
                     "close_nominal": price,
-                    "amount": 1_000_000.0,
+                    "amount": 50_000_000.0,
+                    "amount_ma20": 45_000_000.0,
                     "is_trading": True,
                     "rough_limit_up": False,
                     "rough_limit_down": False,
                     "abnormal_jump": False,
-                    "ret_20": 0.01 * (symbol_index + 1),
-                    "score_mom_lowvol": 0.008 * (symbol_index + 1),
-                    "close_to_ma20": 0.006 * (symbol_index + 1),
+                    "ret_5": 0.010 + 0.001 * symbol_index,
+                    "ret_20": 0.060 + 0.006 * symbol_index,
+                    "score_mom_lowvol": 0.10 + 0.02 * symbol_index,
+                    "close_to_ma20": 0.020 + 0.002 * symbol_index,
                     "volatility_20": 0.01 + symbol_index * 0.002,
+                    "score_orderflow_amount_shock": 0.80 + 0.001 * symbol_index,
+                    "score_orderflow_close_drive": 0.80 + 0.001 * symbol_index,
+                    "score_orderflow_accumulation": 0.80 + 0.001 * symbol_index,
+                    "score_orderflow_efficiency": 0.80 + 0.001 * symbol_index,
+                    "score_eod_close_strength": 0.80,
+                    "score_mean_reversion": 0.75 + 0.001 * symbol_index,
+                    "score_rsi_reversal": 0.75,
+                    "score_kdj_oversold_cross": 0.75,
+                    "score_low_volume_pullback": 0.75,
+                    "score_consecutive_decline_rebound": 0.75,
+                    "score_price_volume_breakout": 0.70,
+                    "score_turtle_breakout": 0.70,
+                    "score_limit_up_follow": 0.70 + 0.001 * symbol_index,
+                    "score_ma_break": 0.70,
+                    "score_macd_trend": 0.70,
+                    "score_macd_cross": 0.70,
+                    "score_ma_cross": 0.70,
                 }
             )
     features = pd.DataFrame(rows)
@@ -276,6 +289,18 @@ def _verify_runner_and_advanced_policies(failures):
             features,
             safety_proxy_mode="strict",
             output_dir=output_dir,
+            alpha_models=(
+                "momentum_20",
+                "mom_lowvol",
+                "ma_break",
+                "orderflow_amount_shock",
+                "mean_reversion",
+                "limit_up_follow",
+            ),
+            entry_confirmation_mode="factor_only",
+            universe_mode="quality_fallback",
+            require_constituents=False,
+            allow_fallback=True,
         ).run()
         required_outputs = {
             "ideal_portfolio_plan",
@@ -294,6 +319,7 @@ def _verify_runner_and_advanced_policies(failures):
             "governance_alpha_collapse_exit_diagnostics",
             "governance_account_audit_ledger",
             "governance_corporate_action_ledger",
+            "governance_runtime_maturity",
             "governance_rollback_recommendation_ledger",
             "governance_strategy_summary",
             "governance_strategy_report",
@@ -308,6 +334,8 @@ def _verify_runner_and_advanced_policies(failures):
         _expect(pd.read_csv(saved["governance_execution_ledger"]).shape[0] > 0, "runner should execute synthetic orders", failures)
         account_audit = pd.read_csv(saved["governance_account_audit_ledger"])
         _expect(account_audit["reconciliation_passed"].all(), "daily account reconciliation should remain exact", failures)
+        maturity = pd.read_csv(saved["governance_runtime_maturity"])
+        _expect(len(maturity) == len(dates), "runtime maturity should save one row per date", failures)
         governance_summary = pd.read_csv(saved["governance_strategy_summary"])
         _expect(
             {

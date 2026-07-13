@@ -16,6 +16,7 @@ from config import (
     FEATURE_REGISTRY_REPORT_CSV,
     FEATURE_STORAGE_MODE,
     FEATURE_STABILITY_REPORT_CSV,
+    ENABLE_PRE_SCREEN_CANDIDATE_FACTOR_POOL,
     HOT_THEME_SLOT_RATIO,
     HOT_THEME_WEIGHTS,
     FORMAL_MODE_NAME,
@@ -42,6 +43,7 @@ from functions.feature_normalization import (
     zscore_cross_section,
 )
 from functions.factors.factor_learning import generate_learning_module_scores, generate_learning_strategy_scores
+from functions.factors.factor_candidate_pool import append_candidate_factors, base_candidate_factor_columns
 from functions.factors.factor_ml import compute_factor as compute_ml_factor
 from functions.labels import apply_default_labels
 from functions.pricing.price_views import (
@@ -264,6 +266,9 @@ def build_feature_frame(df):
     df = apply_default_labels(df, price_col=close_col)
     progress_step("feature frame: attach technical strategy factors")
     df = build_technical_strategy_features(df)
+    if bool(ENABLE_PRE_SCREEN_CANDIDATE_FACTOR_POOL):
+        progress_step("feature frame: attach pre-screen candidate factor pool")
+        df = append_candidate_factors(df, close_col=close_col)
     if bool(FEATURE_DOWNCAST_FLOATS):
         progress_step("feature frame: downcast working numeric columns")
         df = _downcast_numeric_columns(df)
@@ -329,7 +334,8 @@ def _attach_normalized_feature_views(df):
 
 
 def _save_feature_reports(df, memory_report=None):
-    report_cols = [col for col in NORMALIZED_FEATURE_COLUMNS if col in df.columns]
+    candidate_cols = base_candidate_factor_columns() if bool(ENABLE_PRE_SCREEN_CANDIDATE_FACTOR_POOL) else []
+    report_cols = [col for col in [*NORMALIZED_FEATURE_COLUMNS, *candidate_cols] if col in df.columns]
     if report_cols:
         coverage_report = build_feature_coverage_report(df, report_cols)
         extra_rows = pd.DataFrame(

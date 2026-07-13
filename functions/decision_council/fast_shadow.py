@@ -30,6 +30,7 @@ class FastShadowPortfolioRunner:
         allowed_instrument_types: tuple[str, ...] = ("stock",),
         enable_quality_filters: bool = True,
         top_n: int = GOVERNANCE_DEFAULT_TOP_N,
+        runtime_context=None,
     ):
         self.features = features
         self.model_name = str(model_name)
@@ -47,6 +48,7 @@ class FastShadowPortfolioRunner:
         self._allowed_instrument_types = tuple(allowed_instrument_types)
         self._enable_quality_filters = bool(enable_quality_filters)
         self._top_n = int(top_n)
+        self._runtime_context = runtime_context
 
     def step(self, date, day_index: int):
         date = pd.Timestamp(date)
@@ -69,6 +71,7 @@ class FastShadowPortfolioRunner:
             require_constituents=self._require_constituents,
             allow_fallback=self._allow_fallback,
             enable_quality_filters=self._enable_quality_filters,
+            runtime_context=self._runtime_context,
         )
         selected = candidates.head(self._top_n).copy()
         target_values = {}

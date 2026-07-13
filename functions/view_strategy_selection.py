@@ -6,6 +6,7 @@ View and export strategy selection result.
 import pandas as pd
 
 from config import PROCESSED_DIR, REPORT_DIR
+from functions.output_naming import run_suffix
 
 
 def view_strategy_selection(
@@ -99,8 +100,8 @@ def view_strategy_selection(
             _print_last_day_summary(sel, latest_date)
 
     if export_excel:
-        output_excel = REPORT_DIR / "strategy_selection_view.xlsx"
-        output_csv = REPORT_DIR / "strategy_selection_view.csv"
+        output_excel = REPORT_DIR / f"strategy_selection_view{run_suffix()}.xlsx"
+        output_csv = REPORT_DIR / f"strategy_selection_view{run_suffix()}.csv"
 
         sel.to_excel(output_excel, index=False)
         sel.to_csv(output_csv, index=False, encoding="utf-8-sig")
@@ -205,6 +206,6 @@ def _export_last_day_summary(sel, latest_date):
         sector_map = last_day.drop_duplicates("symbol").set_index("symbol")["sector_parent"]
         all_stocks["sector_parent"] = all_stocks["symbol"].map(sector_map)
 
-    output_path = REPORT_DIR / f"last_day_selection_{latest_date.date()}.csv"
+    output_path = REPORT_DIR / f"last_day_selection_{latest_date.date()}{run_suffix()}.csv"
     all_stocks.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"\nSaved last-day selection summary: {output_path}")

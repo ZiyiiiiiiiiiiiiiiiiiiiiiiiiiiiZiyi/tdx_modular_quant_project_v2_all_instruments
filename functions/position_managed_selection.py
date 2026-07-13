@@ -28,6 +28,7 @@ from functions.decision_council.position_management import (
     build_position_management_decisions,
 )
 from functions.investable_universe import filter_investable_universe, load_index_constituents
+from functions.output_naming import run_suffix
 from functions.strategy_selection import get_rebalance_dates
 from functions.strategy_signal_generators import build_technical_strategy_signals
 from functions.strategy_signal_generators import has_precomputed_technical_strategy_features
@@ -320,7 +321,7 @@ def save_position_managed_selection(
     strategy_name: str = "position_managed_kelly",
 ):
     selection_path = PROCESSED_DIR / f"{strategy_name}.parquet"
-    ledger_path = REPORT_DIR / f"{strategy_name}_position_management_ledger.csv"
+    ledger_path = REPORT_DIR / f"{strategy_name}_position_management_ledger{run_suffix()}.csv"
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     selection.to_parquet(selection_path, index=False)

@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 import pandas as pd
 
 from config import FACTOR_REGISTRY_STATUS_DEFAULT
+from functions.factors.factor_candidate_pool import base_candidate_factor_columns
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,14 @@ def default_factor_registry():
             ),
             input_columns=("symbol", "predicted_return", "confidence"),
             category="position_management",
+            status="experimental",
+        ),
+        "pre_screen_candidate_factor_pool": FactorSpec(
+            factor_name="pre_screen_candidate_factor_pool",
+            module_path="functions.factors.factor_candidate_pool",
+            output_columns=tuple(base_candidate_factor_columns()),
+            input_columns=("date", "symbol", "open", "high", "low", "close", "amount", "volume"),
+            category="pre_screen_candidate",
             status="experimental",
         ),
     }

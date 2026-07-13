@@ -1,0 +1,96 @@
+profiles:
+  price_fast:
+    description: "Short-cycle price/volume factor judge for reversal, momentum, volatility, liquidity, and order-flow proxies."
+    use_for:
+      - reversal
+      - momentum
+      - volatility
+      - volume_price
+      - liquidity
+      - orderflow_proxy
+      - price_volume
+      - large_orders
+      - low_noise
+    horizons: [5, 10, 20]
+    neutralize: [industry, size]
+    role_candidates: [entry_alpha, timing_filter, risk_override, liquidity_filter, hold_validation]
+    metrics:
+      min_rank_ic_abs: 0.015
+      min_ic_ir: 0.20
+      require_top_bottom_positive: true
+      min_positive_ic_ratio: 0.52
+      require_coverage: 0.60
+
+  technical_timing:
+    description: "Technical state factor judge for RSI, MACD, KDJ, Bollinger, trend confirmation, and pullback confirmation."
+    use_for:
+      - rsi
+      - macd
+      - kdj
+      - bollinger
+      - trend_confirmation
+      - pullback_confirmation
+      - turtle_breakout
+      - breakout
+    horizons: [5, 10, 20]
+    neutralize: [industry]
+    allow_non_monotonic: true
+    role_candidates: [timing_filter, risk_override, hold_validation]
+    metrics:
+      min_rank_ic_abs: 0.010
+      min_ic_ir: 0.12
+      min_positive_ic_ratio: 0.50
+      require_top_bottom_positive: false
+      require_coverage: 0.50
+
+  fundamental_medium:
+    description: "Medium-cycle PIT fundamental judge for growth, profitability, cashflow, quality, valuation, and Barra style."
+    use_for:
+      - growth
+      - profitability
+      - cashflow
+      - quality
+      - valuation
+      - barra_style
+      - value
+      - fundamental
+    horizons: [20, 60, 120, 240]
+    neutralize: [industry, size, beta]
+    point_in_time_required: true
+    role_candidates: [entry_alpha, hold_validation, risk_override]
+    metrics:
+      min_rank_ic_abs: 0.008
+      min_ic_ir: 0.10
+      require_coverage: 0.60
+      require_top_bottom_positive: false
+      min_positive_ic_ratio: 0.50
+
+  event_decay:
+    description: "Event-window judge for announcements, forecasts, buybacks, shareholder changes, limit structures, and attention proxies."
+    use_for:
+      - announcement
+      - earnings_forecast
+      - earnings_surprise
+      - buyback
+      - shareholder_change
+      - limit_up_structure
+      - limit_down_structure
+      - news_proxy
+      - announcement_density
+      - event_attention
+      - sentiment
+      - supply_chain
+      - social
+      - alternative_proxy
+    horizons: [1, 3, 5, 10, 20]
+    event_window_mode: true
+    role_candidates: [entry_alpha, timing_filter, risk_override]
+    metrics:
+      min_event_count: 100
+      min_win_rate: 0.53
+      min_avg_excess_return: 0.002
+      require_decay_curve: true
+      min_rank_ic_abs: 0.008
+      min_ic_ir: 0.10
+      min_positive_ic_ratio: 0.50
+      require_top_bottom_positive: false

@@ -209,6 +209,10 @@ def build_all_strategies_accuracy_report(
 
     # Governance
     gov_exec_path = RESULT_DIR / "decision_council" / "governance_execution_ledger.csv"
+    if not gov_exec_path.exists():
+        candidates = list((RESULT_DIR / "decision_council").rglob("governance_execution_ledger.csv"))
+        if candidates:
+            gov_exec_path = max(candidates, key=lambda path: path.stat().st_mtime)
     if gov_exec_path.exists():
         gov_exec = pd.read_csv(gov_exec_path)
         gov_result = analyze_governance_decision_accuracy(gov_exec, horizon_days=5)
@@ -217,7 +221,7 @@ def build_all_strategies_accuracy_report(
     return results
 
 
-def plot_all_accuracy(results: dict, output_dir=None):
+def plot_all_accuracy(results: dict, output_dir=None, file_suffix: str = ""):
     """Plot accuracy charts for all strategies."""
     try:
         import matplotlib
@@ -254,7 +258,8 @@ def plot_all_accuracy(results: dict, output_dir=None):
     axis.grid(axis="y", alpha=0.25)
     plt.xticks(rotation=45, ha="right")
     fig.tight_layout()
-    fig.savefig(output_dir / "accuracy_comparison_all_strategies.png", dpi=180, bbox_inches="tight")
+    safe_suffix = str(file_suffix or "")
+    fig.savefig(output_dir / f"accuracy_comparison_all_strategies{safe_suffix}.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
     # 2. Accuracy timeline for each strategy
@@ -285,13 +290,13 @@ def plot_all_accuracy(results: dict, output_dir=None):
 
     fig.suptitle("Decision Accuracy Timeline (all strategies)", fontsize=14, y=1.01)
     fig.tight_layout()
-    fig.savefig(output_dir / "accuracy_timeline_all_strategies.png", dpi=180, bbox_inches="tight")
+    fig.savefig(output_dir / f"accuracy_timeline_all_strategies{safe_suffix}.png", dpi=180, bbox_inches="tight")
     plt.close(fig)
 
     print(f"Saved accuracy charts to {output_dir}")
 
 
-def save_accuracy_summary_csv(results: dict, output_dir=None):
+def save_accuracy_summary_csv(results: dict, output_dir=None, file_suffix: str = ""):
     """Save a summary CSV of all strategies' accuracy."""
     if output_dir is None:
         output_dir = RESULT_DIR
@@ -315,7 +320,8 @@ def save_accuracy_summary_csv(results: dict, output_dir=None):
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    output_path = output_dir / "decision_accuracy_summary.csv"
+    safe_suffix = str(file_suffix or "")
+    output_path = output_dir / f"decision_accuracy_summary{safe_suffix}.csv"
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
     print(f"Saved accuracy summary: {output_path}")
     return df

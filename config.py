@@ -35,6 +35,8 @@ READ_LIMIT = 200
 # -*- coding: utf-8 -*-
 import hashlib
 import json
+import os
+from datetime import datetime
 from pathlib import Path
 
 TDX_DIR = Path(r"F:\tongxinda")
@@ -47,6 +49,15 @@ REPORT_DIR = DATA_DIR / "reports"
 RESULT_DIR = PROJECT_DIR / "results"
 RUNS_DIR = PROJECT_DIR / "runs"
 PIPELINE_CACHE_JSON = REPORT_DIR / "pipeline_run_cache.json"
+
+OUTPUT_RUN_TIMESTAMP = os.environ.setdefault("TDX_RUN_TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+
+def dated_artifact_path(path: Path) -> Path:
+    path = Path(path)
+    if path.suffix.lower() not in {".csv", ".md", ".png", ".gif", ".xlsx", ".xls"}:
+        return path
+    return path.with_name(f"{path.stem}_run{OUTPUT_RUN_TIMESTAMP}{path.suffix}")
 
 for folder in [DATA_DIR, RAW_EXTERNAL_DIR, PROCESSED_DIR, REPORT_DIR, RESULT_DIR, RUNS_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
@@ -86,6 +97,7 @@ ENABLE_LEARNING_STRATEGIES = True
 LEARNING_STRATEGY_WHITELIST = None
 ENABLE_PLACEHOLDER_STRATEGIES = False
 ENABLE_QUANTUM_INSPIRED_STRATEGIES = False
+ENABLE_PRE_SCREEN_CANDIDATE_FACTOR_POOL = True
 
 ENABLE_EXPERIMENT_TRACKING = True
 RUN_ID_PREFIX = "run"
@@ -115,22 +127,22 @@ FEATURE_ROBUST_SCALE_EPSILON = 1e-9
 FACTOR_MIN_COVERAGE_RATIO = 0.10
 FEATURE_PTI_ADJUSTMENT_MIN_COVERAGE_RATIO = 1.0
 FACTOR_REGISTRY_STATUS_DEFAULT = "experimental"
-REPORT_OUTPUT_MD = RESULT_DIR / "strategy_diagnostic_report.md"
-FEATURE_COVERAGE_REPORT_CSV = REPORT_DIR / "feature_coverage_report.csv"
-FEATURE_DISTRIBUTION_REPORT_CSV = REPORT_DIR / "feature_distribution_report.csv"
-FEATURE_STABILITY_REPORT_CSV = REPORT_DIR / "feature_stability_report.csv"
-FEATURE_REGISTRY_REPORT_CSV = REPORT_DIR / "feature_registry_validation_report.csv"
-FEATURE_MEMORY_REPORT_CSV = REPORT_DIR / "feature_memory_report.csv"
-MODEL_TRAINING_DIAGNOSTICS_CSV = REPORT_DIR / "model_training_diagnostics.csv"
+REPORT_OUTPUT_MD = dated_artifact_path(RESULT_DIR / "strategy_diagnostic_report.md")
+FEATURE_COVERAGE_REPORT_CSV = dated_artifact_path(REPORT_DIR / "feature_coverage_report.csv")
+FEATURE_DISTRIBUTION_REPORT_CSV = dated_artifact_path(REPORT_DIR / "feature_distribution_report.csv")
+FEATURE_STABILITY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "feature_stability_report.csv")
+FEATURE_REGISTRY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "feature_registry_validation_report.csv")
+FEATURE_MEMORY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "feature_memory_report.csv")
+MODEL_TRAINING_DIAGNOSTICS_CSV = dated_artifact_path(REPORT_DIR / "model_training_diagnostics.csv")
 FEATURE_STORAGE_MODE = "pruned"
 FEATURE_DOWNCAST_FLOATS = True
-MULTI_WINDOW_BACKTEST_SUMMARY_CSV = RESULT_DIR / "multi_window_backtest_summary.csv"
-MULTI_WINDOW_BACKTEST_REPORT_MD = RESULT_DIR / "multi_window_backtest_report.md"
+MULTI_WINDOW_BACKTEST_SUMMARY_CSV = dated_artifact_path(RESULT_DIR / "multi_window_backtest_summary.csv")
+MULTI_WINDOW_BACKTEST_REPORT_MD = dated_artifact_path(RESULT_DIR / "multi_window_backtest_report.md")
 MULTI_WINDOW_DEFAULT_MONTHS = 12
 MULTI_WINDOW_DEFAULT_STEP_MONTHS = 12
 RUNTIME_CONFIG_SNAPSHOT_JSON = REPORT_DIR / "runtime_config_snapshot.json"
 EVENT_DATA_PARQUET = PROCESSED_DIR / "event_data.parquet"
-EVENT_DATA_QUALITY_CSV = REPORT_DIR / "event_data_quality_report.csv"
+EVENT_DATA_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "event_data_quality_report.csv")
 QML_MIN_TEST_WINDOWS = 5
 QML_WILCOXON_P_THRESHOLD = 0.05
 QML_MAX_DRAWDOWN_MULTIPLIER = 1.2
@@ -138,13 +150,13 @@ QML_MAX_DRAWDOWN_MULTIPLIER = 1.2
 DEFAULT_CORPORATE_ACTIONS_SOURCE = "manual_csv"
 BAOSTOCK_ADJUSTMENT_SOURCE = "baostock_adjust_factor"
 BAOSTOCK_CORPORATE_ACTION_SOURCE = "baostock_dividend"
-CODE_MAPPING_CSV = REPORT_DIR / "code_mapping_report.csv"
+CODE_MAPPING_CSV = dated_artifact_path(REPORT_DIR / "code_mapping_report.csv")
 CORPORATE_ACTIONS_PARQUET = PROCESSED_DIR / "corporate_actions.parquet"
-CORPORATE_ACTIONS_QUALITY_CSV = REPORT_DIR / "corporate_actions_quality_report.csv"
+CORPORATE_ACTIONS_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "corporate_actions_quality_report.csv")
 ADJUSTMENT_FACTORS_PARQUET = PROCESSED_DIR / "adjustment_factors.parquet"
-ADJUSTMENT_FACTORS_QUALITY_CSV = REPORT_DIR / "adjustment_factors_quality_report.csv"
+ADJUSTMENT_FACTORS_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "adjustment_factors_quality_report.csv")
 MARKET_CAP_PARQUET = PROCESSED_DIR / "market_cap_history.parquet"
-MARKET_CAP_QUALITY_CSV = REPORT_DIR / "market_cap_quality_report.csv"
+MARKET_CAP_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "market_cap_quality_report.csv")
 
 COMMISSION_RATE = 0.0003
 STAMP_DUTY_RATE = 0.001
@@ -157,31 +169,31 @@ ENABLE_T_PLUS_ONE = True
 ENABLE_PRICE_LIMIT_CHECK = True
 ENABLE_SUSPENSION_CHECK = True
 MAX_LIQUIDITY_LOCK_DAYS = 10
-LIQUIDITY_LOCK_REPORT_CSV = RESULT_DIR / "extreme_liquidity_lock_report.csv"
-BACKTEST_SKIPPED_STRATEGIES_CSV = RESULT_DIR / "backtest_skipped_strategies.csv"
+LIQUIDITY_LOCK_REPORT_CSV = dated_artifact_path(RESULT_DIR / "extreme_liquidity_lock_report.csv")
+BACKTEST_SKIPPED_STRATEGIES_CSV = dated_artifact_path(RESULT_DIR / "backtest_skipped_strategies.csv")
 ORDER_LEDGER_PREFIX = "backtest_orders"
-BACKTEST_SUMMARY_V2_CSV = RESULT_DIR / "backtest_strategy_summary_v2.csv"
-STRATEGY_RANK_SHIFT_REPORT_CSV = RESULT_DIR / "strategy_rank_shift_report.csv"
-FORMAL_ADMISSION_REPORT_CSV = REPORT_DIR / "formal_admission_report.csv"
+BACKTEST_SUMMARY_V2_CSV = dated_artifact_path(RESULT_DIR / "backtest_strategy_summary_v2.csv")
+STRATEGY_RANK_SHIFT_REPORT_CSV = dated_artifact_path(RESULT_DIR / "strategy_rank_shift_report.csv")
+FORMAL_ADMISSION_REPORT_CSV = dated_artifact_path(REPORT_DIR / "formal_admission_report.csv")
 FORMAL_MANIFEST_JSON = REPORT_DIR / "formal_reproducibility_manifest.json"
-DATA_INTEGRITY_WHITEPAPER_MD = REPORT_DIR / "data_integrity_whitepaper.md"
-DATA_INTEGRITY_REPORT_CSV = REPORT_DIR / "data_integrity_report.csv"
+DATA_INTEGRITY_WHITEPAPER_MD = dated_artifact_path(REPORT_DIR / "data_integrity_whitepaper.md")
+DATA_INTEGRITY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "data_integrity_report.csv")
 DATA_VERIFICATION_STATUS_JSON = REPORT_DIR / "data_verification_status.json"
-EVENT_DENSITY_REPORT_CSV = REPORT_DIR / "strategy_event_density_report.csv"
-STRATEGY_ADMISSION_REPORT_CSV = REPORT_DIR / "strategy_admission_report.csv"
-V6_GAP_MATRIX_CSV = REPORT_DIR / "v6_implementation_gap_matrix.csv"
-V6_RUNTIME_MONITORING_CSV = REPORT_DIR / "v6_runtime_monitoring.csv"
+EVENT_DENSITY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "strategy_event_density_report.csv")
+STRATEGY_ADMISSION_REPORT_CSV = dated_artifact_path(REPORT_DIR / "strategy_admission_report.csv")
+V6_GAP_MATRIX_CSV = dated_artifact_path(REPORT_DIR / "v6_implementation_gap_matrix.csv")
+V6_RUNTIME_MONITORING_CSV = dated_artifact_path(REPORT_DIR / "v6_runtime_monitoring.csv")
 V6_RUNTIME_STATUS_JSON = REPORT_DIR / "v6_runtime_status.json"
-FEATURE_LINEAGE_CSV = REPORT_DIR / "feature_lineage_report.csv"
-FEATURE_TIMESTAMP_AUDIT_CSV = REPORT_DIR / "feature_timestamp_audit.csv"
-BENCHMARK_REPORT_CSV = RESULT_DIR / "investable_benchmark_report.csv"
+FEATURE_LINEAGE_CSV = dated_artifact_path(REPORT_DIR / "feature_lineage_report.csv")
+FEATURE_TIMESTAMP_AUDIT_CSV = dated_artifact_path(REPORT_DIR / "feature_timestamp_audit.csv")
+BENCHMARK_REPORT_CSV = dated_artifact_path(RESULT_DIR / "investable_benchmark_report.csv")
 DEFAULT_INVESTABLE_BENCHMARK_ID = "hs300_etf"
 DEFAULT_INVESTABLE_BENCHMARK_PRICE_COL = "close_nominal"
 TAX_LEDGER_PREFIX = "backtest_tax_ledger"
 CASH_LEDGER_PREFIX = "backtest_cash_ledger"
 VALUATION_LEDGER_PREFIX = "backtest_valuation_ledger"
-CORPORATE_ACTION_LEDGER_CSV = REPORT_DIR / "corporate_action_ledger.csv"
-ADJUSTMENT_PTI_QUALITY_CSV = REPORT_DIR / "adjustment_pti_quality_report.csv"
+CORPORATE_ACTION_LEDGER_CSV = dated_artifact_path(REPORT_DIR / "corporate_action_ledger.csv")
+ADJUSTMENT_PTI_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "adjustment_pti_quality_report.csv")
 
 DEFAULT_BACKTEST_CAPITAL_PROFILE = "institutional_1m"
 BACKTEST_CAPITAL_PROFILES = {
@@ -212,6 +224,28 @@ BACKTEST_CAPITAL_PROFILES = {
         "skip_unaffordable_symbols": True,
         "notes": "Small-account profile with lot-size and cash-buffer discipline.",
     },
+    "small_capital_branch": {
+        "label": "20,000 small-capital branch",
+        "initial_cash": 20_000.0,
+        "min_cash_buffer": 2_000.0,
+        "max_positions": 3,
+        "affordability_first": True,
+        "skip_unaffordable_symbols": True,
+        "retail_lot_adapter": True,
+        "retail_single_position_cap": 0.40,
+        "retail_one_lot_position_cap": 0.40,
+        "retail_min_entry_matrix_score": 0.62,
+        "retail_target_exposure_tolerance": 0.10,
+        "capital_usage_mode": "allow_cash",
+        "min_holdings": 2,
+        "force_deploy_target_exposure_normal": 0.95,
+        "force_deploy_target_exposure_weak": 0.55,
+        "force_deploy_target_exposure_high": 0.35,
+        "retail_max_lot_upgrade_multiplier": 4.0,
+        "retail_strong_lot_upgrade_multiplier": 8.0,
+        "retail_strong_entry_matrix_threshold": 0.75,
+        "notes": "Small-capital branch. Keeps the governance strategy but adapts buy orders to A-share 100-share lot constraints.",
+    },
 }
 
 TRADE_PAIR_LEDGER_PREFIX = "backtest_trade_pairs"
@@ -240,11 +274,11 @@ RAW_DAILY_PARQUET = PROCESSED_DIR / "tdx_daily_raw.parquet"
 CLEAN_DAILY_PARQUET = PROCESSED_DIR / "tdx_daily_clean.parquet"
 FEATURE_DAILY_PARQUET = PROCESSED_DIR / "tdx_daily_features.parquet"
 
-FAILED_CODES_CSV = REPORT_DIR / "failed_codes.csv"
-STOCK_INFO_CSV = REPORT_DIR / "instrument_info.csv"
-ABNORMAL_RETURN_CSV = REPORT_DIR / "abnormal_return_rows.csv"
-DATA_QUALITY_SUMMARY_CSV = REPORT_DIR / "data_quality_summary.csv"
-DATA_CONTINUITY_REPORT_CSV = REPORT_DIR / "data_continuity_report.csv"
+FAILED_CODES_CSV = dated_artifact_path(REPORT_DIR / "failed_codes.csv")
+STOCK_INFO_CSV = dated_artifact_path(REPORT_DIR / "instrument_info.csv")
+ABNORMAL_RETURN_CSV = dated_artifact_path(REPORT_DIR / "abnormal_return_rows.csv")
+DATA_QUALITY_SUMMARY_CSV = dated_artifact_path(REPORT_DIR / "data_quality_summary.csv")
+DATA_CONTINUITY_REPORT_CSV = dated_artifact_path(REPORT_DIR / "data_continuity_report.csv")
 DATA_CONTINUITY_GAP_DAYS_WARN = 10
 
 
@@ -254,6 +288,7 @@ def get_backtest_capital_profile(
     initial_cash=None,
     max_positions_override="__profile_default__",
     min_cash_buffer=None,
+    capital_usage_mode=None,
 ):
     selected = str(profile_name or DEFAULT_BACKTEST_CAPITAL_PROFILE)
     if selected not in BACKTEST_CAPITAL_PROFILES:
@@ -269,6 +304,7 @@ def get_backtest_capital_profile(
     profile["max_positions"] = None if max_positions in (None, "", 0) else int(max_positions)
     profile["affordability_first"] = bool(profile.get("affordability_first", False))
     profile["skip_unaffordable_symbols"] = bool(profile.get("skip_unaffordable_symbols", False))
+    profile["retail_lot_adapter"] = bool(profile.get("retail_lot_adapter", False))
     override_parts = []
     if initial_cash not in (None, ""):
         profile["initial_cash"] = float(initial_cash)
@@ -289,6 +325,12 @@ def get_backtest_capital_profile(
         if profile["min_cash_buffer"] < 0:
             raise ValueError("Backtest min cash buffer cannot be negative")
         override_parts.append(f"buf{_profile_number_slug(profile['min_cash_buffer'])}")
+    if capital_usage_mode not in (None, ""):
+        usage_mode = str(capital_usage_mode).strip().lower()
+        if usage_mode not in {"allow_cash", "force_deploy"}:
+            raise ValueError("Backtest capital usage mode must be allow_cash or force_deploy")
+        profile["capital_usage_mode"] = usage_mode
+        override_parts.append("force" if usage_mode == "force_deploy" else "cashok")
     if override_parts:
         profile["base_profile"] = selected
         profile["name"] = f"{selected}__{'__'.join(override_parts)}"
@@ -650,6 +692,51 @@ GOVERNANCE_ALPHA_MODEL_FEATURES = {
     "kdj_oversold_cross": "score_kdj_oversold_cross",
     "low_volume_pullback": "score_low_volume_pullback",
     "ml_alpha": "score_ml_alpha",
+    # 2026-07-02 fast judge pre-screen promote factors. These candidate
+    # columns are generated on demand by factor_candidate_pool, so they do not
+    # need to be materialized in the base feature parquet.
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": "cand_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30": "cand_grid_rank_ratio__rev_3__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30": "cand_grid_rank_ratio__rev_2__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20": "cand_grid_rank_ratio__rev_3__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10": "cand_grid_rank_ratio__rev_3__amihud_neg_10",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20": "cand_grid_rank_spread__rev_3__amihud_neg_20",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20": "cand_grid_rank_spread__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg": "cand_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30": "cand_grid_rank_spread__rev_3__amihud_neg_30",
+    "candidate_grid_rank_product__rev_3__size_float_neg": "cand_grid_rank_product__rev_3__size_float_neg",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": "cand_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_product__rev_2__size_total_neg": "cand_grid_rank_product__rev_2__size_total_neg",
+    "candidate_grid_rank_product__rev_2__size_float_neg": "cand_grid_rank_product__rev_2__size_float_neg",
+    "candidate_grid_base_rank__rev_40": "cand_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": "cand_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg": "cand_grid_rank_gate_hi__rev_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg": "cand_grid_rank_gate_hi__ret_3__size_float_neg",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": "cand_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg": "cand_grid_rank_gate_hi__ret_2__size_total_neg",
+    "candidate_grid_base_rank__rev_30": "cand_grid_base_rank__rev_30",
+    "candidate_idiosyncratic_vol_60_neg": "cand_idiosyncratic_vol_60_neg",
+    "candidate_grid_rank_mean__rev_2__rev_40": "cand_grid_rank_mean__rev_2__rev_40",
+    "candidate_grid_rank_mean__rev_3__rev_40": "cand_grid_rank_mean__rev_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90": "cand_grid_base_rank__vol_neg_90",
+    "candidate_grid_rank_mean__ret_3__rev_40": "cand_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_30": "cand_grid_base_rank__vol_neg_30",
+    "candidate_volatility_60_neg": "cand_volatility_60_neg",
+    "candidate_volatility_20_neg": "cand_volatility_20_neg",
+    "candidate_size_total_cap_neg": "cand_size_total_cap_neg",
+    "candidate_size_float_cap_neg": "cand_size_float_cap_neg",
+    "candidate_grid_base_rank__size_total_neg": "cand_grid_base_rank__size_total_neg",
+    "candidate_grid_base_rank__size_float_neg": "cand_grid_base_rank__size_float_neg",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_10": "cand_grid_rank_ratio__rev_2__amihud_neg_10",
+    "candidate_grid_rank_product__ret_3__rev_40": "cand_grid_rank_product__ret_3__rev_40",
+    "candidate_grid_rank_product__rev_3__rev_40": "cand_grid_rank_product__rev_3__rev_40",
+    "candidate_grid_rank_gate_hi__rev_3__size_float_neg": "cand_grid_rank_gate_hi__rev_3__size_float_neg",
+    "candidate_grid_rank_mean__rev_1__rev_40": "cand_grid_rank_mean__rev_1__rev_40",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": "cand_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": "cand_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_base_rank__vol_neg_60": "cand_grid_base_rank__vol_neg_60",
+    "candidate_grid_base_rank__downvol_neg_60": "cand_grid_base_rank__downvol_neg_60",
+    "candidate_downside_volatility_60_neg": "cand_downside_volatility_60_neg",
     # Fundamental factors
     "value": "score_value",
     "quality": "score_quality",
@@ -657,7 +744,205 @@ GOVERNANCE_ALPHA_MODEL_FEATURES = {
     "fundamental": "score_fundamental",
 }
 GOVERNANCE_ALPHA_MODELS = tuple(GOVERNANCE_ALPHA_MODEL_FEATURES)
+GOVERNANCE_FACTOR_JUDGE_RUN_ID = "run20260701_201606_233579"
+GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID = "run20260701_201606_233579"
+GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS = (
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20",
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30",
+    "candidate_grid_rank_product__rev_3__size_float_neg",
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30",
+    "candidate_grid_rank_product__rev_2__size_total_neg",
+    "candidate_grid_rank_product__rev_2__size_float_neg",
+    "candidate_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg",
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg",
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg",
+    "candidate_grid_base_rank__rev_30",
+    "candidate_idiosyncratic_vol_60_neg",
+    "candidate_grid_rank_mean__rev_2__rev_40",
+    "candidate_grid_rank_mean__rev_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90",
+    "candidate_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_30",
+    "candidate_volatility_60_neg",
+    "candidate_volatility_20_neg",
+)
+GOVERNANCE_PRE_SCREEN_FACTOR_OBSERVATION_POLICY = {
+    "judge_run_id": GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID,
+    "source_pool": "486 promote_candidate + 114 watchlist from the 2026-07-02 fast judge",
+    "selected_count": len(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS),
+    "watchlist_policy": "observe_only_until_rejudged",
+    "style_only_policy": "size and grid_size are observed as style exposure, not traded as standalone alpha",
+    "indispensable_exceptions": (),
+}
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_DIR = PROCESSED_DIR / "candidate_factor_cache"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_BUNDLE = "pre_screen_promote_bundle"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_VERSION = "pre_screen_promote_v1_20260702"
+GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS = 260
+GOVERNANCE_PRE_SCREEN_FACTOR_ROLE_WEIGHTS = {
+    "liquidity_reversal_entry": {
+        "state_machine_target": "entry_alpha_and_timing",
+        "weight": 0.46,
+        "models": (
+            "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_30",
+            "candidate_grid_rank_ratio__rev_2__amihud_neg_30",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_20",
+            "candidate_grid_rank_ratio__rev_3__amihud_neg_10",
+            "candidate_grid_rank_spread__rev_3__amihud_neg_20",
+            "candidate_grid_rank_spread__rev_2__amihud_neg_20",
+            "candidate_grid_rank_spread__rev_3__amihud_neg_30",
+            "candidate_grid_rank_spread__rev_2__amihud_neg_30",
+        ),
+    },
+    "size_conditioned_reversal": {
+        "state_machine_target": "candidate_sort_and_risk_penalty_context",
+        "weight": 0.28,
+        "models": (
+            "candidate_grid_rank_product__rev_3__size_total_neg",
+            "candidate_grid_rank_product__rev_3__size_float_neg",
+            "candidate_grid_rank_product__rev_2__size_total_neg",
+            "candidate_grid_rank_product__rev_2__size_float_neg",
+            "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+            "candidate_grid_rank_gate_hi__rev_3__size_total_neg",
+            "candidate_grid_rank_gate_hi__ret_3__size_float_neg",
+            "candidate_grid_rank_gate_hi__rev_2__size_total_neg",
+            "candidate_grid_rank_gate_hi__ret_2__size_total_neg",
+        ),
+    },
+    "medium_reversal_blend": {
+        "state_machine_target": "signal_retention_and_stale_exit_context",
+        "weight": 0.16,
+        "models": (
+            "candidate_grid_base_rank__rev_40",
+            "candidate_grid_base_rank__rev_30",
+            "candidate_grid_rank_mean__rev_2__rev_40",
+            "candidate_grid_rank_mean__rev_3__rev_40",
+            "candidate_grid_rank_mean__ret_3__rev_40",
+        ),
+    },
+    "volatility_defense": {
+        "state_machine_target": "risk_filter_and_add_block_context",
+        "weight": 0.10,
+        "models": (
+            "candidate_idiosyncratic_vol_60_neg",
+            "candidate_grid_base_rank__vol_neg_90",
+            "candidate_grid_base_rank__vol_neg_30",
+            "candidate_volatility_60_neg",
+            "candidate_volatility_20_neg",
+        ),
+    },
+}
+GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS = {
+    # 2026-07-01 fast judge result: no formal factor passed admission.
+    # These weights are intentionally defensive: keep only the less-bad and
+    # interpretable signals for a mainline re-test, while suppressing missing,
+    # redundant, negative-direction, or high-turnover factors.
+    "limit_up_follow": 0.45,
+    "mean_reversion": 0.35,
+    "rsi_reversal": 0.30,
+    "macd_trend": 0.25,
+    "orderflow_amount_shock": 0.20,
+    "grid_trading": 0.18,
+    "consecutive_decline_rebound": 0.12,
+    "kdj_oversold_cross": 0.10,
+    "alpha_hedge": 0.08,
+    "event_driven": 0.08,
+    "mom_lowvol": 0.05,
+    "ma_break": 0.05,
+    "momentum_20": 0.05,
+    "orderflow_efficiency": 0.04,
+    "orderflow_accumulation": 0.04,
+    "orderflow_close_drive": 0.03,
+    "eod_close_strength": 0.03,
+    "price_volume_breakout": 0.03,
+    "turtle_breakout": 0.02,
+    "macd_cross": 0.02,
+    "ma_cross": 0.02,
+    "holiday_effect": 0.01,
+    "low_volume_pullback": 0.01,
+    "ml_alpha": 0.0,
+    "value": 0.0,
+    "quality": 0.0,
+    "growth": 0.0,
+    "fundamental": 0.0,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": 0.1200,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_30": 0.1190,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_30": 0.1190,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_20": 0.1184,
+    "candidate_grid_rank_ratio__rev_3__amihud_neg_10": 0.1142,
+    "candidate_grid_rank_spread__rev_3__amihud_neg_20": 0.1118,
+    "candidate_grid_rank_spread__rev_2__amihud_neg_20": 0.1112,
+    "candidate_grid_rank_product__rev_3__size_total_neg": 0.1094,
+    "candidate_grid_rank_spread__rev_3__amihud_neg_30": 0.1072,
+    "candidate_grid_rank_product__rev_3__size_float_neg": 0.1072,
+    "candidate_grid_rank_spread__rev_2__amihud_neg_30": 0.1067,
+    "candidate_grid_rank_product__rev_2__size_total_neg": 0.1056,
+    "candidate_grid_rank_product__rev_2__size_float_neg": 0.1047,
+    "candidate_grid_base_rank__rev_40": 0.1022,
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": 0.0856,
+    "candidate_grid_rank_gate_hi__rev_3__size_total_neg": 0.0838,
+    "candidate_grid_rank_gate_hi__ret_3__size_float_neg": 0.0836,
+    "candidate_grid_rank_gate_hi__rev_2__size_total_neg": 0.0828,
+    "candidate_grid_rank_gate_hi__ret_2__size_total_neg": 0.0821,
+    "candidate_grid_base_rank__rev_30": 0.0799,
+    "candidate_idiosyncratic_vol_60_neg": 0.0642,
+    "candidate_grid_rank_mean__rev_2__rev_40": 0.0588,
+    "candidate_grid_rank_mean__rev_3__rev_40": 0.0580,
+    "candidate_grid_base_rank__vol_neg_90": 0.0521,
+    "candidate_grid_rank_mean__ret_3__rev_40": 0.0515,
+    "candidate_grid_base_rank__vol_neg_30": 0.0488,
+    "candidate_volatility_60_neg": 0.0434,
+    "candidate_volatility_20_neg": 0.0392,
+    "candidate_size_total_cap_neg": 0.1200,
+    "candidate_size_float_cap_neg": 0.1100,
+    "candidate_grid_base_rank__size_total_neg": 0.1150,
+    "candidate_grid_base_rank__size_float_neg": 0.1050,
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_10": 0.1000,
+    "candidate_grid_rank_product__ret_3__rev_40": 0.0880,
+    "candidate_grid_rank_product__rev_3__rev_40": 0.0840,
+    "candidate_grid_rank_gate_hi__rev_3__size_float_neg": 0.0820,
+    "candidate_grid_rank_mean__rev_1__rev_40": 0.0780,
+    "candidate_grid_base_rank__vol_neg_60": 0.0740,
+    "candidate_grid_base_rank__downvol_neg_60": 0.0700,
+    "candidate_downside_volatility_60_neg": 0.0660,
+}
+GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS = {
+    # Negative rank-IC names from the 2026-07-01 judge are treated as inverse
+    # signals when still retained at a small diagnostic weight.
+    "grid_trading": -1.0,
+    "alpha_hedge": -1.0,
+    "event_driven": -1.0,
+    "mom_lowvol": -1.0,
+    "ma_break": -1.0,
+    "momentum_20": -1.0,
+    "orderflow_efficiency": -1.0,
+    "orderflow_accumulation": -1.0,
+    "orderflow_close_drive": -1.0,
+    "eod_close_strength": -1.0,
+    "price_volume_breakout": -1.0,
+    "turtle_breakout": -1.0,
+    "macd_cross": -1.0,
+    "ma_cross": -1.0,
+    "holiday_effect": -1.0,
+    "low_volume_pullback": -1.0,
+}
+GOVERNANCE_FACTOR_JUDGED_MIN_WEIGHT = 0.01
 GOVERNANCE_ALPHA_CANDIDATE_LIMIT = 200
+# Audit rows do not affect selection, sizing, or orders.  Keep their history
+# bounded so a full four-year run remains usable on a 16 GiB workstation.
+GOVERNANCE_AUDIT_CANDIDATE_LIMIT = 50
+GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT = 40
+GOVERNANCE_AUDIT_PRICE_HISTORY_CACHE_SYMBOL_LIMIT = 256
 GOVERNANCE_DEFAULT_TOP_N = 20
 GOVERNANCE_ENTRY_RANK_LIMIT = 20
 GOVERNANCE_HOLD_RANK_LIMIT = 100
@@ -742,6 +1027,171 @@ GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION = 0.35
 GOVERNANCE_HIGH_EXPOSURE_MIN_ACTUAL_TARGET_RATIO = 0.60
 GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL = 0.0
 
+# Governance research diagnostics and admission gates. These are report-layer
+# thresholds first; trading behavior should only consume them after a separate
+# validation pass.
+GOVERNANCE_FACTOR_MIN_COVERAGE = 0.60
+GOVERNANCE_FACTOR_MIN_ABS_RANK_IC = 0.015
+GOVERNANCE_FACTOR_MIN_IC_IR = 0.20
+GOVERNANCE_FACTOR_MIN_RANK_IC_POSITIVE_RATIO = 0.52
+GOVERNANCE_FACTOR_MIN_TOP_BOTTOM_SPREAD_10D = 0.0
+GOVERNANCE_FACTOR_MIN_SAMPLE_COUNT = 500
+GOVERNANCE_CLUSTER_MAX_WEIGHT = 0.25
+GOVERNANCE_ENTRY_CALIBRATION_MIN_BUCKET_SAMPLES = 30
+GOVERNANCE_ENTRY_CALIBRATION_MIN_WILSON_LOWER = 0.48
+GOVERNANCE_ENTRY_CALIBRATION_MIN_EXPECTANCY_10D = 0.0
+GOVERNANCE_ENTRY_CALIBRATION_MAX_OVERCONFIDENCE_GAP = 0.10
+GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N = 5.0
+GOVERNANCE_RESEARCH_MAX_TOP1_ACCOUNT_WEIGHT = 0.25
+GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM = 0.80
+GOVERNANCE_INDUSTRY_MAX_WEIGHT = 0.30
+GOVERNANCE_SINGLE_SYMBOL_MAX_WEIGHT_RESEARCH = 0.20
+GOVERNANCE_ALPHA_DIVERSIFICATION_RULES = {
+    "max_module_weight_share": 0.35,
+    "max_module_factor_count": 6,
+    "max_family_count": 2,
+    "max_pairwise_rank_corr": 0.85,
+    "max_redundancy_flag_ratio": 0.40,
+    "min_distinct_modules": 4,
+    "min_distinct_families": 6,
+    "range_grid_max_weight_share": 0.35,
+}
+GOVERNANCE_STATE_MACHINE_ROLE_REQUIREMENTS = {
+    "entry_alpha": {"min_modules": 3, "max_single_module_share": 0.35},
+    "timing_filter": {"min_modules": 2},
+    "hold_validation": {"min_modules": 2},
+    "sell_trigger": {"min_modules": 2},
+    "risk_override": {"min_modules": 2},
+}
+GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2 = (
+    "candidate_size_total_cap_neg",
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20",
+    "candidate_grid_rank_product__rev_3__size_total_neg",
+    "candidate_grid_base_rank__rev_40",
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg",
+    "candidate_grid_rank_mean__ret_3__rev_40",
+    "candidate_grid_base_rank__vol_neg_90",
+)
+GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP = {
+    "candidate_size_total_cap_neg": ("style_balance", "risk_override"),
+    "candidate_grid_rank_ratio__rev_2__amihud_neg_20": ("entry_alpha", "timing_filter", "liquidity_filter"),
+    "candidate_grid_rank_product__rev_3__size_total_neg": ("style_balance", "entry_alpha"),
+    "candidate_grid_base_rank__rev_40": ("entry_alpha", "timing_filter", "hold_validation"),
+    "candidate_grid_rank_gate_hi__ret_3__size_total_neg": ("entry_alpha", "timing_filter", "style_balance"),
+    "candidate_grid_rank_mean__ret_3__rev_40": ("entry_alpha", "timing_filter", "hold_validation"),
+    "candidate_grid_base_rank__vol_neg_90": ("risk_override", "style_balance", "hold_validation", "sell_trigger"),
+}
+GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE = {
+    "enabled": True,
+    "min_active_modules": 3,
+    "min_active_families": 3,
+    "max_active_module_share": 0.70,
+    "max_range_grid_vote_share": 0.35,
+    "min_entry_alpha_votes": 1,
+    "min_timing_filter_votes": 1,
+    "min_risk_or_liquidity_votes": 1,
+    "min_hold_validation_votes": 1,
+    "min_sell_trigger_votes": 1,
+    "active_model_percentile": 0.55,
+}
+
+# Governance position-state controls. These values are deliberately conservative:
+# they allow fast first buys on strong matrix evidence, but prevent naked averaging
+# down after an exit decision has already won the priority contest.
+GOVERNANCE_ENTRY_MATRIX_STRONG_THRESHOLD = 0.75
+GOVERNANCE_ENTRY_MATRIX_WATCH_THRESHOLD = 0.60
+GOVERNANCE_ENTRY_MATRIX_EXTREME_THRESHOLD = 0.90
+GOVERNANCE_ENTRY_MATRIX_EXIT_DECAY_THRESHOLD = 0.45
+GOVERNANCE_SURGE_CAPTURE_THRESHOLD = 0.75
+GOVERNANCE_SURGE_ALPHA_MIN = 0.70
+GOVERNANCE_EXHAUSTION_BLOCK_THRESHOLD = 0.70
+GOVERNANCE_EXHAUSTION_BUY_MAX = 0.65
+GOVERNANCE_EXHAUSTION_ADD_MAX = 0.55
+GOVERNANCE_FOLLOW_THROUGH_STARTER_2 = 0.58
+GOVERNANCE_FOLLOW_THROUGH_STRONG = 0.65
+GOVERNANCE_ENTRY_MATRIX_STARTER_1 = 0.60
+GOVERNANCE_ENTRY_MATRIX_STARTER_2 = 0.68
+GOVERNANCE_ENTRY_MATRIX_STRONG_STARTER = 0.74
+GOVERNANCE_ENTRY_TIMING_STARTER_1 = 0.56
+GOVERNANCE_ENTRY_TIMING_STARTER_2 = 0.60
+GOVERNANCE_ALPHA_QUALITY_STARTER_1 = 0.52
+GOVERNANCE_ALPHA_QUALITY_STARTER_2 = 0.68
+GOVERNANCE_ALPHA_QUALITY_STRONG_STARTER = 0.70
+GOVERNANCE_ENTRY_SUCCESS_PROB_MIN_BUY = 0.56
+GOVERNANCE_ENTRY_SUCCESS_PROB_NORMAL = 0.62
+GOVERNANCE_RETAIL_STARTER_2_LOTS = 2
+GOVERNANCE_RETAIL_STRONG_STARTER_LOTS = 3
+GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT = "allow_cash"
+GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY = "force_deploy"
+GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN = 0.56
+GOVERNANCE_DIVERSIFY_ALPHA_QUALITY_MIN = 0.48
+GOVERNANCE_DIVERSIFY_ENTRY_TIMING_MIN = 0.52
+GOVERNANCE_DIVERSIFY_FOLLOW_THROUGH_MIN = 0.50
+GOVERNANCE_DIVERSIFY_EXHAUSTION_MAX = 0.55
+GOVERNANCE_DIVERSIFY_DOWNTREND_MAX = 0.55
+GOVERNANCE_BASKET_ENTRY_ENABLED = True
+GOVERNANCE_BASKET_ENTRY_MIN_FINAL_SCORE_PCT = 0.94
+GOVERNANCE_BASKET_ENTRY_MIN_MATRIX_SCORE_PCT = 0.88
+GOVERNANCE_BASKET_ENTRY_MIN_ALPHA_QUALITY_PCT = 0.55
+GOVERNANCE_BASKET_ENTRY_MIN_TIMING_PCT = 0.55
+GOVERNANCE_BASKET_ENTRY_MIN_FOLLOW_THROUGH = 0.48
+GOVERNANCE_BASKET_ENTRY_MAX_EXHAUSTION = 0.58
+GOVERNANCE_BASKET_ENTRY_MAX_DOWNTREND = 0.58
+GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL = 0.95
+GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_WEAK = 0.55
+GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_HIGH = 0.35
+GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K = 2
+GOVERNANCE_FORCE_DEPLOY_MAX_DIVERSIFY_POSITIONS_20K = 5
+GOVERNANCE_DEFENSIVE_SLEEVE_ASSETS = {
+    "gold": ("sh518880", "sz159934"),
+    "treasury_bond": ("sh511010", "sh511260"),
+    "money_market": ("sh511880", "sh511990"),
+    "broad_index": ("sh510300", "sh510500", "sh510050"),
+    "dividend_low_vol": ("sh510880", "sh512890"),
+    "oil_energy": ("sz162411", "sz159930"),
+}
+GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK = 0.55
+GOVERNANCE_DOWNTREND_DECAY_EXIT = 0.75
+GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE = 0.70
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_SCORE = 0.62
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_DAYS = (3, 5, 8)
+GOVERNANCE_POST_ENTRY_FAILURE_EARLY_EXIT_THRESHOLDS = (
+    (3, 0.68),
+    (5, 0.62),
+    (8, 0.58),
+)
+GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS = 3
+GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS = 20
+# Hard-stop is a profit-protection stop, not an entry-failure stop. It only arms
+# after the position's net MFE clears the configured profit threshold.
+GOVERNANCE_HARD_STOP_LOSS = -0.10  # legacy diagnostic only; not used as the live hard-stop trigger.
+GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER = 0.30
+GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK = 0.35
+GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT = 0.0
+GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS = 20
+GOVERNANCE_PROFIT_PROTECT_TRIGGER_1 = 0.08
+GOVERNANCE_PROFIT_GIVEBACK_1 = 0.40
+GOVERNANCE_PROFIT_PROTECT_TRIGGER_2 = 0.15
+GOVERNANCE_PROFIT_GIVEBACK_2 = 0.30
+GOVERNANCE_PROFIT_PROTECT_TRIGGER_3 = 0.25
+GOVERNANCE_PROFIT_GIVEBACK_3 = 0.25
+GOVERNANCE_STALE_WATCH_DAYS = 10
+GOVERNANCE_STALE_REDUCE_DAYS = 20
+GOVERNANCE_STALE_EXIT_DAYS = 30
+GOVERNANCE_STALE_EXIT_MIN_ALPHA_DROP = 0.10
+GOVERNANCE_STALE_EXIT_MIN_LIQUIDITY_DECAY = 0.20
+GOVERNANCE_STALE_EXIT_MAX_MFE = 0.03
+GOVERNANCE_HARD_STOP_COOLDOWN_DAYS = 10
+GOVERNANCE_PROFIT_TAKE_COOLDOWN_DAYS = 3
+GOVERNANCE_SIGNAL_FAILURE_COOLDOWN_DAYS = 5
+GOVERNANCE_LAYER_ADD_GAPS = (-0.03, -0.06)
+GOVERNANCE_LAYER_WEIGHTS = (0.40, 0.30, 0.20, 0.10)
+GOVERNANCE_MAX_ADD_LAYERS_RETAIL_20K = 3
+GOVERNANCE_MAX_ADD_LAYERS_LARGE = 4
+GOVERNANCE_ADD_MIN_FACTOR_CONVICTION = 0.60
+GOVERNANCE_ADD_MIN_SIGNAL_RETENTION = 0.55
+GOVERNANCE_RISK_CONTRIBUTION_SCORE_PENALTY = 0.20
+
 # Position-management P0 contract defaults. These values define the first
 # conservative Kelly implementation and are intentionally explicit because the
 # decision matrix uses them as audited thresholds.
@@ -794,8 +1244,8 @@ POSITION_LIQUIDITY_ALERT_DAYS = 3
 POSITION_LIQUIDITY_ADV_QUANTILE = 0.05
 POSITION_LIQUIDITY_AMIHUD_QUANTILE = 0.95
 POSITION_PORTFOLIO_LIQUIDITY_ALERT_RATIO = 0.20
-KELLY_PRIOR_SENSITIVITY_CSV = REPORT_DIR / "kelly_prior_sensitivity.csv"
-KELLY_PRIOR_SENSITIVITY_MD = REPORT_DIR / "kelly_prior_sensitivity.md"
+KELLY_PRIOR_SENSITIVITY_CSV = dated_artifact_path(REPORT_DIR / "kelly_prior_sensitivity.csv")
+KELLY_PRIOR_SENSITIVITY_MD = dated_artifact_path(REPORT_DIR / "kelly_prior_sensitivity.md")
 
 # V6 strategy governance. Only the formal candidates can receive non-zero
 # admission weights. Observation strategies remain available for diagnostics.
@@ -852,16 +1302,16 @@ V6_RESEARCH_WATERMARK = "基于未完全验证数据，禁止引用为实盘期�
 GOVERNANCE_INDUSTRIAL_DIR = RESULT_DIR / "decision_council_industrial"
 GOVERNANCE_MODEL_REGISTRY_JSON = GOVERNANCE_INDUSTRIAL_DIR / "model_registry.json"
 GOVERNANCE_INDUSTRIAL_MANIFEST_JSON = GOVERNANCE_INDUSTRIAL_DIR / "industrial_manifest.json"
-GOVERNANCE_PHASE_GATE_CSV = GOVERNANCE_INDUSTRIAL_DIR / "phase_gate_report.csv"
-GOVERNANCE_MODEL_CONGRESS_CSV = GOVERNANCE_INDUSTRIAL_DIR / "model_congress_catalog.csv"
-GOVERNANCE_SAFETY_DAILY_CSV = GOVERNANCE_INDUSTRIAL_DIR / "safety_daily_dataset.csv"
+GOVERNANCE_PHASE_GATE_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "phase_gate_report.csv")
+GOVERNANCE_MODEL_CONGRESS_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "model_congress_catalog.csv")
+GOVERNANCE_SAFETY_DAILY_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "safety_daily_dataset.csv")
 GOVERNANCE_SAFETY_MODEL_JSON = GOVERNANCE_INDUSTRIAL_DIR / "safety_model.json"
-GOVERNANCE_SAFETY_CALIBRATION_CSV = GOVERNANCE_INDUSTRIAL_DIR / "safety_calibration.csv"
-GOVERNANCE_SAFETY_EVALUATION_CSV = GOVERNANCE_INDUSTRIAL_DIR / "safety_evaluation.csv"
-GOVERNANCE_BANDIT_ACTIONS_CSV = GOVERNANCE_INDUSTRIAL_DIR / "bandit_action_contract.csv"
+GOVERNANCE_SAFETY_CALIBRATION_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "safety_calibration.csv")
+GOVERNANCE_SAFETY_EVALUATION_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "safety_evaluation.csv")
+GOVERNANCE_BANDIT_ACTIONS_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "bandit_action_contract.csv")
 GOVERNANCE_MONITORING_POLICY_JSON = GOVERNANCE_INDUSTRIAL_DIR / "monitoring_rollback_policy.json"
 GOVERNANCE_TRANSITION_PROTOCOL_JSON = GOVERNANCE_INDUSTRIAL_DIR / "initial_portfolio_transition_protocol.json"
-GOVERNANCE_RESEARCH_REFERENCES_CSV = GOVERNANCE_INDUSTRIAL_DIR / "research_references.csv"
+GOVERNANCE_RESEARCH_REFERENCES_CSV = dated_artifact_path(GOVERNANCE_INDUSTRIAL_DIR / "research_references.csv")
 GOVERNANCE_STREAM_BATCH_SIZE = 50_000
 GOVERNANCE_SAFETY_TRAIN_RATIO = 0.60
 GOVERNANCE_SAFETY_VALIDATION_RATIO = 0.20
@@ -872,19 +1322,19 @@ GOVERNANCE_MOMENTUM_REBOUND_DRAWDOWN = -0.08
 GOVERNANCE_MOMENTUM_REBOUND_RETURN = 0.03
 GOVERNANCE_BANDIT_ACTION_BOUND_RATIO = 0.20
 GOVERNANCE_BANDIT_SHADOW_DAYS = 252
-GOVERNANCE_SUMMARY_CSV = GOVERNANCE_OUTPUT_DIR / "governance_strategy_summary.csv"
-GOVERNANCE_REPORT_MD = GOVERNANCE_OUTPUT_DIR / "governance_strategy_report.md"
+GOVERNANCE_SUMMARY_CSV = dated_artifact_path(GOVERNANCE_OUTPUT_DIR / "governance_strategy_summary.csv")
+GOVERNANCE_REPORT_MD = dated_artifact_path(GOVERNANCE_OUTPUT_DIR / "governance_strategy_report.md")
 
 # Registry Framework Configuration
 # 4-layer extensible architecture: Universe, Alpha, Policy, Evaluation
 REGISTRY_FRAMEWORK_VERSION = "v1.0"
 REGISTRY_OUTPUT_DIR = RESULT_DIR / "registry"
-REGISTRY_VALIDATION_REPORT_CSV = REPORT_DIR / "registry_validation_report.csv"
-REGISTRY_COMPARISON_REPORT_CSV = REPORT_DIR / "registry_comparison_report.csv"
+REGISTRY_VALIDATION_REPORT_CSV = dated_artifact_path(REPORT_DIR / "registry_validation_report.csv")
+REGISTRY_COMPARISON_REPORT_CSV = dated_artifact_path(REPORT_DIR / "registry_comparison_report.csv")
 
 # Default registry selections (can be overridden by CLI or experiment plan)
 DEFAULT_UNIVERSE_NAME = "hs300_csi500_a500_strict"
-DEFAULT_ALPHA_BUNDLE = "president_core_bundle"
+DEFAULT_ALPHA_BUNDLE = "formal_defensive_bundle"
 DEFAULT_GOVERNANCE_VARIANT = "rules_based_president"
 
 # Experiment output structure: results/governance/{universe}/{variant}/{bundle}/

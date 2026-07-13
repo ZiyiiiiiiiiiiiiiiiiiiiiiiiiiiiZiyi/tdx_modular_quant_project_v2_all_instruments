@@ -60,18 +60,17 @@ class GovernanceVariantRegistry:
                 enable_safety_agent=True,
                 enable_market_regime_policy=True,
                 universe_name="hs300_csi500_a500_strict",
-                alpha_bundle="president_core_bundle",
+                alpha_bundle="formal_defensive_bundle",
                 position_sizing_mode="kelly_managed",
-                description="Main governance variant with reputation weighting and safety agent enabled.",
+                description="Main governance variant retested with the explicit formal defensive factor bundle.",
                 status="active",
                 governance_variant_tag="president",
                 extra={
                     "entry_confirmation_mode": "full",
                     "exit_mode": "observe_complex_exit",
-                    "selection_weight_mode": "role_balanced",
+                    "selection_weight_mode": "factor_judged",
                     "regime_overlay_mode": "conservative",
                     "risk_hard_gate_enabled": True,
-                    "probability_bucket_mode": "breakout_high_confidence",
                 },
             )
         )
@@ -96,6 +95,7 @@ class GovernanceVariantRegistry:
                 governance_variant_tag="layer_validation",
                 extra={
                     "purpose": "causal_layer_validation",
+                    "entry_confirmation_mode": "state_machine_roles_only",
                     "recommended_shadow_portfolios": False,
                 },
             )
@@ -197,7 +197,7 @@ class GovernanceVariantRegistry:
                 enable_safety_agent=True,
                 enable_market_regime_policy=True,
                 universe_name="hs300_csi500_a500_strict",
-                alpha_bundle="president_core_bundle",
+                alpha_bundle="formal_defensive_bundle",
                 position_sizing_mode="kelly_managed",
                 description=(
                     "Full-mainline control for the layer ablation suite. This mirrors "
@@ -211,6 +211,7 @@ class GovernanceVariantRegistry:
                     "entry_confirmation_mode": "full",
                     "exit_mode": "observe_complex_exit",
                     "layer_added": "full_mainline_control",
+                    "selection_weight_mode": "factor_judged",
                 },
             )
         )

@@ -26,6 +26,24 @@ PENDING_ORDER_COLUMNS = [
     "block_reason",
     "expired_reason",
     "superseded_by_order_id",
+    "position_state",
+    "position_exit_reason",
+    "add_layer",
+    "add_allowed",
+    "add_block_reason",
+    "entry_matrix_score",
+    "entry_alpha_score",
+    "entry_timing_score",
+    "entry_liquidity_score",
+    "alpha_quality_score",
+    "surge_capture_score",
+    "follow_through_score",
+    "exhaustion_score",
+    "entry_success_probability",
+    "entry_size_tier",
+    "planned_entry_lots",
+    "downtrend_decay_score",
+    "post_entry_failure_score",
 ]
 
 SELL_RETRY_REASONS = {"safety_deleveraging", "qualification_exit", "alpha_collapse_consensus"}
@@ -51,7 +69,12 @@ class PendingOrderBook:
         order["lock_days"] = int(_value_or(order.get("lock_days"), 0))
         order["status"] = str(_value_or(order.get("status"), "pending"))
         new_row = pd.DataFrame([order], columns=PENDING_ORDER_COLUMNS)
-        self.orders = new_row if self.orders.empty else pd.concat([self.orders, new_row], ignore_index=True)
+        if self.orders.empty or self.orders.dropna(how="all").empty:
+            self.orders = new_row
+        else:
+            # Row assignment to a heterogeneous frame triggers a pandas dtype
+            # deprecation warning and repeatedly reallocates its backing blocks.
+            self.orders = pd.concat([self.orders, new_row], ignore_index=True)
         return order["order_id"]
 
     def upsert_sell_intent(self, payload: dict) -> str:
