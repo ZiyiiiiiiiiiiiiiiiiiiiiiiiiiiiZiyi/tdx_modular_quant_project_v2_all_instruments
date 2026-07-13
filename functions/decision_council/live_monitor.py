@@ -35,7 +35,10 @@ class GovernanceLiveMonitor:
         self._write_failures = 0
         self._write_counter = 0
         self._run_id = ""
+        self._title = ""
         self._last_day_index = -1
+        self._chart_history: list[dict] = []
+        self._last_update_payload: dict = {}
         self._start_browser_monitor()
 
     @property
@@ -47,14 +50,17 @@ class GovernanceLiveMonitor:
             return
         self._ensure_monitor_process()
         self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
+        self._title = str(title)
         self._last_day_index = -1
+        self._chart_history = []
+        self._last_update_payload = {}
         self.total_days = max(int(total_days), 1)
         self.initial_nav = max(float(initial_nav), 1e-12)
         self._write_state(
             {
                 "command": "session",
                 "run_id": self._run_id,
-                "title": str(title),
+                "title": self._title,
                 "total_days": self.total_days,
                 "initial_nav": self.initial_nav,
                 "max_chart_points": self.max_chart_points,
@@ -81,10 +87,27 @@ class GovernanceLiveMonitor:
             return
         self._last_day_index = max(self._last_day_index, int(day_index))
         progress_pct = min((self._last_day_index + 1) / max(self.total_days, 1) * 100.0, 100.0)
-        self._write_state(
-            {
+        monitor_values = dict(monitor_state or {})
+        chart_point = {
+            "date": str(date)[:10],
+            "day_index": int(day_index),
+            "nav": nav,
+            "account_net_value": monitor_values.get("account_net_value"),
+            "benchmark_nav": monitor_values.get("benchmark_nav"),
+            "excess_net_value": monitor_values.get("excess_net_value"),
+            "cash": exposure.get("cash"),
+            "invested_value": exposure.get("invested_value"),
+            "actual_exposure": exposure.get("actual_exposure", monitor_values.get("actual_exposure")),
+        }
+        if self._chart_history and self._chart_history[-1].get("day_index") == int(day_index):
+            self._chart_history[-1] = chart_point
+        else:
+            self._chart_history.append(chart_point)
+        self._chart_history = self._chart_history[-self.max_chart_points :]
+        update_payload = {
                 "command": "update",
                 "run_id": self._run_id,
+                "title": self._title,
                 "date": str(date)[:10],
                 "exposure": dict(exposure),
                 "day_index": int(day_index),
@@ -92,9 +115,11 @@ class GovernanceLiveMonitor:
                 "progress_pct": progress_pct,
                 "initial_nav": self.initial_nav,
                 "holdings": list(holdings or []),
-                "monitor_state": dict(monitor_state or {}),
+                "monitor_state": monitor_values,
+                "chart_history": list(self._chart_history),
             }
-        )
+        self._last_update_payload = update_payload
+        self._write_state(update_payload)
 
     def report_stage(self, *, step: str, message: str = "", detail: str = "", progress_pct: float = 0.0) -> None:
         if self._closed:
@@ -105,10 +130,12 @@ class GovernanceLiveMonitor:
         if not self._run_id:
             self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
         bounded_progress = min(max(float(progress_pct or 0.0), 0.0), 100.0)
-        self._write_state(
+        stage_payload = dict(self._last_update_payload)
+        stage_payload.update(
             {
                 "command": "stage",
                 "run_id": self._run_id,
+                "title": self._title,
                 "step": str(step),
                 "message": str(message),
                 "detail": str(detail),
@@ -117,23 +144,28 @@ class GovernanceLiveMonitor:
                 "initial_nav": self.initial_nav,
             }
         )
+        self._write_state(stage_payload)
 
     def finish(self, message: str | None = None) -> None:
         if self._closed:
             return
         completed_days = max(self._last_day_index + 1, 0)
         progress_pct = min(completed_days / max(self.total_days, 1) * 100.0, 100.0)
-        self._write_state(
+        finish_payload = dict(self._last_update_payload)
+        finish_payload.update(
             {
                 "command": "finish",
                 "run_id": self._run_id,
+                "title": self._title,
                 "day_index": self._last_day_index,
                 "total_days": self.total_days,
                 "progress_pct": progress_pct,
                 "completed": completed_days >= self.total_days,
                 "message": message or "回测完成。窗口会保持打开，关闭浏览器标签即可。",
+                "chart_history": list(self._chart_history),
             }
         )
+        self._write_state(finish_payload)
 
     def hide(self) -> None:
         # Browser tabs are user-controlled. Kept for compatibility with old callers.

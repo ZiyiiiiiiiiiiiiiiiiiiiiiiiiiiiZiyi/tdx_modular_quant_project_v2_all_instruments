@@ -420,23 +420,40 @@ HTML = r"""<!doctype html>
       document.getElementById("orderReasonText").textContent=summaryLines(ms.order_reason_summary,"暂无计划订单").join("\n");
       window.latestHoldingPaths=ms.holding_price_paths||[];
     }
+    function hydrateChartHistory(rows){
+      const restored=[];let peak=0,previousNav=0,validInvestedNav=1;
+      for(const row of rows||[]){
+        const date=String(row.date||"").slice(0,10),dayIndex=finite(row.day_index,-1);
+        const navAmount=finite(row.nav,initialNav),navMultiple=normalizeNav(row.account_net_value,navAmount/initialNav),nav=navMultiple*initialNav;
+        const benchmarkNav=normalizeNav(row.benchmark_nav,1),excessNav=normalizeNav(row.excess_net_value,navMultiple/Math.max(benchmarkNav,1e-12));
+        const actualExposure=finite(row.actual_exposure),latestRet=previousNav>0?nav/previousNav-1:0,investedRet=actualExposure>=.05?latestRet/actualExposure:0;
+        validInvestedNav*=1+investedRet;peak=Math.max(peak,nav);
+        restored.push({key:`${dayIndex}|${date}`,date,nav,navMultiple,benchmarkNav,excessNav,drawdown:peak>0?nav/peak-1:0,cash:finite(row.cash),invested:finite(row.invested_value),actualExposure,validInvestedNav});
+        previousNav=nav;
+      }
+      return restored.slice(-1200);
+    }
     function renderState(payload){
-      const command=String(payload.command||"update").toLowerCase();
+      let command=String(payload.command||"update").toLowerCase();const stageCommand=command==="stage",finishCommand=command==="finish";
       if(command==="session"){activeRunId=String(payload.run_id||"");totalDays=Math.max(finite(payload.total_days,1),1);initialNav=Math.max(finite(payload.initial_nav,1),1e-12);history=[];factorHistory=[];moduleHistory=[];lastProgressPct=0;document.getElementById("runTitle").textContent=payload.title||"治理运行";document.title=payload.title||"治理实时监控";setStatus("准备运行",0,"session");drawAllCharts();return;}
-      if(command==="stage"){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");return;}
-      if(command==="finish"){setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";return;}
+      if(payload.title){document.getElementById("runTitle").textContent=payload.title;document.title=payload.title;}
+      if((stageCommand||finishCommand)&&payload.exposure)command="update";
+      else if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");return;}
+      else if(finishCommand){if(Array.isArray(payload.chart_history)&&payload.chart_history.length)history=hydrateChartHistory(payload.chart_history);setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";drawAllCharts();return;}
       if(command==="close"){setStatus("监控已关闭",lastProgressPct,"closed");return;}
       if(command!=="update")return;
       const runId=String(payload.run_id||"");if(runId&&runId!==activeRunId){activeRunId=runId;history=[];factorHistory=[];moduleHistory=[];}
       totalDays=Math.max(finite(payload.total_days,totalDays),1);initialNav=Math.max(finite(payload.initial_nav,initialNav),1e-12);
       const exposure=payload.exposure||{},ms=payload.monitor_state||{},holdings=payload.holdings||[],dayIndex=finite(payload.day_index);
+      if(Array.isArray(payload.chart_history)&&payload.chart_history.length)history=hydrateChartHistory(payload.chart_history);
       const navAmount=finite(exposure.liquidatable_nav||exposure.nominal_nav,initialNav),navMultiple=normalizeNav(ms.account_net_value,navAmount/initialNav),nav=navMultiple*initialNav;if(!(navMultiple>0))return;
-      const previousPeak=history.length?Math.max(...history.map(x=>x.nav)):nav,peak=Math.max(previousPeak,nav),drawdown=nav/peak-1;
+      const dateKey=String(payload.date||"").slice(0,10),pointKey=`${dayIndex}|${dateKey}`,hasCurrent=history.length&&history[history.length-1].key===pointKey,priorHistory=hasCurrent?history.slice(0,-1):history;
+      const previousPeak=priorHistory.length?Math.max(...priorHistory.map(x=>x.nav)):nav,peak=Math.max(previousPeak,nav),drawdown=nav/peak-1;
       const benchmarkNav=normalizeNav(ms.benchmark_nav,1),excessNav=normalizeNav(ms.excess_net_value,navMultiple/Math.max(benchmarkNav,1e-12));
       const actualExposure=finite(exposure.actual_exposure||ms.actual_exposure),targetExposure=finite(ms.target_exposure),exposureGap=finite(ms.exposure_gap,Math.max(targetExposure-actualExposure,0));
-      const latestRet=history.length&&history[history.length-1].nav>0?nav/history[history.length-1].nav-1:0,investedRet=actualExposure>=.05?latestRet/actualExposure:0,previousInvested=history.length?finite(history[history.length-1].validInvestedNav,1):1;
-      history.push({date:String(payload.date||"").slice(0,10),nav,navMultiple,benchmarkNav,excessNav,drawdown,cash:finite(exposure.cash),invested:finite(exposure.invested_value),actualExposure,validInvestedNav:previousInvested*(1+investedRet)});if(history.length>1200)history=history.slice(-1200);
-      factorHistory.push({date:String(payload.date||"").slice(0,10),weights:ms.factor_weights||[]});moduleHistory.push({date:String(payload.date||"").slice(0,10),weights:aggregateModules(ms.factor_weights||[])});if(factorHistory.length>1200)factorHistory=factorHistory.slice(-1200);if(moduleHistory.length>1200)moduleHistory=moduleHistory.slice(-1200);
+      const latestRet=priorHistory.length&&priorHistory[priorHistory.length-1].nav>0?nav/priorHistory[priorHistory.length-1].nav-1:0,investedRet=actualExposure>=.05?latestRet/actualExposure:0,previousInvested=priorHistory.length?finite(priorHistory[priorHistory.length-1].validInvestedNav,1):1;
+      const currentPoint={key:pointKey,date:dateKey,nav,navMultiple,benchmarkNav,excessNav,drawdown,cash:finite(exposure.cash),invested:finite(exposure.invested_value),actualExposure,validInvestedNav:previousInvested*(1+investedRet)};if(hasCurrent)history[history.length-1]=currentPoint;else history.push(currentPoint);if(history.length>1200)history=history.slice(-1200);
+      const factorPoint={key:pointKey,date:dateKey,weights:ms.factor_weights||[]},modulePoint={key:pointKey,date:dateKey,weights:aggregateModules(ms.factor_weights||[])};if(factorHistory.length&&factorHistory[factorHistory.length-1].key===pointKey)factorHistory[factorHistory.length-1]=factorPoint;else factorHistory.push(factorPoint);if(moduleHistory.length&&moduleHistory[moduleHistory.length-1].key===pointKey)moduleHistory[moduleHistory.length-1]=modulePoint;else moduleHistory.push(modulePoint);if(factorHistory.length>1200)factorHistory=factorHistory.slice(-1200);if(moduleHistory.length>1200)moduleHistory=moduleHistory.slice(-1200);
       const returns=history.slice(1).map((x,i)=>x.nav/history[i].nav-1),mean=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0,sd=returns.length>1?Math.sqrt(returns.reduce((a,b)=>a+(b-mean)**2,0)/returns.length):0;
       const totalReturn=navMultiple-1,maxDrawdown=Math.min(...history.map(x=>x.drawdown)),annualVol=sd*Math.sqrt(252),sharpe=sd>1e-12?mean/sd*Math.sqrt(252):NaN,cashDrag=investedRet-latestRet;
       const seriesDrawdown=values=>Math.min(...values.map((v,i)=>v/Math.max(...values.slice(0,i+1))-1));
@@ -447,6 +464,8 @@ HTML = r"""<!doctype html>
       document.getElementById("accountSummary").innerHTML=[["账户资产",fmtMoney(nav)],["现金",fmtMoney(exposure.cash)],["已投入市值",fmtMoney(exposure.invested_value)],["风险等级",String(ms.risk_level||"--").toUpperCase()],["计划订单",String(ms.order_count??0)],["未完成订单",String(ms.pending_order_count??0)]].map(x=>`<dt>${x[0]}</dt><dd>${x[1]}</dd>`).join("");
       document.getElementById("actualExposureLabel").textContent=fmtPct(actualExposure);document.getElementById("actualExposureBar").style.width=`${Math.min(Math.max(actualExposure*100,0),100)}%`;document.getElementById("targetExposureLabel").textContent=fmtPct(targetExposure);document.getElementById("targetExposureBar").style.width=`${Math.min(Math.max(targetExposure*100,0),100)}%`;
       updateReports(exposure,ms,{navMultiple,totalReturn,benchmarkNav,excessNav,maxDrawdown,actualExposure,targetExposure,exposureGap,cashDrag});renderOperational(exposure,ms,holdings,nav);drawAllCharts();
+      if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");}
+      if(finishCommand){setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";}
     }
     function setStatus(message,progress,detail){lastProgressPct=Math.max(0,Math.min(finite(progress),100));document.getElementById("status").textContent=message||"运行中";document.getElementById("runDetail").textContent=`${lastProgressPct.toFixed(1)}% · ${detail||""}`;document.getElementById("progressBar").style.width=`${lastProgressPct}%`;}
     async function poll(){try{const response=await fetch(`/state?ts=${Date.now()}`,{cache:"no-store"});if(response.ok)renderState(await response.json());else setStatus("状态接口异常",lastProgressPct,`HTTP ${response.status}`);}catch(error){setStatus("监控连接中断",lastProgressPct,String(error));document.getElementById("statusDot").style.background="#bd3d39";}setTimeout(poll,1000);}

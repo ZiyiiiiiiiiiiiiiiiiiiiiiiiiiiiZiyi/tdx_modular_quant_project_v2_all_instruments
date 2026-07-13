@@ -30,6 +30,10 @@ def main() -> None:
         'data-tab="factors"',
         'addEventListener("mousemove"',
         'setTimeout(poll,1000)',
+        "hydrateChartHistory(payload.chart_history)",
+        "factorHistory[factorHistory.length-1].key===pointKey",
+        'document.getElementById("runTitle").textContent=payload.title',
+        "(stageCommand||finishCommand)&&payload.exposure",
     ):
         assert token in HTML, token
     assert "radial-gradient" not in HTML
