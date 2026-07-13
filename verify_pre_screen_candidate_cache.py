@@ -16,7 +16,7 @@ from functions.decision_council.candidate_factor_cache import (
     load_pre_screen_candidate_factor_cache,
     pre_screen_candidate_raw_columns,
 )
-from functions.decision_council.runner import run_governance_backtest
+from functions.decision_council.factor_source import resolve_factor_source
 
 
 def _expect(condition: bool, message: str, failures: list[str]) -> None:
@@ -52,34 +52,15 @@ def main() -> int:
     _expect(set(raw_columns).issubset(cache.columns), "candidate cache should contain all selected raw columns", failures)
     _expect(len(models) == len(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS) == 28, "pre-screen bundle should contain fixed 28 models", failures)
 
-    saved = run_governance_backtest(
-        output_dir=Path("results") / "pre_screen_promote_cache_verify",
-        start_date=str(target_start.date()),
-        end_date=str(target_start.date()),
-        max_days=1,
-        alpha_bundle="pre_screen_promote_bundle",
-        universe_name="cache_verify_quality_fallback",
-        universe_mode="quality_fallback",
-        require_constituents=False,
-        allow_fallback=True,
-        allowed_instrument_types=("stock",),
-        enable_shadow_portfolios=False,
-        show_live_monitor=False,
-    )
-    required = {
-        "governance_daily_result",
-        "governance_factor_registry_snapshot",
-        "governance_factor_validation_report",
-        "governance_strategy_summary",
-    }
-    _expect(required.issubset(saved), "governance run should save key outputs", failures)
-    if "governance_factor_registry_snapshot" in saved:
-        registry = pd.read_csv(saved["governance_factor_registry_snapshot"])
-        _expect(
-            set(GOVERNANCE_PRE_SCREEN_SELECTED_ALPHA_MODELS).issubset(set(registry.get("factor_name", pd.Series(dtype=str)).astype(str))),
-            "factor registry snapshot should include selected pre-screen factors",
-            failures,
+    try:
+        resolve_factor_source(
+            factor_source="legacy_bundle",
+            alpha_bundle="pre_screen_promote_bundle",
         )
+    except ValueError:
+        pass
+    else:
+        failures.append("retired pre_screen bundle must not enter governance as legacy_bundle")
 
     expected_path, expected_manifest = candidate_factor_cache_paths(cache_start, cache_end)
     _expect(parquet_path == expected_path, "cache path should be deterministic", failures)

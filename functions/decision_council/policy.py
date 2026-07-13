@@ -29,6 +29,7 @@ ORDER_PRIORITIES = {
 }
 ORDER_COLUMNS = [
     "decision_id",
+    "decision_date",
     "execution_date",
     "symbol",
     "side",
@@ -64,6 +65,10 @@ ORDER_COLUMNS = [
     "future_loss_risk_score",
     "downtrend_decay_score",
     "post_entry_failure_score",
+    "orderflow_candidate_score",
+    "reversal_entry_score",
+    "breakout_gate_score",
+    "trend_hold_score",
     "alpha_active_model_count",
     "alpha_active_module_count",
     "alpha_active_family_count",
@@ -517,6 +522,7 @@ class RulesBasedPresidentPolicy:
         get = candidate_row.get if candidate_row is not None else lambda key, default=None: default
         return {
             "decision_id": context.decision_id,
+            "decision_date": pd.Timestamp(context.decision_date),
             "execution_date": pd.Timestamp(context.decision_date) + pd.offsets.BDay(1),
             "symbol": symbol,
             "side": "buy" if delta > 0 else "sell",
@@ -552,6 +558,10 @@ class RulesBasedPresidentPolicy:
             "future_loss_risk_score": get("future_loss_risk_score", pd.NA),
             "downtrend_decay_score": get("downtrend_decay_score", pd.NA),
             "post_entry_failure_score": get("post_entry_failure_score", pd.NA),
+            "orderflow_candidate_score": get("orderflow_candidate_score", pd.NA),
+            "reversal_entry_score": get("reversal_entry_score", pd.NA),
+            "breakout_gate_score": get("breakout_gate_score", pd.NA),
+            "trend_hold_score": get("trend_hold_score", pd.NA),
             "alpha_active_model_count": get("alpha_active_model_count", pd.NA),
             "alpha_active_module_count": get("alpha_active_module_count", pd.NA),
             "alpha_active_family_count": get("alpha_active_family_count", pd.NA),

@@ -41,7 +41,12 @@ def execute_pending(runner, date, daily):
             requested = min(requested, position.shares if position else 0.0)
         row = {
             "symbol": symbol,
+            "signal_date": pd.Timestamp(order["created_date"]),
+            "decision_timestamp": pd.Timestamp(order["created_date"]) + pd.Timedelta(hours=15),
+            "scheduled_execution_date": runner.trading_calendar.next_session(order["created_date"]),
+            "next_trading_day": pd.Timestamp(date),
             "trade_date": date,
+            "execution_price_basis": "next_available_trading_day_open_nominal",
             "side": order["side"],
             "target_shares": requested,
             "price": price,
@@ -84,6 +89,10 @@ def execute_pending(runner, date, daily):
             "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
             "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
             "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
+            "orderflow_candidate_score": order.get("orderflow_candidate_score", pd.NA),
+            "reversal_entry_score": order.get("reversal_entry_score", pd.NA),
+            "breakout_gate_score": order.get("breakout_gate_score", pd.NA),
+            "trend_hold_score": order.get("trend_hold_score", pd.NA),
         }
         rows.append(row)
     if not rows:
@@ -179,7 +188,12 @@ def register_orders(runner, orders, daily, nominal_nav):
     reserved_cash = 0.0
     for _, order in orders.iterrows():
         symbol = str(order["symbol"])
-        mark = runner.price_ledger.mark(symbol, as_of=order["execution_date"] - pd.offsets.BDay(1))
+        decision_value = order.get("decision_date")
+        if decision_value is None or pd.isna(decision_value):
+            decision_value = runner.trading_calendar.previous_session(order["execution_date"])
+        decision_date = pd.Timestamp(decision_value)
+        actual_execution_date = runner.trading_calendar.next_session(decision_date)
+        mark = runner.price_ledger.mark(symbol, as_of=decision_date)
         if symbol in prices.index:
             order_price = float(prices.at[symbol])
         elif mark is not None:
@@ -257,7 +271,8 @@ def register_orders(runner, orders, daily, nominal_nav):
             "side": order["side"],
             "reason": order["reason"],
             "priority": int(order["priority"]),
-            "created_date": order["execution_date"] - pd.offsets.BDay(1),
+            "created_date": decision_date,
+            "scheduled_execution_date": actual_execution_date,
             "target_shares": shares,
             "position_state": order.get("position_state", ""),
             "position_exit_reason": order.get("position_exit_reason", ""),

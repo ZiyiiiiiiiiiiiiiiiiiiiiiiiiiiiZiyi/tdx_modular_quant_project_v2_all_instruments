@@ -219,12 +219,18 @@ RUN_HTML = """<!doctype html>
       <div class="section-title">选择要运行的任务</div>
       <label class="item"><input type="checkbox" id="main_pipeline">主策略流水线/回测：使用下面账户参数运行普通策略路径。</label>
       <label class="item"><input type="checkbox" id="governance_active">治理主线单次运行：只跑默认股票池，适合观察弹窗监控和排查行为问题。</label>
-      <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite">增强模块诊断：一次运行核心基线、简单止盈止损、趋势/反转/订单流/突破模块、减模块测试、市场状态、校准诊断、复杂退出和主线对照。</label>
+      <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite">增强控制层诊断：factor_cabinet 模式运行核心基线、市场状态、概率校准、复杂退出和完整主线对照。旧趋势/反转/订单流 bundle 消融不会冒充 cabinet 消融。</label>
       <label class="item"><input type="checkbox" id="governance_layer_validation">层验证线：紧凑 8 因子等权测试，关闭声誉/影子组合和市场状态叠加，保留安全模块。用于先判断基础信号有没有边际收益。</label>
       <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
       <label class="item recommended"><input type="checkbox" id="fast_factor_judge">快速因子审判：只读现有特征和股票池，计算 IC/分层/换手成本/冗余，不跑状态机、不下单、不跑完整回测。</label>
       <label class="item recommended"><input type="checkbox" id="factor_appeal_judge">因子申诉审判：对 RSI、基本面、事件和另类代理等被旧门槛误杀的非 grid 因子单独复核。</label>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet">因子柜生成：从 486+114 和申诉审判结果中按模块、家族、角色、近亲关系生成状态机固定因子矩阵。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_cabinet_feature_cache">factor_cabinet 特征缓存/物化：预先生成因子柜所需 cand_ 特征缓存，治理回测只读缓存。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_cabinet_gap_report">factor_cabinet 缺口审计：检查角色配比、家族集中、近亲重复、相关性和 top overlap，不新增因子。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_cabinet_prune">factor_cabinet 去重/瘦身：按相关性、top overlap、角色和家族上限生成 pruned cabinet，不新增因子。</label>
+      <label class="item recommended"><input type="checkbox" id="orderflow_parameter_research">订单流/突破参数重审：在限定窗口和时限内重审可执行日线代理，输出独立申诉结果，不改旧 cabinet。</label>
+      <label class="item"><input type="checkbox" id="pit_level1_audit">PIT Level-1 状态审计：检查四类 PIT 表是否可用；正式模式缺失时拒绝运行。</label>
+      <label class="item"><input type="checkbox" id="registered_mainline_v2_suite">预登记主线 v1/v2 对照：固定运行四组实验，不临时扩充消融组合。</label>
 
       <div class="hint">
         当前建议：先运行“增强模块诊断”。<br>
@@ -283,6 +289,13 @@ RUN_HTML = """<!doctype html>
           </select>
         </div>
         <div class="field">
+          <label for="strategy_logic_version">主线策略逻辑版本</label>
+          <select id="strategy_logic_version">
+            <option value="production_v1">production_v1 - 冻结生产对照</option>
+            <option value="mainline_v2" selected>mainline_v2 - 简化入场实验主线</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="governance_alpha_bundle">治理主线因子包</label>
           <select id="governance_alpha_bundle">
             <option value="diversified_pre_screen_bundle_v2" selected>legacy: diversified_pre_screen_bundle_v2 - 24 candidate diversified alpha</option>
@@ -293,8 +306,8 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="governance_factor_source">治理主线因子来源</label>
           <select id="governance_factor_source">
-            <option value="legacy_bundle" selected>legacy_bundle - 旧治理因子包</option>
-            <option value="latest_factor_cabinet">latest_factor_cabinet - 自动使用最新 factor_cabinet</option>
+            <option value="legacy_bundle">legacy_bundle - 旧治理因子包</option>
+            <option value="latest_factor_cabinet" selected>latest_factor_cabinet - 自动使用最新 factor_cabinet</option>
             <option value="selected_factor_cabinet">selected_factor_cabinet - 手动选择 factor_cabinet run_id</option>
           </select>
         </div>
@@ -319,6 +332,18 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="fast_factor_max_count">快速因子审判数量</label>
           <input type="number" id="fast_factor_max_count" min="1" step="100" value="7000" placeholder="7000=去掉不合格grid后的全矩阵候选；留空=全部注册池">
+        </div>
+        <div class="field">
+          <label for="pit_mode">PIT 数据模式</label>
+          <select id="pit_mode">
+            <option value="research" selected>research - 缺失时明确降级并写审计</option>
+            <option value="formal">formal - 任一必需表缺失即停止</option>
+            <option value="off">off - 关闭 PIT 检查并明确标记</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="research_max_runtime_seconds">研究任务最长运行秒数</label>
+          <input type="number" id="research_max_runtime_seconds" min="30" step="30" value="1800">
         </div>
       </div>
       <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>
@@ -370,6 +395,10 @@ RUN_HTML = """<!doctype html>
         });
         capitalProfile.value = "small_capital_branch";
       }
+      const factorSource = document.getElementById("governance_factor_source");
+      if (factorSource) {
+        factorSource.value = "latest_factor_cabinet";
+      }
       startProgressPolling();
     });
     function currentProfile() {
@@ -407,20 +436,30 @@ RUN_HTML = """<!doctype html>
       const maxDays = document.getElementById("max_days").value.trim();
       const fastFactorMaxCountNode = document.getElementById("fast_factor_max_count");
       const fastFactorMaxCount = fastFactorMaxCountNode ? fastFactorMaxCountNode.value.trim() : "";
+      const pitModeNode = document.getElementById("pit_mode");
+      const pitMode = pitModeNode ? pitModeNode.value : "research";
+      const researchRuntimeNode = document.getElementById("research_max_runtime_seconds");
+      const researchMaxRuntimeSeconds = researchRuntimeNode ? researchRuntimeNode.value.trim() : "1800";
       const shadowPortfolios = document.getElementById("shadow_portfolios").checked;
       const alphaCollapseExitNode = document.getElementById("alpha_collapse_exit_enabled");
       const alphaCollapseExitEnabled = alphaCollapseExitNode ? alphaCollapseExitNode.checked : true;
       const controlModeNode = document.getElementById("governance_control_mode");
       const controlMode = controlModeNode ? controlModeNode.value : "normal";
+      const strategyLogicNode = document.getElementById("strategy_logic_version");
+      const strategyLogicVersion = strategyLogicNode ? strategyLogicNode.value : "production_v1";
       const alphaBundleNode = document.getElementById("governance_alpha_bundle");
-      const alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
+      let alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
       const factorSourceNode = document.getElementById("governance_factor_source");
-      const factorSource = factorSourceNode ? factorSourceNode.value : "legacy_bundle";
+      const factorSource = factorSourceNode ? factorSourceNode.value : "latest_factor_cabinet";
       const cabinetNode = document.getElementById("factor_cabinet_run_id");
       const cabinetRunId = cabinetNode ? cabinetNode.value : "";
       const cabinetPath = cabinetNode && cabinetNode.selectedOptions.length ? (cabinetNode.selectedOptions[0].dataset.path || "") : "";
-      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet");
-      if (touchesGovernance && universes.length === 0) {
+      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "orderflow_parameter_research" || task === "pit_level1_audit" || task === "registered_mainline_v2_suite");
+      const requiresUniverse = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "orderflow_parameter_research" || task === "registered_mainline_v2_suite");
+      if (tasks.some((task) => task === "governance_layer_validation")) {
+        alphaBundle = "diversified_pre_screen_bundle_v2";
+      }
+      if (requiresUniverse && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
       }
       if (startMonth && endMonth && startMonth > endMonth) {
@@ -432,8 +471,11 @@ RUN_HTML = """<!doctype html>
         end_month: endMonth,
         max_days: maxDays,
         fast_factor_max_count: fastFactorMaxCount,
+        pit_mode: pitMode,
+        research_max_runtime_seconds: researchMaxRuntimeSeconds,
         shadow_portfolios: shadowPortfolios,
         control_mode: controlMode,
+        strategy_logic_version: strategyLogicVersion,
         alpha_bundle: alphaBundle,
         factor_source: factorSource,
         factor_cabinet_run_id: cabinetRunId,
@@ -481,24 +523,29 @@ RUN_HTML = """<!doctype html>
       return data;
     }
     let progressTimer = null;
+    let progressTerminalSeen = false;
     function startProgressPolling() {
       if (progressTimer) clearInterval(progressTimer);
+      progressTerminalSeen = false;
       loadProgressOnce().catch(() => {});
       progressTimer = setInterval(async () => {
         try {
           const data = await loadProgressOnce();
           if (["complete", "failed"].includes(String(data.status || ""))) {
+            progressTerminalSeen = true;
             clearInterval(progressTimer);
             progressTimer = null;
           }
         } catch (err) {
-          document.getElementById("progress_detail").textContent = `Progress read failed: ${err.message || err}`;
+          if (!progressTerminalSeen) {
+            document.getElementById("progress_detail").textContent = `Progress read failed: ${err.message || err}`;
+          }
         }
       }, 2000);
     }
     async function submitSelected() {
       const tasks = [];
-      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet"].forEach((id) => {
+      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet", "factor_cabinet_prune", "factor_cabinet_feature_cache", "factor_cabinet_gap_report", "orderflow_parameter_research", "pit_level1_audit", "registered_mainline_v2_suite"].forEach((id) => {
         const node = document.getElementById(id);
         if (node && node.checked) tasks.push(id);
       });
@@ -558,7 +605,7 @@ RUN_HTML = """<!doctype html>
       }
     }
     async function submitAll() {
-      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet"];
+      const tasks = ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet", "factor_cabinet_feature_cache"];
       if (!window.confirm("运行全部任务会启动主策略流水线、治理主线、主线复核、层验证和完整增强诊断，耗时可能很长。确认继续吗？")) {
         document.getElementById("status").textContent = "已取消运行全部任务。";
         return;
@@ -1754,6 +1801,22 @@ def main(argv: list[str]) -> int:
 
     state_path = Path(argv[1])
     stop_event = threading.Event()
+    shutdown_scheduled = {"done": False}
+
+    def schedule_shutdown(delay_seconds: float = 8.0) -> None:
+        if shutdown_scheduled["done"]:
+            return
+        shutdown_scheduled["done"] = True
+        stop_event.set()
+
+        def _shutdown_later():
+            time.sleep(max(float(delay_seconds), 0.0))
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+
+        threading.Thread(target=_shutdown_later, daemon=True).start()
     port = _pick_port()
 
     class Handler(BaseHTTPRequestHandler):
@@ -1786,7 +1849,10 @@ def main(argv: list[str]) -> int:
                 try:
                     from functions.runtime_progress import read_progress
 
-                    _json_response(self, read_progress())
+                    progress = read_progress()
+                    _json_response(self, progress)
+                    if str(progress.get("status", "")).lower() in {"complete", "failed"}:
+                        schedule_shutdown()
                 except Exception as exc:
                     _json_response(self, {"status": "unknown", "message": f"progress read failed: {exc}"}, status=500)
                 return
@@ -1811,11 +1877,6 @@ def main(argv: list[str]) -> int:
                 payload = {}
             _write_selection(state_path, payload if isinstance(payload, dict) else {})
             _json_response(self, {"message": "选择已记录，可以关闭本页面。"})
-            stop_event.set()
-            task_payload = payload if isinstance(payload, dict) else {}
-            tasks = task_payload.get("tasks") if isinstance(task_payload, dict) else []
-            if not tasks:
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         def log_message(self, format, *args):
             return

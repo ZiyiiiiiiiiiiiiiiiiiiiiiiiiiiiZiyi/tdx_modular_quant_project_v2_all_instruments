@@ -318,11 +318,19 @@ def _future_loss_duration_audit(trade_pairs: pd.DataFrame, features: pd.DataFram
     price_col = "close_nominal" if "close_nominal" in features.columns else "close"
     if not {"date", "symbol", price_col}.issubset(features.columns):
         return pd.DataFrame(columns=columns)
-    prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    trade_symbols = set(trade_pairs["symbol"].dropna().astype(str).unique())
+    if not trade_symbols:
+        return pd.DataFrame(columns=columns)
+    source_prices = features.loc[features["symbol"].astype(str).isin(trade_symbols), ["date", "symbol", price_col]]
+    prices = source_prices.copy()
     prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
     prices["symbol"] = prices["symbol"].astype(str)
     prices[price_col] = pd.to_numeric(prices[price_col], errors="coerce")
     prices = prices.dropna(subset=["date", "symbol", price_col]).sort_values(["symbol", "date"])
+    prices_by_symbol = {
+        symbol: group.reset_index(drop=True)
+        for symbol, group in prices.groupby("symbol", sort=False)
+    }
     rows = []
     for _, trade in trade_pairs.iterrows():
         symbol = str(trade.get("symbol", ""))
@@ -333,7 +341,11 @@ def _future_loss_duration_audit(trade_pairs: pd.DataFrame, features: pd.DataFram
         shares = _safe_float(trade.get("exit_shares"), default=0.0)
         if exit_price <= 0.0 or shares <= 0.0:
             continue
-        path = prices[(prices["symbol"].eq(symbol)) & (prices["date"] > pd.Timestamp(exit_date))].head(int(horizon_days)).copy()
+        symbol_prices = prices_by_symbol.get(symbol)
+        if symbol_prices is None or symbol_prices.empty:
+            continue
+        start_pos = int(symbol_prices["date"].searchsorted(pd.Timestamp(exit_date), side="right"))
+        path = symbol_prices.iloc[start_pos : start_pos + int(horizon_days)].copy()
         if path.empty:
             continue
         close = path[price_col].astype(float).reset_index(drop=True)
@@ -422,20 +434,30 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
     ].copy()
     if sells.empty:
         return pd.DataFrame(columns=columns)
-    feature_prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    sell_symbols = set(sells["symbol"].dropna().astype(str).unique())
+    if not sell_symbols:
+        return pd.DataFrame(columns=columns)
+    source_prices = features.loc[features["symbol"].astype(str).isin(sell_symbols), ["date", "symbol", price_col]]
+    feature_prices = source_prices.copy()
     feature_prices["date"] = pd.to_datetime(feature_prices["date"], errors="coerce")
     feature_prices["symbol"] = feature_prices["symbol"].astype(str)
     feature_prices[price_col] = pd.to_numeric(feature_prices[price_col], errors="coerce")
     feature_prices = feature_prices.dropna(subset=["date", "symbol", price_col])
+    feature_prices = feature_prices.sort_values(["symbol", "date"])
+    prices_by_symbol = {
+        symbol: group.reset_index(drop=True)
+        for symbol, group in feature_prices.groupby("symbol", sort=False)
+    }
     rows = []
     horizon_days = int(GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS)
     for _, sell in sells.iterrows():
         symbol = str(sell["symbol"])
         trade_date = pd.Timestamp(sell["trade_date"])
-        path = feature_prices[
-            (feature_prices["symbol"].eq(symbol))
-            & (feature_prices["date"] > trade_date)
-        ].sort_values("date")
+        symbol_prices = prices_by_symbol.get(symbol)
+        if symbol_prices is None or symbol_prices.empty:
+            continue
+        start_pos = int(symbol_prices["date"].searchsorted(trade_date, side="right"))
+        path = symbol_prices.iloc[start_pos:].copy()
         if as_of_ts is not None:
             path = path[path["date"] <= as_of_ts]
         path = path.head(horizon_days)

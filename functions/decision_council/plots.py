@@ -1,10 +1,13 @@
 """Diagnostic charts emitted after an exploratory governance backtest."""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from functions.decision_council.outputs import CSV_WRITE_RETRIES
 
 
 def save_governance_diagnostic_plots(
@@ -86,8 +89,19 @@ def save_governance_diagnostic_plots(
 
 def _safe_savefig(fig, output_path, *, dpi=220, bbox_inches="tight"):
     path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+    last_error: OSError | None = None
+    for attempt in range(1, CSV_WRITE_RETRIES + 1):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+            return path
+        except OSError as exc:
+            last_error = exc
+        if attempt < CSV_WRITE_RETRIES:
+            time.sleep(0.5 * attempt)
+    raise RuntimeError(
+        f"Unable to save governance diagnostic plot after {CSV_WRITE_RETRIES} attempts: {path}"
+    ) from last_error
 
 
 def _plot_performance_risk(plt, daily_result, output_path):

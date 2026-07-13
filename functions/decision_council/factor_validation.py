@@ -21,6 +21,8 @@ def build_factor_research_reports(
     progress_callback=None,
     emit_quantile_rows: bool = True,
     cluster_max_factors: int = 300,
+    max_rows: int | None = None,
+    include_missing_factors: bool = True,
 ) -> dict[str, pd.DataFrame]:
     registry = registry or build_factor_registry()
     snapshot = factor_registry_snapshot(registry)
@@ -61,6 +63,9 @@ def build_factor_research_reports(
             "governance_factor_quantile_report": pd.DataFrame(),
             "governance_factor_cluster_report": pd.DataFrame(),
         }
+    original_row_count = int(len(data))
+    data = _sample_factor_research_data(data, max_rows=max_rows)
+    sampled_row_count = int(len(data))
     for horizon in horizons:
         data[f"forward_return_{int(horizon)}d"] = data.groupby("symbol", sort=False)[close_col].shift(-int(horizon)) / data[close_col] - 1.0
 
@@ -81,14 +86,17 @@ def build_factor_research_reports(
             )
         raw_column = meta.get("raw_column")
         if raw_column not in data.columns:
-            validation_rows.append(_missing_factor_row(meta, "missing_feature_column"))
+            if include_missing_factors:
+                validation_rows.append(_missing_factor_row(meta, "missing_feature_column"))
             continue
         factor_values = pd.to_numeric(data[raw_column], errors="coerce")
+        direction_sign = _factor_direction_sign(meta.get("direction", "higher_better"))
         coverage_ratio = float(factor_values.notna().mean()) if len(factor_values) else 0.0
         for horizon in horizons:
             fwd_col = f"forward_return_{int(horizon)}d"
             frame = data[["date", "symbol", raw_column, fwd_col]].copy()
             frame[raw_column] = pd.to_numeric(frame[raw_column], errors="coerce")
+            frame[raw_column] = frame[raw_column] * direction_sign
             frame[fwd_col] = pd.to_numeric(frame[fwd_col], errors="coerce")
             frame = frame.dropna(subset=["date", "symbol", raw_column, fwd_col])
             if frame.empty:
@@ -127,7 +135,55 @@ def build_factor_research_reports(
         "governance_factor_layer_return_report": quantile_report,
         "governance_factor_quantile_report": quantile_report,
         "governance_factor_cluster_report": build_factor_cluster_report(data, registry, max_factors=cluster_max_factors),
+        "governance_factor_validation_runtime_audit": pd.DataFrame(
+            [{
+                "original_rows": original_row_count,
+                "sampled_rows": sampled_row_count,
+                "max_rows": int(max_rows) if max_rows is not None else None,
+                "sampled": bool(max_rows is not None and original_row_count > int(max_rows)),
+                "factor_count": int(len([meta for meta in registry.values() if meta.get("raw_column") in data.columns])),
+                "horizons": "|".join(str(int(h)) for h in horizons),
+                "emit_quantile_rows": bool(emit_quantile_rows),
+                "cluster_max_factors": int(cluster_max_factors),
+                "include_missing_factors": bool(include_missing_factors),
+            }]
+        ),
     }
+
+
+def _factor_direction_sign(direction) -> float:
+    value = str(direction or "higher_better").strip().lower()
+    if value in {"lower_better", "lower", "descending", "inverse", "-1", "-1.0"}:
+        return -1.0
+    if value in {"higher_better", "higher", "ascending", "long", "1", "1.0"}:
+        return 1.0
+    raise ValueError(f"Unsupported factor direction: {direction!r}")
+
+
+def _sample_factor_research_data(data: pd.DataFrame, *, max_rows: int | None) -> pd.DataFrame:
+    """Bound post-run research diagnostics without changing trading decisions."""
+    if max_rows is None or int(max_rows) <= 0 or len(data) <= int(max_rows):
+        return data
+    limit = int(max_rows)
+    dates = pd.Index(pd.to_datetime(data["date"], errors="coerce").dropna().sort_values().unique())
+    if dates.empty:
+        return data.sample(n=limit, random_state=17).sort_values(["symbol", "date"])
+    median_rows_per_date = max(int(data.groupby("date", sort=False).size().median()), 1)
+    target_dates = max(min(len(dates), limit // median_rows_per_date), 1)
+    positions = np.linspace(0, len(dates) - 1, num=target_dates, dtype=int)
+    selected_dates = set(pd.Timestamp(dates[int(pos)]) for pos in positions)
+    sampled = data[data["date"].isin(selected_dates)].copy()
+    if len(sampled) <= limit:
+        return sampled.sort_values(["symbol", "date"])
+    per_date = max(int(limit / max(len(selected_dates), 1)), 1)
+    sampled = (
+        sampled.groupby("date", group_keys=False, sort=True)
+        .apply(lambda group: group.sample(n=min(len(group), per_date), random_state=17))
+        .reset_index(drop=True)
+    )
+    if len(sampled) > limit:
+        sampled = sampled.sample(n=limit, random_state=17)
+    return sampled.sort_values(["symbol", "date"]).reset_index(drop=True)
 
 
 def build_factor_cluster_report(

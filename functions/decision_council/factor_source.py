@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 import pandas as pd
 
@@ -18,6 +20,29 @@ FACTOR_SOURCE_CHOICES = (
 )
 FACTOR_CABINET_ROOT = Path("results/factor_cabinet")
 LEGACY_GOVERNANCE_ALPHA_BUNDLE = "diversified_pre_screen_bundle_v2"
+_CABINET_ROLES = frozenset({
+    "entry_alpha", "entry_alpha_proxy", "timing_filter", "risk_override",
+    "liquidity_filter", "hold_validation", "sell_trigger",
+})
+
+
+@dataclass(frozen=True)
+class FactorRuntimeContext:
+    """Immutable factor metadata used by one governance run only."""
+
+    factor_source: str
+    cabinet_run_id: str
+    cabinet_manifest_hash: str
+    model_feature_map: object
+    role_map: object
+    module_map: object
+    family_map: object
+    strict_entry_alpha_map: object
+    diversity_gate: object
+
+    @property
+    def alpha_models(self) -> tuple[str, ...]:
+        return tuple(self.model_feature_map)
 
 
 @dataclass(frozen=True)
@@ -36,6 +61,10 @@ class FactorSourceSpec:
     hold_validation_count: int = 0
     model_feature_map: dict[str, str] | None = None
     role_map: dict[str, str] | None = None
+    module_map: dict[str, str] | None = None
+    family_map: dict[str, str] | None = None
+    strict_entry_alpha_map: dict[str, bool] | None = None
+    cabinet_manifest_hash: str = ""
 
     @property
     def uses_factor_cabinet(self) -> bool:
@@ -44,6 +73,42 @@ class FactorSourceSpec:
     @property
     def alpha_models(self) -> tuple[str, ...]:
         return tuple((self.model_feature_map or {}).keys())
+
+    def runtime_context(self) -> FactorRuntimeContext:
+        """Return per-run metadata without mutating process-wide configuration."""
+        if self.uses_factor_cabinet:
+            missing = [
+                name for name in self.alpha_models
+                if name not in (self.role_map or {})
+                or name not in (self.module_map or {})
+                or name not in (self.family_map or {})
+            ]
+            if missing:
+                raise ValueError(f"factor_cabinet runtime metadata missing for models: {missing[:10]}")
+            from config import GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE
+            gate = dict(GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE)
+            # Cabinets without sell-trigger factors cannot satisfy a positive sell vote.
+            if "sell_trigger" not in set((self.role_map or {}).values()):
+                gate["min_sell_trigger_votes"] = 0
+            return FactorRuntimeContext(
+                factor_source=self.factor_source,
+                cabinet_run_id=self.factor_cabinet_run_id,
+                cabinet_manifest_hash=self.cabinet_manifest_hash,
+                model_feature_map=MappingProxyType(dict(self.model_feature_map or {})),
+                role_map=MappingProxyType({name: (_normalize_state_machine_role(role),) for name, role in (self.role_map or {}).items()}),
+                module_map=MappingProxyType(dict(self.module_map or {})),
+                family_map=MappingProxyType(dict(self.family_map or {})),
+                strict_entry_alpha_map=MappingProxyType(dict(self.strict_entry_alpha_map or {})),
+                diversity_gate=MappingProxyType(gate),
+            )
+        return FactorRuntimeContext(
+            factor_source=self.factor_source,
+            cabinet_run_id="",
+            cabinet_manifest_hash="",
+            model_feature_map=MappingProxyType({}), role_map=MappingProxyType({}),
+            module_map=MappingProxyType({}), family_map=MappingProxyType({}),
+            strict_entry_alpha_map=MappingProxyType({}), diversity_gate=MappingProxyType({}),
+        )
 
     def summary_dict(self) -> dict:
         return {
@@ -91,10 +156,33 @@ def list_factor_cabinet_runs(root: str | Path = FACTOR_CABINET_ROOT) -> list[dic
 
 
 def latest_factor_cabinet_path(root: str | Path = FACTOR_CABINET_ROOT) -> Path:
-    runs = list_factor_cabinet_runs(root)
-    if not runs:
+    base = Path(root)
+    candidates = [
+        run_dir / "factor_cabinet.json"
+        for run_dir in base.iterdir()
+        if run_dir.is_dir() and (run_dir / "factor_cabinet.json").exists()
+    ] if base.exists() else []
+    if not candidates:
         raise FileNotFoundError(f"No factor_cabinet.json found under {Path(root)}")
-    return Path(runs[0]["path"])
+    # Do not use the UI listing here: it intentionally omits malformed entries.
+    # The newest artifact must either validate or fail; selecting an older cabinet
+    # would be an unreported fallback.
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def factor_source_output_label(spec: FactorSourceSpec) -> str:
+    """Return a short, collision-resistant output-path component.
+
+    Cabinet run ids are intentionally descriptive and can be long enough to
+    push Windows result artifact paths past the traditional 260-character
+    boundary.  The full run id remains in metadata and runtime audit files;
+    this label is used only for the directory component.
+    """
+    if not spec.uses_factor_cabinet:
+        return str(spec.alpha_bundle or LEGACY_GOVERNANCE_ALPHA_BUNDLE)
+    run_id = str(spec.factor_cabinet_run_id or "factor_cabinet")
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+    return f"cab_{digest}"
 
 
 def resolve_factor_source(
@@ -131,25 +219,15 @@ def resolve_factor_source(
 
 
 def install_factor_source_model_map(spec: FactorSourceSpec) -> None:
+    """Compatibility shim. Cabinet callers must pass ``runtime_context`` instead.
+
+    Keeping this function side-effect free prevents one Web task from altering the
+    next task in the same Python process.
+    """
     if not spec.uses_factor_cabinet:
-        return
-    model_feature_map = dict(spec.model_feature_map or {})
-    if not model_feature_map:
-        raise ValueError("factor_cabinet source resolved without any model feature mappings")
-
-    import config
-    from functions.decision_council import candidate_factor_cache, proposals
-
-    role_map = {
-        name: (_normalize_state_machine_role(role),)
-        for name, role in (spec.role_map or {}).items()
-        if name and role
-    }
-    config.GOVERNANCE_ALPHA_MODEL_FEATURES.update(model_feature_map)
-    config.GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP.update(role_map)
-    proposals.MODEL_FEATURES.update(model_feature_map)
-    proposals.GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP.update(role_map)
-    candidate_factor_cache.GOVERNANCE_ALPHA_MODEL_FEATURES.update(model_feature_map)
+        return None
+    spec.runtime_context()
+    return None
 
 
 def _normalize_state_machine_role(role: str) -> str:
@@ -172,10 +250,26 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
     if frame.empty:
         raise ValueError(f"factor_cabinet has no factors: {path}")
     run_id = str(payload.get("run_id") or path.parent.name)
-    role_series = frame.get("role", frame.get("cabinet_role", pd.Series(dtype=str))).fillna("").astype(str)
+    required_columns = {"factor_name", "raw_column", "role", "module", "family"}
+    missing_columns = sorted(required_columns - set(frame.columns))
+    if missing_columns:
+        raise ValueError(f"factor_cabinet missing required columns: {missing_columns}")
+    role_series = frame["role"].fillna("").astype(str).str.strip()
     role_distribution = {str(k): int(v) for k, v in role_series.value_counts().sort_index().items()}
-    raw_column = frame.get("raw_column", pd.Series(dtype=str)).fillna("").astype(str)
-    factor_name = frame.get("factor_name", pd.Series(dtype=str)).fillna("").astype(str)
+    raw_column = frame["raw_column"].fillna("").astype(str).str.strip()
+    factor_name = frame["factor_name"].fillna("").astype(str).str.strip()
+    module_series = frame["module"].fillna("").astype(str).str.strip()
+    family_series = frame["family"].fillna("").astype(str).str.strip()
+    invalid = frame.loc[
+        factor_name.eq("") | raw_column.eq("") | ~raw_column.str.startswith("cand_")
+        | role_series.eq("") | ~role_series.isin(_CABINET_ROLES)
+        | module_series.eq("") | family_series.eq(""),
+        ["factor_name", "raw_column", "role", "module", "family"],
+    ]
+    if not invalid.empty:
+        raise ValueError(f"factor_cabinet contains invalid runtime metadata: {invalid.head(5).to_dict('records')}")
+    if factor_name.duplicated().any() or raw_column.duplicated().any():
+        raise ValueError("factor_cabinet requires unique factor_name and raw_column values")
     model_feature_map = {
         str(name): str(raw)
         for name, raw in zip(factor_name.tolist(), raw_column.tolist())
@@ -186,7 +280,13 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
         for name, role in zip(factor_name.tolist(), role_series.tolist())
         if str(name).strip() and str(role).strip()
     }
+    module_map = {str(name): str(module) for name, module in zip(factor_name.tolist(), module_series.tolist())}
+    family_map = {str(name): str(family) for name, family in zip(factor_name.tolist(), family_series.tolist())}
     strict_flags = frame.get("strict_entry_alpha", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
+    strict_map = {str(name): bool(flag) for name, flag in zip(factor_name.tolist(), strict_flags.tolist())}
+    invalid_strict = [name for name, flag in strict_map.items() if flag and role_map.get(name) != "entry_alpha"]
+    if invalid_strict:
+        raise ValueError(f"strict_entry_alpha requires role=entry_alpha: {invalid_strict[:10]}")
     return FactorSourceSpec(
         factor_source=factor_source,
         alpha_bundle=f"factor_cabinet:{run_id}",
@@ -202,4 +302,8 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
         hold_validation_count=int(role_distribution.get("hold_validation", 0)),
         model_feature_map=model_feature_map,
         role_map=role_map,
+        module_map=module_map,
+        family_map=family_map,
+        strict_entry_alpha_map=strict_map,
+        cabinet_manifest_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
     )

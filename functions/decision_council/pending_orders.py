@@ -72,7 +72,9 @@ class PendingOrderBook:
         if self.orders.empty or self.orders.dropna(how="all").empty:
             self.orders = new_row
         else:
-            self.orders.loc[len(self.orders)] = order
+            # Row assignment to a heterogeneous frame triggers a pandas dtype
+            # deprecation warning and repeatedly reallocates its backing blocks.
+            self.orders = pd.concat([self.orders, new_row], ignore_index=True)
         return order["order_id"]
 
     def upsert_sell_intent(self, payload: dict) -> str:

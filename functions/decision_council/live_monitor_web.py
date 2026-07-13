@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import socket
 import sys
 import threading
@@ -334,7 +335,7 @@ HTML = """<!doctype html>
       ["current_drawdown", "当前回撤"],
       ["account_max_drawdown", "账户最大回撤"],
       ["holding_max_drawdown", "持仓最大回撤"],
-      ["benchmark_max_drawdown", "前30强度基准最大回撤"],
+      ["benchmark_max_drawdown", "前30强基准最大回撤"],
       ["excess_max_drawdown", "超额最大回撤"],
       ["sharpe", "年化夏普"],
       ["annual_volatility", "年化波动"],
@@ -347,7 +348,7 @@ HTML = """<!doctype html>
       ["actual_exposure", "实际仓位"],
       ["exposure_gap", "仓位缺口"],
       ["valid_invested_nav", "持仓/投入净值"],
-      ["benchmark_nav", "前30强度基准净值"],
+      ["benchmark_nav", "前30强基准净值"],
       ["excess_nav", "超额净值"],
       ["cash_drag", "现金拖累"],
       ["buy_accuracy_5d", "买入5日准确率"],
@@ -794,8 +795,21 @@ HTML = """<!doctype html>
       }
       if (cmd !== "update") return;
       const payloadRunId = String(payload.run_id || "");
-      if (activeRunId && payloadRunId && payloadRunId !== activeRunId) return;
-      if (!activeRunId && payloadRunId) activeRunId = payloadRunId;
+      if (payloadRunId && payloadRunId !== activeRunId) {
+        activeRunId = payloadRunId;
+        lastProgressPct = 0;
+        history = [];
+        factorHistory = [];
+        moduleHistory = [];
+      }
+      const payloadTotalDays = Number(payload.total_days || 0);
+      if (Number.isFinite(payloadTotalDays) && payloadTotalDays > 0) {
+        totalDays = Math.max(payloadTotalDays, 1);
+      }
+      const payloadInitialNav = Number(payload.initial_nav || 0);
+      if (Number.isFinite(payloadInitialNav) && payloadInitialNav > 0) {
+        initialNav = Math.max(payloadInitialNav, 1e-12);
+      }
 
       const exposure = payload.exposure || {};
       const ms = payload.monitor_state || {};
@@ -893,7 +907,16 @@ HTML = """<!doctype html>
       setMetric("realized_pnl", fmtMoney(Number(ms.realized_pnl || 0)), Number(ms.realized_pnl || 0));
       setMetric("gross_profit", fmtMoney(Number(ms.gross_profit || 0)), Number(ms.gross_profit || 0));
       setMetric("gross_loss", fmtMoney(Number(ms.gross_loss || 0)), Number(ms.gross_loss || 0));
-      setMetric("profit_factor", fmtNum(Number(ms.profit_factor), 2), Number(ms.profit_factor || 0) - 1.0);
+      const grossProfit = Number(ms.gross_profit || 0);
+      const grossLoss = Number(ms.gross_loss || 0);
+      const reportedProfitFactor = Number(ms.profit_factor);
+      const profitFactorText = Math.abs(grossLoss) <= 1e-12 && grossProfit > 0
+        ? "∞"
+        : fmtNum(reportedProfitFactor, 2);
+      const profitFactorDirection = profitFactorText === "∞"
+        ? 1.0
+        : (Number.isFinite(reportedProfitFactor) ? reportedProfitFactor - 1.0 : 0.0);
+      setMetric("profit_factor", profitFactorText, profitFactorDirection);
       setMetric("control_exit_count", String(Number(ms.control_exit_count || 0)), Number(ms.control_exit_count || 0));
       setMetric("control_avoided_loss", fmtMoney(Number(ms.avoided_loss_to_window_low || 0)), Number(ms.avoided_loss_to_window_low || 0));
       setMetric("hard_stop_avoided_loss", fmtMoney(Number(ms.hard_stop_avoided_loss_to_window_low || 0)), Number(ms.hard_stop_avoided_loss_to_window_low || 0));
@@ -1302,6 +1325,21 @@ def main(argv: list[str]) -> int:
     threading.Thread(target=shutdown_watcher, args=(server,), daemon=True).start()
 
     url = f"http://127.0.0.1:{port}/"
+    endpoint_path = state_path.with_suffix(".endpoint.json")
+    endpoint_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "pid": os.getpid(),
+                "url": url,
+                "state_path": str(state_path),
+                "started_at": time.time(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"治理实时监控浏览器地址: {url}")
     try:
       opened = webbrowser.open(url, new=1)
@@ -1315,6 +1353,13 @@ def main(argv: list[str]) -> int:
     finally:
         stop_event.set()
         server.server_close()
+        try:
+            endpoint_path.write_text(
+                json.dumps({"status": "stopped", "pid": os.getpid(), "url": url}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     return 0
 
 

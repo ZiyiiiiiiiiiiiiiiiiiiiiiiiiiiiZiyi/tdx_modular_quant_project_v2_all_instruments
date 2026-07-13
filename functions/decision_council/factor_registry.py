@@ -18,6 +18,7 @@ from config import (
     GOVERNANCE_FACTOR_MIN_RANK_IC_POSITIVE_RATIO,
     GOVERNANCE_FACTOR_MIN_SAMPLE_COUNT,
     GOVERNANCE_FACTOR_MIN_TOP_BOTTOM_SPREAD_10D,
+    GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS,
 )
 from functions.decision_council.analytics import factor_module
 from functions.factors.factor_candidate_pool import candidate_factor_registry_rows
@@ -34,7 +35,11 @@ def build_factor_registry() -> dict[str, dict]:
             "module": module,
             "source_file": _source_file_for_column(column),
             "raw_column": str(column),
-            "direction": "higher_better",
+            "direction": (
+                "lower_better"
+                if float(GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS.get(str(factor_name), 1.0)) < 0.0
+                else "higher_better"
+            ),
             "horizons": "5|10|20",
             "allowed_roles": "|".join(role["allowed_roles"]),
             "requires_pit": True,

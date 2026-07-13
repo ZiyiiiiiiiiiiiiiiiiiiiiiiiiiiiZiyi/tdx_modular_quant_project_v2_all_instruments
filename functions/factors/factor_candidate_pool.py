@@ -357,6 +357,19 @@ def append_candidate_factors(
     if df is None or df.empty:
         return df
     include_set = set(include_columns) if include_columns is not None else None
+    if include_set:
+        from functions.factors.orderflow_parameter_factors import (
+            append_parameterized_orderflow_factors,
+            parameter_raw_columns,
+        )
+
+        parameter_columns = include_set & parameter_raw_columns()
+        if parameter_columns and parameter_columns == include_set:
+            return append_parameterized_orderflow_factors(
+                df,
+                include_columns=parameter_columns,
+                close_col=close_col,
+            )
     frame = df.copy(deep=False)
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.sort_values(["symbol", "date"])

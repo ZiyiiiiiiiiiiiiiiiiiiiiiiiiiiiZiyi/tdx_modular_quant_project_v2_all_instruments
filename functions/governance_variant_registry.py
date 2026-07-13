@@ -95,6 +95,7 @@ class GovernanceVariantRegistry:
                 governance_variant_tag="layer_validation",
                 extra={
                     "purpose": "causal_layer_validation",
+                    "entry_confirmation_mode": "state_machine_roles_only",
                     "recommended_shadow_portfolios": False,
                 },
             )

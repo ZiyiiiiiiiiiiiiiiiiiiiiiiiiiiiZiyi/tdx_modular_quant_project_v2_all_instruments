@@ -9,7 +9,11 @@ from functions.factor_selection.factor_cabinet_builder import build_factor_cabin
 
 
 def main() -> int:
-    saved = build_factor_cabinet(min_factors=60, max_factors=120)
+    saved = build_factor_cabinet(
+        min_factors=60,
+        max_factors=120,
+        output_root=Path("reports/verify_factor_cabinet_builder/factor_cabinet"),
+    )
     output = Path(saved["output_dir"])
     required = [
         "factor_cabinet.json",

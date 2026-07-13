@@ -628,6 +628,20 @@ def apply_entry_confirmation(
         & ~hard_veto.astype(bool)
         & checks["liquidity_confirmation"].astype(bool)
     )
+    fixed_percentile_confirm = (
+        ~hard_veto.astype(bool)
+        & checks["alpha_percentile"].astype(bool)
+        & market_confirm.astype(bool)
+        & flow_confirm.astype(bool)
+    )
+    if is_rebound:
+        fixed_percentile_confirm &= rebound_follow_through.astype(bool)
+    role_only_confirm = (
+        data.get("state_machine_role_pass", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+        & data["exhaustion_score"].lt(float(GOVERNANCE_EXHAUSTION_BLOCK_THRESHOLD))
+        & checks["liquidity_confirmation"].astype(bool)
+        & ~risk_blocks_new_buy.astype(bool)
+    )
     confirmed = matrix_confirm.astype(bool)
     if mode in {"factor_only", "matrix_only", "stop_mode"}:
         confirmed = (
@@ -636,9 +650,21 @@ def apply_entry_confirmation(
             & checks["liquidity_confirmation"].astype(bool)
             & ~risk_blocks_new_buy.astype(bool)
         )
+    if mode == "state_machine_roles_only":
+        confirmed = role_only_confirm
     if not ENABLE_GOVERNANCE_ENTRY_CONFIRMATION:
         confirmed = pd.Series(True, index=data.index)
     data["entry_confirmed"] = confirmed.astype(bool)
+    data["entry_confirmed_matrix_counterfactual"] = matrix_confirm.astype(bool)
+    data["entry_confirmed_without_probability"] = fixed_percentile_confirm.astype(bool)
+    data["entry_confirmed_roles_only_counterfactual"] = role_only_confirm.astype(bool)
+    probability_active = mode not in {"fixed_percentile_only", "no_probability", "no_probability_edge", "factor_only", "matrix_only", "stop_mode", "state_machine_roles_only"}
+    data["probability_gate_evaluated"] = bool(probability_active)
+    data["probability_gate_changed_decision"] = (
+        confirmed.astype(bool) != fixed_percentile_confirm.astype(bool)
+        if probability_active
+        else pd.Series(False, index=data.index)
+    )
     data["entry_block_reason"] = [
         _first_block_reason(row_index, checks, risk_level, data)
         if not bool(data.at[row_index, "entry_confirmed"])

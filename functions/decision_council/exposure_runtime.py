@@ -58,8 +58,10 @@ def record_exposure(runner, date, daily):
     snapshot["sleeve_effective_n"] = float(1.0 / sleeve_weight_square_sum) if sleeve_weight_square_sum > 0 else 0.0
     snapshot["top1_account_weight"] = float(sorted_account_weights.iloc[0]) if len(sorted_account_weights) else 0.0
     snapshot["top5_account_weight_sum"] = float(sorted_account_weights.head(5).sum()) if len(sorted_account_weights) else 0.0
-    account_weight_square_sum = float(sorted_account_weights.pow(2).sum()) if len(sorted_account_weights) else 0.0
-    snapshot["account_effective_n"] = float(1.0 / account_weight_square_sum) if account_weight_square_sum > 0 else 0.0
+    cash_weight = max(float(runner.cash) / nominal_nav, 0.0) if nominal_nav > 0 else 0.0
+    # Account effective N includes cash as an account component. Omitting cash
+    # made a 4% single-stock position report an impossible effective N above 600.
+    snapshot["account_effective_n"] = _account_effective_n(sorted_account_weights, cash_weight=cash_weight)
     snapshot["top1_weight"] = snapshot["top1_sleeve_weight"]
     snapshot["top5_weight_sum"] = snapshot["top5_sleeve_weight_sum"]
     snapshot["effective_n"] = snapshot["sleeve_effective_n"]
@@ -111,6 +113,12 @@ def record_exposure(runner, date, daily):
             )
     runner.exposure_rows.append(snapshot)
     return snapshot
+
+
+def _account_effective_n(account_weights: pd.Series, *, cash_weight: float) -> float:
+    square_sum = float(pd.to_numeric(account_weights, errors="coerce").fillna(0.0).pow(2).sum())
+    square_sum += max(float(cash_weight), 0.0) ** 2
+    return float(1.0 / square_sum) if square_sum > 0 else 0.0
 
 def current_weights(runner, daily, nominal_nav):
     if nominal_nav <= 0:

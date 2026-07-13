@@ -1,13 +1,18 @@
 """Verify no-future-leakage guards for new PIT/event modules."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
 
 
 def main() -> int:
-    pit_reports = sorted(Path("reports").glob("**/pit_sanity_check.csv"))
+    pit_reports = []
+    for root, _, files in os.walk("reports", onerror=lambda _: None):
+        if "pit_sanity_check.csv" in files:
+            pit_reports.append(Path(root) / "pit_sanity_check.csv")
+    pit_reports.sort()
     for report in pit_reports:
         data = pd.read_csv(report)
         if "future_leakage_rows" in data.columns and int(pd.to_numeric(data["future_leakage_rows"], errors="coerce").fillna(0).sum()) > 0:

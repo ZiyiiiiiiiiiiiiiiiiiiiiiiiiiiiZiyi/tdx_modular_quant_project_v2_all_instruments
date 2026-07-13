@@ -14,6 +14,7 @@ from functions.formal_admission import build_formal_admission_report
 from functions.decision_council.factor_source import (
     FACTOR_SOURCE_LEGACY,
     LEGACY_GOVERNANCE_ALPHA_BUNDLE,
+    factor_source_output_label,
     resolve_factor_source,
 )
 
@@ -220,11 +221,7 @@ def build_report(
         factor_cabinet_path=factor_cabinet_path,
         alpha_bundle=alpha_bundle,
     )
-    effective_alpha_bundle = (
-        f"factor_cabinet_{factor_spec.factor_cabinet_run_id}"
-        if factor_spec.uses_factor_cabinet
-        else LEGACY_GOVERNANCE_ALPHA_BUNDLE
-    )
+    effective_alpha_bundle = factor_source_output_label(factor_spec)
     universe_rows = _load_universe_rows(alpha_bundle=effective_alpha_bundle)
     comparison_path = OUTPUT_DIR / "governance_mainline_review_summary.csv"
     universe_rows.to_csv(comparison_path, index=False, encoding="utf-8-sig")

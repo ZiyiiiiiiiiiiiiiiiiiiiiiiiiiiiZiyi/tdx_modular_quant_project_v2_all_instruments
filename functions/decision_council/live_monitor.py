@@ -40,11 +40,12 @@ class GovernanceLiveMonitor:
 
     @property
     def available(self) -> bool:
-        return not self._closed and self._proc is not None
+        return not self._closed and self._proc is not None and self._proc.poll() is None
 
     def start_session(self, *, title: str, total_days: int, initial_nav: float) -> None:
         if self._closed:
             return
+        self._ensure_monitor_process()
         self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
         self._last_day_index = -1
         self.total_days = max(int(total_days), 1)
@@ -72,6 +73,7 @@ class GovernanceLiveMonitor:
     ) -> None:
         if self._closed:
             return
+        self._ensure_monitor_process()
         nav = float(exposure.get("liquidatable_nav", exposure.get("nominal_nav", 0.0)) or 0.0)
         if nav <= 0:
             return
@@ -91,6 +93,28 @@ class GovernanceLiveMonitor:
                 "initial_nav": self.initial_nav,
                 "holdings": list(holdings or []),
                 "monitor_state": dict(monitor_state or {}),
+            }
+        )
+
+    def report_stage(self, *, step: str, message: str = "", detail: str = "", progress_pct: float = 0.0) -> None:
+        if self._closed:
+            return
+        self._ensure_monitor_process()
+        if str(step or "") in {"run_backtest", "process_date", "date_complete"}:
+            return
+        if not self._run_id:
+            self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
+        bounded_progress = min(max(float(progress_pct or 0.0), 0.0), 100.0)
+        self._write_state(
+            {
+                "command": "stage",
+                "run_id": self._run_id,
+                "step": str(step),
+                "message": str(message),
+                "detail": str(detail),
+                "progress_pct": bounded_progress,
+                "total_days": self.total_days,
+                "initial_nav": self.initial_nav,
             }
         )
 
@@ -140,6 +164,10 @@ class GovernanceLiveMonitor:
         state_dir = Path(tempfile.gettempdir()) / "tdx_governance_live_monitor"
         state_dir.mkdir(parents=True, exist_ok=True)
         self._state_path = state_dir / f"monitor_state_{os.getpid()}.json"
+        self._close_existing_monitor_process()
+        # Clear the previous session's close command before the new monitor's
+        # shutdown watcher starts. Otherwise the new process can exit instantly.
+        self._prime_state_for_new_monitor()
         try:
             self._proc = subprocess.Popen(
                 [sys.executable, "-u", str(script_path), str(self._state_path)],
@@ -150,6 +178,40 @@ class GovernanceLiveMonitor:
             self._proc = None
             self._closed = True
             print(f"治理实时监控已禁用：{exc}")
+
+    def _prime_state_for_new_monitor(self) -> None:
+        if self._state_path is None:
+            return
+        self._write_state(
+            {
+                "command": "idle",
+                "run_id": self._run_id,
+                "message": "monitor process starting",
+                "total_days": self.total_days,
+                "initial_nav": self.initial_nav,
+            }
+        )
+
+    def _ensure_monitor_process(self) -> None:
+        if self._closed or self._state_path is None:
+            return
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        script_path = Path(__file__).with_name("live_monitor_web.py")
+        if not script_path.exists():
+            self._closed = True
+            return
+        self._proc = None
+        self._prime_state_for_new_monitor()
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, "-u", str(script_path), str(self._state_path)],
+                cwd=str(Path(__file__).resolve().parents[2]),
+            )
+        except Exception as exc:
+            self._proc = None
+            if self._write_failures in {0, 1, 5, 25}:
+                print(f"Governance live monitor restart failed: {exc}", flush=True)
 
     def _write_state(self, payload: dict) -> None:
         if self._state_path is None:
@@ -184,6 +246,24 @@ class GovernanceLiveMonitor:
                 "治理实时监控跳过了一次状态更新，因为 Windows 锁定了监控文件。"
                 f"回测会继续运行。最后错误：{last_error}"
             )
+
+    def _close_existing_monitor_process(self) -> None:
+        """Ask any previous monitor for this parent process to exit before launching a new one."""
+        if self._state_path is None or not self._state_path.exists():
+            return
+        tmp_path = self._state_path.with_name(f"{self._state_path.stem}_{os.getpid()}_close.tmp")
+        try:
+            tmp_path.write_text(json.dumps({"command": "close"}), encoding="utf-8")
+            os.replace(tmp_path, self._state_path)
+            time.sleep(0.8)
+        except Exception:
+            pass
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _make_json_safe(value):

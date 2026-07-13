@@ -112,6 +112,14 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         signal.get("alpha_quality_score") if hasattr(signal, "get") else pd.NA,
         default=float(existing.get("entry_alpha_quality_score", 0.0)) if existing else 0.0,
     )
+    support_scores = {
+        "momentum": _safe_float(signal.get("trend_hold_score") if hasattr(signal, "get") else pd.NA, 0.0),
+        "reversal": _safe_float(signal.get("reversal_entry_score") if hasattr(signal, "get") else pd.NA, 0.0),
+        "orderflow": _safe_float(signal.get("orderflow_candidate_score") if hasattr(signal, "get") else pd.NA, 0.0),
+        "breakout": _safe_float(signal.get("breakout_gate_score") if hasattr(signal, "get") else pd.NA, 0.0),
+    }
+    entry_thesis = max(support_scores, key=support_scores.get) if max(support_scores.values()) > 0.0 else "composite"
+    entry_support = float(support_scores.get(entry_thesis, 0.0))
     runner.position_lifecycle[symbol] = {
         "entry_date": pd.Timestamp(entry_date),
         "entry_price": float(entry_price),
@@ -128,6 +136,8 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         "entry_matrix_score": _safe_float(signal.get("entry_matrix_score") if hasattr(signal, "get") else pd.NA, default=0.0),
         "entry_timing_score": _safe_float(signal.get("entry_timing_score") if hasattr(signal, "get") else pd.NA, default=0.0),
         "entry_size_tier": str(signal.get("entry_size_tier", "") if hasattr(signal, "get") else ""),
+        "entry_thesis": str(existing.get("entry_thesis", entry_thesis)) if existing and previous_shares > 0.0 else entry_thesis,
+        "entry_module_support": float(existing.get("entry_module_support", entry_support)) if existing and previous_shares > 0.0 else entry_support,
     }
 
 def mark_lifecycle(runner, symbol: str, *, date, price: float) -> dict:
@@ -369,6 +379,17 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         trend_direction_score = _safe_float(row.get("trend_direction_score"), default=0.50)
         peak_decay_score = _safe_float(row.get("peak_decay_score"), default=0.0)
         orderflow_score = _safe_float(row.get("orderflow_candidate_score"), default=0.50)
+        entry_thesis = str(lifecycle.get("entry_thesis", "composite"))
+        entry_module_support = _safe_float(lifecycle.get("entry_module_support"), default=0.0)
+        current_support_by_thesis = {
+            "momentum": _safe_float(row.get("trend_hold_score"), default=trend_score),
+            "reversal": _safe_float(row.get("reversal_entry_score"), default=entry_score),
+            "orderflow": orderflow_score,
+            "breakout": _safe_float(row.get("breakout_gate_score"), default=0.0),
+            "composite": entry_score,
+        }
+        current_module_support = _clip01(current_support_by_thesis.get(entry_thesis, entry_score))
+        support_decay = max(entry_module_support - current_module_support, 0.0)
         orderflow_decay_score = max(0.55 - orderflow_score, 0.0) / 0.55
         liquidity_decay_score = max(0.55 - volume_score, 0.0) / 0.55
         factor_conviction_score = _clip01(
@@ -384,6 +405,9 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             + 0.20 * volume_score
             + 0.20 * orderflow_score
         )
+        if entry_thesis == "composite":
+            current_module_support = signal_retention_score
+            support_decay = max(entry_module_support - current_module_support, 0.0)
         dynamic_giveback_limit = _dynamic_giveback_limit(
             mfe=mfe,
             trend_direction_score=trend_direction_score,
@@ -448,6 +472,14 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             and entry_score < float(GOVERNANCE_ENTRY_MATRIX_EXIT_DECAY_THRESHOLD)
             and trend_score < 0.45
         )
+        thesis_failure = bool(
+            is_held
+            and holding_days >= int(GOVERNANCE_STALE_WATCH_DAYS)
+            and entry_module_support >= 0.45
+            and current_module_support < 0.35
+            and support_decay >= 0.20
+        )
+        signal_failure = bool(signal_failure or thesis_failure)
         downtrend_exit = bool(
             is_held
             and downtrend_score >= float(GOVERNANCE_DOWNTREND_DECAY_EXIT)
@@ -634,6 +666,12 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "paper_post_entry_failure_exit": post_entry_failure,
             "signal_failure_exit": bool(signal_failure or downtrend_exit) and runner._control_enabled("signal_failure_exit"),
             "paper_signal_failure_exit": bool(signal_failure or downtrend_exit),
+            "entry_thesis": entry_thesis,
+            "entry_module_support": entry_module_support,
+            "current_module_support": current_module_support,
+            "support_decay": support_decay,
+            "thesis_failure_exit": thesis_failure and runner._control_enabled("signal_failure_exit"),
+            "paper_thesis_failure_exit": thesis_failure,
             "stale_time_reduce": stale_reduce and runner._control_enabled("stale_exit"),
             "paper_stale_time_reduce": stale_reduce,
             "stale_time_exit": stale_exit and runner._control_enabled("stale_exit"),

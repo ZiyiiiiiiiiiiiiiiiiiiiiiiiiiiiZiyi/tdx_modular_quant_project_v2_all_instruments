@@ -42,11 +42,14 @@ def build_governance_quality_reports(
     daily_result: pd.DataFrame | None = None,
     attribution_ledger: pd.DataFrame | None = None,
     return_pivot: pd.DataFrame | None = None,
+    runtime_context=None,
 ) -> dict[str, pd.DataFrame]:
+    _log_quality_stage("prepare_price_frames")
     close_pivot = _close_pivot(feature_data)
     benchmark_returns = _top_strength_benchmark_forward_returns(feature_data)
     if all(series.empty for series in benchmark_returns.values()):
         benchmark_returns = _benchmark_forward_returns(close_pivot, benchmark_symbol)
+    _log_quality_stage("trade_quality_reports")
     reports = {
         "governance_entry_payoff_report": build_entry_payoff_report(
             execution_ledger=execution_ledger,
@@ -89,9 +92,9 @@ def build_governance_quality_reports(
             ideal_portfolio_plan=ideal_portfolio_plan,
             return_pivot=return_pivot,
         ),
-        "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals),
-        "governance_factor_role_report": build_factor_role_report(alpha_proposals),
-        "governance_alpha_diversification_report": build_alpha_diversification_report(alpha_proposals),
+        "governance_factor_redundancy_report": build_factor_redundancy_report(alpha_proposals, runtime_context=runtime_context),
+        "governance_factor_role_report": build_factor_role_report(alpha_proposals, runtime_context=runtime_context),
+        "governance_alpha_diversification_report": build_alpha_diversification_report(alpha_proposals, runtime_context=runtime_context),
         "governance_trading_evidence_report": build_trading_evidence_report(
             daily_result=daily_result,
             execution_ledger=execution_ledger,
@@ -100,7 +103,18 @@ def build_governance_quality_reports(
         "governance_module_role_summary": build_module_role_summary(ideal_portfolio_plan),
         "governance_portfolio_constraint_report": build_portfolio_constraint_report(daily_result),
     }
-    reports.update(build_factor_research_reports(feature_data))
+    _log_quality_stage("factor_research_reports_lightweight")
+    reports.update(
+        build_factor_research_reports(
+            feature_data,
+            horizons=(5, 10),
+            emit_quantile_rows=False,
+            cluster_max_factors=80,
+            max_rows=80_000,
+            include_missing_factors=False,
+        )
+    )
+    _log_quality_stage("strategy_validation_reports")
     reports["governance_entry_failure_timing_report"] = build_entry_failure_timing_report(
         execution_ledger=execution_ledger,
         close_pivot=close_pivot,
@@ -116,6 +130,10 @@ def build_governance_quality_reports(
     reports["governance_strategy_validation_matrix"] = build_strategy_validation_matrix(reports)
     reports["governance_research_gate_report"] = build_research_gate_report(reports)
     return reports
+
+
+def _log_quality_stage(stage: str) -> None:
+    print(f"[governance] quality_reports: {stage}", flush=True)
 
 
 def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFrame:
@@ -890,14 +908,15 @@ def build_selection_funnel_attribution(
         frames.append(ideal)
     if execution_ledger is not None and not execution_ledger.empty:
         executed = execution_ledger[execution_ledger.get("side", "").astype(str).eq("buy")].copy()
-        executed["decision_date"] = pd.to_datetime(executed.get("trade_date"), errors="coerce")
-        executed["symbol"] = executed.get("symbol", pd.Series(dtype=object)).astype(str)
-        executed["layer"] = "executed_buy"
-        frames.append(executed)
+        if not executed.empty:
+            executed["decision_date"] = pd.to_datetime(executed.get("trade_date"), errors="coerce")
+            executed["symbol"] = executed.get("symbol", pd.Series(dtype=object)).astype(str)
+            executed["layer"] = "executed_buy"
+            frames.append(executed)
     if not frames:
         return pd.DataFrame()
     rows = []
-    data = pd.concat(frames, ignore_index=True, sort=False)
+    data = pd.concat([frame.dropna(axis=1, how="all") for frame in frames], ignore_index=True, sort=False)
     for horizon in horizons:
         outcomes = _attach_forward_outcomes(
             data,
@@ -1147,6 +1166,7 @@ def build_risk_contribution_ledger(
         if len(valid) < 2:
             continue
         weights = group.set_index("symbol").loc[valid, "ideal_weight"].to_numpy(dtype=float)
+        total_account_exposure = float(max(weights.sum(), 0.0))
         sigma = cov.loc[valid, valid].to_numpy(dtype=float)
         rc = _risk_contribution(weights, sigma)
         marginal = sigma @ weights if weights.size else np.array([])
@@ -1160,13 +1180,15 @@ def build_risk_contribution_ledger(
                     "marginal_risk": float(marginal_risk),
                     "risk_contribution_share": float(rc_share),
                     "positive_risk_contribution_share": positive_share,
+                    "account_exposure_scaled_risk_share": positive_share * total_account_exposure,
+                    "total_account_exposure": total_account_exposure,
                     "risk_gate_eligible": bool(float(weight) >= float(min_gate_weight)),
                 }
             )
     return pd.DataFrame(rows)
 
 
-def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int = 200_000) -> pd.DataFrame:
+def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int = 200_000, runtime_context=None) -> pd.DataFrame:
     if alpha_proposals is None or alpha_proposals.empty:
         return pd.DataFrame()
     required = {"decision_date", "symbol", "model_name", "predicted_return_5d"}
@@ -1195,7 +1217,7 @@ def build_factor_redundancy_report(alpha_proposals: pd.DataFrame, max_rows: int 
     return _rows_frame(rows, sort_by=["max_abs_rank_corr_to_other"], ascending=False)
 
 
-def build_alpha_diversification_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
+def build_alpha_diversification_report(alpha_proposals: pd.DataFrame, runtime_context=None) -> pd.DataFrame:
     """Gate whether a candidate alpha bundle is diverse enough for trading use."""
     rules = dict(GOVERNANCE_ALPHA_DIVERSIFICATION_RULES)
     columns = [
@@ -1246,8 +1268,10 @@ def build_alpha_diversification_report(alpha_proposals: pd.DataFrame) -> pd.Data
             }],
             columns=columns,
         )
-    modules = pd.Series({model: factor_module(model) for model in models})
-    families = pd.Series({model: _factor_family(model) for model in models})
+    module_map = getattr(runtime_context, "module_map", None) or {}
+    family_map = getattr(runtime_context, "family_map", None) or {}
+    modules = pd.Series({model: module_map.get(model, factor_module(model)) for model in models})
+    families = pd.Series({model: family_map.get(model, _factor_family(model)) for model in models})
     weights = pd.Series(
         {
             model: float(GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS.get(model, 1.0))
@@ -1266,7 +1290,7 @@ def build_alpha_diversification_report(alpha_proposals: pd.DataFrame) -> pd.Data
     max_module_share = float(module_weight_share.max()) if not module_weight_share.empty else 0.0
     range_grid_share = float(module_weight_share.get("range_grid", 0.0))
 
-    redundancy = build_factor_redundancy_report(alpha_proposals)
+    redundancy = build_factor_redundancy_report(alpha_proposals, runtime_context=runtime_context)
     if redundancy.empty:
         redundancy_ratio = 1.0
         max_pairwise_corr = np.nan
@@ -1349,15 +1373,18 @@ def build_trading_evidence_report(
     )
 
 
-def build_factor_role_report(alpha_proposals: pd.DataFrame) -> pd.DataFrame:
+def build_factor_role_report(alpha_proposals: pd.DataFrame, runtime_context=None) -> pd.DataFrame:
     if alpha_proposals is None or alpha_proposals.empty or "model_name" not in alpha_proposals.columns:
         return pd.DataFrame()
     models = sorted(str(name) for name in alpha_proposals["model_name"].dropna().astype(str).unique())
     rows = []
     for model in models:
-        module = factor_module(model)
+        module = (getattr(runtime_context, "module_map", None) or {}).get(model, factor_module(model))
         role = _factor_role(model, module)
-        configured_roles = tuple(str(item) for item in GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP.get(model, ()))
+        configured_roles = tuple(
+            str(item)
+            for item in (getattr(runtime_context, "role_map", None) or GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP).get(model, ())
+        )
         if configured_roles:
             role = {
                 **role,

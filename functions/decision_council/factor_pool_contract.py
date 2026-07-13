@@ -85,7 +85,7 @@ def normalize_factor_module(module, *, factor_name: str = "") -> str:
         return "volatility"
     if "liquidity" in text or "turnover" in name or "amihud" in name:
         return "liquidity"
-    if "large_order" in text or "order" in text:
+    if "large_order" in text or "order" in text or "orderflow" in name or "money_flow" in name:
         return "orderflow"
     if any(token in text or token in name for token in ("valuation", "value", "pe_", "pb_")):
         return "valuation"

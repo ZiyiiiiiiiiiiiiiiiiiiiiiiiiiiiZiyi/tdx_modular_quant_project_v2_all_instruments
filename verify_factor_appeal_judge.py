@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from functions.decision_council.factor_appeal_judge import DEFAULT_V1_RUN_DIR, run_factor_appeal_judge
+from functions.factor_selection.factor_cabinet_builder import build_factor_cabinet
 
 
 REQUIRED_FILES = [
@@ -29,7 +30,10 @@ def main() -> int:
         print(f"[SKIP] v1 summary not found: {v1_summary}")
         return 0
     before_mtime = v1_summary.stat().st_mtime
-    saved = run_factor_appeal_judge(max_days=120)
+    saved = run_factor_appeal_judge(
+        max_days=120,
+        output_root=Path("reports/verify_factor_appeal_judge"),
+    )
     output = Path(saved["output_dir"])
     missing = [name for name in REQUIRED_FILES if not (output / name).exists()]
     if missing:
@@ -42,6 +46,9 @@ def main() -> int:
     summary = pd.read_csv(output / "appeal_summary.csv")
     required_columns = {
         "factor_name",
+        "raw_column",
+        "direction",
+        "parameter_version",
         "factor_family",
         "factor_type",
         "judge_profile",
@@ -65,11 +72,30 @@ def main() -> int:
     if summary.empty:
         print("[FAIL] appeal summary is empty")
         return 1
-    if summary["judge_profile"].astype(str).ne("technical_timing").sum() != 0:
-        print("[FAIL] RSI appeal did not use technical_timing profile")
+    expected_profiles = {"technical_timing", "technical_timing_sparse", "price_fast_orderflow"}
+    if not expected_profiles.issubset(set(summary["judge_profile"].astype(str))):
+        print("[FAIL] role-aware appeal profiles are incomplete")
         return 1
     if summary["new_role"].astype(str).eq("entry_alpha").any():
         print("[FAIL] RSI appeal assigned entry_alpha")
+        return 1
+    breakout = summary[summary["factor_type"].eq("breakout")]
+    if len(breakout) != 2 or not breakout["new_decision"].eq("promote_candidate").all():
+        print("[FAIL] sparse breakout appeal did not promote both validated signals")
+        return 1
+    if summary.loc[summary["new_decision"].ne("reject_or_rework"), "raw_column"].astype(str).eq("").any():
+        print("[FAIL] admitted/watchlist appeal factor missing executable raw_column")
+        return 1
+    cabinet_saved = build_factor_cabinet(
+        appeal_run_dir=output,
+        output_root=Path("reports/verify_factor_appeal_judge/factor_cabinet"),
+        min_factors=60,
+        max_factors=120,
+    )
+    cabinet = pd.read_csv(cabinet_saved["factor_cabinet_csv"])
+    required_breakouts = {"price_volume_breakout", "turtle_breakout"}
+    if not required_breakouts.issubset(set(cabinet["factor_name"].astype(str))):
+        print("[FAIL] promoted breakout factors did not reach the executable cabinet")
         return 1
     print(f"[PASS] appeal judge output={output}, rows={len(summary)}")
     return 0

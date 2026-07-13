@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import time
 
@@ -90,9 +91,29 @@ def write_progress(
         "eta_seconds": round(eta, 1) if eta is not None else None,
     }
     PROGRESS_JSON.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = PROGRESS_JSON.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(PROGRESS_JSON)
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    last_error = None
+    for attempt in range(8):
+        tmp_path = PROGRESS_JSON.with_name(
+            f"{PROGRESS_JSON.stem}_{os.getpid()}_{time.time_ns()}_{attempt}.tmp"
+        )
+        try:
+            tmp_path.write_text(data, encoding="utf-8")
+            tmp_path.replace(PROGRESS_JSON)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(0.03 * (attempt + 1))
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.03 * (attempt + 1))
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+    print(f"[WARN] runtime progress write skipped after retries: {last_error}", flush=True)
 
 
 def read_progress() -> dict:

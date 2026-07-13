@@ -319,6 +319,7 @@ def _verify_runner_and_advanced_policies(failures):
             "governance_alpha_collapse_exit_diagnostics",
             "governance_account_audit_ledger",
             "governance_corporate_action_ledger",
+            "governance_runtime_maturity",
             "governance_rollback_recommendation_ledger",
             "governance_strategy_summary",
             "governance_strategy_report",
@@ -333,6 +334,8 @@ def _verify_runner_and_advanced_policies(failures):
         _expect(pd.read_csv(saved["governance_execution_ledger"]).shape[0] > 0, "runner should execute synthetic orders", failures)
         account_audit = pd.read_csv(saved["governance_account_audit_ledger"])
         _expect(account_audit["reconciliation_passed"].all(), "daily account reconciliation should remain exact", failures)
+        maturity = pd.read_csv(saved["governance_runtime_maturity"])
+        _expect(len(maturity) == len(dates), "runtime maturity should save one row per date", failures)
         governance_summary = pd.read_csv(saved["governance_strategy_summary"])
         _expect(
             {

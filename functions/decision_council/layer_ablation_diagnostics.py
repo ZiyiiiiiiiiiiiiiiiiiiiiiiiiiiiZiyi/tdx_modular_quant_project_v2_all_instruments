@@ -24,12 +24,18 @@ KEY_METRICS = [
 ]
 
 
+def _numeric_column(data: pd.DataFrame, column: str, *, default=np.nan) -> pd.Series:
+    source = data[column] if column in data.columns else pd.Series(default, index=data.index)
+    return pd.to_numeric(source, errors="coerce")
+
+
 def build_layer_ablation_diagnostics(
     *,
     suite_id: str,
     universe_names: tuple[str, ...],
     suite_steps: tuple[tuple[str, str, str], ...],
     result_dir,
+    run_dirs: dict[tuple[str, str], str | Path] | None = None,
 ) -> dict[str, Path]:
     """Build timestamped CSV, markdown, and plot diagnostics for one suite run."""
     result_root = Path(result_dir)
@@ -47,7 +53,10 @@ def build_layer_ablation_diagnostics(
     for universe_name in universe_names:
         universe_root = result_root / "governance" / universe_name
         for variant_name, alpha_bundle, suite_step in suite_steps:
-            run_dir = _resolve_suite_run_dir(universe_root / variant_name / alpha_bundle, suite_id)
+            mapped_dir = (run_dirs or {}).get((universe_name, suite_step))
+            run_dir = Path(mapped_dir) if mapped_dir else _resolve_suite_run_dir(
+                universe_root / variant_name / alpha_bundle, suite_id
+            )
             context = {
                 "suite_id": suite_id,
                 "suite_step": suite_step,
@@ -154,8 +163,8 @@ def _risk_summary_rows(path: Path, context: dict) -> list[dict]:
     if data.empty:
         return []
     metric_col = "positive_risk_contribution_share" if "positive_risk_contribution_share" in data.columns else "risk_contribution_share"
-    data[metric_col] = pd.to_numeric(data.get(metric_col), errors="coerce")
-    data["target_weight"] = pd.to_numeric(data.get("target_weight"), errors="coerce")
+    data[metric_col] = _numeric_column(data, metric_col)
+    data["target_weight"] = _numeric_column(data, "target_weight")
     rows = []
     grouped = data.groupby("date", dropna=False) if "date" in data.columns else [(None, data)]
     for date, group in grouped:
@@ -262,8 +271,8 @@ def _module_weight_rows(path: Path, context: dict) -> list[dict]:
         return []
     if data.empty or "factor_module" not in data.columns:
         return []
-    data["weight_share"] = pd.to_numeric(data.get("weight_share"), errors="coerce").fillna(0.0)
-    data["avg_predicted_return_5d"] = pd.to_numeric(data.get("avg_predicted_return_5d"), errors="coerce")
+    data["weight_share"] = _numeric_column(data, "weight_share", default=0.0).fillna(0.0)
+    data["avg_predicted_return_5d"] = _numeric_column(data, "avg_predicted_return_5d")
     latest_date = pd.to_datetime(data.get("date"), errors="coerce").max() if "date" in data.columns else pd.NaT
     rows = []
     for module, group in data.groupby("factor_module", dropna=False):
@@ -301,8 +310,8 @@ def _reason_rows(path: Path, context: dict) -> list[dict]:
                 "reason": str(reason),
                 "order_count": int(len(group)),
                 "filled_count": int(group.get("execution_status", pd.Series(dtype=object)).astype(str).eq("filled").sum()),
-                "trade_notional": float(pd.to_numeric(group.get("trade_notional"), errors="coerce").fillna(0.0).sum()),
-                "total_cost": float(pd.to_numeric(group.get("total_cost"), errors="coerce").fillna(0.0).sum()),
+                "trade_notional": float(_numeric_column(group, "trade_notional", default=0.0).fillna(0.0).sum()),
+                "total_cost": float(_numeric_column(group, "total_cost", default=0.0).fillna(0.0).sum()),
             }
         )
         rows.append(item)
@@ -426,27 +435,33 @@ def _save_plots(
     if summary is not None and not summary.empty:
         path = output_dir / f"layer_ablation_overview_{suite_id}.png"
         _plot_overview(plt, summary, path)
-        saved["overview_plot"] = path
+        if path.exists():
+            saved["overview_plot"] = path
     if payoff is not None and not payoff.empty:
         path = output_dir / f"layer_ablation_entry_sell_payoff_{suite_id}.png"
         _plot_payoff(plt, payoff, path)
-        saved["payoff_plot"] = path
+        if path.exists():
+            saved["payoff_plot"] = path
     if calibration is not None and not calibration.empty:
         path = output_dir / f"layer_ablation_probability_calibration_{suite_id}.png"
         _plot_calibration(plt, calibration, path)
-        saved["calibration_plot"] = path
+        if path.exists():
+            saved["calibration_plot"] = path
     if risk is not None and not risk.empty:
         path = output_dir / f"layer_ablation_risk_concentration_{suite_id}.png"
         _plot_risk(plt, risk, path)
-        saved["risk_plot"] = path
+        if path.exists():
+            saved["risk_plot"] = path
     if modules is not None and not modules.empty:
         path = output_dir / f"layer_ablation_module_weights_{suite_id}.png"
         _plot_modules(plt, modules, path)
-        saved["module_plot"] = path
+        if path.exists():
+            saved["module_plot"] = path
     if increments is not None and not increments.empty:
         path = output_dir / f"layer_ablation_incremental_contribution_{suite_id}.png"
         _plot_incremental(plt, increments, path)
-        saved["incremental_plot"] = path
+        if path.exists():
+            saved["incremental_plot"] = path
     return saved
 
 
@@ -464,7 +479,7 @@ def _plot_overview(plt, summary: pd.DataFrame, path: Path) -> None:
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
     colors = ["#1f7a5a", "#2c7fb8", "#d4a84f", "#a35f2a", "#b3403a"]
     for axis, (metric, title) in zip(axes.ravel(), metrics):
-        vals = pd.to_numeric(data.get(metric), errors="coerce")
+        vals = _numeric_column(data, metric)
         axis.bar(data["label"], vals, color=colors[: len(data)])
         axis.axhline(0, color="#30343b", linewidth=0.8)
         axis.set_title(title)
@@ -478,7 +493,7 @@ def _plot_overview(plt, summary: pd.DataFrame, path: Path) -> None:
 
 def _plot_payoff(plt, payoff: pd.DataFrame, path: Path) -> None:
     data = payoff.copy()
-    data["horizon_days"] = pd.to_numeric(data.get("horizon_days"), errors="coerce")
+    data["horizon_days"] = _numeric_column(data, "horizon_days")
     data = data[data["horizon_days"].eq(10)]
     data = data[data.get("side", pd.Series(dtype=object)).astype(str).isin(["buy", "sell"])]
     if data.empty:
@@ -497,7 +512,7 @@ def _plot_payoff(plt, payoff: pd.DataFrame, path: Path) -> None:
 
 def _plot_calibration(plt, calibration: pd.DataFrame, path: Path) -> None:
     data = calibration.copy()
-    data["horizon_days"] = pd.to_numeric(data.get("horizon_days"), errors="coerce")
+    data["horizon_days"] = _numeric_column(data, "horizon_days")
     data = data[data["horizon_days"].eq(10)]
     if data.empty:
         return
@@ -519,7 +534,7 @@ def _plot_calibration(plt, calibration: pd.DataFrame, path: Path) -> None:
 def _plot_risk(plt, risk: pd.DataFrame, path: Path) -> None:
     data = risk.copy()
     data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
-    data["max_risk_contribution"] = pd.to_numeric(data.get("max_risk_contribution"), errors="coerce")
+    data["max_risk_contribution"] = _numeric_column(data, "max_risk_contribution")
     data = data.dropna(subset=["date", "max_risk_contribution"])
     if data.empty:
         return
@@ -540,7 +555,7 @@ def _plot_risk(plt, risk: pd.DataFrame, path: Path) -> None:
 
 def _plot_modules(plt, modules: pd.DataFrame, path: Path) -> None:
     data = modules.copy()
-    data["avg_weight_share"] = pd.to_numeric(data.get("avg_weight_share"), errors="coerce").fillna(0.0)
+    data["avg_weight_share"] = _numeric_column(data, "avg_weight_share", default=0.0).fillna(0.0)
     pivot = data.pivot_table(index="suite_step", columns="factor_module", values="avg_weight_share", aggfunc="sum").fillna(0.0)
     if pivot.empty:
         return
@@ -571,7 +586,7 @@ def _plot_incremental(plt, increments: pd.DataFrame, path: Path) -> None:
     ]
     fig, axes = plt.subplots(2, 2, figsize=(18, 9))
     for axis, (metric, title) in zip(axes.ravel(), metrics):
-        values = pd.to_numeric(data.get(metric), errors="coerce").fillna(0.0)
+        values = _numeric_column(data, metric, default=0.0).fillna(0.0)
         colors = ["#1f7a5a" if value >= 0 else "#b3403a" for value in values]
         axis.bar(data["label"], values, color=colors)
         axis.axhline(0, color="#30343b", linewidth=0.8)

@@ -216,10 +216,9 @@ def build_strategy_report(
 
 
 def save_strategy_report(report_text, output_path=REPORT_OUTPUT_MD):
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(report_text, encoding="utf-8")
-    return output_file
+    from functions.decision_council.outputs import write_governance_text
+
+    return write_governance_text(report_text, output_path, encoding="utf-8")
 
 
 def _normalize_summary(frame):

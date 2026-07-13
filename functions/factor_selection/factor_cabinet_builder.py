@@ -10,7 +10,7 @@ import pandas as pd
 
 DEFAULT_V1_CONTRACT = Path(
     "results/decision_council/fast_factor_judge/"
-    "hs300_csi500_a500_strict/run20260704_004631_813799/factor_pool_contract.csv"
+    "hs300_csi500_a500_strict/run20260705_180001_095951/factor_pool_contract.csv"
 )
 DEFAULT_APPEAL_ROOT = Path("results/decision_council/factor_appeal_judge")
 OUTPUT_ROOT = Path("results/factor_cabinet")
@@ -77,7 +77,7 @@ def _load_v1(path: str | Path) -> pd.DataFrame:
 
 
 def _load_v2(appeal_run_dir: str | Path | None) -> pd.DataFrame:
-    run_dir = Path(appeal_run_dir) if appeal_run_dir else _latest_dir(DEFAULT_APPEAL_ROOT)
+    run_dir = _resolve_appeal_run_dir(appeal_run_dir)
     if run_dir is None:
         return pd.DataFrame()
     parts = []
@@ -99,6 +99,48 @@ def _load_v2(appeal_run_dir: str | Path | None) -> pd.DataFrame:
     data["score"] = pd.to_numeric(data.get("ic_ir"), errors="coerce").fillna(0.0)
     data["strict_entry_alpha"] = False
     return data
+
+
+def _resolve_appeal_run_dir(appeal_run_dir: str | Path | None) -> Path | None:
+    if appeal_run_dir:
+        run_dir = Path(appeal_run_dir)
+        if not _is_consumable_appeal_run(run_dir, allow_legacy=True):
+            raise ValueError(f"Appeal run is incomplete or not consumable: {run_dir}")
+        return run_dir
+    if not DEFAULT_APPEAL_ROOT.exists():
+        return None
+    candidates = sorted(
+        (path for path in DEFAULT_APPEAL_ROOT.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in candidates:
+        if _is_consumable_appeal_run(run_dir, allow_legacy=True):
+            return run_dir
+    return None
+
+
+def _is_consumable_appeal_run(run_dir: Path, *, allow_legacy: bool) -> bool:
+    manifest_path = run_dir / "artifact_manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if str(manifest.get("status", "")).lower() != "complete":
+            return False
+        if str(manifest.get("run_kind", "production")).lower() != "production":
+            return False
+        return (run_dir / "appeal_summary.csv").exists() and (run_dir / "admitted_v2.csv").exists()
+    if not allow_legacy:
+        return False
+    # Backward compatibility is intentionally strict: test artifacts whose
+    # admitted output was renamed must never become the implicit production run.
+    return (
+        (run_dir / "appeal_manifest.csv").exists()
+        and (run_dir / "appeal_summary.csv").exists()
+        and (run_dir / "admitted_v2.csv").exists()
+    )
 
 
 def _cabinet_role_from_v1(row) -> str:
@@ -201,6 +243,24 @@ def _select_by_role(candidates: pd.DataFrame, *, min_factors: int, max_factors: 
         used.update(take["factor_name"].astype(str))
         quota_rows.append({"role": role, "target_min": min_count, "target_max": max_count, "selected": int(len(take)), "pass": bool(len(take) >= min_count)})
     selected = pd.concat(selected_parts, ignore_index=True) if selected_parts else pd.DataFrame()
+    protected = candidates[
+        candidates.get("source", pd.Series("", index=candidates.index)).astype(str).eq("v2_appeal")
+        & candidates.get("decision", pd.Series("", index=candidates.index)).astype(str).eq("promote_candidate")
+        & candidates.get("factor_type", pd.Series("", index=candidates.index)).astype(str).isin({"breakout", "orderflow_proxy"})
+    ].copy()
+    if not protected.empty:
+        selected = pd.concat(
+            [selected[~selected["factor_name"].astype(str).isin(protected["factor_name"].astype(str))], protected],
+            ignore_index=True,
+        )
+        protected_names = set(protected["factor_name"].astype(str))
+        trimmed = []
+        for role, (_, role_max) in ROLE_QUOTA.items():
+            group = selected[selected["cabinet_role"].astype(str).eq(role)].copy()
+            group["_protected"] = group["factor_name"].astype(str).isin(protected_names)
+            group = group.sort_values(["_protected", "cabinet_score"], ascending=[False, False]).head(role_max)
+            trimmed.append(group.drop(columns="_protected"))
+        selected = pd.concat(trimmed, ignore_index=True) if trimmed else selected
     if len(selected) < min_factors:
         extra = candidates[~candidates["factor_name"].astype(str).isin(used)].sort_values("cabinet_score", ascending=False).head(min_factors - len(selected))
         selected = pd.concat([selected, extra], ignore_index=True)

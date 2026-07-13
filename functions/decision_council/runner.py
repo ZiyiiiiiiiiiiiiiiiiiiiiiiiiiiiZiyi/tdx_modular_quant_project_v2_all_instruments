@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -10,6 +11,9 @@ import pandas as pd
 
 from config import (
     COMMISSION_RATE,
+    GOVERNANCE_AUDIT_CANDIDATE_LIMIT,
+    GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT,
+    GOVERNANCE_AUDIT_PRICE_HISTORY_CACHE_SYMBOL_LIMIT,
     ENABLE_MARKET_REGIME_POLICY,
     FEATURE_DAILY_PARQUET,
     GOVERNANCE_ALPHA_CANDIDATE_LIMIT,
@@ -127,6 +131,18 @@ from functions.decision_council.exposure_runtime import (
 from functions.decision_council.fast_shadow import FastShadowPortfolioRunner
 from functions.decision_council.leakage import validate_governance_split
 from functions.decision_council.market_regime_policy import MarketRegimePolicy
+from functions.decision_council.mainline_v2 import (
+    MAINLINE_V2,
+    apply_mainline_v2_entry_policy,
+    calibration_runtime_state,
+    normalize_strategy_logic_version,
+)
+from functions.decision_council.runtime_maturity import (
+    combined_runtime_maturity,
+    covariance_runtime_state,
+    reputation_runtime_state,
+    trade_accuracy_runtime_state,
+)
 from functions.decision_council.proposals import build_daily_candidates
 from functions.decision_council.factor_source import (
     FACTOR_SOURCE_LEGACY,
@@ -135,7 +151,26 @@ from functions.decision_council.factor_source import (
     install_factor_source_model_map,
     resolve_factor_source,
 )
+from functions.decision_council.factor_runtime_audit import (
+    build_factor_runtime_audit,
+    print_factor_runtime_audit,
+    save_factor_runtime_audit,
+)
 from functions.decision_council.candidate_factor_cache import attach_pre_screen_candidate_factor_cache
+from functions.decision_council.candidate_funnel_audit import (
+    build_candidate_rejection_detail,
+    build_control_opportunity_cost,
+    build_control_trigger_summary_from_csv_parts,
+    build_entry_gate_summary,
+    build_exposure_reconciliation,
+    reconcile_funnel_daily,
+    summarize_funnel,
+)
+from functions.decision_council.factor_cabinet_feature_cache import attach_factor_cabinet_feature_cache
+from functions.decision_council.factor_cabinet_module_taxonomy import (
+    build_cabinet_experiment_contracts,
+    build_cabinet_module_mapping,
+)
 from functions.decision_council.plots import save_governance_diagnostic_plots
 from functions.decision_council.position_lifecycle import (
     apply_candidate_risk_penalty as apply_candidate_risk_penalty_runtime,
@@ -150,6 +185,7 @@ from functions.decision_council.position_lifecycle import (
 )
 from functions.decision_council.policy import ORDER_COLUMNS, ORDER_PRIORITIES
 from functions.decision_council.quality_reports import build_governance_quality_reports
+from functions.decision_council.outputs import write_governance_csv, write_governance_text
 from functions.decision_council.monitoring import evaluate_daily_rollback
 from functions.decision_council.reputation import ReputationLedger
 from functions.decision_council.runner_data import (
@@ -163,6 +199,7 @@ from functions.decision_council.retail_execution import (
     sort_retail_orders as sort_retail_orders_runtime,
 )
 from functions.decision_council.runner_summary import build_governance_summary as build_governance_summary_frame
+from functions.decision_council.runtime_integrity_audit import build_runtime_integrity_audit
 from functions.execution.cost_model import estimate_trade_costs
 from functions.execution.order_simulator import simulate_order_book
 from functions.execution.trade_pairing import build_trade_pairing_ledgers
@@ -174,10 +211,16 @@ from functions.report_builder import build_strategy_report, save_strategy_report
 
 EXECUTION_LEDGER_COLUMNS = [
     "symbol",
+    "signal_date",
+    "decision_timestamp",
+    "scheduled_execution_date",
+    "next_trading_day",
     "trade_date",
+    "execution_price_basis",
     "side",
     "target_shares",
     "executed_shares",
+    "remaining_shares",
     "price",
     "trade_notional",
     "total_cost",
@@ -190,6 +233,10 @@ EXECUTION_LEDGER_COLUMNS = [
     "decision_id",
     "reason",
     "position_state",
+    "orderflow_candidate_score",
+    "reversal_entry_score",
+    "breakout_gate_score",
+    "trend_hold_score",
     "position_exit_reason",
     "add_layer",
     "add_allowed",
@@ -285,6 +332,12 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "paper_alpha_collapse_exit",
     "signal_failure_exit",
     "paper_signal_failure_exit",
+    "entry_thesis",
+    "entry_module_support",
+    "current_module_support",
+    "support_decay",
+    "thesis_failure_exit",
+    "paper_thesis_failure_exit",
     "stale_time_reduce",
     "paper_stale_time_reduce",
     "stale_time_exit",
@@ -346,6 +399,7 @@ class ProgressTracker:
         self.current_step = 0
         self.desc = desc
         self.start_time = time.time()
+        self._last_line_width = 0
     
     def update(self, step_info=""):
         self.current_step += 1
@@ -368,10 +422,14 @@ class ProgressTracker:
         bar_length = 30
         filled_length = int(bar_length * progress)
         bar = "#" * filled_length + "-" * (bar_length - filled_length)
-        # Print progress
         elapsed_str = str(timedelta(seconds=int(elapsed)))
-        print(f"\r{self.desc}: [{bar}] {progress_pct:.1f}% ({self.current_step}/{self.total_steps}) | "
-              f"Elapsed: {elapsed_str} | Remaining: {remaining_str} | {step_info}", end="", flush=True)
+        line = (
+            f"{self.desc}: [{bar}] {progress_pct:.1f}% ({self.current_step}/{self.total_steps}) | "
+            f"Elapsed: {elapsed_str} | Remaining: {remaining_str} | {step_info}"
+        )
+        trailing_spaces = " " * max(self._last_line_width - len(line), 0)
+        print(f"\r{line}{trailing_spaces}", end="", flush=True)
+        self._last_line_width = len(line)
         
         if self.current_step >= self.total_steps:
             print()  # New line when complete
@@ -429,6 +487,8 @@ class GovernanceBacktestRunner:
         max_positions: int | None = None,
         capital_profile: dict | None = None,
         factor_source_spec: FactorSourceSpec | None = None,
+        strategy_logic_version: str = "production_v1",
+        pit_runtime_state: str = "degraded",
     ):
         self.features = feature_df if prepared_features else _prepare_features(feature_df)
         self.features["date"] = pd.to_datetime(self.features["date"], errors="coerce")
@@ -465,6 +525,15 @@ class GovernanceBacktestRunner:
             factor_source=FACTOR_SOURCE_LEGACY,
             alpha_bundle=LEGACY_GOVERNANCE_ALPHA_BUNDLE,
         )
+        self.strategy_logic_version = normalize_strategy_logic_version(strategy_logic_version)
+        self.pit_runtime_state = str(pit_runtime_state or "degraded")
+        self.factor_runtime_context = self.factor_source_spec.runtime_context()
+        self.factor_runtime_audit = build_factor_runtime_audit(
+            self.factor_source_spec,
+            available_columns=self.features.columns,
+        )
+        if self.factor_source_spec.uses_factor_cabinet and self.factor_runtime_audit.fallback_detected:
+            raise RuntimeError(f"factor_cabinet runtime contract failed: {self.factor_runtime_audit.fallback_reason}")
         self.capital_profile.setdefault("name", "custom")
         self.capital_usage_mode = _normalize_capital_usage_mode(
             self.capital_profile.get("capital_usage_mode", GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT)
@@ -506,9 +575,15 @@ class GovernanceBacktestRunner:
         self.position_state_rows = []
         self.retail_execution_rows = []
         self.entry_formula_audit_rows = []
+        self.candidate_gate_rows = []
+        self._candidate_gate_spool_dir = self.output_dir / "_runtime_audit_spool" / "candidate_gates"
+        self.candidate_funnel_rows = []
         self.retail_executable_rank_rows = []
         self.defensive_sleeve_rows = []
-        self._close_history_by_symbol: dict[str, pd.DataFrame] | None = None
+        # Entry-price diagnostics are post-trade audit data.  Do not materialize
+        # a copied DataFrame for every symbol in the full feature universe.
+        self._feature_indices_by_symbol: dict[str, object] | None = None
+        self._close_history_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         self.engine = PhaseOneDecisionCouncilEngine(
             self.features,
             safety_proxy_mode=safety_proxy_mode,
@@ -558,6 +633,7 @@ class GovernanceBacktestRunner:
         show_progress: bool = True,
         show_live_monitor: bool = False,
         live_monitor=None,
+        progress_callback=None,
     ) -> dict[str, Path]:
         dates = pd.Index(self.features["date"].drop_duplicates().sort_values())
         if start_date is not None:
@@ -588,6 +664,41 @@ class GovernanceBacktestRunner:
         
         try:
             for day_index, date in enumerate(dates):
+                date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
+                if progress_callback is not None:
+                    try:
+                        progress_callback(
+                            {
+                                "percent": 80.0 + (day_index / max(total_days, 1)) * 13.0,
+                                "step": "process_date",
+                                "message": f"processing governance date {date_str}",
+                                "detail": f"day={day_index + 1}/{total_days}",
+                            }
+                        )
+                    except Exception:
+                        pass
+                if live_monitor is not None:
+                    previous_exposure = self.exposure_rows[-1] if self.exposure_rows else {
+                        "nominal_nav": self.initial_cash,
+                        "liquidatable_nav": self.initial_cash,
+                        "cash": self.cash,
+                        "holding_count": len(self.positions),
+                    }
+                    previous_monitor_state = dict(self._latest_monitor_state or {})
+                    previous_monitor_state.update(
+                        {
+                            "phase": "processing_date",
+                            "date_status": "started",
+                            "processing_date": date_str,
+                        }
+                    )
+                    live_monitor.update(
+                        date=date,
+                        exposure=previous_exposure,
+                        day_index=day_index,
+                        holdings=self._last_position_mark_rows,
+                        monitor_state=previous_monitor_state,
+                    )
                 shadow_rewards = {}
                 shadow_activity = {}
                 for model_name, shadow in shadows.items():
@@ -615,10 +726,21 @@ class GovernanceBacktestRunner:
 
                 # Update progress
                 if progress:
-                    date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
                     nav = exposure.get("nominal_nav", 0)
                     holding_count = int(exposure.get("holding_count", len(self.positions)) or 0)
                     progress.update(f"Date: {date_str} | NAV: {nav:,.0f} | Holdings: {holding_count}")
+                if progress_callback is not None:
+                    try:
+                        progress_callback(
+                            {
+                                "percent": 80.0 + ((day_index + 1) / max(total_days, 1)) * 13.0,
+                                "step": "date_complete",
+                                "message": f"completed governance date {date_str}",
+                                "detail": f"day={day_index + 1}/{total_days}",
+                            }
+                        )
+                    except Exception:
+                        pass
         finally:
             if live_monitor is not None:
                 live_monitor.finish("回测完成。窗口会保持打开，关闭浏览器标签即可。")
@@ -652,6 +774,13 @@ class GovernanceBacktestRunner:
         )
         self._prune_empty_positions()
         self.entry_calibrator.mature(day_index=day_index, price_frame=daily)
+        calibration_state = calibration_runtime_state(
+            matured_sample_count=len(self.entry_calibrator.history_rows),
+            day_index=day_index,
+        )
+        from functions.data.trading_calendar import TradingCalendar
+
+        self.trading_calendar = TradingCalendar(self._daily_feature_indices.keys())
         self._execute_pending(date, daily)
         self._prune_empty_positions()
         self._mature_alpha_collapse_diagnostics(date)
@@ -664,6 +793,13 @@ class GovernanceBacktestRunner:
             model_activity=reputation_activity or {},
         )
         self.engine.record_reputation(reputation_snapshot)
+        reputation_state = reputation_runtime_state(day_index=day_index, snapshot=reputation_snapshot)
+        closed_trade_count = sum(
+            str(row.get("side", "")).lower() == "sell"
+            and str(row.get("execution_status", "")).lower() == "filled"
+            for row in self.execution_rows
+        )
+        trade_accuracy_state = trade_accuracy_runtime_state(closed_trade_count=closed_trade_count)
         
         # Get regime-adjusted parameters if market regime policy is enabled
         regime_params = self._get_regime_params(date)
@@ -671,6 +807,11 @@ class GovernanceBacktestRunner:
             regime_params = None
         current_turnover_budget = regime_params.default_turnover_budget if regime_params else GOVERNANCE_DEFAULT_TURNOVER_BUDGET
         current_min_score_percentile = regime_params.min_score_percentile if regime_params else None
+        if self.strategy_logic_version == MAINLINE_V2:
+            # V2 keeps regime as an account-level exposure/risk overlay. It must
+            # not also alter candidate admission or portfolio operating cadence.
+            current_turnover_budget = GOVERNANCE_DEFAULT_TURNOVER_BUDGET
+            current_min_score_percentile = 0.80
         
         candidates, proposals = build_daily_candidates(
             daily,
@@ -688,24 +829,61 @@ class GovernanceBacktestRunner:
             allow_fallback=self._allow_fallback,
             enable_quality_filters=self._enable_quality_filters,
             selection_weight_mode=self.selection_weight_mode,
+            runtime_context=self.factor_runtime_context,
         )
+        candidate_build_counts = dict(candidates.attrs.get("candidate_funnel_counts", {}))
         safety_row = self.engine.safety_signals.loc[pd.Timestamp(date)]
         if isinstance(safety_row, pd.DataFrame):
             safety_row = safety_row.iloc[-1]
         risk_level = str(safety_row.get("risk_level", "normal"))
         structural_regime_level = str(safety_row.get("structural_regime_level", "bull"))
+        confirmation_mode = self.entry_confirmation_mode
+        if self.governance_control_mode in {"factor_only", "safe_factor_only"}:
+            if str(confirmation_mode or "").strip().lower() in {"", "full", "fixed_percentile_only"}:
+                confirmation_mode = "factor_only"
         candidates = apply_entry_confirmation(
             candidates,
             risk_level=risk_level,
             structural_regime_level=structural_regime_level if self._control_enabled("regime") else "neutral",
             entry_calibrator=self.entry_calibrator,
-            confirmation_mode="factor_only" if self.governance_control_mode in {"factor_only", "safe_factor_only"} else self.entry_confirmation_mode,
+            confirmation_mode=confirmation_mode,
             capital_usage_mode=self.capital_usage_mode,
         )
         candidates = self._apply_candidate_risk_penalty(candidates, exposure=exposure)
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
         candidates = self._apply_position_state_constraints(candidates, date=date, exposure=exposure)
         candidates = self._apply_optional_exit_controls(candidates)
+        candidates["calibration_runtime_state"] = calibration_state
+        candidates["reputation_runtime_state"] = reputation_state
+        candidates["trade_accuracy_runtime_state"] = trade_accuracy_state
+        candidates["pit_runtime_state"] = self.pit_runtime_state
+        if self.strategy_logic_version == MAINLINE_V2:
+            candidates = apply_mainline_v2_entry_policy(
+                candidates,
+                risk_level=risk_level,
+                max_new_candidates=self._max_positions_override or 5,
+            )
+        self._record_candidate_gate_audit(date=date, candidates=candidates)
+        entry_confirmed = candidates.get("entry_confirmed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+        role_pass = candidates.get("state_machine_role_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+        cooldown_clear = ~candidates.get("cooldown_active", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+        candidate_funnel_row = {
+            "date": pd.Timestamp(date),
+            "decision_id": f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
+            **candidate_build_counts,
+            "entry_confirmation_pass_count": int(entry_confirmed.sum()),
+            "state_machine_role_pass_count": int((entry_confirmed & role_pass).sum()),
+            "risk_pass_count": int((entry_confirmed & role_pass).sum()),
+            "reputation_pass_count": int((entry_confirmed & role_pass).sum()),
+            "regime_pass_count": int((entry_confirmed & role_pass).sum()),
+            "cooldown_pass_count": int((entry_confirmed & role_pass & cooldown_clear).sum()),
+            "capital_pass_count": 0,
+            "risk_stage_mode": "score_or_size_only",
+            "reputation_stage_mode": "diagnostics_only",
+            "regime_stage_mode": "confirmation_or_exposure_overlay",
+            "candidate_detail_scope": f"top_{int(GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT)}",
+            "candidate_detail_count": 0,
+        }
         defensive_candidates = self._record_defensive_sleeve_diagnostics(
             date=date,
             daily=daily,
@@ -730,7 +908,7 @@ class GovernanceBacktestRunner:
             self._record_entry_confirmation(date, candidates)
         proposals["decision_date"] = date
         if not self.shadow_fast_mode:
-            audit_symbols = set(candidates.head(GOVERNANCE_ALPHA_CANDIDATE_LIMIT)["symbol"].astype(str)) | set(self.positions)
+            audit_symbols = set(candidates.head(GOVERNANCE_AUDIT_CANDIDATE_LIMIT)["symbol"].astype(str)) | set(self.positions)
             self.alpha_rows.append(proposals[proposals["symbol"].astype(str).isin(audit_symbols)].copy())
         allow_normal_rebalance = self._allow_normal_rebalance(date, day_index)
         actual_exposure = float(exposure.get("invested_value", 0.0)) / max(float(exposure.get("nominal_nav", 0.0)), 1e-12)
@@ -785,21 +963,39 @@ class GovernanceBacktestRunner:
             "actual_target_ratio_for_gate": high_exposure_gate["actual_target_ratio"],
             "latest_top1_risk_contribution_for_gate": high_exposure_gate["latest_top1_risk_contribution"],
         }
-        _, orders, diagnostics = self.engine.decide_day(
+        covariance_matrix = self._rolling_candidate_covariance(date, candidates)
+        if self.governance_variant == "governance_layer_validation" and self.governance_control_mode == "factor_only":
+            covariance_matrix = None
+        covariance_state = covariance_runtime_state(day_index=day_index, covariance_matrix=covariance_matrix)
+        runtime_maturity_state = combined_runtime_maturity(
+            probability_state=calibration_state,
+            reputation_state=reputation_state,
+            covariance_state=covariance_state,
+            trade_accuracy_state=trade_accuracy_state,
+            pit_state=self.pit_runtime_state,
+        )
+        ideal_plan, orders, diagnostics = self.engine.decide_day(
             decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
             decision_date=date,
             candidates=candidates,
             current_weights=self._current_weights(daily, exposure["nominal_nav"]),
             holding_days=self.holding_days,
             turnover_budget=current_turnover_budget,
-            top_n=self._max_positions_override or (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N),
+            top_n=(
+                self._max_positions_override
+                or (
+                    GOVERNANCE_DEFAULT_TOP_N
+                    if self.strategy_logic_version == MAINLINE_V2
+                    else (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N)
+                )
+            ),
             allow_normal_rebalance=allow_normal_rebalance,
             transition_only=day_index < GOVERNANCE_INITIAL_TRANSITION_DAYS,
             hard_qualification_symbols=self._hard_qualification_symbols(),
             catchup_buy_budget=catchup_decision.catchup_buy_budget,
             catchup_allowed=catchup_decision.catchup_allowed,
             target_exposure_cap=target_exposure_proxy,
-            covariance_matrix=self._rolling_candidate_covariance(date, candidates),
+            covariance_matrix=covariance_matrix,
         )
         orders = self._augment_force_deploy_diversify_orders(
             orders=orders,
@@ -825,9 +1021,27 @@ class GovernanceBacktestRunner:
         diagnostics["trailing_buy_accuracy_5d"] = trailing_buy_accuracy_5d
         retail_diagnostics = self._register_orders(orders, daily, exposure["nominal_nav"])
         diagnostics.update(retail_diagnostics)
+        today_entry_audit = [
+            row for row in self.entry_formula_audit_rows
+            if pd.Timestamp(row.get("date")).normalize() == pd.Timestamp(date).normalize()
+        ]
+        candidate_funnel_row["capital_pass_count"] = int(
+            sum(bool(row.get("retail_executable", False)) for row in today_entry_audit)
+        )
+        candidate_funnel_row["candidate_detail_count"] = int(len(today_entry_audit))
+        candidate_funnel_row["ideal_portfolio_count"] = int(len(ideal_plan))
+        candidate_funnel_row["order_count"] = int(len(orders))
+        self.candidate_funnel_rows.append(candidate_funnel_row)
         self.exposure_rows[-1].update(
             {
                 "target_exposure": diagnostics["target_exposure"],
+                "strategy_logic_version": self.strategy_logic_version,
+                "calibration_runtime_state": calibration_state,
+                "reputation_runtime_state": reputation_state,
+                "covariance_runtime_state": covariance_state,
+                "trade_accuracy_runtime_state": trade_accuracy_state,
+                "runtime_maturity_state": runtime_maturity_state,
+                "pit_runtime_state": self.pit_runtime_state,
                 "capital_usage_mode": self.capital_usage_mode,
                 "force_deploy_enabled": self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
                 "target_holding_count": int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K),
@@ -1232,7 +1446,7 @@ class GovernanceBacktestRunner:
             previous = float(self._last_factor_weights.get(model_name, weight))
             stats = contribution.loc[model_name] if model_name in contribution.index else {}
             rep = reputation_state.loc[model_name] if not reputation_state.empty and model_name in reputation_state.index else {}
-            module = factor_module(model_name)
+            module = self.factor_runtime_context.module_map.get(model_name, factor_module(model_name))
             avg_exposure_ema = float(rep.get("avg_exposure_ema", 0.0)) if len(reputation_state) else 0.0
             activity_ema = float(rep.get("activity_ema", 0.0)) if len(reputation_state) else 0.0
             zero_trade_warning = bool(weight > 1.0 and avg_exposure_ema < 0.01)
@@ -1241,7 +1455,11 @@ class GovernanceBacktestRunner:
                     "date": pd.Timestamp(date),
                     "model_name": str(model_name),
                     "factor_module": module,
-                    "factor_role": _factor_primary_role(model_name, module),
+                    "factor_role": _factor_primary_role(
+                        model_name,
+                        module,
+                        configured_roles=self.factor_runtime_context.role_map.get(model_name, ()),
+                    ),
                     "weight": weight,
                     "weight_share": weight / total_weight,
                     "weight_delta": weight - previous,
@@ -1767,7 +1985,8 @@ class GovernanceBacktestRunner:
         payload.update(
             {
                 "decision_id": str(decision_id),
-                "execution_date": pd.Timestamp(decision_date) + pd.offsets.BDay(1),
+                "decision_date": pd.Timestamp(decision_date),
+                "execution_date": self.trading_calendar.next_session(decision_date),
                 "symbol": str(row["symbol"]),
                 "side": "buy",
                 "current_weight": old_weight,
@@ -1802,6 +2021,10 @@ class GovernanceBacktestRunner:
                 "future_loss_risk_score": row.get("future_loss_risk_score", pd.NA),
                 "downtrend_decay_score": row.get("downtrend_decay_score", pd.NA),
                 "post_entry_failure_score": row.get("post_entry_failure_score", pd.NA),
+                "orderflow_candidate_score": row.get("orderflow_candidate_score", pd.NA),
+                "reversal_entry_score": row.get("reversal_entry_score", pd.NA),
+                "breakout_gate_score": row.get("breakout_gate_score", pd.NA),
+                "trend_hold_score": row.get("trend_hold_score", pd.NA),
             }
         )
         return payload, one_lot_cash, one_lot_weight
@@ -1893,6 +2116,100 @@ class GovernanceBacktestRunner:
             row[f"entry_reason_count_{reason}"] = int(count)
         self.entry_confirmation_rows.append(row)
 
+    def _record_candidate_gate_audit(self, *, date, candidates: pd.DataFrame) -> None:
+        """Store one narrow row per ranked candidate; never copy cabinet factor columns."""
+        if self.shadow_fast_mode or candidates is None or candidates.empty:
+            return
+        decision_id = f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}"
+        bool_fields = (
+            "alpha_confirm", "market_confirm", "flow_confirm",
+            "orderflow_candidate_pass", "reversal_confirm_pass", "breakout_gate_pass",
+            "state_machine_role_pass", "entry_confirmed", "cooldown_active", "exit_state",
+            "entry_confirmed_matrix_counterfactual", "entry_confirmed_without_probability",
+            "entry_confirmed_roles_only_counterfactual", "probability_gate_evaluated",
+            "probability_gate_changed_decision", "paper_exit_state", "paper_profit_giveback_exit",
+            "paper_post_entry_failure_exit", "paper_signal_failure_exit", "paper_hard_stop_exit",
+            "profit_giveback_exit", "post_entry_failure_exit", "signal_failure_exit",
+            "production_v1_entry_confirmed", "mainline_v2_eligible",
+            "mainline_v2_entry_confirmed", "mainline_v2_changed_decision",
+        )
+        score_fields = (
+            "primary_score", "alpha_percentile", "entry_alpha_score", "entry_timing_score",
+            "entry_liquidity_score", "entry_matrix_score", "final_entry_score",
+            "p_win_10d_calibrated", "p_win_10d_wilson_lower",
+            "production_v1_target_weight", "target_weight",
+        )
+        day_rows = []
+        for _, candidate in candidates.iterrows():
+            row = {
+                "decision_id": decision_id,
+                "signal_date": pd.Timestamp(date),
+            "strategy_logic_version": self.strategy_logic_version,
+            "calibration_runtime_state": str(candidate.get("calibration_runtime_state", "")),
+                "symbol": str(candidate.get("symbol", "")),
+                "candidate_rank": candidate.get("candidate_rank", pd.NA),
+                "entry_block_reason": str(candidate.get("entry_block_reason", "")),
+                "state_machine_role_block_reason": str(candidate.get("state_machine_role_block_reason", "")),
+                "position_state": str(candidate.get("position_state", "")),
+            }
+            for field in bool_fields:
+                value = candidate.get(field, pd.NA)
+                row[field] = bool(value) if pd.notna(value) else pd.NA
+            for source, target in (
+                ("alpha_confirm", "alpha_confirm_pass"),
+                ("market_confirm", "market_confirm_pass"),
+                ("flow_confirm", "flow_confirm_pass"),
+            ):
+                row[target] = row.get(source, pd.NA)
+            for field in score_fields:
+                row[field] = candidate.get(field, pd.NA)
+            day_rows.append(row)
+        if day_rows:
+            self._candidate_gate_spool_dir.mkdir(parents=True, exist_ok=True)
+            month_path = self._candidate_gate_spool_dir / f"candidate_gates_{pd.Timestamp(date):%Y%m}.csv"
+            pd.DataFrame(day_rows).to_csv(
+                month_path,
+                mode="a",
+                header=not month_path.exists(),
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+    def _candidate_gate_part_paths(self) -> list[Path]:
+        if not self._candidate_gate_spool_dir.exists():
+            return []
+        return sorted(self._candidate_gate_spool_dir.glob("candidate_gates_*.csv"))
+
+    def _candidate_gate_partition_index(self) -> pd.DataFrame:
+        rows = []
+        for path in self._candidate_gate_part_paths():
+            try:
+                row_count = sum(len(chunk) for chunk in pd.read_csv(path, usecols=["date"], chunksize=5000))
+            except (OSError, pd.errors.EmptyDataError, ValueError):
+                row_count = 0
+            rows.append({"path": str(path), "row_count": int(row_count), "size_bytes": int(path.stat().st_size)})
+        return pd.DataFrame(rows)
+
+    def _load_candidate_gate_audit(self, *, max_rows: int = 20000) -> pd.DataFrame:
+        parts = []
+        remaining = max(int(max_rows), 0)
+        for path in self._candidate_gate_part_paths():
+            if remaining <= 0:
+                break
+            try:
+                part = pd.read_csv(path, nrows=remaining)
+            except (OSError, pd.errors.EmptyDataError):
+                continue
+            if not part.empty:
+                parts.append(part)
+                remaining -= len(part)
+        if self.candidate_gate_rows:
+            parts.append(pd.DataFrame(self.candidate_gate_rows))
+        result = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+        if not result.empty:
+            result["audit_detail_scope"] = "bounded_sample; full_detail_in_runtime_audit_spool"
+        return result
+
     def _record_defensive_sleeve_diagnostics(
         self,
         *,
@@ -1980,7 +2297,9 @@ class GovernanceBacktestRunner:
             for row in getattr(self, "_last_position_mark_rows", []) or []
         }
         rank_rows = []
-        ordered = data.sort_values(["entry_matrix_score", "primary_score", "symbol"], ascending=[False, False, True]).head(80)
+        ordered = data.sort_values(["entry_matrix_score", "primary_score", "symbol"], ascending=[False, False, True]).head(
+            GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT
+        )
         for _, row in ordered.iterrows():
             symbol = str(row.get("symbol", ""))
             price = _safe_float(price_map.get(symbol), default=float("nan"))
@@ -2027,6 +2346,7 @@ class GovernanceBacktestRunner:
                 + 0.05 * (1.0 - one_lot_penalty)
             )
             payload = {
+                "decision_id": f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
                 "date": pd.Timestamp(date),
                 "symbol": symbol,
                 "primary_score": row.get("primary_score", pd.NA),
@@ -2050,6 +2370,9 @@ class GovernanceBacktestRunner:
                 "entry_quality_tier": row.get("entry_quality_tier", ""),
                 "position_state": row.get("position_state", ""),
                 "entry_block_reason": row.get("entry_block_reason", ""),
+                "state_machine_role_pass": row.get("state_machine_role_pass", pd.NA),
+                "state_machine_role_block_reason": row.get("state_machine_role_block_reason", ""),
+                "cooldown_active": row.get("cooldown_active", False),
                 "retail_executable": not block_reasons,
                 "retail_block_reason": "|".join(block_reasons),
                 "retail_executable_score": float(retail_score),
@@ -2100,21 +2423,36 @@ class GovernanceBacktestRunner:
             return pd.NA
 
     def _close_history(self, symbol: str) -> pd.DataFrame:
-        if self._close_history_by_symbol is None:
-            close_col = "close_nominal" if "close_nominal" in self.features.columns else "close"
-            if close_col not in self.features.columns:
-                self._close_history_by_symbol = {}
-            else:
-                data = self.features[["symbol", "date", close_col]].copy()
-                data["symbol"] = data["symbol"].astype(str)
-                data["date"] = pd.to_datetime(data["date"], errors="coerce")
-                data["close"] = pd.to_numeric(data[close_col], errors="coerce")
-                data = data.dropna(subset=["symbol", "date", "close"]).sort_values(["symbol", "date"])
-                self._close_history_by_symbol = {
-                    str(group_symbol): group[["date", "close"]].reset_index(drop=True)
-                    for group_symbol, group in data.groupby("symbol", sort=False)
-                }
-        return self._close_history_by_symbol.get(str(symbol), pd.DataFrame(columns=["date", "close"]))
+        symbol_key = str(symbol)
+        cached = self._close_history_cache.pop(symbol_key, None)
+        if cached is not None:
+            self._close_history_cache[symbol_key] = cached
+            return cached
+
+        close_col = "close_nominal" if "close_nominal" in self.features.columns else "close"
+        if close_col not in self.features.columns:
+            return pd.DataFrame(columns=["date", "close"])
+        if self._feature_indices_by_symbol is None:
+            # Integer index arrays are compact references into self.features;
+            # unlike a group-by DataFrame dictionary they do not duplicate the
+            # full 5M+ row feature table.
+            self._feature_indices_by_symbol = {
+                str(key): value
+                for key, value in self.features.groupby("symbol", sort=False).indices.items()
+            }
+        indices = self._feature_indices_by_symbol.get(symbol_key)
+        if indices is None:
+            return pd.DataFrame(columns=["date", "close"])
+        history = self.features.iloc[indices][["date", close_col]].copy()
+        history["date"] = pd.to_datetime(history["date"], errors="coerce")
+        if close_col != "close":
+            history = history.rename(columns={close_col: "close"})
+        history["close"] = pd.to_numeric(history["close"], errors="coerce")
+        history = history.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+        self._close_history_cache[symbol_key] = history
+        while len(self._close_history_cache) > int(GOVERNANCE_AUDIT_PRICE_HISTORY_CACHE_SYMBOL_LIMIT):
+            self._close_history_cache.popitem(last=False)
+        return history
 
     def _post_entry_price_diagnostics(self, symbol: str, date, entry_price) -> dict:
         result = {
@@ -2158,6 +2496,7 @@ class GovernanceBacktestRunner:
                 allowed_instrument_types=self._allowed_instrument_types,
                 enable_quality_filters=self._enable_quality_filters,
                 top_n=GOVERNANCE_DEFAULT_TOP_N,
+                runtime_context=self.factor_runtime_context,
             )
             for model_name in self.alpha_models
         }
@@ -2277,6 +2616,8 @@ class GovernanceBacktestRunner:
     def _allow_normal_rebalance(self, date, day_index):
         if self._normal_rebalance_dates:
             return pd.Timestamp(date) in self._normal_rebalance_dates
+        if self.strategy_logic_version == MAINLINE_V2:
+            return int(day_index) % 5 == 0
         # Use regime-adjusted rebalancing interval
         regime_params = self._get_regime_params(date)
         if regime_params:
@@ -2517,11 +2858,19 @@ class GovernanceBacktestRunner:
         )
         return summary
 
+    def _log_save_stage(self, stage: str, **details) -> None:
+        detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
+        suffix = f" | {detail_text}" if detail_text else ""
+        print(f"[governance] save_stage: {stage}{suffix}", flush=True)
+
     def _save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._log_save_stage("engine_ledgers")
         saved = self.engine.save(self.output_dir)
+        self._log_save_stage("build_extra_frames")
+        daily_result = pd.DataFrame(self.exposure_rows)
         extra = {
-            "governance_daily_result": pd.DataFrame(self.exposure_rows),
+            "governance_daily_result": daily_result,
             "governance_holdings_ledger": _frame_with_columns(self.holdings_rows, HOLDINGS_LEDGER_COLUMNS),
             "governance_execution_ledger": _frame_with_columns(self.execution_rows, EXECUTION_LEDGER_COLUMNS),
             "governance_reward_ledger": _frame_with_columns(
@@ -2581,6 +2930,8 @@ class GovernanceBacktestRunner:
                 ],
             ),
             "governance_entry_formula_audit": pd.DataFrame(self.entry_formula_audit_rows),
+            "governance_candidate_gate_audit": self._load_candidate_gate_audit(),
+            "governance_candidate_gate_partition_index": self._candidate_gate_partition_index(),
             "governance_retail_executable_rank": pd.DataFrame(self.retail_executable_rank_rows),
             "governance_defensive_sleeve_diagnostics": pd.DataFrame(self.defensive_sleeve_rows),
             "governance_factor_weight_ledger": pd.DataFrame(self.factor_weight_rows),
@@ -2590,6 +2941,25 @@ class GovernanceBacktestRunner:
             "governance_account_audit_ledger": pd.DataFrame(self.account_audit_rows),
             "governance_corporate_action_ledger": self.corporate_actions.audit_frame(),
         }
+        maturity_columns = [
+            column
+            for column in (
+                "date",
+                "strategy_logic_version",
+                "calibration_runtime_state",
+                "reputation_runtime_state",
+                "covariance_runtime_state",
+                "trade_accuracy_runtime_state",
+                "pit_runtime_state",
+                "runtime_maturity_state",
+            )
+            if column in daily_result.columns
+        ]
+        extra["governance_runtime_maturity"] = daily_result.loc[:, maturity_columns].copy()
+        cabinet_mapping = build_cabinet_module_mapping(self.factor_source_spec)
+        extra["governance_factor_cabinet_module_mapping"] = cabinet_mapping
+        extra["governance_factor_cabinet_experiment_contracts"] = build_cabinet_experiment_contracts(cabinet_mapping)
+        self._log_save_stage("trade_pairing")
         trade_pairs, open_positions, trade_summary = build_trade_pairing_ledgers(
             extra["governance_execution_ledger"],
             latest_prices=self._latest_price_frame_for_trade_pairing(extra["governance_execution_ledger"]),
@@ -2607,11 +2977,40 @@ class GovernanceBacktestRunner:
             extra["governance_execution_ledger"],
         )
         extra["governance_pnl_by_sell_reason"] = _pnl_by_sell_reason(trade_pairs)
+        rejection_detail = build_candidate_rejection_detail(extra["governance_entry_formula_audit"])
+        funnel_daily = reconcile_funnel_daily(
+            pd.DataFrame(self.candidate_funnel_rows),
+            ideal_plan=self.engine.ledgers.frame("ideal_portfolio_plan"),
+            order_plan=self.engine.ledgers.frame("executable_order_plan"),
+            execution_ledger=extra["governance_execution_ledger"],
+        )
+        extra["governance_candidate_rejection_detail"] = rejection_detail
+        extra["governance_candidate_funnel_daily"] = funnel_daily
+        extra["governance_candidate_funnel_summary"] = summarize_funnel(funnel_daily)
+        extra["governance_control_opportunity_cost"] = build_control_opportunity_cost(rejection_detail)
+        from functions.decision_council.candidate_funnel_audit import build_entry_gate_summary_from_csv_parts
+        extra["governance_entry_gate_summary"] = build_entry_gate_summary_from_csv_parts(
+            self._candidate_gate_part_paths()
+        )
+        extra["governance_control_trigger_summary"] = build_control_trigger_summary_from_csv_parts(
+            self._candidate_gate_part_paths(),
+            order_plan=self.engine.ledgers.frame("executable_order_plan"),
+            execution_ledger=extra["governance_execution_ledger"],
+        )
+        extra["governance_exposure_reconciliation"] = build_exposure_reconciliation(
+            extra["governance_daily_result"]
+        )
+        extra["governance_runtime_integrity_audit"] = build_runtime_integrity_audit(
+            execution_ledger=extra["governance_execution_ledger"],
+            account_audit=extra["governance_account_audit_ledger"],
+        )
+        self._log_save_stage("future_loss_duration_audit", trades=len(trade_pairs))
         extra["governance_future_loss_duration_audit"] = _future_loss_duration_audit(
             trade_pairs,
             self.features,
             horizon_days=40,
         )
+        self._log_save_stage("control_avoided_loss")
         extra["governance_control_avoided_loss_ledger"] = _control_avoided_loss_ledger(
             extra["governance_execution_ledger"],
             self.features,
@@ -2619,6 +3018,7 @@ class GovernanceBacktestRunner:
         extra["governance_control_avoided_loss_summary"] = _control_avoided_loss_summary_frame(
             extra["governance_control_avoided_loss_ledger"]
         )
+        self._log_save_stage("attribution")
         extra["governance_attribution_ledger"] = build_governance_attribution(
             daily_result=extra["governance_daily_result"],
             feature_data=self.features,
@@ -2626,6 +3026,7 @@ class GovernanceBacktestRunner:
             factor_weight_ledger=extra["governance_factor_weight_ledger"],
         )
         extra["governance_bucket_attribution"] = build_bucket_attribution(extra["governance_attribution_ledger"])
+        self._log_save_stage("quality_reports")
         quality_reports = build_governance_quality_reports(
             ideal_portfolio_plan=self.engine.ledgers.frame("ideal_portfolio_plan"),
             executable_order_plan=self.engine.ledgers.frame("executable_order_plan"),
@@ -2636,6 +3037,7 @@ class GovernanceBacktestRunner:
             daily_result=extra["governance_daily_result"],
             attribution_ledger=extra["governance_attribution_ledger"],
             return_pivot=self._return_pivot,
+            runtime_context=self.factor_runtime_context,
         )
         extra.update(quality_reports)
         monitoring_input = extra["governance_daily_result"].merge(
@@ -2647,11 +3049,11 @@ class GovernanceBacktestRunner:
             monitoring_input,
             safety_ledger=self.engine.ledgers.frame("safety_decision_ledger"),
         )
+        self._log_save_stage("write_extra_csv", frames=len(extra))
         for name, frame in extra.items():
             path = self.output_dir / f"{name}.csv"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            frame.to_csv(path, index=False, encoding="utf-8-sig")
-            saved[name] = path
+            saved[name] = write_governance_csv(frame, path)
+        self._log_save_stage("summary_report")
         governance_summary = self._build_governance_summary(
             daily_result=extra["governance_daily_result"],
             execution_ledger=extra["governance_execution_ledger"],
@@ -2669,8 +3071,7 @@ class GovernanceBacktestRunner:
             if self.output_dir.resolve() == Path(GOVERNANCE_OUTPUT_DIR).resolve()
             else self.output_dir / "governance_strategy_summary.csv"
         )
-        governance_summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
-        saved["governance_strategy_summary"] = summary_path
+        saved["governance_strategy_summary"] = write_governance_csv(governance_summary, summary_path)
         report_path = (
             GOVERNANCE_REPORT_MD
             if self.output_dir.resolve() == Path(GOVERNANCE_OUTPUT_DIR).resolve()
@@ -2685,6 +3086,8 @@ class GovernanceBacktestRunner:
             alpha_bundle=self._alpha_bundle,
         )
         saved["governance_strategy_report"] = save_strategy_report(report_text, report_path)
+        saved["factor_runtime_audit"] = save_factor_runtime_audit(self.factor_runtime_audit, self.output_dir)
+        self._log_save_stage("shadow_diagnostics")
         shadow_diagnostics = build_shadow_factor_diagnostics(
             self.engine.ledgers.frame("shadow_portfolio_ledger"),
             reputation_ledger=self.engine.ledgers.frame("reputation_ledger"),
@@ -2692,13 +3095,15 @@ class GovernanceBacktestRunner:
         if not shadow_diagnostics.empty:
             shadow_csv_path = self.output_dir / "governance_shadow_factor_diagnostics.csv"
             shadow_md_path = self.output_dir / "governance_shadow_factor_diagnostics.md"
-            shadow_diagnostics.to_csv(shadow_csv_path, index=False, encoding="utf-8-sig")
-            shadow_md_path.write_text(
+            write_governance_csv(shadow_diagnostics, shadow_csv_path)
+            write_governance_text(
                 render_shadow_factor_diagnostics_markdown(shadow_diagnostics),
+                shadow_md_path,
                 encoding="utf-8",
             )
             saved["governance_shadow_factor_diagnostics"] = shadow_csv_path
             saved["governance_shadow_factor_diagnostics_report"] = shadow_md_path
+        self._log_save_stage("diagnostic_plots")
         saved.update(
             save_governance_diagnostic_plots(
                 daily_result=extra["governance_daily_result"],
@@ -2713,6 +3118,7 @@ class GovernanceBacktestRunner:
                 output_dir=self.output_dir,
             )
         )
+        self._log_save_stage("complete")
         return saved
 
     def _trade_pairing_capital_profile(self) -> str:
@@ -2808,6 +3214,8 @@ def run_governance_backtest(
     factor_source: str = FACTOR_SOURCE_LEGACY,
     factor_cabinet_run_id: str = "",
     factor_cabinet_path: str = "",
+    strategy_logic_version: str = "production_v1",
+    pit_mode: str = "research",
 ) -> dict[str, Path]:
     from functions.decision_council.policy import RulesBasedPresidentPolicy
     from functions.alpha_bundles import ALPHA_BUNDLE_REGISTRY
@@ -2820,6 +3228,13 @@ def run_governance_backtest(
     output_dir = Path(output_dir)
     if not output_dir.name.startswith("run"):
         output_dir = dated_run_dir(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from functions.data.pit_level1_store import run_pit_preflight
+
+    pit_preflight = run_pit_preflight(
+        mode=pit_mode,
+        output_path=output_dir / "pit_runtime_audit.json",
+    )
 
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE) if (start_date or GOVERNANCE_START_DATE) else None
     effective_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE) if (end_date or GOVERNANCE_END_DATE) else None
@@ -2837,8 +3252,9 @@ def run_governance_backtest(
         factor_cabinet_path=factor_cabinet_path,
         alpha_bundle=alpha_bundle or LEGACY_GOVERNANCE_ALPHA_BUNDLE,
     )
+    factor_runtime_audit = build_factor_runtime_audit(factor_spec, requested_factor_source=factor_source)
+    print_factor_runtime_audit(factor_runtime_audit)
     if factor_spec.uses_factor_cabinet:
-        install_factor_source_model_map(factor_spec)
         alpha_models = factor_spec.alpha_models
         alpha_bundle = f"factor_cabinet_{factor_spec.factor_cabinet_run_id}"
     else:
@@ -2850,14 +3266,18 @@ def run_governance_backtest(
         available_columns = set(pq.read_schema(feature_path).names)
     except Exception:
         available_columns = set(_governance_feature_columns())
+    feature_map = dict(factor_spec.model_feature_map or {}) if factor_spec.uses_factor_cabinet else GOVERNANCE_ALPHA_MODEL_FEATURES
     generated_candidate_columns = {
-        GOVERNANCE_ALPHA_MODEL_FEATURES[name]
+        feature_map[name]
         for name in alpha_models
-        if name in GOVERNANCE_ALPHA_MODEL_FEATURES
-        and GOVERNANCE_ALPHA_MODEL_FEATURES[name].startswith("cand_")
-        and GOVERNANCE_ALPHA_MODEL_FEATURES[name] not in available_columns
+        if name in feature_map
+        and feature_map[name].startswith("cand_")
+        and feature_map[name] not in available_columns
     }
-    load_columns = list(_governance_feature_columns())
+    load_columns = list(_governance_feature_columns()) + [
+        feature_map[name] for name in alpha_models
+        if name in feature_map and feature_map[name] not in generated_candidate_columns
+    ]
     features = pd.read_parquet(
         feature_path,
         columns=[column for column in dict.fromkeys(load_columns) if column in available_columns],
@@ -2866,13 +3286,23 @@ def run_governance_backtest(
     if generated_candidate_columns:
         cache_start = effective_start - pd.Timedelta(days=GOVERNANCE_PRELOAD_CALENDAR_DAYS) if effective_start is not None else features["date"].min()
         cache_end = effective_end if effective_end is not None else features["date"].max()
-        features = attach_pre_screen_candidate_factor_cache(
-            features,
-            start_date=cache_start,
-            end_date=cache_end,
-            alpha_models=alpha_models,
-            feature_path=Path(feature_path),
-        )
+        if factor_spec.uses_factor_cabinet:
+            cabinet_cache_start = effective_start if effective_start is not None else cache_start
+            features = attach_factor_cabinet_feature_cache(
+                features,
+                spec=factor_spec,
+                start_date=cabinet_cache_start,
+                end_date=cache_end,
+                feature_path=Path(feature_path),
+            )
+        else:
+            features = attach_pre_screen_candidate_factor_cache(
+                features,
+                start_date=cache_start,
+                end_date=cache_end,
+                alpha_models=alpha_models,
+                feature_path=Path(feature_path),
+            )
         still_missing = sorted(generated_candidate_columns - set(features.columns))
         if still_missing:
             raise ValueError(f"Candidate factor cache did not provide required columns: {still_missing}")
@@ -2914,6 +3344,8 @@ def run_governance_backtest(
         max_positions=max_positions,
         capital_profile=capital_profile,
         factor_source_spec=factor_spec,
+        strategy_logic_version=strategy_logic_version,
+        pit_runtime_state=pit_preflight["pit_runtime_state"],
     )
     return runner.run(
         start_date=effective_start,
@@ -3235,11 +3667,19 @@ def _future_loss_duration_audit(trade_pairs: pd.DataFrame, features: pd.DataFram
     price_col = "close_nominal" if "close_nominal" in features.columns else "close"
     if not {"date", "symbol", price_col}.issubset(features.columns):
         return pd.DataFrame(columns=columns)
-    prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    trade_symbols = set(trade_pairs["symbol"].dropna().astype(str).unique())
+    if not trade_symbols:
+        return pd.DataFrame(columns=columns)
+    source_prices = features.loc[features["symbol"].astype(str).isin(trade_symbols), ["date", "symbol", price_col]]
+    prices = source_prices.copy()
     prices["date"] = pd.to_datetime(prices["date"], errors="coerce")
     prices["symbol"] = prices["symbol"].astype(str)
     prices[price_col] = pd.to_numeric(prices[price_col], errors="coerce")
     prices = prices.dropna(subset=["date", "symbol", price_col]).sort_values(["symbol", "date"])
+    prices_by_symbol = {
+        symbol: group.reset_index(drop=True)
+        for symbol, group in prices.groupby("symbol", sort=False)
+    }
     rows = []
     for _, trade in trade_pairs.iterrows():
         symbol = str(trade.get("symbol", ""))
@@ -3250,7 +3690,11 @@ def _future_loss_duration_audit(trade_pairs: pd.DataFrame, features: pd.DataFram
         shares = _safe_float(trade.get("exit_shares"), default=0.0)
         if exit_price <= 0.0 or shares <= 0.0:
             continue
-        path = prices[(prices["symbol"].eq(symbol)) & (prices["date"] > pd.Timestamp(exit_date))].head(int(horizon_days)).copy()
+        symbol_prices = prices_by_symbol.get(symbol)
+        if symbol_prices is None or symbol_prices.empty:
+            continue
+        start_pos = int(symbol_prices["date"].searchsorted(pd.Timestamp(exit_date), side="right"))
+        path = symbol_prices.iloc[start_pos : start_pos + int(horizon_days)].copy()
         if path.empty:
             continue
         close = path[price_col].astype(float).reset_index(drop=True)
@@ -3339,20 +3783,30 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
     ].copy()
     if sells.empty:
         return pd.DataFrame(columns=columns)
-    feature_prices = features.loc[:, ["date", "symbol", price_col]].copy()
+    sell_symbols = set(sells["symbol"].dropna().astype(str).unique())
+    if not sell_symbols:
+        return pd.DataFrame(columns=columns)
+    source_prices = features.loc[features["symbol"].astype(str).isin(sell_symbols), ["date", "symbol", price_col]]
+    feature_prices = source_prices.copy()
     feature_prices["date"] = pd.to_datetime(feature_prices["date"], errors="coerce")
     feature_prices["symbol"] = feature_prices["symbol"].astype(str)
     feature_prices[price_col] = pd.to_numeric(feature_prices[price_col], errors="coerce")
     feature_prices = feature_prices.dropna(subset=["date", "symbol", price_col])
+    feature_prices = feature_prices.sort_values(["symbol", "date"])
+    prices_by_symbol = {
+        symbol: group.reset_index(drop=True)
+        for symbol, group in feature_prices.groupby("symbol", sort=False)
+    }
     rows = []
     horizon_days = int(GOVERNANCE_CONTROL_AVOIDED_LOSS_HORIZON_DAYS)
     for _, sell in sells.iterrows():
         symbol = str(sell["symbol"])
         trade_date = pd.Timestamp(sell["trade_date"])
-        path = feature_prices[
-            (feature_prices["symbol"].eq(symbol))
-            & (feature_prices["date"] > trade_date)
-        ].sort_values("date")
+        symbol_prices = prices_by_symbol.get(symbol)
+        if symbol_prices is None or symbol_prices.empty:
+            continue
+        start_pos = int(symbol_prices["date"].searchsorted(trade_date, side="right"))
+        path = symbol_prices.iloc[start_pos:].copy()
         if as_of_ts is not None:
             path = path[path["date"] <= as_of_ts]
         path = path.head(horizon_days)
@@ -3729,7 +4183,9 @@ def _factor_weight_explanation(*, activity_ema: float, avg_exposure_ema: float, 
     return "active shadow contribution"
 
 
-def _factor_primary_role(model_name: str, module: str) -> str:
+def _factor_primary_role(model_name: str, module: str, *, configured_roles=()) -> str:
+    if configured_roles:
+        return str(tuple(configured_roles)[0])
     name = str(model_name).lower()
     module = str(module).lower()
     if module == "defensive" or "lowvol" in name:

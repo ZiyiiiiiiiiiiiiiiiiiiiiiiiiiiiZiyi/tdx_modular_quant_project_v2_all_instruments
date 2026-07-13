@@ -237,15 +237,17 @@ def build_rule_alpha_proposals(
     reputation_weights: dict[str, float] | None = None,
     model_names=GOVERNANCE_ALPHA_MODELS,
     factor_judged: bool = False,
+    runtime_context=None,
 ) -> pd.DataFrame:
     """Build deterministic proposal rows without pretending they are trained ML outputs."""
     reputation_weights = reputation_weights or {}
     data = daily_features.copy()
     rows = []
+    model_features = getattr(runtime_context, "model_feature_map", None) or MODEL_FEATURES
     for model_name in model_names:
-        if model_name not in MODEL_FEATURES:
+        if model_name not in model_features:
             raise KeyError(f"Governance alpha model is not configured: {model_name}")
-        feature_col = MODEL_FEATURES[model_name]
+        feature_col = model_features[model_name]
         if feature_col not in data.columns:
             continue
         score = pd.to_numeric(data[feature_col], errors="coerce")
@@ -299,6 +301,7 @@ def build_daily_candidates(
     require_constituents: bool = True,
     allow_fallback: bool = False,
     selection_weight_mode: str = "reputation_weighted",
+    runtime_context=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Combine rule proposals with tradable feature rows for president-policy input.
@@ -329,16 +332,21 @@ def build_daily_candidates(
     if enable_quality_filters is None:
         enable_quality_filters = ENABLE_BUY_QUALITY_FILTERS
     
+    funnel_counts = {"universe_count": int(len(daily_features))}
     proposals = build_rule_alpha_proposals(
         daily_features,
         reputation_weights=reputation_weights,
         model_names=model_names,
         factor_judged=str(selection_weight_mode or "").strip().lower() == "factor_judged",
+        runtime_context=runtime_context,
     )
+    funnel_counts["proposal_symbol_count"] = int(proposals["symbol"].nunique()) if not proposals.empty else 0
     if proposals.empty:
-        return _empty_candidates(), proposals
+        empty = _empty_candidates()
+        empty.attrs["candidate_funnel_counts"] = funnel_counts
+        return empty, proposals
     combined = combine_alpha_proposals(proposals)
-    combined = _attach_state_machine_alpha_evidence(combined, proposals)
+    combined = _attach_state_machine_alpha_evidence(combined, proposals, runtime_context=runtime_context)
     collapses = alpha_collapse_symbols(proposals, combined, holding_days or {})
     source = daily_features.copy()
     keep = [
@@ -382,6 +390,7 @@ def build_daily_candidates(
     ]
     source = source[[column for column in keep if column in source.columns]].copy()
     candidates = source.merge(combined, on="symbol", how="inner")
+    funnel_counts["factor_valid_count"] = int(len(candidates))
     candidates["expected_return_5d"] = (
         proposals.groupby("symbol")["predicted_return_5d"].mean().reindex(candidates["symbol"]).to_numpy()
     )
@@ -390,6 +399,7 @@ def build_daily_candidates(
     candidates = candidates[
         candidates["instrument_type"].astype(str).isin(instrument_types)
     ]
+    funnel_counts["instrument_type_pass_count"] = int(len(candidates))
     # Filter to target index pools (沪深300/中证500/中证100/上证50/中证A500) + all ETFs
     candidates = _apply_index_pool_filter_registry(
         candidates,
@@ -398,10 +408,13 @@ def build_daily_candidates(
         require_constituents=require_constituents,
         allow_fallback=allow_fallback,
     )
+    funnel_counts["universe_membership_pass_count"] = int(len(candidates))
     if "is_trading" in candidates.columns:
         candidates = candidates[candidates["is_trading"].fillna(False)]
+    funnel_counts["trading_pass_count"] = int(len(candidates))
     if "abnormal_jump" in candidates.columns:
         candidates = candidates[~candidates["abnormal_jump"].fillna(True)]
+    funnel_counts["price_quality_pass_count"] = int(len(candidates))
     amount = pd.to_numeric(candidates.get("amount"), errors="coerce").fillna(0.0)
     rolling_amount = pd.to_numeric(candidates.get("amount_ma20", amount), errors="coerce").fillna(amount)
     candidates["liquidity_eligible"] = (
@@ -409,12 +422,15 @@ def build_daily_candidates(
         & (rolling_amount >= float(GOVERNANCE_MIN_DAILY_AMOUNT))
     )
     candidates = candidates[candidates["liquidity_eligible"]]
+    funnel_counts["liquidity_pass_count"] = int(len(candidates))
     
     # Apply buy quality filters to improve selection accuracy
     if enable_quality_filters:
         candidates = _apply_buy_quality_filters(candidates)
+    funnel_counts["buy_quality_pass_count"] = int(len(candidates))
     
     candidates = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
+    funnel_counts["required_value_pass_count"] = int(len(candidates))
     selection_mode = str(selection_weight_mode or "reputation_weighted").strip().lower()
     if selection_mode == "factor_judged":
         candidates["primary_score"] = pd.to_numeric(candidates["alpha_percentile"], errors="coerce")
@@ -432,6 +448,7 @@ def build_daily_candidates(
         candidates["primary_score"] = candidates["alpha_score"]
         candidates["score_authority"] = "exploratory_alpha_fallback"
     candidates = candidates.dropna(subset=["primary_score"])
+    funnel_counts["primary_score_pass_count"] = int(len(candidates))
     candidates = candidates.sort_values(["primary_score", "symbol"], ascending=[False, True])
     candidates["candidate_rank"] = range(1, len(candidates) + 1)
 
@@ -442,6 +459,7 @@ def build_daily_candidates(
         # Always keep currently held positions even if below threshold
         held = set((holding_days or {}).keys())
         candidates = candidates[qualified_mask | candidates["symbol"].astype(str).isin(held)]
+    funnel_counts["score_percentile_pass_count"] = int(len(candidates))
 
     if candidate_limit is not None:
         held = set((holding_days or {}).keys())
@@ -449,10 +467,13 @@ def build_daily_candidates(
             (candidates["candidate_rank"] <= int(candidate_limit))
             | candidates["symbol"].astype(str).isin(held)
         ]
-    return candidates.reset_index(drop=True), proposals
+    funnel_counts["candidate_limit_pass_count"] = int(len(candidates))
+    result = candidates.reset_index(drop=True)
+    result.attrs["candidate_funnel_counts"] = funnel_counts
+    return result, proposals
 
 
-def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.DataFrame) -> pd.DataFrame:
+def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.DataFrame, *, runtime_context=None) -> pd.DataFrame:
     """Attach per-symbol diversity evidence used by the president state machine.
 
     This is intentionally computed from active model votes, not from the raw
@@ -480,7 +501,7 @@ def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.D
     if proposals is None or proposals.empty or "symbol" not in proposals.columns:
         return output
 
-    gate = dict(GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE)
+    gate = dict(getattr(runtime_context, "diversity_gate", None) or GOVERNANCE_STATE_MACHINE_DIVERSITY_GATE)
     if not bool(gate.get("enabled", True)):
         output["state_machine_role_pass"] = True
         output["state_machine_role_block_reason"] = "disabled"
@@ -501,8 +522,10 @@ def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.D
     if active.empty:
         return output
 
-    active["factor_module"] = active["model_name"].map(factor_module)
-    active["factor_family"] = active["model_name"].map(_state_machine_factor_family)
+    module_map = getattr(runtime_context, "module_map", None) or {}
+    family_map = getattr(runtime_context, "family_map", None) or {}
+    active["factor_module"] = active["model_name"].map(lambda name: module_map.get(name, factor_module(name)))
+    active["factor_family"] = active["model_name"].map(lambda name: family_map.get(name, _state_machine_factor_family(name)))
     active["vote_weight"] = active["reputation_weight"].clip(lower=0.0)
 
     rows = []
@@ -511,7 +534,7 @@ def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.D
         families = group["factor_family"].astype(str)
         total_weight = max(float(group["vote_weight"].sum()), 1e-12)
         module_share = group.groupby("factor_module")["vote_weight"].sum() / total_weight
-        roles = _role_vote_counts(group)
+        roles = _role_vote_counts(group, runtime_context=runtime_context)
         max_share = float(module_share.max()) if not module_share.empty else 1.0
         range_grid_share = float(module_share.get("range_grid", 0.0))
         block_reasons = []
@@ -568,7 +591,7 @@ def _attach_state_machine_alpha_evidence(combined: pd.DataFrame, proposals: pd.D
     )
 
 
-def _role_vote_counts(group: pd.DataFrame) -> dict[str, int]:
+def _role_vote_counts(group: pd.DataFrame, *, runtime_context=None) -> dict[str, int]:
     counts = {
         "entry_alpha_vote_count": 0,
         "timing_filter_vote_count": 0,
@@ -578,8 +601,11 @@ def _role_vote_counts(group: pd.DataFrame) -> dict[str, int]:
         "sell_trigger_vote_count": 0,
     }
     for model_name in group["model_name"].dropna().astype(str).unique():
-        roles = GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP.get(model_name)
+        role_map = getattr(runtime_context, "role_map", None) or GOVERNANCE_DIVERSIFIED_PRE_SCREEN_BUNDLE_V2_ROLE_MAP
+        roles = role_map.get(model_name)
         if not roles:
+            if runtime_context is not None and getattr(runtime_context, "factor_source", "") != "legacy_bundle":
+                raise ValueError(f"factor_cabinet role missing for runtime model: {model_name}")
             module = factor_module(model_name)
             roles = _default_roles_for_module(module)
         role_set = {str(role) for role in roles}
