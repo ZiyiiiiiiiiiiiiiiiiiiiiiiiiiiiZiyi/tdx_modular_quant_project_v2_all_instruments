@@ -1265,6 +1265,16 @@ HTML = """<!doctype html>
 </html>
 """
 
+# Keep the HTTP/state transport stable while the dashboard presentation lives
+# in a separate, testable template module. The fallback supports the production
+# launcher, which executes this file directly rather than with ``python -m``.
+try:
+    from functions.decision_council.live_monitor_dashboard import HTML as PROFESSIONAL_HTML
+except ModuleNotFoundError:
+    from live_monitor_dashboard import HTML as PROFESSIONAL_HTML
+
+HTML = PROFESSIONAL_HTML
+
 
 def _pick_port() -> int:
     with socket.socket() as sock:
