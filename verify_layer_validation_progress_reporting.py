@@ -27,7 +27,7 @@ def main() -> int:
     check_layer_validation_runtime_progress()
     check_run_single_experiment_progress_hooks()
     check_layer_validation_live_monitor_stage_progress()
-    check_web_defaults_latest_factor_cabinet()
+    check_web_defaults_selected_factor_cabinet()
     return 0
 
 
@@ -238,13 +238,13 @@ def check_layer_validation_live_monitor_stage_progress() -> None:
     print("[PASS] layer validation sends pre-trade stage progress without overwriting date updates")
 
 
-def check_web_defaults_latest_factor_cabinet() -> None:
+def check_web_defaults_selected_factor_cabinet() -> None:
     import main_launcher_web
 
     html = main_launcher_web._render_run_html()
-    assert 'factorSource.value = "latest_factor_cabinet"' in html
-    assert 'factorSourceNode.value : "latest_factor_cabinet"' in html
-    print("[PASS] web launcher defaults factor source to latest_factor_cabinet")
+    assert 'factorSource.value = "selected_factor_cabinet"' in html
+    assert 'factorSourceNode.value : "selected_factor_cabinet"' in html
+    print("[PASS] web launcher defaults factor source to selected_factor_cabinet")
 
 
 if __name__ == "__main__":

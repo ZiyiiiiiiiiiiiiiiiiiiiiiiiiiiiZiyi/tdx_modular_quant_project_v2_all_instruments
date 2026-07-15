@@ -55,6 +55,29 @@ def main() -> int:
             )
             payload = json.loads(state_path.read_text(encoding="utf-8"))
             assert payload["command"] == "update", payload
+            assert payload["title"] == "test", payload
+            assert len(payload["chart_history"]) == 1, payload["chart_history"]
+            monitor.update(
+                date="2023-01-04",
+                exposure={"nominal_nav": 20_010, "liquidatable_nav": 20_010},
+                day_index=0,
+            )
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            assert len(payload["chart_history"]) == 1, payload["chart_history"]
+            assert payload["chart_history"][0]["nav"] == 20_010
+            monitor.update(
+                date="2023-01-05",
+                exposure={"nominal_nav": 20_020, "liquidatable_nav": 20_020},
+                day_index=1,
+            )
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            assert len(payload["chart_history"]) == 2, payload["chart_history"]
+            monitor.finish("done")
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            assert payload["command"] == "finish", payload
+            assert payload["title"] == "test", payload
+            assert payload["exposure"]["liquidatable_nav"] == 20_020, payload
+            assert len(payload["chart_history"]) == 2, payload["chart_history"]
             assert len(processes) == 2, len(processes)
             assert monitor.available
         finally:

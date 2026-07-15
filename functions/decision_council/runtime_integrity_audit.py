@@ -13,6 +13,8 @@ def build_runtime_integrity_audit(
     *,
     execution_ledger: pd.DataFrame,
     account_audit: pd.DataFrame,
+    daily_result: pd.DataFrame | None = None,
+    max_positions: int | None = None,
 ) -> pd.DataFrame:
     rows = []
     trades = execution_ledger.copy() if execution_ledger is not None else pd.DataFrame()
@@ -81,6 +83,23 @@ def build_runtime_integrity_audit(
             "account_nav_reconciliation",
             bool(passed.all()),
             f"rows={len(accounts)}, failed={int((~passed).sum())}, max_abs_error={float(error.abs().max())}",
+        ))
+    daily = daily_result.copy() if daily_result is not None else pd.DataFrame()
+    if max_positions in (None, "", 0):
+        rows.append(_row("position_limit_contract", True, "max_positions not configured"))
+    elif daily.empty or "holding_count" not in daily.columns:
+        rows.append(_row("position_limit_contract", False, "daily holding_count missing"))
+    else:
+        observed = pd.to_numeric(daily["holding_count"], errors="coerce")
+        violations = observed.gt(int(max_positions))
+        rows.append(_row(
+            "position_limit_contract",
+            bool(observed.notna().all() and not violations.any()),
+            (
+                f"configured={int(max_positions)}, max_observed="
+                f"{int(observed.max()) if observed.notna().any() else 'missing'}, "
+                f"violation_days={int(violations.sum())}"
+            ),
         ))
     return pd.DataFrame(rows)
 

@@ -7,6 +7,8 @@ import json
 
 import pandas as pd
 
+from functions.decision_council.factor_source import is_factor_cabinet_runtime_column
+
 
 DEFAULT_V1_CONTRACT = Path(
     "results/decision_council/fast_factor_judge/"
@@ -22,6 +24,25 @@ ROLE_QUOTA = {
     "liquidity_filter": (10, 20),
     "hold_validation": (10, 20),
 }
+PIT_AUGMENT_FAMILY_CAP = {
+    "valuation": 3,
+    "profitability": 4,
+    "investment": 3,
+    "cashflow": 4,
+    "growth": 5,
+    "event": 5,
+    "rsi": 4,
+    "orderflow": 4,
+    "breakout": 2,
+}
+PIT_AUGMENT_ROLE_CAP = {
+    "proxy_entry_alpha": 10,
+    "timing_filter": 6,
+    "risk_override": 6,
+    "liquidity_filter": 4,
+    "hold_validation": 6,
+}
+PIT_AUGMENT_TARGET_FAMILIES = tuple(PIT_AUGMENT_FAMILY_CAP)
 
 
 def build_factor_cabinet(
@@ -31,37 +52,349 @@ def build_factor_cabinet(
     output_root: str | Path = OUTPUT_ROOT,
     min_factors: int = 60,
     max_factors: int = 120,
+    base_cabinet_path: str | Path | None = None,
+    augmented_max_factors: int = 150,
 ) -> dict[str, Path]:
-    v1 = _load_v1(v1_contract_path)
     v2 = _load_v2(appeal_run_dir)
-    candidates = pd.concat([v1, v2], ignore_index=True)
-    if candidates.empty:
-        raise ValueError("No cabinet candidates available")
-    candidates["cabinet_score"] = candidates.apply(_cabinet_score, axis=1)
-    deduped, dedup_report = _near_relative_dedup(candidates)
-    deduped = _assign_proxy_entry_roles(deduped)
-    selected, quota_report = _select_by_role(deduped, min_factors=min_factors, max_factors=max_factors)
+    appeal_provenance = _appeal_provenance(v2)
+    base_path = Path(base_cabinet_path).resolve() if base_cabinet_path else None
+    base_artifact_type = ""
+    base_lineage_status = "not_applicable"
+    base_lineage_warning = ""
+    available_pruned_candidate_run_id = ""
+    available_pruned_candidate_path = ""
+    if base_path is not None:
+        base_payload = _read_cabinet_payload(base_path)
+        base_artifact_type = str(base_payload.get("artifact_type") or "factor_cabinet").strip()
+        pruned_descendant = find_latest_pruned_descendant(base_path, search_root=output_root)
+        if pruned_descendant is not None:
+            descendant_run_id, descendant_path = pruned_descendant
+            raise ValueError(
+                "Selected base factor cabinet already has a pruned descendant; "
+                "refusing to rebuild from the unpruned ancestor. "
+                f"selected_run_id={base_payload.get('run_id') or base_path.parent.name}, "
+                f"recommended_run_id={descendant_run_id}, recommended_path={descendant_path}"
+            )
+        base_lineage_status = (
+            "pruned_base"
+            if base_artifact_type == "factor_cabinet_pruned"
+            else "unpruned_base_requires_downstream_prune"
+        )
+        if base_lineage_status != "pruned_base":
+            base_lineage_warning = (
+                "The selected base cabinet is not pruned. The augmented cabinet must complete "
+                "a cache-backed gap audit and pruning before production promotion."
+            )
+            unrelated_pruned = find_latest_pruned_cabinet(search_root=output_root)
+            if unrelated_pruned is not None:
+                available_pruned_candidate_run_id, unrelated_path = unrelated_pruned
+                available_pruned_candidate_path = str(unrelated_path)
+                base_lineage_warning += (
+                    " A pruned cabinet exists but is not a verified descendant of the selected base, "
+                    "so it was not substituted automatically: "
+                    f"run_id={available_pruned_candidate_run_id}."
+                )
+            print(f"[factor_cabinet_builder] lineage_warning: {base_lineage_warning}", flush=True)
+        base, base_run_id = _load_base_cabinet(base_path)
+        selected, dedup_report, quota_report, family_report = _build_pit_augmented_cabinet(
+            base,
+            v2,
+            augmented_max_factors=int(augmented_max_factors),
+        )
+        generation_policy = "pit_augmented_v2"
+    else:
+        v1 = _load_v1(v1_contract_path)
+        candidates = pd.concat([v1, v2], ignore_index=True)
+        if candidates.empty:
+            raise ValueError("No cabinet candidates available")
+        candidates["cabinet_score"] = candidates.apply(_cabinet_score, axis=1)
+        deduped, dedup_report = _near_relative_dedup(candidates)
+        deduped = _assign_proxy_entry_roles(deduped)
+        selected, quota_report = _select_by_role(deduped, min_factors=min_factors, max_factors=max_factors)
+        family_report = pd.DataFrame()
+        base_run_id = ""
+        generation_policy = "judge_pool_rebuild_v1"
+    _validate_runtime_contract(selected)
     run_id = datetime.now().strftime("run%Y%m%d_%H%M%S_%f")
     output = Path(output_root) / run_id
     output.mkdir(parents=True, exist_ok=False)
     selected.to_csv(output / "factor_cabinet.csv", index=False, encoding="utf-8-sig")
+    payload = {
+        "run_id": run_id,
+        "artifact_type": "factor_cabinet_pit_augmented" if base_path is not None else "factor_cabinet",
+        "generation_policy": generation_policy,
+        "base_source_run_id": base_run_id,
+        "base_factor_cabinet_path": str(base_path) if base_path is not None else "",
+        "base_artifact_type": base_artifact_type,
+        "base_lineage_status": base_lineage_status,
+        "base_lineage_warning": base_lineage_warning,
+        "available_pruned_candidate_run_id": available_pruned_candidate_run_id,
+        "available_pruned_candidate_path": available_pruned_candidate_path,
+        "base_factor_count": int(len(base)) if base_path is not None else 0,
+        "added_factor_count": int(selected.get("augmentation_action", pd.Series(dtype=str)).eq("added").sum()),
+        "appeal_source_run_id": appeal_provenance["run_id"],
+        "appeal_source_path": appeal_provenance["path"],
+        "appeal_artifact_types": appeal_provenance["artifact_types"],
+        "appeal_artifact_versions": appeal_provenance["artifact_versions"],
+        "pit_level2_appeal_evaluated": appeal_provenance["pit_level2_evaluated"],
+        "orderflow_parameter_research_evaluated": appeal_provenance["orderflow_research_evaluated"],
+        "default_eligible": bool(
+            base_path is not None
+            and appeal_provenance["pit_level2_evaluated"]
+            and appeal_provenance["orderflow_research_evaluated"]
+        ),
+        "factors": selected.to_dict("records"),
+    }
     (output / "factor_cabinet.json").write_text(
-        json.dumps({"run_id": run_id, "factors": selected.to_dict("records")}, ensure_ascii=False, indent=2, default=str),
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
     dedup_report.to_csv(output / "near_relative_dedup_report.csv", index=False, encoding="utf-8-sig")
     _correlation_cluster_placeholder(selected).to_csv(output / "correlation_cluster_report.csv", index=False, encoding="utf-8-sig")
     quota_report.to_csv(output / "role_quota_report.csv", index=False, encoding="utf-8-sig")
-    (output / "factor_cabinet_report.md").write_text(_render_report(selected, quota_report), encoding="utf-8")
+    family_report.to_csv(output / "pit_family_inclusion_report.csv", index=False, encoding="utf-8-sig")
+    if base_path is not None:
+        _base_preservation_report(base, selected).to_csv(
+            output / "base_cabinet_preservation_report.csv", index=False, encoding="utf-8-sig"
+        )
+    else:
+        pd.DataFrame(columns=["factor_name", "raw_column", "preserved"]).to_csv(
+            output / "base_cabinet_preservation_report.csv", index=False, encoding="utf-8-sig"
+        )
+    (output / "factor_cabinet_report.md").write_text(
+        _render_report(
+            selected,
+            quota_report,
+            generation_policy=generation_policy,
+            base_run_id=base_run_id,
+            base_factor_count=int(len(base)) if base_path is not None else 0,
+            family_report=family_report,
+            appeal_provenance=appeal_provenance,
+            default_eligible=bool(payload["default_eligible"]),
+        ),
+        encoding="utf-8",
+    )
     return {
         "output_dir": output,
+        "factor_cabinet": output / "factor_cabinet.json",
         "factor_cabinet_json": output / "factor_cabinet.json",
         "factor_cabinet_csv": output / "factor_cabinet.csv",
         "factor_cabinet_report": output / "factor_cabinet_report.md",
         "near_relative_dedup_report": output / "near_relative_dedup_report.csv",
         "correlation_cluster_report": output / "correlation_cluster_report.csv",
         "role_quota_report": output / "role_quota_report.csv",
+        "pit_family_inclusion_report": output / "pit_family_inclusion_report.csv",
+        "base_cabinet_preservation_report": output / "base_cabinet_preservation_report.csv",
     }
+
+
+def _load_base_cabinet(path: Path) -> tuple[pd.DataFrame, str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Base factor cabinet not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    data = pd.DataFrame(payload.get("factors", []))
+    if data.empty:
+        raise ValueError(f"Base factor cabinet has no factors: {path}")
+    required = {"factor_name", "raw_column", "role", "module", "family"}
+    missing = sorted(required - set(data.columns))
+    if missing:
+        raise ValueError(f"Base factor cabinet missing columns: {missing}")
+    data = data.copy()
+    data["source"] = data.get("source", "base_cabinet")
+    data["decision"] = "base_preserved"
+    data["augmentation_action"] = "preserved"
+    score_values = data.get(
+        "cabinet_score",
+        data.get("score", pd.Series(0.0, index=data.index, dtype=float)),
+    )
+    data["cabinet_score"] = pd.to_numeric(score_values, errors="coerce").fillna(0.0)
+    strict = data.get("strict_entry_alpha", pd.Series(False, index=data.index)).fillna(False).astype(bool)
+    role = data["role"].fillna("").astype(str)
+    data["cabinet_role"] = role
+    data.loc[role.eq("entry_alpha") & strict, "cabinet_role"] = "strict_entry_alpha"
+    data.loc[role.eq("entry_alpha") & ~strict, "cabinet_role"] = "proxy_entry_alpha"
+    data.loc[role.eq("entry_alpha_proxy"), "cabinet_role"] = "proxy_entry_alpha"
+    if "near_relative_key" not in data.columns:
+        data["near_relative_key"] = (
+            data["module"].astype(str) + ":" + data["family"].astype(str) + ":" + data["factor_name"].astype(str)
+        )
+    return data, str(payload.get("run_id") or path.parent.name)
+
+
+def _read_cabinet_payload(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Factor cabinet not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Factor cabinet payload must be an object: {path}")
+    return payload
+
+
+def find_latest_pruned_descendant(
+    base_cabinet_path: str | Path,
+    *,
+    search_root: str | Path = OUTPUT_ROOT,
+) -> tuple[str, Path] | None:
+    """Return the newest transitive pruned child of a selected cabinet."""
+    base_path = Path(base_cabinet_path).resolve()
+    base_payload = _read_cabinet_payload(base_path)
+    if str(base_payload.get("artifact_type") or "").strip() == "factor_cabinet_pruned":
+        return None
+    base_run_id = str(base_payload.get("run_id") or base_path.parent.name).strip()
+    root = Path(search_root)
+    if not root.exists():
+        return None
+
+    candidates: list[tuple[str, Path, dict]] = []
+    for run_dir in root.iterdir():
+        candidate_path = run_dir / "factor_cabinet.json"
+        if not run_dir.is_dir() or not candidate_path.exists():
+            continue
+        try:
+            payload = _read_cabinet_payload(candidate_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        candidates.append((str(payload.get("run_id") or run_dir.name), candidate_path.resolve(), payload))
+
+    lineage = {base_run_id}
+    descendants: list[tuple[str, Path]] = []
+    changed = True
+    while changed:
+        changed = False
+        for run_id, candidate_path, payload in candidates:
+            if run_id in lineage:
+                continue
+            source_run_id = str(payload.get("source_run_id") or "").strip()
+            if source_run_id not in lineage:
+                continue
+            lineage.add(run_id)
+            changed = True
+            if str(payload.get("artifact_type") or "").strip() == "factor_cabinet_pruned":
+                descendants.append((run_id, candidate_path))
+    if not descendants:
+        return None
+    return max(descendants, key=lambda item: item[1].stat().st_mtime)
+
+
+def find_latest_pruned_cabinet(
+    *,
+    search_root: str | Path = OUTPUT_ROOT,
+) -> tuple[str, Path] | None:
+    """Return the newest pruned artifact without implying lineage compatibility."""
+    root = Path(search_root)
+    if not root.exists():
+        return None
+    candidates: list[tuple[str, Path]] = []
+    for run_dir in root.iterdir():
+        candidate_path = run_dir / "factor_cabinet.json"
+        if not run_dir.is_dir() or not candidate_path.exists():
+            continue
+        try:
+            payload = _read_cabinet_payload(candidate_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if str(payload.get("artifact_type") or "").strip() != "factor_cabinet_pruned":
+            continue
+        candidates.append((str(payload.get("run_id") or run_dir.name), candidate_path.resolve()))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1].stat().st_mtime)
+
+
+def _build_pit_augmented_cabinet(
+    base: pd.DataFrame,
+    appeals: pd.DataFrame,
+    *,
+    augmented_max_factors: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if augmented_max_factors < len(base):
+        raise ValueError(
+            f"augmented_max_factors={augmented_max_factors} is below base factor count={len(base)}"
+        )
+    candidates = appeals.copy()
+    if candidates.empty:
+        candidates = pd.DataFrame(columns=base.columns)
+    candidates = candidates[
+        candidates.get("decision", pd.Series("", index=candidates.index)).astype(str).eq("promote_candidate")
+    ].copy()
+    candidates["cabinet_score"] = candidates.apply(_cabinet_score, axis=1) if not candidates.empty else pd.Series(dtype=float)
+    candidates["augmentation_action"] = "added"
+    factor_type = candidates.get("factor_type", pd.Series("", index=candidates.index)).fillna("").astype(str)
+    family_value = candidates.get("family", pd.Series("", index=candidates.index)).fillna("").astype(str)
+    candidates["augmentation_family"] = factor_type.where(
+        factor_type.isin(PIT_AUGMENT_TARGET_FAMILIES), family_value
+    )
+    base_names = set(base["factor_name"].astype(str))
+    base_raw = set(base["raw_column"].astype(str))
+    duplicate_mask = (
+        candidates["factor_name"].astype(str).isin(base_names)
+        | candidates["raw_column"].astype(str).isin(base_raw)
+    ) if not candidates.empty else pd.Series(dtype=bool)
+    duplicate_rows = candidates[duplicate_mask].copy() if not candidates.empty else pd.DataFrame()
+    candidates = candidates[~duplicate_mask].copy() if not candidates.empty else candidates
+    deduped, near_report = _near_relative_dedup(candidates) if not candidates.empty else (candidates, pd.DataFrame())
+    decisions = []
+    selected_additions = []
+    family_counts: dict[str, int] = {}
+    role_counts: dict[str, int] = {}
+    room = max(int(augmented_max_factors) - len(base), 0)
+    for _, row in deduped.sort_values(["cabinet_score", "factor_name"], ascending=[False, True]).iterrows():
+        family = str(row.get("augmentation_family", row.get("family", "")))
+        role = str(row.get("cabinet_role", ""))
+        family_cap = int(PIT_AUGMENT_FAMILY_CAP.get(family, 2))
+        role_cap = int(PIT_AUGMENT_ROLE_CAP.get(role, 2))
+        keep = True
+        reason = "added_promoted_factor"
+        if len(selected_additions) >= room:
+            keep, reason = False, "augmented_total_cap"
+        elif family_counts.get(family, 0) >= family_cap:
+            keep, reason = False, f"new_family_cap_{family_cap}"
+        elif role_counts.get(role, 0) >= role_cap:
+            keep, reason = False, f"new_role_cap_{role_cap}"
+        if keep:
+            selected_additions.append(row)
+            family_counts[family] = family_counts.get(family, 0) + 1
+            role_counts[role] = role_counts.get(role, 0) + 1
+        decisions.append({
+            "factor_name": row.get("factor_name", ""), "family": family,
+            "role": row.get("role", ""), "selected": keep, "reason": reason,
+        })
+    additions = pd.DataFrame(selected_additions)
+    selected = pd.concat([base, additions], ignore_index=True, sort=False).drop_duplicates("factor_name", keep="first")
+    if len(selected) < len(base):
+        raise AssertionError("PIT augmentation unexpectedly removed base factors")
+    dedup_report = pd.concat([
+        near_report,
+        duplicate_rows.assign(action="drop", reason="already_present_in_base")[
+            [column for column in ("near_relative_key", "factor_name", "action", "reason") if column in duplicate_rows.columns or column in {"action", "reason"}]
+        ] if not duplicate_rows.empty else pd.DataFrame(),
+    ], ignore_index=True, sort=False)
+    quota_report = pd.DataFrame([
+        {"scope": "augmentation", "role": role, "target_min": 0, "target_max": cap,
+         "selected": role_counts.get(role, 0), "pass": role_counts.get(role, 0) <= cap}
+        for role, cap in PIT_AUGMENT_ROLE_CAP.items()
+    ])
+    family_rows = []
+    decision_frame = pd.DataFrame(decisions)
+    for family in PIT_AUGMENT_TARGET_FAMILIES:
+        promoted = int((candidates.get("augmentation_family", pd.Series(dtype=str)).astype(str) == family).sum())
+        selected_count = int(family_counts.get(family, 0))
+        family_rows.append({
+            "family": family, "promoted_available": promoted,
+            "selected_additions": selected_count,
+            "status": "included" if selected_count else ("no_promoted_evidence" if promoted == 0 else "blocked_by_caps"),
+            "forced_inclusion": False,
+        })
+    return selected.reset_index(drop=True), dedup_report, quota_report, pd.DataFrame(family_rows)
+
+
+def _base_preservation_report(base: pd.DataFrame, selected: pd.DataFrame) -> pd.DataFrame:
+    selected_names = set(selected["factor_name"].astype(str))
+    return pd.DataFrame({
+        "factor_name": base["factor_name"].astype(str),
+        "raw_column": base["raw_column"].astype(str),
+        "preserved": base["factor_name"].astype(str).isin(selected_names),
+    })
 
 
 def _load_v1(path: str | Path) -> pd.DataFrame:
@@ -80,6 +413,8 @@ def _load_v2(appeal_run_dir: str | Path | None) -> pd.DataFrame:
     run_dir = _resolve_appeal_run_dir(appeal_run_dir)
     if run_dir is None:
         return pd.DataFrame()
+    manifest_path = run_dir / "artifact_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     parts = []
     for filename in ("admitted_v2.csv", "watchlist_v2.csv"):
         path = run_dir / filename
@@ -87,18 +422,88 @@ def _load_v2(appeal_run_dir: str | Path | None) -> pd.DataFrame:
             parts.append(pd.read_csv(path))
     parts = [part for part in parts if part is not None and not part.empty]
     if not parts:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs.update({"appeal_run_dir": str(run_dir), "appeal_manifest": manifest})
+        return empty
     data = pd.concat(parts, ignore_index=True)
     data["source"] = "v2_appeal"
     data["decision"] = data["new_decision"]
     data["module"] = data.get("factor_type", "")
     data["family"] = data.get("factor_family", "")
-    data["role"] = data.get("new_role", "")
-    data["cabinet_role"] = data["new_role"].map(lambda role: "proxy_entry_alpha" if str(role) == "entry_alpha_proxy" else str(role))
+    data["role"] = data["new_role"].map(
+        lambda role: "entry_alpha_proxy" if str(role) in {"entry_alpha", "entry_alpha_proxy"} else str(role)
+    )
+    data["cabinet_role"] = data["new_role"].map(
+        lambda role: "proxy_entry_alpha" if str(role) in {"entry_alpha", "entry_alpha_proxy"} else str(role)
+    )
     data["near_relative_key"] = data["factor_type"].astype(str) + ":" + data["factor_family"].astype(str) + ":" + data["factor_name"].astype(str)
     data["score"] = pd.to_numeric(data.get("ic_ir"), errors="coerce").fillna(0.0)
     data["strict_entry_alpha"] = False
+    # v3 RSI appeal artifacts predate the cand_* runtime-column contract.
+    # This is the only legacy mapping accepted here; unknown columns fail below.
+    legacy_rsi = (
+        data["factor_type"].astype(str).eq("rsi")
+        & ~data["raw_column"].map(is_factor_cabinet_runtime_column)
+    )
+    data.loc[legacy_rsi, "raw_column"] = "cand_" + data.loc[legacy_rsi, "factor_name"].astype(str)
+    data.attrs.update({"appeal_run_dir": str(run_dir), "appeal_manifest": manifest})
     return data
+
+
+def _validate_runtime_contract(frame: pd.DataFrame) -> None:
+    required = {"factor_name", "raw_column", "role"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"factor_cabinet output is missing runtime columns: {missing}")
+    names = frame["factor_name"].fillna("").astype(str).str.strip()
+    raw_columns = frame["raw_column"].fillna("").astype(str).str.strip()
+    roles = frame["role"].fillna("").astype(str).str.strip()
+    invalid = frame.loc[
+        names.eq("")
+        | raw_columns.eq("")
+        | ~raw_columns.map(is_factor_cabinet_runtime_column)
+        | ~roles.isin({
+            "entry_alpha", "entry_alpha_proxy", "timing_filter", "risk_override",
+            "liquidity_filter", "hold_validation", "sell_trigger",
+        })
+    ]
+    if not invalid.empty:
+        columns = [column for column in ("factor_name", "raw_column", "role", "module", "family") if column in invalid]
+        raise ValueError(
+            "factor_cabinet builder produced invalid runtime metadata: "
+            f"{invalid[columns].head(10).to_dict('records')}"
+        )
+    duplicates = sorted(names[names.duplicated(keep=False)].unique())
+    if duplicates:
+        raise ValueError(f"factor_cabinet builder produced duplicate factor names: {duplicates[:10]}")
+
+
+def _appeal_provenance(data: pd.DataFrame) -> dict:
+    manifest = dict(data.attrs.get("appeal_manifest") or {})
+    artifact_types: set[str] = set()
+    artifact_versions: set[str] = set()
+
+    def collect(item) -> None:
+        if not isinstance(item, dict):
+            return
+        artifact_type = str(item.get("artifact_type") or "").strip()
+        artifact_version = str(item.get("artifact_version") or "").strip()
+        if artifact_type:
+            artifact_types.add(artifact_type)
+        if artifact_version:
+            artifact_versions.add(artifact_version)
+        for child in item.get("source_artifacts", []) or []:
+            collect(child)
+
+    collect(manifest)
+    return {
+        "run_id": str(manifest.get("run_id") or ""),
+        "path": str(data.attrs.get("appeal_run_dir") or ""),
+        "artifact_types": sorted(artifact_types),
+        "artifact_versions": sorted(artifact_versions),
+        "pit_level2_evaluated": any("pit_level2" in value for value in artifact_versions),
+        "orderflow_research_evaluated": "orderflow_parameter_research" in artifact_types,
+    }
 
 
 def _resolve_appeal_run_dir(appeal_run_dir: str | Path | None) -> Path | None:
@@ -155,10 +560,15 @@ def _cabinet_role_from_v1(row) -> str:
 
 
 def _cabinet_score(row) -> float:
-    rank_ic = abs(_num(row.get("best_rank_ic_mean", row.get("rank_ic")), 0.0))
-    ic_ir = _num(row.get("best_ic_ir", row.get("ic_ir")), 0.0)
-    spread = _num(row.get("best_cost_adjusted_top_bottom_spread", row.get("top_bottom_spread")), 0.0)
-    turnover = _num(row.get("avg_turnover_mean"), 0.5)
+    # Judge outputs are already normalized to the declared economic direction.
+    # Negative evidence must not be revived by taking an absolute value.
+    rank_ic = max(_num(row.get("best_rank_ic_mean", row.get("rank_ic")), 0.0), 0.0)
+    ic_ir = max(_num(row.get("best_ic_ir", row.get("ic_ir")), 0.0), 0.0)
+    spread = _num(
+        row.get("best_cost_adjusted_top_bottom_spread", row.get("top_bottom_spread")),
+        0.0,
+    )
+    turnover = _num(row.get("avg_turnover_mean", row.get("avg_turnover")), 0.5)
     coverage = _num(row.get("coverage"), 1.0)
     stability = _num(row.get("positive_ic_ratio"), 0.52)
     turnover_score = max(1.0 - turnover, 0.0)
@@ -246,7 +656,10 @@ def _select_by_role(candidates: pd.DataFrame, *, min_factors: int, max_factors: 
     protected = candidates[
         candidates.get("source", pd.Series("", index=candidates.index)).astype(str).eq("v2_appeal")
         & candidates.get("decision", pd.Series("", index=candidates.index)).astype(str).eq("promote_candidate")
-        & candidates.get("factor_type", pd.Series("", index=candidates.index)).astype(str).isin({"breakout", "orderflow_proxy"})
+        & candidates.get("factor_type", pd.Series("", index=candidates.index)).astype(str).isin({
+            "breakout", "orderflow_proxy", "rsi", "growth", "profitability",
+            "cashflow", "valuation", "investment", "event",
+        })
     ].copy()
     if not protected.empty:
         selected = pd.concat(
@@ -261,6 +674,8 @@ def _select_by_role(candidates: pd.DataFrame, *, min_factors: int, max_factors: 
             group = group.sort_values(["_protected", "cabinet_score"], ascending=[False, False]).head(role_max)
             trimmed.append(group.drop(columns="_protected"))
         selected = pd.concat(trimmed, ignore_index=True) if trimmed else selected
+    selected = selected.drop_duplicates("factor_name", keep="first")
+    used = set(selected["factor_name"].astype(str))
     if len(selected) < min_factors:
         extra = candidates[~candidates["factor_name"].astype(str).isin(used)].sort_values("cabinet_score", ascending=False).head(min_factors - len(selected))
         selected = pd.concat([selected, extra], ignore_index=True)
@@ -272,7 +687,13 @@ def _correlation_cluster_placeholder(selected: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for cluster_id, (_, group) in enumerate(selected.groupby("family", dropna=False), start=1):
         for _, row in group.iterrows():
-            rows.append({"cluster_id": cluster_id, "factor_name": row["factor_name"], "family": row.get("family", ""), "cluster_size": int(len(group)), "reason": "family_cluster_proxy"})
+            rows.append({
+                "cluster_id": cluster_id,
+                "factor_name": row["factor_name"],
+                "family": row.get("family", ""),
+                "cluster_size": int(len(group)),
+                "reason": "metadata_family_group_not_value_correlation",
+            })
     return pd.DataFrame(rows)
 
 
@@ -283,15 +704,39 @@ def _latest_dir(root: Path) -> Path | None:
     return sorted(dirs, key=lambda path: path.stat().st_mtime, reverse=True)[0] if dirs else None
 
 
-def _render_report(selected: pd.DataFrame, quota: pd.DataFrame) -> str:
+def _render_report(
+    selected: pd.DataFrame,
+    quota: pd.DataFrame,
+    *,
+    generation_policy: str = "judge_pool_rebuild_v1",
+    base_run_id: str = "",
+    base_factor_count: int = 0,
+    family_report: pd.DataFrame | None = None,
+    appeal_provenance: dict | None = None,
+    default_eligible: bool = False,
+) -> str:
     role_counts = selected["cabinet_role"].value_counts().to_dict() if not selected.empty else {}
     failures = quota[~quota["pass"].astype(bool)].to_dict("records") if not quota.empty else []
+    additions = int(selected.get("augmentation_action", pd.Series(dtype=str)).eq("added").sum())
+    family_rows = family_report.to_dict("records") if family_report is not None and not family_report.empty else []
+    provenance = appeal_provenance or {}
     return "\n".join([
         "# Factor Cabinet Report",
         "",
+        f"Generation policy: {generation_policy}",
+        f"Base cabinet run: {base_run_id or 'none'}",
+        f"Base factor count: {base_factor_count}",
+        f"Evidence-backed additions: {additions}",
+        f"Appeal source run: {provenance.get('run_id') or 'none'}",
+        f"Appeal artifact versions: {provenance.get('artifact_versions') or []}",
+        f"PIT Level-2 appeal evaluated: {bool(provenance.get('pit_level2_evaluated'))}",
+        f"Orderflow parameter research evaluated: {bool(provenance.get('orderflow_research_evaluated'))}",
+        f"Eligible as Web default: {bool(default_eligible)}",
         f"Factor count: {len(selected)}",
         f"Role distribution: {role_counts}",
         f"Quota failures: {failures}",
+        f"PIT family inclusion: {family_rows}",
         "",
+        "Missing families are reported as no evidence and are never forced into the executable cabinet.",
         "State machine should read factor_cabinet.json only, not raw admitted pools.",
     ])

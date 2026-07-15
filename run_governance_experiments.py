@@ -69,6 +69,7 @@ from functions.decision_council.factor_cabinet_feature_cache import (
     attach_factor_cabinet_feature_cache,
 )
 from functions.decision_council.outputs import write_governance_csv, write_governance_text
+from functions.data.trading_calendar import bounded_observed_feature_end
 from functions.decision_council.factor_source import (
     FACTOR_SOURCE_LEGACY,
     LEGACY_GOVERNANCE_ALPHA_BUNDLE,
@@ -376,6 +377,16 @@ def _load_governance_features(
     return data
 
 
+def _bounded_feature_end_date(start_date, end_date, max_days: int | None) -> pd.Timestamp:
+    """Bound feature loading to the sessions the runner can actually consume."""
+    return bounded_observed_feature_end(
+        FEATURE_DAILY_PARQUET,
+        start_date,
+        end_date,
+        max_days,
+    )
+
+
 def _emit_progress(progress_callback, **payload) -> None:
     step = str(payload.get("step", ""))
     message = str(payload.get("message", ""))
@@ -473,7 +484,7 @@ def run_single_experiment(
             float(capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0),
             0.0,
         )
-    if requested_control_mode != "normal":
+    if control_mode != "normal":
         control_dir_names = {
             "factor_only": "ctrl_factor",
             "safe_factor_only": "ctrl_safe_factor",
@@ -513,7 +524,16 @@ def run_single_experiment(
 
     # Load and normalize only the columns needed by this bundle.
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE)
-    effective_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE)
+    requested_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE)
+    effective_end = _bounded_feature_end_date(effective_start, requested_end, max_days)
+    if effective_end < requested_end:
+        _emit_progress(
+            progress_callback,
+            percent=16.0,
+            step="bound_feature_window",
+            message="bounded feature loading to requested governance trading days",
+            detail=f"requested_end={requested_end.date()}, effective_end={effective_end.date()}, max_days={max_days}",
+        )
     features = _load_governance_features(
         effective_start,
         effective_end,
@@ -827,6 +847,7 @@ def run_registered_mainline_v2_suite(
     capital_profile: dict | None = None,
     pit_mode: str = "research",
     max_runtime_seconds: float | None = None,
+    progress_callback=None,
 ) -> dict[str, dict[str, Path]]:
     """Run only the four pre-registered mainline comparisons."""
     specs = (
@@ -839,11 +860,32 @@ def run_registered_mainline_v2_suite(
 
     started = time.monotonic()
     results = {}
-    for label, logic, regime_override, exit_override, regime_policy_override in specs:
+    for experiment_index, (label, logic, regime_override, exit_override, regime_policy_override) in enumerate(specs):
         if max_runtime_seconds is not None and time.monotonic() - started >= float(max_runtime_seconds):
             raise TimeoutError(
                 f"Registered mainline v2 suite exceeded {float(max_runtime_seconds):.1f}s before {label}"
             )
+        _emit_progress(
+            progress_callback,
+            percent=experiment_index / len(specs) * 100.0,
+            current=experiment_index + 1,
+            total=len(specs),
+            step=label,
+            message=f"starting {label}",
+        )
+
+        def _suite_progress(payload, *, _index=experiment_index, _label=label):
+            child_percent = float(payload.get("percent", 0.0) or 0.0)
+            _emit_progress(
+                progress_callback,
+                percent=(_index + child_percent / 100.0) / len(specs) * 100.0,
+                current=_index + 1,
+                total=len(specs),
+                step=f"{_label}:{payload.get('step', '')}",
+                message=str(payload.get("message", _label)),
+                detail=str(payload.get("detail", "")),
+            )
+
         results[label] = run_single_experiment(
             variant_name="rules_based_president",
             alpha_bundle=LEGACY_GOVERNANCE_ALPHA_BUNDLE,
@@ -862,6 +904,15 @@ def run_registered_mainline_v2_suite(
             exit_mode_override=exit_override,
             enable_market_regime_policy_override=regime_policy_override,
             pit_mode=pit_mode,
+            progress_callback=_suite_progress,
+        )
+        _emit_progress(
+            progress_callback,
+            percent=(experiment_index + 1) / len(specs) * 100.0,
+            current=experiment_index + 1,
+            total=len(specs),
+            step=label,
+            message=f"completed {label}",
         )
     return results
 

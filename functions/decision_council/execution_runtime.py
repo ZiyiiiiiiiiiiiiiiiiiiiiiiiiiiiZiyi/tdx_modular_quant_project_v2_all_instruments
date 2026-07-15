@@ -27,6 +27,7 @@ def execute_pending(runner, date, daily):
     market = daily.set_index("symbol", drop=False)
     rows = []
     blocked_symbols = set()
+    blocked_reasons = {}
     fill_map = {}
     for _, order in active.sort_values(["priority", "created_date"]).iterrows():
         symbol = str(order["symbol"])
@@ -109,6 +110,15 @@ def execute_pending(runner, date, daily):
         notional = float(fill["trade_notional"])
         cost = float(fill["total_cost"])
         if str(fill["side"]) == "buy":
+            max_positions = getattr(runner, "_max_positions_override", None)
+            if (
+                max_positions is not None
+                and symbol not in runner.positions
+                and len(runner.positions) >= int(max_positions)
+            ):
+                blocked_symbols.add(symbol)
+                blocked_reasons[symbol] = "position_limit"
+                continue
             affordable = max(runner.cash - cost, 0.0)
             shares = min(shares, float(int(affordable // float(fill["price"]) // MIN_LOT_SIZE) * MIN_LOT_SIZE))
             if shares <= 0:
@@ -158,7 +168,18 @@ def execute_pending(runner, date, daily):
                     "exit_price": float(fill["price"]),
                 }
             )
-    runner.engine.settle_pending_orders(date, fills=fill_map, blocked_symbols=blocked_symbols)
+    runner.engine.settle_pending_orders(
+        date,
+        fills=fill_map,
+        blocked_symbols=blocked_symbols,
+        blocked_reasons=blocked_reasons,
+    )
+    max_positions = getattr(runner, "_max_positions_override", None)
+    if max_positions is not None and len(runner.positions) > int(max_positions):
+        raise RuntimeError(
+            "governance position limit invariant failed after execution: "
+            f"positions={len(runner.positions)}, max_positions={int(max_positions)}"
+        )
 
 def prune_empty_positions(runner, *, min_shares: float = 1e-9) -> None:
     empty_symbols = [
@@ -306,4 +327,3 @@ def register_orders(runner, orders, daily, nominal_nav):
         else:
             runner.engine.pending_orders.add_order(payload)
     return diagnostics
-

@@ -132,11 +132,19 @@ class PhaseOneDecisionCouncilEngine:
         )
         return saved
 
-    def settle_pending_orders(self, trade_date, *, fills=None, blocked_symbols=()) -> pd.DataFrame:
+    def settle_pending_orders(
+        self,
+        trade_date,
+        *,
+        fills=None,
+        blocked_symbols=(),
+        blocked_reasons=None,
+    ) -> pd.DataFrame:
         ledger = self.pending_orders.settle_day(
             trade_date,
             fills=fills,
             blocked_symbols=blocked_symbols,
+            blocked_reasons=blocked_reasons,
         )
         self.ledgers.append("pending_order_ledger", ledger)
         return ledger

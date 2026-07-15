@@ -11,6 +11,25 @@ from config import RESULT_DIR
 
 
 PROGRESS_JSON = Path(RESULT_DIR) / "runtime_progress.json"
+_PROGRESS_CONTEXT: dict = {}
+
+
+def set_progress_context(*, parent_task_name: str, task_index: int, task_total: int) -> None:
+    """Map nested task progress into one stable parent progress stream."""
+    existing = read_progress(owner_pid=os.getpid())
+    _PROGRESS_CONTEXT.clear()
+    _PROGRESS_CONTEXT.update(
+        {
+            "parent_task_name": str(parent_task_name),
+            "task_index": max(int(task_index), 1),
+            "task_total": max(int(task_total), 1),
+            "started_at": existing.get("started_at") or time.time(),
+        }
+    )
+
+
+def clear_progress_context() -> None:
+    _PROGRESS_CONTEXT.clear()
 
 
 def reset_progress(*, task_name: str, total: int | None = None, message: str = "starting") -> None:
@@ -28,7 +47,7 @@ def reset_progress(*, task_name: str, total: int | None = None, message: str = "
 
 
 def complete_progress(*, task_name: str, message: str = "complete") -> None:
-    existing = read_progress()
+    existing = read_progress(owner_pid=os.getpid())
     write_progress(
         task_name=task_name,
         status="complete",
@@ -42,7 +61,7 @@ def complete_progress(*, task_name: str, message: str = "complete") -> None:
 
 
 def fail_progress(*, task_name: str, message: str) -> None:
-    existing = read_progress()
+    existing = read_progress(owner_pid=os.getpid())
     write_progress(
         task_name=task_name,
         status="failed",
@@ -67,7 +86,27 @@ def write_progress(
     detail: str = "",
     started_at: float | None = None,
 ) -> None:
-    started = float(started_at or read_progress().get("started_at") or time.time())
+    child_payload = None
+    if _PROGRESS_CONTEXT and str(task_name) != _PROGRESS_CONTEXT["parent_task_name"]:
+        child_percent = min(max(float(percent), 0.0), 100.0)
+        task_index = int(_PROGRESS_CONTEXT["task_index"])
+        task_total = int(_PROGRESS_CONTEXT["task_total"])
+        child_payload = {
+            "child_task_name": str(task_name),
+            "child_status": str(status),
+            "child_percent": round(child_percent, 2),
+            "child_current": int(current) if current is not None else None,
+            "child_total": int(total) if total is not None else None,
+        }
+        task_name = _PROGRESS_CONTEXT["parent_task_name"]
+        status = "running"
+        percent = ((task_index - 1) + child_percent / 100.0) / task_total * 100.0
+        current = task_index
+        total = task_total
+        started_at = _PROGRESS_CONTEXT["started_at"]
+
+    owner_pid = os.getpid()
+    started = float(started_at or read_progress(owner_pid=owner_pid).get("started_at") or time.time())
     now = time.time()
     bounded_percent = min(max(float(percent), 0.0), 100.0)
     elapsed = max(now - started, 0.0)
@@ -89,17 +128,25 @@ def write_progress(
         "updated_at_text": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
         "elapsed_seconds": round(elapsed, 1),
         "eta_seconds": round(eta, 1) if eta is not None else None,
+        "owner_pid": owner_pid,
+        **(child_payload or {}),
     }
     PROGRESS_JSON.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, ensure_ascii=False, indent=2)
+    owner_path = PROGRESS_JSON.with_name(f"{PROGRESS_JSON.stem}_{owner_pid}{PROGRESS_JSON.suffix}")
+    _atomic_write_progress(owner_path, data)
+    _atomic_write_progress(PROGRESS_JSON, data)
+
+
+def _atomic_write_progress(target_path: Path, data: str) -> None:
     last_error = None
     for attempt in range(8):
-        tmp_path = PROGRESS_JSON.with_name(
-            f"{PROGRESS_JSON.stem}_{os.getpid()}_{time.time_ns()}_{attempt}.tmp"
+        tmp_path = target_path.with_name(
+            f"{target_path.stem}_{os.getpid()}_{time.time_ns()}_{attempt}.tmp"
         )
         try:
             tmp_path.write_text(data, encoding="utf-8")
-            tmp_path.replace(PROGRESS_JSON)
+            tmp_path.replace(target_path)
             return
         except PermissionError as exc:
             last_error = exc
@@ -113,11 +160,15 @@ def write_progress(
                     tmp_path.unlink()
             except Exception:
                 pass
-    print(f"[WARN] runtime progress write skipped after retries: {last_error}", flush=True)
+    print(f"[WARN] runtime progress write skipped for {target_path} after retries: {last_error}", flush=True)
 
 
-def read_progress() -> dict:
-    if not PROGRESS_JSON.exists():
+def read_progress(*, owner_pid: int | None = None) -> dict:
+    progress_path = (
+        PROGRESS_JSON.with_name(f"{PROGRESS_JSON.stem}_{int(owner_pid)}{PROGRESS_JSON.suffix}")
+        if owner_pid is not None else PROGRESS_JSON
+    )
+    if not progress_path.exists():
         return {
             "task_name": "",
             "status": "idle",
@@ -125,7 +176,10 @@ def read_progress() -> dict:
             "message": "no task has reported progress yet",
         }
     try:
-        return json.loads(PROGRESS_JSON.read_text(encoding="utf-8"))
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        if owner_pid is not None and int(payload.get("owner_pid", -1)) != int(owner_pid):
+            raise ValueError(f"progress owner mismatch for pid={owner_pid}")
+        return payload
     except Exception as exc:
         return {
             "task_name": "",

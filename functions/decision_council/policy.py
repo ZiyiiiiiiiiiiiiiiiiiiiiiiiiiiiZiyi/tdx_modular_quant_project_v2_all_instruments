@@ -140,9 +140,23 @@ class RulesBasedPresidentPolicy:
             )
         ].sort_values(["primary_score", "symbol"], ascending=[False, True])["symbol"].tolist()
         selected_symbols = list(dict.fromkeys(held_symbols))
+        # Every live position consumes a slot even when it is absent from today's
+        # ranked candidate frame.  Counting only held_symbols allowed stale
+        # positions to coexist with new buys above context.top_n.
+        projected_position_symbols = {
+            str(symbol)
+            for symbol, weight in context.current_weights.items()
+            if float(weight) > 1e-12
+        }
         for symbol in ranked_symbols:
-            if symbol not in selected_symbols and len(selected_symbols) < int(context.top_n):
+            if symbol in selected_symbols:
+                continue
+            if symbol in projected_position_symbols:
                 selected_symbols.append(symbol)
+                continue
+            if len(projected_position_symbols) < int(context.top_n):
+                selected_symbols.append(symbol)
+                projected_position_symbols.add(symbol)
         selected = eligible[eligible["symbol"].isin(selected_symbols)].copy()
         selected = selected.sort_values(["primary_score", "symbol"], ascending=[False, True])
         allocated, allocation_diagnostics = self.portfolio_constructor.construct(
