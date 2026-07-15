@@ -125,6 +125,7 @@ HTML = r"""<!doctype html>
     .legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 11px; }
     .legend-item { display: inline-flex; align-items: center; gap: 5px; }
     .legend-line { width: 16px; height: 2px; background: var(--blue); }
+    .legend-entry-dot { width: 7px; height: 7px; border-radius: 50%; box-shadow: 0 0 0 2px #fff, 0 0 0 3px currentColor; }
     .range-control { display: inline-flex; padding: 2px; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 5px; }
     .range-button { min-width: 38px; padding: 4px 7px; border: 0; border-radius: 3px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }
     .range-button.active { color: var(--ink); background: #fff; box-shadow: 0 1px 2px rgba(23,33,31,.1); }
@@ -210,7 +211,8 @@ HTML = r"""<!doctype html>
       <button class="tab active" data-tab="overview">总览</button>
       <button class="tab" data-tab="risk">风险与仓位</button>
       <button class="tab" data-tab="execution">候选与执行</button>
-      <button class="tab" data-tab="factors">因子与持仓</button>
+      <button class="tab" data-tab="factors">因子权重</button>
+      <button class="tab" data-tab="holdings">持仓路径</button>
     </nav>
 
     <section class="tab-panel active" id="tab-overview">
@@ -280,8 +282,15 @@ HTML = r"""<!doctype html>
         <article class="panel"><div class="panel-header"><div class="panel-title">模块权重明细</div></div><div class="table-scroll"><table><thead><tr><th>模块</th><th>占比</th><th>因子数</th><th>5 日预测</th></tr></thead><tbody id="moduleWeightsBody"></tbody></table></div></article>
       </div>
       <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">因子权重明细</div></div><div class="table-scroll"><table><thead><tr><th>模块</th><th>角色</th><th>因子</th><th>权重</th><th>占比</th><th>变化</th><th>5 日预测</th><th>说明</th></tr></thead><tbody id="factorWeightsBody"></tbody></table></div></article>
-      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">持仓价格路径</div><div class="panel-note">入场日归一化为 1.0000</div></div><div class="chart-body"><canvas class="chart medium" id="holdingPathChart"></canvas></div></article>
-      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">持仓生命周期</div></div><div class="table-scroll"><table><thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>MFE</th><th>MAE</th><th>回吐</th><th>趋势</th><th>峰值衰减</th><th>亏损风险</th><th>状态</th><th>警报</th></tr></thead><tbody id="lifecycleBody"></tbody></table></div></article>
+    </section>
+
+    <section class="tab-panel" id="tab-holdings">
+      <article class="panel">
+        <div class="panel-header"><div><div class="panel-title">当前持仓价格路径</div><div class="panel-note">每只股票按实际入场价归一化为 1.0000；实心圆标记实际买入节点；最多展示市值前六只</div></div></div>
+        <div class="chart-body"><canvas class="chart" id="holdingPathChart"></canvas></div>
+        <div class="panel-body legend" id="holdingPathLegend"><span class="panel-note">尚无有效持仓路径</span></div>
+      </article>
+      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">持仓生命周期</div><div class="panel-note">入场、浮盈亏和退出警报使用同一持仓状态快照</div></div><div class="table-scroll"><table><thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>MFE</th><th>MAE</th><th>回吐</th><th>趋势</th><th>峰值衰减</th><th>亏损风险</th><th>状态</th><th>警报</th></tr></thead><tbody id="lifecycleBody"></tbody></table></div></article>
     </section>
   </main>
 
@@ -296,7 +305,7 @@ HTML = r"""<!doctype html>
       overviewDetails: [
         ["benchmark_nav","基准净值"],["valid_invested_nav","持仓/投入净值"],["account_max_drawdown","账户最大回撤"],
         ["holding_max_drawdown","持仓最大回撤"],["benchmark_max_drawdown","基准最大回撤"],["excess_max_drawdown","超额最大回撤"],
-        ["sharpe","年化夏普"],["annual_volatility","年化波动"],["cash","现金"],["cash_drag","现金拖累"],
+        ["sharpe","年化夏普"],["sortino","年化索提诺"],["annual_volatility","年化波动"],["cash","现金"],["cash_drag","现金拖累"],
         ["closed_trade_win_rate","平仓胜率"],["profit_factor","利润因子"],
       ],
       riskDetails: [
@@ -393,9 +402,65 @@ HTML = r"""<!doctype html>
     function drawExcess() { const c=prepareCanvas("excessChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"等待超额净值数据");const v=points.map(x=>x.excessNav),bounds=chartBounds(v,1),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),x=>fmtNum(x,4));const y0=p.b-(1-bounds.min)/(bounds.max-bounds.min)*(p.b-p.t);ctx.strokeStyle="#b8c0bc";ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(p.l,y0);ctx.lineTo(p.r,y0);ctx.stroke();ctx.setLineDash([]);drawLine(ctx,v,p,bounds,"#a87518",2.2);drawHover(ctx,p,points,[{label:"超额",values:v,format:x=>fmtNum(x,4)}]); }
     function drawDrawdown() { const c=prepareCanvas("drawdownChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"等待回撤数据");const v=points.map(x=>x.drawdown),bounds={min:Math.min(...v,-.01)*1.12,max:0},p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);drawLine(ctx,v,p,bounds,"#bd3d39",2);drawHover(ctx,p,points,[{label:"回撤",values:v,format:fmtPct}]); }
     function drawEmpty(ctx,text){ctx.fillStyle="#7c8783";ctx.font="12px Microsoft YaHei UI";ctx.fillText(text,18,28);}
+    function annualizedSortino(returns,navMultiple,tradingDays){
+      const values=(returns||[]).map(Number).filter(Number.isFinite),downside=values.filter(value=>value<0);
+      const periods=Math.max(Math.floor(finite(tradingDays)),0);
+      if(values.length<2||downside.length<2||periods<=1||!(finite(navMultiple)>0))return NaN;
+      const annualReturn=Math.pow(finite(navMultiple),252/periods)-1;
+      const downsideMean=downside.reduce((sum,value)=>sum+value,0)/downside.length;
+      const downsideVariance=downside.reduce((sum,value)=>sum+(value-downsideMean)**2,0)/(downside.length-1);
+      const annualDownsideVolatility=Math.sqrt(Math.max(downsideVariance,0))*Math.sqrt(252);
+      return annualDownsideVolatility>1e-12?annualReturn/annualDownsideVolatility:NaN;
+    }
     function aggregateModules(weights){const map={};for(const item of weights||[]){const key=String(item.factor_module||"unknown");if(!map[key])map[key]={factor_module:key,weight_share:0,weight:0,factor_count:0,avg_predicted_return_5d:0};map[key].weight_share+=finite(item.weight_share);map[key].weight+=finite(item.weight);map[key].factor_count+=1;map[key].avg_predicted_return_5d+=finite(item.avg_predicted_return_5d);}return Object.values(map).sort((a,b)=>b.weight_share-a.weight_share);}
     function drawMulti(id,points,nameKey,label){const c=prepareCanvas(id);if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,`等待${label}数据`);const latest=points[points.length-1].weights||[];const names=latest.slice().sort((a,b)=>finite(b.weight_share)-finite(a.weight_share)).slice(0,8).map(x=>String(x[nameKey]));const all=[];for(const point of points){const map=Object.fromEntries((point.weights||[]).map(x=>[String(x[nameKey]),finite(x.weight_share)]));names.forEach(n=>all.push(map[n]||0));}const bounds=chartBounds(all,0),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);names.forEach((name,j)=>{const vals=points.map(point=>{const found=(point.weights||[]).find(x=>String(x[nameKey])===name);return finite(found&&found.weight_share);});drawLine(ctx,vals,p,bounds,palette[j%palette.length],1.7);ctx.fillStyle=palette[j%palette.length];ctx.font="10px Microsoft YaHei UI";ctx.fillText(name.slice(0,18),p.l+(j%4)*Math.max((p.r-p.l)/4,100),10+Math.floor(j/4)*12);});}
-    function drawHoldingPaths(paths){const c=prepareCanvas("holdingPathChart");if(!c)return;const {ctx,w,h}=c;const usable=(paths||[]).filter(x=>(x.points||[]).length>1).slice(0,6);if(!usable.length)return drawEmpty(ctx,"暂无有效持仓价格路径");const values=usable.flatMap(x=>x.points.map(p=>finite(p.value,1))),dates=Array.from({length:Math.max(...usable.map(x=>x.points.length))},(_,i)=>String(i)),bounds=chartBounds(values,1),p=drawFrame(ctx,w,h,bounds,dates,x=>fmtNum(x,3));usable.forEach((path,j)=>{const vals=path.points.map(x=>finite(x.value,1));drawLine(ctx,vals,p,bounds,palette[j%palette.length],1.8);ctx.fillStyle=palette[j%palette.length];ctx.font="10px Consolas";ctx.fillText(String(path.symbol||"").slice(0,10),p.l+j*90,10);});}
+    function drawHoldingPaths(paths) {
+      const c=prepareCanvas("holdingPathChart"); if(!c)return;
+      const {ctx,w,h}=c,legend=document.getElementById("holdingPathLegend");
+      const usable=(paths||[]).filter(x=>(x.points||[]).length>1).slice(0,6);
+      if(!usable.length){
+        if(legend)legend.innerHTML='<span class="panel-note">当前没有可绘制的持仓；成交并完成首日收盘标记后自动出现。</span>';
+        return drawEmpty(ctx,"暂无有效持仓价格路径");
+      }
+      const values=usable.flatMap(x=>x.points.map(point=>finite(point.value,1)));
+      const longest=usable.slice().sort((a,b)=>b.points.length-a.points.length)[0];
+      const dates=longest.points.map(point=>point.date),bounds=chartBounds(values,1);
+      const p=drawFrame(ctx,w,h,bounds,dates,value=>fmtNum(value,3));
+      const y0=p.b-(1-bounds.min)/Math.max(bounds.max-bounds.min,1e-12)*(p.b-p.t);
+      ctx.strokeStyle="#aeb7b3";ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(p.l,y0);ctx.lineTo(p.r,y0);ctx.stroke();ctx.setLineDash([]);
+
+      usable.forEach((path,j)=>{
+        const color=palette[j%palette.length];
+        const vals=path.points.map(point=>finite(point.value,1));
+        drawLine(ctx,vals,p,bounds,color,2);
+        const entryIndex=Number(path.entry_index);
+        const entryVisible=Boolean(path.entry_visible!==false)&&Number.isInteger(entryIndex)&&entryIndex>=0&&entryIndex<vals.length;
+        if(!entryVisible)return;
+
+        const x=vals.length===1?p.l:p.l+(p.r-p.l)*entryIndex/(vals.length-1);
+        const entryDate=String(path.entry_date||path.points[entryIndex].date||"").slice(5);
+        const entryPrice=Number(path.entry_price);
+        const label=`买入 ${entryDate}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}`;
+        ctx.save();
+        ctx.strokeStyle=`${color}66`;ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(x,p.t);ctx.lineTo(x,p.b);ctx.stroke();ctx.setLineDash([]);
+        ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(x,y0,6,0,Math.PI*2);ctx.fill();
+        ctx.fillStyle=color;ctx.beginPath();ctx.arc(x,y0,4,0,Math.PI*2);ctx.fill();
+        ctx.font="10px Microsoft YaHei UI";
+        const labelWidth=ctx.measureText(label).width+10;
+        const labelX=Math.max(p.l,Math.min(x+7,p.r-labelWidth));
+        const upperY=y0-12-(j%3)*16;
+        const labelY=upperY>p.t+8?upperY:Math.min(y0+18+(j%3)*16,p.b-4);
+        ctx.fillStyle="rgba(255,255,255,.92)";ctx.fillRect(labelX-3,labelY-11,labelWidth,15);
+        ctx.fillStyle="#173f35";ctx.fillText(label,labelX+2,labelY);
+        ctx.restore();
+      });
+      if(legend)legend.innerHTML=usable.map((path,j)=>{
+        const color=palette[j%palette.length],entryDate=String(path.entry_date||"").slice(0,10);
+        const entryPrice=Number(path.entry_price),outside=path.entry_visible===false?"（窗口外）":"";
+        const entryText=entryDate?`买入 ${escapeHtml(entryDate)}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}${outside}`:"买入信息缺失";
+        return `<span class="legend-item" style="color:${color}"><i class="legend-line" style="background:${color}"></i><i class="legend-entry-dot" style="background:${color}"></i><span style="color:var(--muted)">${escapeHtml(String(path.symbol||""))} ${fmtPct(finite(path.unrealized_return))} · ${entryText}</span></span>`;
+      }).join("");
+    }
     function drawAllCharts(){drawPerformance();drawExcess();drawDrawdown();drawMulti("factorChart",factorHistory,"model_name","因子权重");drawMulti("moduleChart",moduleHistory,"factor_module","模块权重");drawHoldingPaths(window.latestHoldingPaths||[]);}
     function summaryLines(items,empty="暂无记录"){const rows=(items||[]).slice(0,10);return rows.length?rows.map(x=>`${String(x.name||"").padEnd(26)} ${String(x.count??"").padStart(5)} ${fmtPct(finite(x.share)).padStart(9)}`):[empty];}
     function renderTable(id,rows,columns,colspan){const body=document.getElementById(id);body.innerHTML=rows.length?rows.map(row=>`<tr>${columns.map(column=>`<td class="${column.tone?column.tone(row):""}">${column.render(row)}</td>`).join("")}</tr>`).join(""):`<tr><td colspan="${colspan}" class="empty">暂无数据</td></tr>`;}
@@ -468,10 +533,10 @@ HTML = r"""<!doctype html>
       const currentPoint={key:pointKey,date:dateKey,nav,navMultiple,benchmarkNav,excessNav,drawdown,cash:finite(exposure.cash),invested:finite(exposure.invested_value),actualExposure,validInvestedNav:previousInvested*(1+investedRet)};if(hasCurrent)history[history.length-1]=currentPoint;else history.push(currentPoint);if(history.length>1200)history=history.slice(-1200);
       const factorPoint={key:pointKey,date:dateKey,weights:ms.factor_weights||[]},modulePoint={key:pointKey,date:dateKey,weights:aggregateModules(ms.factor_weights||[])};if(factorHistory.length&&factorHistory[factorHistory.length-1].key===pointKey)factorHistory[factorHistory.length-1]=factorPoint;else factorHistory.push(factorPoint);if(moduleHistory.length&&moduleHistory[moduleHistory.length-1].key===pointKey)moduleHistory[moduleHistory.length-1]=modulePoint;else moduleHistory.push(modulePoint);if(factorHistory.length>1200)factorHistory=factorHistory.slice(-1200);if(moduleHistory.length>1200)moduleHistory=moduleHistory.slice(-1200);
       const returns=history.slice(1).map((x,i)=>x.nav/history[i].nav-1),mean=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0,sd=returns.length>1?Math.sqrt(returns.reduce((a,b)=>a+(b-mean)**2,0)/returns.length):0;
-      const totalReturn=navMultiple-1,maxDrawdown=Math.min(...history.map(x=>x.drawdown)),annualVol=sd*Math.sqrt(252),sharpe=sd>1e-12?mean/sd*Math.sqrt(252):NaN,cashDrag=investedRet-latestRet;
+      const totalReturn=navMultiple-1,maxDrawdown=Math.min(...history.map(x=>x.drawdown)),annualVol=sd*Math.sqrt(252),sharpe=sd>1e-12?mean/sd*Math.sqrt(252):NaN,sortino=annualizedSortino(returns,navMultiple,history.length),cashDrag=investedRet-latestRet;
       const seriesDrawdown=values=>Math.min(...values.map((v,i)=>v/Math.max(...values.slice(0,i+1))-1));
       const grossProfit=finite(ms.gross_profit),grossLoss=finite(ms.gross_loss),profitFactor=Math.abs(grossLoss)<=1e-12&&grossProfit>0?"∞":fmtNum(ms.profit_factor,2);
-      const metrics={total_return:[fmtPct(totalReturn),totalReturn],nav:[fmtNum(navMultiple,4),totalReturn],excess_nav:[fmtNum(excessNav,4),excessNav-1],current_drawdown:[fmtPct(drawdown),drawdown],account_max_drawdown:[fmtPct(maxDrawdown),maxDrawdown],holding_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.validInvestedNav))),-1],benchmark_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.benchmarkNav))),-1],excess_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.excessNav))),-1],benchmark_nav:[fmtNum(benchmarkNav,4),benchmarkNav-1],valid_invested_nav:[fmtNum(history[history.length-1].validInvestedNav,4),history[history.length-1].validInvestedNav-1],sharpe:[fmtNum(sharpe,2),sharpe],annual_volatility:[fmtPct(annualVol),-annualVol],cash:[fmtMoney(exposure.cash),0],cash_drag:[fmtPct(cashDrag),-cashDrag],holdings:[String(exposure.holding_count??0),0],risk_level:[String(ms.risk_level||"--").toUpperCase(),String(ms.risk_level||"").toLowerCase()==="normal"?1:-1],exposure_cap:[fmtPct(finite(ms.exposure_cap)),-finite(ms.exposure_cap)],target_exposure:[fmtPct(targetExposure),targetExposure],actual_exposure:[fmtPct(actualExposure),actualExposure],exposure_gap:[fmtPct(exposureGap),-exposureGap],idle_cash_ratio:[fmtPct(finite(ms.idle_cash_ratio)),-finite(ms.idle_cash_ratio)],target_holding_count:[String(ms.target_holding_count??0),0],holding_shortfall_count:[String(ms.holding_shortfall_count??0),-finite(ms.holding_shortfall_count)],tail_risk_proxy_mean:[fmtNum(ms.tail_risk_proxy_mean,3),.5-finite(ms.tail_risk_proxy_mean)],future_loss_risk_score_mean:[fmtNum(ms.future_loss_risk_score_mean,3),.5-finite(ms.future_loss_risk_score_mean)],downtrend_decay_count:[String(ms.downtrend_decay_count??0),-finite(ms.downtrend_decay_count)],lifecycle_alerts:[String(ms.lifecycle_alert_count??0),-finite(ms.lifecycle_alert_count)],candidate_count:[String(ms.candidate_count??0),0],confirmed_count:[String(ms.entry_confirmed_count??0),finite(ms.entry_confirmed_count)],order_count:[String(ms.order_count??0),0],pending_orders:[String(ms.pending_order_count??0),-finite(ms.pending_order_count)],buy_accuracy_5d:[fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN)),finite(ms.trailing_buy_accuracy_5d)-.5],sell_accuracy_5d:[fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN)),finite(ms.trailing_sell_accuracy_5d)-.5],closed_trade_win_rate:[fmtPct(finite(ms.closed_trade_win_rate,NaN)),finite(ms.closed_trade_win_rate)-.5],realized_pnl:[fmtMoney(ms.realized_pnl),finite(ms.realized_pnl)],gross_profit:[fmtMoney(grossProfit),grossProfit],gross_loss:[fmtMoney(grossLoss),grossLoss],profit_factor:[profitFactor,profitFactor==="∞"?1:finite(ms.profit_factor)-1],control_exit_count:[String(ms.control_exit_count??0),0],retail_lot_cash_insufficient_count:[String(ms.retail_lot_cash_insufficient_count??0),-finite(ms.retail_lot_cash_insufficient_count)],retail_state_block_count:[String(ms.retail_state_block_count??0),-finite(ms.retail_state_block_count)],surge_candidate_count:[String(ms.surge_candidate_count??0),finite(ms.surge_candidate_count)],strong_starter_count:[String(ms.strong_starter_count??0),finite(ms.strong_starter_count)],exhaustion_block_count:[String(ms.exhaustion_block_count??0),-finite(ms.exhaustion_block_count)],protecting_profit_count:[String(ms.protecting_profit_count??0),finite(ms.protecting_profit_count)]};
+      const metrics={total_return:[fmtPct(totalReturn),totalReturn],nav:[fmtNum(navMultiple,4),totalReturn],excess_nav:[fmtNum(excessNav,4),excessNav-1],current_drawdown:[fmtPct(drawdown),drawdown],account_max_drawdown:[fmtPct(maxDrawdown),maxDrawdown],holding_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.validInvestedNav))),-1],benchmark_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.benchmarkNav))),-1],excess_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.excessNav))),-1],benchmark_nav:[fmtNum(benchmarkNav,4),benchmarkNav-1],valid_invested_nav:[fmtNum(history[history.length-1].validInvestedNav,4),history[history.length-1].validInvestedNav-1],sharpe:[fmtNum(sharpe,2),sharpe],sortino:[fmtNum(sortino,2),sortino],annual_volatility:[fmtPct(annualVol),-annualVol],cash:[fmtMoney(exposure.cash),0],cash_drag:[fmtPct(cashDrag),-cashDrag],holdings:[String(exposure.holding_count??0),0],risk_level:[String(ms.risk_level||"--").toUpperCase(),String(ms.risk_level||"").toLowerCase()==="normal"?1:-1],exposure_cap:[fmtPct(finite(ms.exposure_cap)),-finite(ms.exposure_cap)],target_exposure:[fmtPct(targetExposure),targetExposure],actual_exposure:[fmtPct(actualExposure),actualExposure],exposure_gap:[fmtPct(exposureGap),-exposureGap],idle_cash_ratio:[fmtPct(finite(ms.idle_cash_ratio)),-finite(ms.idle_cash_ratio)],target_holding_count:[String(ms.target_holding_count??0),0],holding_shortfall_count:[String(ms.holding_shortfall_count??0),-finite(ms.holding_shortfall_count)],tail_risk_proxy_mean:[fmtNum(ms.tail_risk_proxy_mean,3),.5-finite(ms.tail_risk_proxy_mean)],future_loss_risk_score_mean:[fmtNum(ms.future_loss_risk_score_mean,3),.5-finite(ms.future_loss_risk_score_mean)],downtrend_decay_count:[String(ms.downtrend_decay_count??0),-finite(ms.downtrend_decay_count)],lifecycle_alerts:[String(ms.lifecycle_alert_count??0),-finite(ms.lifecycle_alert_count)],candidate_count:[String(ms.candidate_count??0),0],confirmed_count:[String(ms.entry_confirmed_count??0),finite(ms.entry_confirmed_count)],order_count:[String(ms.order_count??0),0],pending_orders:[String(ms.pending_order_count??0),-finite(ms.pending_order_count)],buy_accuracy_5d:[fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN)),finite(ms.trailing_buy_accuracy_5d)-.5],sell_accuracy_5d:[fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN)),finite(ms.trailing_sell_accuracy_5d)-.5],closed_trade_win_rate:[fmtPct(finite(ms.closed_trade_win_rate,NaN)),finite(ms.closed_trade_win_rate)-.5],realized_pnl:[fmtMoney(ms.realized_pnl),finite(ms.realized_pnl)],gross_profit:[fmtMoney(grossProfit),grossProfit],gross_loss:[fmtMoney(grossLoss),grossLoss],profit_factor:[profitFactor,profitFactor==="∞"?1:finite(ms.profit_factor)-1],control_exit_count:[String(ms.control_exit_count??0),0],retail_lot_cash_insufficient_count:[String(ms.retail_lot_cash_insufficient_count??0),-finite(ms.retail_lot_cash_insufficient_count)],retail_state_block_count:[String(ms.retail_state_block_count??0),-finite(ms.retail_state_block_count)],surge_candidate_count:[String(ms.surge_candidate_count??0),finite(ms.surge_candidate_count)],strong_starter_count:[String(ms.strong_starter_count??0),finite(ms.strong_starter_count)],exhaustion_block_count:[String(ms.exhaustion_block_count??0),-finite(ms.exhaustion_block_count)],protecting_profit_count:[String(ms.protecting_profit_count??0),finite(ms.protecting_profit_count)]};
       Object.entries(metrics).forEach(([key,value])=>setMetric(key,value[0],value[1]));
       const parityMetrics={
         retail_upgraded_to_one_lot_count:[String(ms.retail_upgraded_to_one_lot_count??0),finite(ms.retail_upgraded_to_one_lot_count)],

@@ -31,6 +31,7 @@ def main() -> int:
         return 0
     before_mtime = v1_summary.stat().st_mtime
     saved = run_factor_appeal_judge(
+        families={"rsi", "orderflow_proxy", "breakout"},
         max_days=120,
         output_root=Path("reports/verify_factor_appeal_judge"),
     )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import time
 
 from functions.decision_council.factor_registry import build_factor_registry, factor_registry_snapshot
 
@@ -23,6 +24,7 @@ def build_factor_research_reports(
     cluster_max_factors: int = 300,
     max_rows: int | None = None,
     include_missing_factors: bool = True,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, pd.DataFrame]:
     registry = registry or build_factor_registry()
     snapshot = factor_registry_snapshot(registry)
@@ -75,6 +77,7 @@ def build_factor_research_reports(
     registry_items = sorted(registry.items())
     total_factors = len(registry_items)
     for factor_index, (factor_name, meta) in enumerate(registry_items, start=1):
+        _check_validation_deadline(deadline_monotonic, factor_name=factor_name, horizon=None)
         if progress_callback is not None:
             progress_callback(
                 {
@@ -93,6 +96,7 @@ def build_factor_research_reports(
         direction_sign = _factor_direction_sign(meta.get("direction", "higher_better"))
         coverage_ratio = float(factor_values.notna().mean()) if len(factor_values) else 0.0
         for horizon in horizons:
+            _check_validation_deadline(deadline_monotonic, factor_name=factor_name, horizon=horizon)
             fwd_col = f"forward_return_{int(horizon)}d"
             frame = data[["date", "symbol", raw_column, fwd_col]].copy()
             frame[raw_column] = pd.to_numeric(frame[raw_column], errors="coerce")
@@ -149,6 +153,15 @@ def build_factor_research_reports(
             }]
         ),
     }
+
+
+def _check_validation_deadline(deadline_monotonic, *, factor_name: str, horizon) -> None:
+    if deadline_monotonic is None:
+        return
+    if time.monotonic() > float(deadline_monotonic):
+        raise TimeoutError(
+            f"factor validation deadline exceeded at factor={factor_name}, horizon={horizon}"
+        )
 
 
 def _factor_direction_sign(direction) -> float:

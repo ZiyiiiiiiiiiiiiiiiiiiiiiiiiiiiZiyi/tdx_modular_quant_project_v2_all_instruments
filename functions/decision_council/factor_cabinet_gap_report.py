@@ -45,6 +45,7 @@ def build_factor_cabinet_gap_report(
     sample_rows: int = 40_000,
     sample_days: int = 48,
     top_quantile: float = 0.2,
+    require_cache_metrics: bool = False,
     output_root: str | Path = REPORT_ROOT,
     progress_callback=None,
 ) -> dict[str, Path]:
@@ -100,6 +101,12 @@ def build_factor_cabinet_gap_report(
             progress("top_overlap_report", 78.0, f"rows={len(sample)}, raw_columns={len(raw_columns)}")
             overlap = _build_top_overlap_report(sample, raw_columns, top_quantile=top_quantile)
         except Exception as exc:
+            if require_cache_metrics:
+                raise RuntimeError(
+                    "factor_cabinet gap audit requires a current feature cache; "
+                    "run 'factor_cabinet feature cache/materialization' for this exact cabinet first. "
+                    f"Reason: {exc}"
+                ) from exc
             cache_status = {"status": "skipped_cache_metrics", "reason": str(exc)}
     saved["factor_value_spearman_corr"] = _write_csv(corr, run_dir / "factor_value_spearman_corr.csv")
     saved["top_quantile_overlap"] = _write_csv(overlap, run_dir / "top_quantile_overlap.csv")

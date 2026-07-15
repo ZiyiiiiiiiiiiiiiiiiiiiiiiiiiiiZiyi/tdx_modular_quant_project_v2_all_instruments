@@ -17,9 +17,14 @@ def main() -> int:
     assert label.startswith("cab_") and len(label) == 16, label
     root = build_output_path("governance_layer_validation", label, "hs300_csi500_a500_strict")
     artifact = root / "small_capital_branch" / "run20260711_153407" / "constraint_allocation_ledger.csv"
+    candidate_gate_part = root / "small_capital_branch" / "run20260711_153407" / "_audit" / "cg" / "cg_202410.csv"
     assert len(str(artifact)) < 240, (len(str(artifact)), artifact)
+    assert len(str(candidate_gate_part)) < 240, (len(str(candidate_gate_part)), candidate_gate_part)
     assert run_id not in label
-    print(f"[PASS] cabinet output label={label}; longest standard artifact path={len(str(artifact))}")
+    print(
+        f"[PASS] cabinet output label={label}; standard artifact path={len(str(artifact))}; "
+        f"candidate audit path={len(str(candidate_gate_part))}"
+    )
     return 0
 
 

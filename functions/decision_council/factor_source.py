@@ -25,6 +25,21 @@ _CABINET_ROLES = frozenset({
     "liquidity_filter", "hold_validation", "sell_trigger",
 })
 
+# These four appeal-judge factors are materialized by the main feature pipeline
+# under their established score columns. Keep this allowlist narrow: arbitrary
+# legacy score columns must not enter a factor cabinet unnoticed.
+FACTOR_CABINET_PASSTHROUGH_COLUMNS = frozenset({
+    "score_orderflow_close_drive",
+    "score_orderflow_efficiency",
+    "score_price_volume_breakout",
+    "score_turtle_breakout",
+})
+
+
+def is_factor_cabinet_runtime_column(column: object) -> bool:
+    value = str(column or "").strip()
+    return value.startswith("cand_") or value in FACTOR_CABINET_PASSTHROUGH_COLUMNS
+
 
 @dataclass(frozen=True)
 class FactorRuntimeContext:
@@ -39,6 +54,7 @@ class FactorRuntimeContext:
     family_map: object
     strict_entry_alpha_map: object
     diversity_gate: object
+    direction_map: object = None
 
     @property
     def alpha_models(self) -> tuple[str, ...]:
@@ -64,6 +80,7 @@ class FactorSourceSpec:
     module_map: dict[str, str] | None = None
     family_map: dict[str, str] | None = None
     strict_entry_alpha_map: dict[str, bool] | None = None
+    direction_map: dict[str, str] | None = None
     cabinet_manifest_hash: str = ""
 
     @property
@@ -100,6 +117,7 @@ class FactorSourceSpec:
                 family_map=MappingProxyType(dict(self.family_map or {})),
                 strict_entry_alpha_map=MappingProxyType(dict(self.strict_entry_alpha_map or {})),
                 diversity_gate=MappingProxyType(gate),
+                direction_map=MappingProxyType(dict(self.direction_map or {})),
             )
         return FactorRuntimeContext(
             factor_source=self.factor_source,
@@ -108,6 +126,7 @@ class FactorSourceSpec:
             model_feature_map=MappingProxyType({}), role_map=MappingProxyType({}),
             module_map=MappingProxyType({}), family_map=MappingProxyType({}),
             strict_entry_alpha_map=MappingProxyType({}), diversity_gate=MappingProxyType({}),
+            direction_map=MappingProxyType({}),
         )
 
     def summary_dict(self) -> dict:
@@ -206,15 +225,26 @@ def resolve_factor_source(
             alpha_bundle=LEGACY_GOVERNANCE_ALPHA_BUNDLE,
         )
 
-    if factor_cabinet_path:
-        path = Path(factor_cabinet_path)
-    elif source == FACTOR_SOURCE_LATEST_CABINET:
+    if source == FACTOR_SOURCE_LATEST_CABINET:
+        # Stale Web form fields must never pin an automatic-latest request to
+        # an older cabinet. Explicit paths belong to selected mode only.
         path = latest_factor_cabinet_path(root)
     else:
-        run_id = str(factor_cabinet_run_id or "").strip()
-        if not run_id:
+        requested_run_id = str(factor_cabinet_run_id or "").strip()
+        if not requested_run_id:
             raise ValueError("selected_factor_cabinet requires factor_cabinet_run_id")
-        path = Path(root) / run_id / "factor_cabinet.json"
+        path = (
+            Path(factor_cabinet_path)
+            if factor_cabinet_path
+            else Path(root) / requested_run_id / "factor_cabinet.json"
+        )
+        spec = _spec_from_cabinet_path(path, factor_source=source)
+        if spec.factor_cabinet_run_id != requested_run_id:
+            raise ValueError(
+                "selected_factor_cabinet run_id/path mismatch: "
+                f"requested {requested_run_id!r}, loaded {spec.factor_cabinet_run_id!r} from {path}"
+            )
+        return spec
     return _spec_from_cabinet_path(path, factor_source=source)
 
 
@@ -260,8 +290,20 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
     factor_name = frame["factor_name"].fillna("").astype(str).str.strip()
     module_series = frame["module"].fillna("").astype(str).str.strip()
     family_series = frame["family"].fillna("").astype(str).str.strip()
+    if "direction" in frame.columns:
+        direction_series = frame["direction"].fillna("higher_better").astype(str).str.strip()
+        direction_series = direction_series.where(direction_series.ne(""), "higher_better")
+    else:
+        direction_series = pd.Series("higher_better", index=frame.index)
+    invalid_directions = ~direction_series.isin({"higher_better", "lower_better"})
+    if invalid_directions.any():
+        raise ValueError(
+            "factor_cabinet contains invalid directions: "
+            f"{sorted(direction_series[invalid_directions].unique().tolist())}"
+        )
+    valid_runtime_column = raw_column.map(is_factor_cabinet_runtime_column)
     invalid = frame.loc[
-        factor_name.eq("") | raw_column.eq("") | ~raw_column.str.startswith("cand_")
+        factor_name.eq("") | raw_column.eq("") | ~valid_runtime_column
         | role_series.eq("") | ~role_series.isin(_CABINET_ROLES)
         | module_series.eq("") | family_series.eq(""),
         ["factor_name", "raw_column", "role", "module", "family"],
@@ -282,6 +324,10 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
     }
     module_map = {str(name): str(module) for name, module in zip(factor_name.tolist(), module_series.tolist())}
     family_map = {str(name): str(family) for name, family in zip(factor_name.tolist(), family_series.tolist())}
+    direction_map = {
+        str(name): str(direction)
+        for name, direction in zip(factor_name.tolist(), direction_series.tolist())
+    }
     strict_flags = frame.get("strict_entry_alpha", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
     strict_map = {str(name): bool(flag) for name, flag in zip(factor_name.tolist(), strict_flags.tolist())}
     invalid_strict = [name for name, flag in strict_map.items() if flag and role_map.get(name) != "entry_alpha"]
@@ -304,6 +350,7 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
         role_map=role_map,
         module_map=module_map,
         family_map=family_map,
+        direction_map=direction_map,
         strict_entry_alpha_map=strict_map,
         cabinet_manifest_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
     )

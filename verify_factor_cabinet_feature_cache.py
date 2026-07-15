@@ -4,10 +4,16 @@ from __future__ import annotations
 import inspect
 import sys
 from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
 
 from functions.decision_council.factor_cabinet_feature_cache import (
+    FACTOR_CABINET_FEATURE_CACHE_ROOT,
     build_factor_cabinet_feature_cache,
+    attach_factor_cabinet_feature_cache,
     load_factor_cabinet_feature_cache,
+    validate_factor_cabinet_feature_cache_artifacts,
 )
 from functions.decision_council.factor_source import (
     FACTOR_SOURCE_LATEST_CABINET,
@@ -153,6 +159,74 @@ def check_interactive_order_prepares_cache_first() -> None:
     _pass("interactive order prepares cache before governance")
 
 
+def check_partitioned_cache_artifact_contract() -> None:
+    manifests = sorted(
+        FACTOR_CABINET_FEATURE_CACHE_ROOT.glob("run*/factor_cabinet_features_*.manifest.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    partitioned = []
+    for manifest_path in manifests:
+        import json
+
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("storage_layout") == "partitioned_parquet_directory":
+            partitioned.append((manifest_path, payload))
+    if not partitioned:
+        _fail("partitioned cache artifact contract", "no partitioned cache manifest is available")
+    manifest_path, payload = partitioned[0]
+    parquet_path, checked_manifest = validate_factor_cabinet_feature_cache_artifacts(
+        payload.get("parquet_path", ""),
+        manifest_path,
+    )
+    if not parquet_path.is_dir() or checked_manifest != manifest_path.resolve():
+        _fail("partitioned cache artifact contract", f"unexpected artifacts: {parquet_path}, {checked_manifest}")
+    _pass("partitioned cache directory and manifest validate as one artifact")
+
+
+def check_preloaded_passthrough_columns_do_not_collide() -> None:
+    spec = FactorSourceSpec(
+        factor_source=FACTOR_SOURCE_LATEST_CABINET,
+        alpha_bundle="factor_cabinet:collision_smoke",
+        factor_cabinet_run_id="collision_smoke",
+        factor_cabinet_path="collision_smoke/factor_cabinet.json",
+        factor_count=2,
+        model_feature_map={
+            "passthrough": "score_existing",
+            "generated": "cand_missing",
+        },
+        role_map={"passthrough": "entry_alpha", "generated": "timing_filter"},
+    )
+    base = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+        "symbol": ["000001.SZ", "600000.SH"],
+        "score_existing": [1.0, 2.0],
+    })
+    cached_missing = pd.DataFrame({
+        "date": base["date"],
+        "symbol": base["symbol"],
+        "cand_missing": [3.0, 4.0],
+    })
+    with patch(
+        "functions.decision_council.factor_cabinet_feature_cache.load_factor_cabinet_feature_cache",
+        return_value=cached_missing,
+    ) as loader:
+        merged = attach_factor_cabinet_feature_cache(
+            base,
+            spec=spec,
+            start_date="2024-01-02",
+            end_date="2024-01-02",
+        )
+    requested = loader.call_args.kwargs.get("requested_columns")
+    if requested != ("cand_missing",):
+        _fail("preloaded passthrough cache merge", f"unexpected requested columns: {requested}")
+    if list(merged["score_existing"]) != [1.0, 2.0] or "cand_missing" not in merged.columns:
+        _fail("preloaded passthrough cache merge", f"bad merged columns: {list(merged.columns)}")
+    if any(column.endswith(("_x", "_y")) for column in merged.columns):
+        _fail("preloaded passthrough cache merge", f"merge suffix collision: {list(merged.columns)}")
+    _pass("preloaded score columns coexist with missing materialized cabinet columns")
+
+
 def main() -> int:
     checks = [
         check_latest_cabinet_resolves,
@@ -161,6 +235,8 @@ def main() -> int:
         check_runtime_uses_cache_for_cabinet,
         check_web_and_cli_entrypoints,
         check_interactive_order_prepares_cache_first,
+        check_partitioned_cache_artifact_contract,
+        check_preloaded_passthrough_columns_do_not_collide,
     ]
     failures = 0
     for check in checks:

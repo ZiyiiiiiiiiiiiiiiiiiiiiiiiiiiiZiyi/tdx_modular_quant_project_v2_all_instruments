@@ -30,6 +30,7 @@ def run_orderflow_parameter_research(
     max_variants: int | None = None,
     max_runtime_seconds: float = 1800.0,
     run_kind: str = "production",
+    progress_callback=None,
 ) -> dict[str, Path]:
     started = time.monotonic()
     run_id = datetime.now().strftime("run%Y%m%d_%H%M%S_%f")
@@ -38,12 +39,21 @@ def run_orderflow_parameter_research(
     status_path = output / "artifact_manifest.json"
     _write_manifest(status_path, run_id=run_id, run_kind=run_kind, status="running")
     try:
+        _emit_progress(progress_callback, percent=2.0, step="load_window", message="loading bounded feature window")
         data, analysis_dates = _load_window(
             Path(feature_path), start_date=start_date, end_date=end_date, max_days=max_days
         )
         specs = parameter_factor_specs()
         if max_variants is not None:
             specs = specs[: max(int(max_variants), 1)]
+        _emit_progress(
+            progress_callback,
+            percent=8.0,
+            step="evaluate_variants",
+            message=f"evaluating {len(specs)} parameter variants",
+            current=0,
+            total=len(specs),
+        )
         rows = []
         for index, spec in enumerate(specs, start=1):
             _check_deadline(started, max_runtime_seconds, detail=f"variant {index}/{len(specs)}")
@@ -60,6 +70,15 @@ def run_orderflow_parameter_research(
             for metric in metrics:
                 rows.append({**spec, **metric, "normalization": normalization})
             del work, factor
+            _emit_progress(
+                progress_callback,
+                percent=8.0 + 84.0 * index / max(len(specs), 1),
+                step="evaluate_variants",
+                message=str(spec.get("raw_column", "factor variant")),
+                current=index,
+                total=len(specs),
+            )
+        _emit_progress(progress_callback, percent=94.0, step="select_decisions", message="selecting parameter profiles")
         summary = pd.DataFrame(rows)
         decisions = _select_decisions(summary)
         summary.to_csv(output / "parameter_summary.csv", index=False, encoding="utf-8-sig")
@@ -70,6 +89,7 @@ def run_orderflow_parameter_research(
         decisions[decisions["new_decision"].eq("watchlist")].to_csv(
             output / "watchlist_v2.csv", index=False, encoding="utf-8-sig"
         )
+        _emit_progress(progress_callback, percent=98.0, step="save_artifacts", message="saving research artifacts")
         _write_manifest(
             status_path,
             run_id=run_id,
@@ -99,6 +119,11 @@ def run_orderflow_parameter_research(
             extra={"error": str(exc), "elapsed_seconds": round(time.monotonic() - started, 3)},
         )
         raise
+
+
+def _emit_progress(progress_callback, **payload) -> None:
+    if progress_callback is not None:
+        progress_callback(payload)
 
 
 def _load_window(path: Path, *, start_date=None, end_date=None, max_days=None):

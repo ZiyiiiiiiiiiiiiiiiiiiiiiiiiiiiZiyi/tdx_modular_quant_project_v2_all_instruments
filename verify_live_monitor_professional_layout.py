@@ -40,7 +40,7 @@ def main() -> None:
         "holdingPathChart", "benchmarkText", "exposureText", "entryGateText",
         "tradeQualityText", "riskModelText", "safetyText", "holdingsBody",
         "candidatesText", "ordersText", "pendingText", "orderReasonText",
-        "moduleWeightsBody", "factorWeightsBody", "lifecycleBody",
+        "moduleWeightsBody", "factorWeightsBody", "lifecycleBody", "holdingPathLegend",
     }
     for element_id in required_ids:
         assert f'id="{element_id}"' in HTML, element_id
@@ -51,16 +51,31 @@ def main() -> None:
         'data-tab="risk"',
         'data-tab="execution"',
         'data-tab="factors"',
+        'data-tab="holdings"',
+        'id="tab-holdings"',
+        '按实际入场价归一化为 1.0000',
         'addEventListener("mousemove"',
         'setTimeout(poll,1000)',
         "hydrateChartHistory(payload.chart_history)",
         "factorHistory[factorHistory.length-1].key===pointKey",
         'document.getElementById("runTitle").textContent=payload.title',
         "(stageCommand||finishCommand)&&payload.exposure",
+        "实心圆标记实际买入节点",
+        "const entryIndex=Number(path.entry_index)",
+        "ctx.arc(x,y0,4,0,Math.PI*2)",
+        "买入 ${entryDate}",
+        "path.entry_visible===false",
+        '["sortino","年化索提诺"]',
+        "function annualizedSortino(returns,navMultiple,tradingDays)",
+        "annualizedSortino(returns,navMultiple,history.length)",
+        "sortino:[fmtNum(sortino,2),sortino]",
     ):
         assert token in HTML, token
     assert "radial-gradient" not in HTML
     assert "border-radius: 14px" not in HTML
+    runner_source = (ROOT / "functions/decision_council/runner.py").read_text(encoding="utf-8")
+    assert "entry_date_ts >= first_visible_date" in runner_source
+    assert '"entry_visible": entry_index is not None' in runner_source
     legacy_html = _legacy_html()
     for object_name in ("ms", "exposure", "payload"):
         missing = _object_fields(legacy_html, object_name) - _object_fields(HTML, object_name)

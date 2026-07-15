@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import os
 import socket
 import sys
 import threading
@@ -15,12 +16,51 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from functions.decision_council.factor_source import list_factor_cabinet_runs
+from functions.decision_council.factor_source import (
+    FACTOR_SOURCE_CHOICES,
+    FACTOR_SOURCE_SELECTED_CABINET,
+    list_factor_cabinet_runs,
+)
 
 
 TRADE_PAIR_PREFIX = "backtest_trade_pairs_"
 OPEN_POSITION_PREFIX = "backtest_open_positions_"
 METRICS_PREFIX = "backtest_metrics_"
+MAX_SUBMIT_BODY_BYTES = 1024 * 1024
+DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID = "pruned_run20260714_184846_581132_20260715_230524"
+ALLOWED_INTERACTIVE_TASKS = frozenset(
+    {
+        "main_pipeline",
+        "governance_active",
+        "governance_mainline_review",
+        "governance_layer_validation",
+        "governance_layer_ablation_suite",
+        "fast_factor_judge",
+        "factor_appeal_judge",
+        "factor_cabinet",
+        "factor_cabinet_prune",
+        "factor_cabinet_feature_cache",
+        "factor_cabinet_gap_report",
+        "orderflow_parameter_research",
+        "pit_level1_audit",
+        "pit_level2_audit",
+        "pit_level2_build",
+        "registered_mainline_v2_suite",
+    }
+)
+TASKS_REQUIRING_FACTOR_SOURCE = frozenset(
+    {
+        "governance_active",
+        "governance_mainline_review",
+        "governance_layer_validation",
+        "governance_layer_ablation_suite",
+        "factor_cabinet",
+        "factor_cabinet_feature_cache",
+        "factor_cabinet_gap_report",
+        "factor_cabinet_prune",
+        "registered_mainline_v2_suite",
+    }
+)
 
 
 RUN_HTML = """<!doctype html>
@@ -31,36 +71,39 @@ RUN_HTML = """<!doctype html>
   <title>量化运行配置</title>
   <style>
     :root {
-      --bg: #f5efe5;
-      --panel: #fffdf7;
-      --line: #d6cfbd;
-      --ink: #173f35;
-      --muted: #6c675d;
-      --accent: #d4a84f;
+      --bg: #eef1ef;
+      --panel: #ffffff;
+      --line: #d8dfdb;
+      --ink: #1d2926;
+      --muted: #65716d;
+      --accent: #a87518;
+      --success: #087a55;
+      --blue: #246b9e;
       --danger: #b3403a;
     }
     body {
       margin: 0;
-      background: linear-gradient(160deg, #efe4d2 0%%, #f7f3ea 45%%, #e7efe8 100%%);
+      padding-bottom: 190px;
+      background: var(--bg);
       color: var(--ink);
       font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
     }
     .wrap {
-      max-width: 920px;
-      margin: 32px auto;
+      max-width: 1120px;
+      margin: 22px auto;
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 16px;
-      box-shadow: 0 16px 40px rgba(23, 63, 53, 0.10);
+      border-radius: 8px;
+      box-shadow: 0 8px 28px rgba(23, 45, 39, 0.08);
       overflow: hidden;
     }
     .head {
       padding: 20px 24px;
       background: #173f35;
-      color: #f7d774;
-      font-size: 22px;
-      font-weight: 700;
-      letter-spacing: 0.04em;
+      color: #f6faf8;
+      font-size: 20px;
+      font-weight: 650;
+      letter-spacing: 0;
       display: flex;
       justify-content: space-between;
       gap: 16px;
@@ -71,7 +114,7 @@ RUN_HTML = """<!doctype html>
       font-size: 14px;
       text-decoration: none;
       border: 1px solid rgba(255,255,255,0.35);
-      border-radius: 999px;
+      border-radius: 5px;
       padding: 7px 11px;
     }
     .body {
@@ -87,12 +130,12 @@ RUN_HTML = """<!doctype html>
       padding: 12px 14px;
       margin: 10px 0;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #fffef9;
+      border-radius: 6px;
+      background: #ffffff;
     }
     .item.recommended {
       border-color: #c99a2e;
-      background: linear-gradient(180deg, #fffaf0 0%, #fffdf7 100%);
+      background: #fffaf0;
       box-shadow: inset 4px 0 0 #c99a2e;
     }
     .item input {
@@ -108,8 +151,8 @@ RUN_HTML = """<!doctype html>
     .field {
       padding: 12px 14px;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #fffef9;
+      border-radius: 6px;
+      background: #ffffff;
     }
     .field label {
       display: block;
@@ -121,10 +164,10 @@ RUN_HTML = """<!doctype html>
       box-sizing: border-box;
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 9px;
+      border-radius: 5px;
       padding: 9px 10px;
       color: var(--ink);
-      background: #fffdf7;
+      background: #ffffff;
       font-size: 14px;
     }
     .hint {
@@ -132,7 +175,7 @@ RUN_HTML = """<!doctype html>
       padding: 14px 16px;
       background: #f8f2e4;
       border-left: 4px solid var(--accent);
-      border-radius: 10px;
+      border-radius: 6px;
       color: var(--muted);
       line-height: 1.55;
     }
@@ -150,7 +193,7 @@ RUN_HTML = """<!doctype html>
     }
     button {
       border: 0;
-      border-radius: 10px;
+      border-radius: 5px;
       padding: 12px 18px;
       font-size: 15px;
       cursor: pointer;
@@ -173,12 +216,25 @@ RUN_HTML = """<!doctype html>
       min-height: 20px;
     }
     .progress-box {
+      position: fixed;
+      left: 50%;
+      bottom: 12px;
+      width: min(1072px, calc(100% - 24px));
+      transform: translateX(-50%);
+      z-index: 15;
       margin-top: 16px;
-      padding: 14px 16px;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: #fffef9;
+      padding: 15px 16px 13px;
+      border: 1px solid #c8d2cd;
+      border-radius: 7px;
+      background: rgba(255,255,255,.97);
+      box-shadow: 0 7px 22px rgba(23,45,39,.12);
     }
+    .progress-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .progress-name { font-weight: 650; color: var(--ink); }
+    .progress-badges { display: flex; align-items: center; gap: 6px; }
+    .status-badge { padding: 3px 7px; border-radius: 4px; color: #285446; background: #e8f4ee; font-size: 11px; }
+    .connection-badge { padding: 3px 7px; border-radius: 4px; color: #315d7b; background: #eaf2f8; font-size: 11px; }
+    .connection-badge.error { color: #8f342f; background: #faeceb; }
     .progress-line {
       display: flex;
       justify-content: space-between;
@@ -188,17 +244,21 @@ RUN_HTML = """<!doctype html>
       margin-bottom: 8px;
     }
     .progress-track {
-      height: 12px;
-      background: #e8e1d2;
-      border-radius: 999px;
+      height: 8px;
+      background: #e8ecea;
+      border-radius: 4px;
       overflow: hidden;
     }
     .progress-fill {
       height: 100%;
       width: 0%;
-      background: #173f35;
+      background: var(--success);
       transition: width 0.3s ease;
     }
+    .progress-meta { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .progress-meta-item { min-width: 0; }
+    .progress-meta-label { color: #85908c; font-size: 10px; }
+    .progress-meta-value { margin-top: 2px; color: var(--ink); font: 12px Consolas, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     @media (max-width: 720px) {
       .wrap {
         margin: 12px;
@@ -209,6 +269,7 @@ RUN_HTML = """<!doctype html>
       .actions {
         flex-direction: column;
       }
+      .progress-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
@@ -224,12 +285,14 @@ RUN_HTML = """<!doctype html>
       <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
       <label class="item recommended"><input type="checkbox" id="fast_factor_judge">快速因子审判：只读现有特征和股票池，计算 IC/分层/换手成本/冗余，不跑状态机、不下单、不跑完整回测。</label>
       <label class="item recommended"><input type="checkbox" id="factor_appeal_judge">因子申诉审判：对 RSI、基本面、事件和另类代理等被旧门槛误杀的非 grid 因子单独复核。</label>
-      <label class="item recommended"><input type="checkbox" id="factor_cabinet">因子柜生成：从 486+114 和申诉审判结果中按模块、家族、角色、近亲关系生成状态机固定因子矩阵。</label>
+      <label class="item recommended"><input type="checkbox" id="factor_cabinet">因子柜生成：完整保留所选基柜，只追加申诉审判正式晋级的价值、质量、成长、事件、RSI、订单流和突破因子；无证据家族不会强制入柜。</label>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet_feature_cache">factor_cabinet 特征缓存/物化：预先生成因子柜所需 cand_ 特征缓存，治理回测只读缓存。</label>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet_gap_report">factor_cabinet 缺口审计：检查角色配比、家族集中、近亲重复、相关性和 top overlap，不新增因子。</label>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet_prune">factor_cabinet 去重/瘦身：按相关性、top overlap、角色和家族上限生成 pruned cabinet，不新增因子。</label>
       <label class="item recommended"><input type="checkbox" id="orderflow_parameter_research">订单流/突破参数重审：在限定窗口和时限内重审可执行日线代理，输出独立申诉结果，不改旧 cabinet。</label>
       <label class="item"><input type="checkbox" id="pit_level1_audit">PIT Level-1 状态审计：检查四类 PIT 表是否可用；正式模式缺失时拒绝运行。</label>
+      <label class="item"><input type="checkbox" id="pit_level2_audit">PIT Level-2 状态审计：检查财报、每日估值和公司事件表；正式模式缺失时拒绝运行。</label>
+      <label class="item"><input type="checkbox" id="pit_level2_build">PIT Level-2 本地构建：低内存读取本地 TDX 财务快照和市值历史，生成 research-only 财报、估值和事件表。</label>
       <label class="item"><input type="checkbox" id="registered_mainline_v2_suite">预登记主线 v1/v2 对照：固定运行四组实验，不临时扩充消融组合。</label>
 
       <div class="hint">
@@ -307,8 +370,8 @@ RUN_HTML = """<!doctype html>
           <label for="governance_factor_source">治理主线因子来源</label>
           <select id="governance_factor_source">
             <option value="legacy_bundle">legacy_bundle - 旧治理因子包</option>
-            <option value="latest_factor_cabinet" selected>latest_factor_cabinet - 自动使用最新 factor_cabinet</option>
-            <option value="selected_factor_cabinet">selected_factor_cabinet - 手动选择 factor_cabinet run_id</option>
+            <option value="latest_factor_cabinet">latest_factor_cabinet - 自动使用最新 factor_cabinet</option>
+            <option value="selected_factor_cabinet" selected>selected_factor_cabinet - 手动选择 factor_cabinet run_id</option>
           </select>
         </div>
         <div class="field">
@@ -367,7 +430,7 @@ RUN_HTML = """<!doctype html>
         <div>
           <button class="primary" onclick="submitSelected()">运行所选任务</button>
           <button class="primary" onclick="submitFastFactorJudge()">只运行快速因子审判</button>
-          <button class="primary" onclick="submitFactorCabinetFlow()">只构建因子柜</button>
+          <button class="primary" onclick="submitFactorCabinetFlow()">构建新因子柜（申诉 + 订单流/突破重审）</button>
           <button class="primary" onclick="submitDiagnosticSuite()">只运行增强诊断</button>
           <button class="secondary" onclick="submitLayerSuiteOnly()">只运行层消融套件</button>
           <button class="secondary" onclick="submitAll()">运行全部任务</button>
@@ -376,12 +439,22 @@ RUN_HTML = """<!doctype html>
       </div>
       <div id="status"></div>
       <div class="progress-box">
+        <div class="progress-heading">
+          <div><div class="progress-name" id="progress_task">等待任务</div><div class="mini" id="progress_message">选择任务后将在这里显示完整运行链路。</div></div>
+          <div class="progress-badges"><span class="status-badge" id="progress_status">IDLE</span><span class="connection-badge" id="progress_connection">接口正常</span></div>
+        </div>
         <div class="progress-line">
-          <span id="progress_title">Progress: waiting for task</span>
+          <span id="progress_title">任务组尚未开始</span>
           <span id="progress_percent">0%</span>
         </div>
         <div class="progress-track"><div class="progress-fill" id="progress_fill"></div></div>
-        <div class="mini" id="progress_detail">Step: -; ETA: -</div>
+        <div class="progress-meta">
+          <div class="progress-meta-item"><div class="progress-meta-label">当前阶段</div><div class="progress-meta-value" id="progress_step">-</div></div>
+          <div class="progress-meta-item"><div class="progress-meta-label">任务计数</div><div class="progress-meta-value" id="progress_count">-</div></div>
+          <div class="progress-meta-item"><div class="progress-meta-label">已用 / 预计剩余</div><div class="progress-meta-value" id="progress_time">- / -</div></div>
+          <div class="progress-meta-item"><div class="progress-meta-label">最后更新</div><div class="progress-meta-value" id="progress_updated">-</div></div>
+        </div>
+        <div class="mini" id="progress_detail">等待运行数据</div>
       </div>
     </div>
   </div>
@@ -397,7 +470,7 @@ RUN_HTML = """<!doctype html>
       }
       const factorSource = document.getElementById("governance_factor_source");
       if (factorSource) {
-        factorSource.value = "latest_factor_cabinet";
+        factorSource.value = "selected_factor_cabinet";
       }
       startProgressPolling();
     });
@@ -450,17 +523,21 @@ RUN_HTML = """<!doctype html>
       const alphaBundleNode = document.getElementById("governance_alpha_bundle");
       let alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
       const factorSourceNode = document.getElementById("governance_factor_source");
-      const factorSource = factorSourceNode ? factorSourceNode.value : "latest_factor_cabinet";
+      const factorSource = factorSourceNode ? factorSourceNode.value : "selected_factor_cabinet";
       const cabinetNode = document.getElementById("factor_cabinet_run_id");
       const cabinetRunId = cabinetNode ? cabinetNode.value : "";
       const cabinetPath = cabinetNode && cabinetNode.selectedOptions.length ? (cabinetNode.selectedOptions[0].dataset.path || "") : "";
-      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "orderflow_parameter_research" || task === "pit_level1_audit" || task === "registered_mainline_v2_suite");
+      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "orderflow_parameter_research" || task === "pit_level1_audit" || task === "pit_level2_audit" || task === "pit_level2_build" || task === "registered_mainline_v2_suite");
       const requiresUniverse = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "orderflow_parameter_research" || task === "registered_mainline_v2_suite");
+      const requiresFactorSource = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "registered_mainline_v2_suite");
       if (tasks.some((task) => task === "governance_layer_validation")) {
         alphaBundle = "diversified_pre_screen_bundle_v2";
       }
       if (requiresUniverse && universes.length === 0) {
         throw new Error("请至少选择一个治理股票池。");
+      }
+      if (requiresFactorSource && factorSource === "selected_factor_cabinet" && !cabinetRunId) {
+        throw new Error("selected_factor_cabinet requires an available factor cabinet run_id.");
       }
       if (startMonth && endMonth && startMonth > endMonth) {
         throw new Error("开始月份不能晚于结束月份。");
@@ -512,14 +589,25 @@ RUN_HTML = """<!doctype html>
       return `${hours}h ${minutes % 60}m`;
     }
     async function loadProgressOnce() {
-      const response = await fetch("/api/progress");
+      const response = await fetch(`/api/progress?_=${Date.now()}`, {cache: "no-store"});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
       const percent = Number(data.percent || 0);
-      document.getElementById("progress_title").textContent = `${data.task_name || "task"} | ${data.status || "idle"} | ${data.message || ""}`;
+      const childName = data.child_task_name || data.step || "";
+      document.getElementById("progress_task").textContent = childName || data.task_name || "等待任务";
+      document.getElementById("progress_message").textContent = data.message || "等待任务写入进度";
+      document.getElementById("progress_status").textContent = String(data.status || "idle").toUpperCase();
+      document.getElementById("progress_title").textContent = data.task_name === "interactive_task_suite" ? "所选任务总体进度" : (data.task_name || "运行进度");
       document.getElementById("progress_percent").textContent = `${percent.toFixed(1)}%`;
       document.getElementById("progress_fill").style.width = `${Math.max(0, Math.min(percent, 100))}%`;
-      const countText = data.current && data.total ? `; count: ${data.current}/${data.total}` : "";
-      document.getElementById("progress_detail").textContent = `Step: ${data.step || "-"}${countText}; detail: ${data.detail || "-"}; elapsed: ${formatDuration(data.elapsed_seconds)}; ETA: ${formatDuration(data.eta_seconds)}`;
+      document.getElementById("progress_step").textContent = data.step || "-";
+      document.getElementById("progress_count").textContent = data.current && data.total ? `${data.current} / ${data.total}` : "-";
+      document.getElementById("progress_time").textContent = `${formatDuration(data.elapsed_seconds)} / ${formatDuration(data.eta_seconds)}`;
+      document.getElementById("progress_updated").textContent = data.updated_at_text || "-";
+      document.getElementById("progress_detail").textContent = data.detail || (data.child_status ? `子任务状态：${data.child_status}` : "进度接口已连接");
+      const connection = document.getElementById("progress_connection");
+      connection.textContent = "接口正常";
+      connection.classList.remove("error");
       return data;
     }
     let progressTimer = null;
@@ -531,21 +619,26 @@ RUN_HTML = """<!doctype html>
       progressTimer = setInterval(async () => {
         try {
           const data = await loadProgressOnce();
-          if (["complete", "failed"].includes(String(data.status || ""))) {
+          const suiteFinished = String(data.task_name || "") === "interactive_task_suite"
+            && ["complete", "failed"].includes(String(data.status || ""));
+          if (suiteFinished) {
             progressTerminalSeen = true;
             clearInterval(progressTimer);
             progressTimer = null;
           }
         } catch (err) {
           if (!progressTerminalSeen) {
-            document.getElementById("progress_detail").textContent = `Progress read failed: ${err.message || err}`;
+            const connection = document.getElementById("progress_connection");
+            connection.textContent = "正在重连";
+            connection.classList.add("error");
+            document.getElementById("progress_detail").textContent = `进度接口暂时不可用，页面会继续重试：${err.message || err}`;
           }
         }
-      }, 2000);
+      }, 1000);
     }
     async function submitSelected() {
       const tasks = [];
-      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet", "factor_cabinet_prune", "factor_cabinet_feature_cache", "factor_cabinet_gap_report", "orderflow_parameter_research", "pit_level1_audit", "registered_mainline_v2_suite"].forEach((id) => {
+      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet", "factor_cabinet_prune", "factor_cabinet_feature_cache", "factor_cabinet_gap_report", "orderflow_parameter_research", "pit_level1_audit", "pit_level2_audit", "pit_level2_build", "registered_mainline_v2_suite"].forEach((id) => {
         const node = document.getElementById(id);
         if (node && node.checked) tasks.push(id);
       });
@@ -591,10 +684,10 @@ RUN_HTML = """<!doctype html>
       }
     }
     async function submitFactorCabinetFlow() {
-      const tasks = ["factor_appeal_judge", "factor_cabinet"];
+      const tasks = ["factor_appeal_judge", "orderflow_parameter_research", "factor_cabinet"];
       const shadowNode = document.getElementById("shadow_portfolios");
       if (shadowNode) shadowNode.checked = false;
-      ["factor_appeal_judge", "factor_cabinet"].forEach((id) => {
+      ["factor_appeal_judge", "orderflow_parameter_research", "factor_cabinet"].forEach((id) => {
         const node = document.getElementById(id);
         if (node) node.checked = true;
       });
@@ -1135,12 +1228,36 @@ def _write_selection(state_path: Path, payload: dict) -> None:
 
 def _sanitize_selection_payload(payload: dict) -> dict:
     if not isinstance(payload, dict):
-        return {}
+        raise ValueError("Selection payload must be a JSON object.")
     clean = dict(payload)
     tasks = clean.get("tasks")
     if not isinstance(tasks, list):
-        return clean
-    tasks = [str(task) for task in tasks]
+        raise ValueError("Selection tasks must be a list.")
+    tasks = list(dict.fromkeys(str(task).strip() for task in tasks if str(task).strip()))
+    unknown_tasks = sorted(set(tasks) - ALLOWED_INTERACTIVE_TASKS)
+    if unknown_tasks:
+        raise ValueError(f"Unsupported interactive tasks: {unknown_tasks}")
+    if "factor_cabinet" in tasks:
+        # A Web cabinet build is the complete research flow.  Prevent a stale
+        # checkbox submission from silently rebuilding against an old appeal.
+        tasks = [
+            task for task in ("factor_appeal_judge", "orderflow_parameter_research", *tasks)
+            if task in ALLOWED_INTERACTIVE_TASKS
+        ]
+        tasks = list(dict.fromkeys(tasks))
+    governance = clean.get("governance", {})
+    if governance is not None and not isinstance(governance, dict):
+        raise ValueError("Selection governance settings must be a JSON object.")
+    governance = governance or {}
+    if set(tasks) & TASKS_REQUIRING_FACTOR_SOURCE:
+        factor_source = str(governance.get("factor_source") or "").strip()
+        if factor_source not in FACTOR_SOURCE_CHOICES:
+            raise ValueError(f"Unsupported governance factor_source: {factor_source!r}")
+        if (
+            factor_source == FACTOR_SOURCE_SELECTED_CABINET
+            and not str(governance.get("factor_cabinet_run_id") or "").strip()
+        ):
+            raise ValueError("selected_factor_cabinet requires factor_cabinet_run_id")
     allow_multi_task = bool(clean.get("allow_multi_task", False))
     # Mainline review and the enhanced diagnostic suite are both long governance
     # jobs. If a stale browser page or checkbox state submits both, prefer the
@@ -1168,6 +1285,8 @@ def _json_response(handler: BaseHTTPRequestHandler, payload: dict, status: int =
     body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
@@ -1177,6 +1296,8 @@ def _html_response(handler: BaseHTTPRequestHandler, body_text: str) -> None:
     data = body_text.encode("utf-8")
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
@@ -1187,8 +1308,26 @@ def _render_factor_cabinet_options() -> str:
     if not rows:
         return '<option value="" data-path="">未找到 results/factor_cabinet 下的 factor_cabinet.json</option>'
     options = []
-    for index, row in enumerate(rows):
+    payloads_by_run_id = _factor_cabinet_payloads(rows)
+    available_run_ids = {str(row.get("run_id") or "") for row in rows}
+    selected_run_id, default_reason = _select_default_factor_cabinet_run(rows)
+    if selected_run_id not in available_run_ids:
+        options.append(
+            f'<option value="" data-path="" selected>'
+            f'默认因子柜不可用：{html.escape(selected_run_id)}；请重新选择或先生成因子柜'
+            f'</option>'
+        )
+    for row in rows:
         run_id = str(row.get("run_id") or "")
+        payload = payloads_by_run_id.get(run_id, {})
+        artifact_type = str(payload.get("artifact_type") or "").strip()
+        lineage_state = (
+            "pruned"
+            if artifact_type == "factor_cabinet_pruned"
+            else "pending_prune"
+            if artifact_type == "factor_cabinet_pit_augmented"
+            else "base"
+        )
         label = (
             f"{run_id} - {int(row.get('factor_count') or 0)} factors; "
             f"strict_entry_alpha={int(row.get('strict_entry_alpha_count') or 0)}, "
@@ -1196,14 +1335,66 @@ def _render_factor_cabinet_options() -> str:
             f"timing_filter={int(row.get('timing_filter_count') or 0)}, "
             f"risk_override={int(row.get('risk_override_count') or 0)}, "
             f"liquidity_filter={int(row.get('liquidity_filter_count') or 0)}, "
-            f"hold_validation={int(row.get('hold_validation_count') or 0)}"
+            f"hold_validation={int(row.get('hold_validation_count') or 0)}; "
+            f"lineage={lineage_state}"
         )
-        selected = " selected" if index == 0 else ""
+        if run_id == selected_run_id:
+            label += f"; default={default_reason}"
+        selected = " selected" if run_id == selected_run_id else ""
         options.append(
             f'<option value="{html.escape(run_id)}" data-path="{html.escape(str(row.get("path") or ""))}"{selected}>'
             f"{html.escape(label)}</option>"
         )
     return "\n".join(options)
+
+
+def _select_default_factor_cabinet_run(rows: list[dict]) -> tuple[str, str]:
+    """Prefer the newest PIT-augmented lineage, then the pinned safe base."""
+    payloads = _factor_cabinet_payloads(rows)
+
+    def belongs_to_augmented_lineage(run_id: str, seen: set[str] | None = None) -> bool:
+        visited = set(seen or ())
+        if not run_id or run_id in visited:
+            return False
+        visited.add(run_id)
+        payload = payloads.get(run_id, {})
+        if (
+            bool(payload.get("default_eligible"))
+            and (
+                str(payload.get("generation_policy") or "") == "pit_augmented_v2"
+                or str(payload.get("artifact_type") or "") == "factor_cabinet_pit_augmented"
+            )
+        ):
+            return True
+        source_run_id = str(payload.get("source_run_id") or "")
+        return belongs_to_augmented_lineage(source_run_id, visited) if source_run_id else False
+
+    # list_factor_cabinet_runs() is newest first, so a pruned descendant created
+    # after its augmented source naturally wins without relying on run-id text.
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        if belongs_to_augmented_lineage(run_id):
+            return run_id, "latest_pit_augmented"
+    available = {str(row.get("run_id") or "") for row in rows}
+    if DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID in available:
+        return DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID, "safe_base_fallback"
+    return DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID, "configured_default_missing"
+
+
+def _factor_cabinet_payloads(rows: list[dict]) -> dict[str, dict]:
+    payloads: dict[str, dict] = {}
+    for row in rows:
+        run_id = str(row.get("run_id") or "")
+        path = Path(str(row.get("path") or ""))
+        if not run_id or not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            payloads[run_id] = payload
+    return payloads
 
 
 def _render_run_html() -> str:
@@ -1803,7 +1994,7 @@ def main(argv: list[str]) -> int:
     stop_event = threading.Event()
     shutdown_scheduled = {"done": False}
 
-    def schedule_shutdown(delay_seconds: float = 8.0) -> None:
+    def schedule_shutdown(delay_seconds: float = 3.0) -> None:
         if shutdown_scheduled["done"]:
             return
         shutdown_scheduled["done"] = True
@@ -1849,9 +2040,12 @@ def main(argv: list[str]) -> int:
                 try:
                     from functions.runtime_progress import read_progress
 
-                    progress = read_progress()
+                    progress = read_progress(owner_pid=os.getppid())
                     _json_response(self, progress)
-                    if str(progress.get("status", "")).lower() in {"complete", "failed"}:
+                    if (
+                        str(progress.get("task_name", "")) == "interactive_task_suite"
+                        and str(progress.get("status", "")).lower() in {"complete", "failed"}
+                    ):
                         schedule_shutdown()
                 except Exception as exc:
                     _json_response(self, {"status": "unknown", "message": f"progress read failed: {exc}"}, status=500)
@@ -1869,13 +2063,28 @@ def main(argv: list[str]) -> int:
             if self.path != "/submit":
                 self.send_error(404)
                 return
-            length = int(self.headers.get("Content-Length", "0") or 0)
+            host_name = str(self.headers.get("Host", "")).split(":", 1)[0].strip().lower()
+            if host_name not in {"127.0.0.1", "localhost"}:
+                _json_response(self, {"message": "Task submission is restricted to localhost."}, status=403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                _json_response(self, {"message": "Invalid Content-Length."}, status=400)
+                return
+            if length <= 0:
+                _json_response(self, {"message": "Request body is required."}, status=400)
+                return
+            if length > MAX_SUBMIT_BODY_BYTES:
+                _json_response(self, {"message": "Request body is too large."}, status=413)
+                return
             raw = self.rfile.read(length)
             try:
-                payload = json.loads(raw.decode("utf-8")) if raw else {}
-            except Exception:
-                payload = {}
-            _write_selection(state_path, payload if isinstance(payload, dict) else {})
+                payload = json.loads(raw.decode("utf-8"))
+                _write_selection(state_path, payload)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                _json_response(self, {"message": f"Invalid selection request: {exc}"}, status=400)
+                return
             _json_response(self, {"message": "选择已记录，可以关闭本页面。"})
 
         def log_message(self, format, *args):

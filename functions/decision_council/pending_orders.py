@@ -101,24 +101,34 @@ class PendingOrderBook:
             self.orders.at[index, "decision_id"] = payload["decision_id"]
         return str(self.orders.at[index, "order_id"])
 
-    def settle_day(self, trade_date, fills: dict[str, float] | None = None, blocked_symbols=()) -> pd.DataFrame:
+    def settle_day(
+        self,
+        trade_date,
+        fills: dict[str, float] | None = None,
+        blocked_symbols=(),
+        blocked_reasons: dict[str, str] | None = None,
+    ) -> pd.DataFrame:
         trade_date = pd.Timestamp(trade_date)
         before = self.orders.copy(deep=True).set_index("order_id", drop=False)
         fills = fills or {}
         blocked = {str(symbol) for symbol in blocked_symbols}
+        reason_by_symbol = {str(symbol): str(reason) for symbol, reason in (blocked_reasons or {}).items()}
         for index, order in self.orders.iterrows():
             if order["status"] not in {"pending", "pending_locked"}:
                 continue
             symbol = str(order["symbol"])
             if symbol in blocked:
+                block_reason = reason_by_symbol.get(symbol, "liquidity_locked")
                 if str(order["side"]) == "buy":
                     self.orders.at[index, "status"] = "expired"
-                    self.orders.at[index, "expired_reason"] = "daily_expiry"
-                    self.orders.at[index, "block_reason"] = "liquidity_locked"
+                    self.orders.at[index, "expired_reason"] = (
+                        block_reason if block_reason != "liquidity_locked" else "daily_expiry"
+                    )
+                    self.orders.at[index, "block_reason"] = block_reason
                     continue
                 lock_days = int(order["lock_days"]) + 1
                 self.orders.at[index, "lock_days"] = lock_days
-                self.orders.at[index, "block_reason"] = "liquidity_locked"
+                self.orders.at[index, "block_reason"] = block_reason
                 if str(order["side"]) == "sell" and lock_days > GOVERNANCE_LOCK_HAIRCUT_DAYS:
                     self.orders.at[index, "status"] = "pending_locked"
                 continue

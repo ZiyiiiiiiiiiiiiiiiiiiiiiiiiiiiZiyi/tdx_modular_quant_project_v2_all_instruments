@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import json
+import hashlib
+import time
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,13 @@ from functions.decision_council.factor_pool_contract import load_factor_pool_con
 from functions.decision_council.factor_registry import build_factor_registry
 from functions.decision_council.factor_validation import build_factor_research_reports
 from functions.factors.technical_timing_factors import append_rsi_timing_factors, rsi_timing_registry_rows
+from functions.data.pit_level2_store import (
+    DEFAULT_PIT_LEVEL2_ROOT,
+    PitLevel2UnavailableError,
+    run_pit_level2_preflight,
+)
+from functions.factors.pit_factor_materialization import attach_pit_level2_factors
+from functions.factors.pit_factor_registry import pit_factor_registry_rows
 
 
 DEFAULT_V1_RUN_DIR = Path(
@@ -52,8 +61,20 @@ def run_factor_appeal_judge(
     families: set[str] | None = None,
     max_days: int | None = None,
     run_kind: str = "production",
+    pit_mode: str = "research",
+    pit_level2_root: str | Path = DEFAULT_PIT_LEVEL2_ROOT,
+    pit_max_symbols: int = 200,
+    max_runtime_seconds: float = 1800.0,
+    progress_callback=None,
 ) -> dict[str, Path]:
+    def progress(percent: float, step: str, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback({"percent": float(percent), "step": step, "message": message})
+
     v1_dir = Path(v1_run_dir)
+    if float(max_runtime_seconds) <= 0.0:
+        raise ValueError("max_runtime_seconds must be positive")
+    deadline_monotonic = time.monotonic() + float(max_runtime_seconds)
     summary_path = v1_dir / "fast_factor_summary.csv"
     manifest_path = v1_dir / "fast_factor_judge_manifest.csv"
     if not summary_path.exists():
@@ -62,6 +83,7 @@ def run_factor_appeal_judge(
     output = Path(output_root) / run_id
     output.mkdir(parents=True, exist_ok=False)
 
+    progress(8.0, "profile_mapping", "loading judge profiles and factor contracts")
     profiles = load_factor_judge_profiles()
     v1_contract = load_factor_pool_contract(summary_path)
     mapping_report, unmapped = build_profile_mapping_report(v1_contract, profiles=profiles)
@@ -70,9 +92,19 @@ def run_factor_appeal_judge(
 
     target_families = set(families or APPEAL_TARGET_FAMILIES)
     appeal_parts = []
+    pending_reasons: dict[str, str] = {}
     if "rsi" in target_families:
-        appeal_parts.append(_run_rsi_appeal(v1_dir, feature_path=Path(feature_path), profiles=profiles, max_days=max_days))
+        progress(22.0, "rsi_appeal", "evaluating RSI timing and risk roles")
+        appeal_parts.append(_run_rsi_appeal(
+            v1_dir,
+            feature_path=Path(feature_path),
+            profiles=profiles,
+            max_days=max_days,
+            deadline_monotonic=deadline_monotonic,
+            progress_callback=progress,
+        ))
     if target_families.intersection({"orderflow_proxy", "breakout"}):
+        progress(40.0, "flow_breakout_appeal", "evaluating orderflow proxies and sparse breakouts")
         appeal_parts.append(
             _run_flow_breakout_appeal(
                 v1_dir,
@@ -80,6 +112,42 @@ def run_factor_appeal_judge(
                 include_breakout="breakout" in target_families,
             )
         )
+    pit_families = target_families.intersection({
+        "growth", "profitability", "cashflow", "valuation", "investment", "event"
+    })
+    if pit_families:
+        progress(48.0, "pit_level2_appeal", "evaluating PIT fundamental and event factors")
+        try:
+            preflight = run_pit_level2_preflight(mode=pit_mode, root=pit_level2_root)
+            required_tables = {
+                "event": {"corporate_event_pit"},
+                "fundamental": {"financial_statement_pit", "valuation_daily_pit"},
+            }
+            missing = set(preflight.get("missing_tables", []))
+            executable = set(pit_families)
+            if missing & required_tables["fundamental"]:
+                unavailable = executable - {"event"}
+                executable -= unavailable
+                pending_reasons.update({family: "pit_level2_financial_or_valuation_table_unavailable" for family in unavailable})
+            if "corporate_event_pit" in missing and "event" in executable:
+                executable.remove("event")
+                pending_reasons["event"] = "pit_level2_event_table_unavailable"
+            if executable:
+                appeal_parts.extend(_run_pit_level2_appeals(
+                    v1_dir,
+                    feature_path=Path(feature_path),
+                    families=executable,
+                    profiles=profiles,
+                    max_days=max_days,
+                    pit_level2_root=pit_level2_root,
+                    pit_max_symbols=pit_max_symbols,
+                    deadline_monotonic=deadline_monotonic,
+                ))
+        except PitLevel2UnavailableError:
+            if str(pit_mode).lower() == "formal":
+                raise
+            pending_reasons.update({family: "pit_level2_preflight_failed" for family in pit_families})
+    progress(82.0, "merge_decisions", "merging role-aware appeal decisions")
     nonempty_parts = [part.dropna(axis=1, how="all") for part in appeal_parts if part is not None and not part.empty]
     appeal = pd.concat(nonempty_parts, ignore_index=True) if nonempty_parts else _empty_appeal_summary()
     if appeal.empty:
@@ -87,10 +155,11 @@ def run_factor_appeal_judge(
     appeal["v1_run_dir"] = str(v1_dir)
     appeal["appeal_run_id"] = run_id
     appeal = appeal[_appeal_columns()]
+    progress(92.0, "save_artifacts", "saving appeal artifacts and distributions")
     appeal.to_csv(output / "appeal_summary.csv", index=False, encoding="utf-8-sig")
     _write_split_outputs(appeal, output)
     _write_distribution_outputs(appeal, output)
-    _write_pending_family_report(target_families, appeal, output)
+    _write_pending_family_report(target_families, appeal, output, pending_reasons=pending_reasons)
     _write_manifest(v1_dir, manifest_path, output, run_id)
     (output / "appeal_report.md").write_text(_render_appeal_report(appeal, output), encoding="utf-8")
     artifact_manifest = output / "artifact_manifest.json"
@@ -98,7 +167,7 @@ def run_factor_appeal_judge(
         json.dumps(
             {
                 "artifact_type": "factor_appeal_judge",
-                "artifact_version": "v3_role_aware_rsi_orderflow_breakout",
+                "artifact_version": "v4_pit_level2_fundamental_event",
                 "run_id": run_id,
                 "run_kind": str(run_kind or "production").strip().lower(),
                 "status": "complete",
@@ -112,6 +181,7 @@ def run_factor_appeal_judge(
         ),
         encoding="utf-8",
     )
+    progress(100.0, "complete", "factor appeal judge complete")
     return {
         "output_dir": output,
         "appeal_summary": output / "appeal_summary.csv",
@@ -125,13 +195,35 @@ def run_factor_appeal_judge(
     }
 
 
-def _run_rsi_appeal(v1_dir: Path, *, feature_path: Path, profiles: dict, max_days: int | None = None) -> pd.DataFrame:
+def _run_rsi_appeal(
+    v1_dir: Path,
+    *,
+    feature_path: Path,
+    profiles: dict,
+    max_days: int | None = None,
+    deadline_monotonic: float | None = None,
+    progress_callback=None,
+) -> pd.DataFrame:
     profile = profiles["technical_timing"]
     manifest = _read_manifest(v1_dir / "fast_factor_judge_manifest.csv")
     start_date = manifest.get("analysis_start_date") or None
     end_date = manifest.get("analysis_end_date") or None
+    _check_deadline(deadline_monotonic, "rsi_feature_load")
     data = _load_feature_window(feature_path, start_date=start_date, end_date=end_date, max_days=max_days)
-    data = append_rsi_timing_factors(data, close_col="close_nominal" if "close_nominal" in data.columns else "close")
+    if progress_callback is not None:
+        progress_callback(24.0, "rsi_feature_loaded", f"loaded RSI feature window rows={len(data)}")
+    stage_percent = iter((27.0, 30.0, 33.0, 35.0))
+    data = append_rsi_timing_factors(
+        data,
+        close_col="close_nominal" if "close_nominal" in data.columns else "close",
+        progress_callback=(
+            lambda step, message: progress_callback(next(stage_percent, 35.0), step, message)
+        ) if progress_callback is not None else None,
+    )
+    data = _trim_analysis_days(data, max_days=max_days)
+    _check_deadline(deadline_monotonic, "rsi_factor_validation")
+    if progress_callback is not None:
+        progress_callback(37.0, "rsi_validation", f"judging RSI factors rows={len(data)}")
     registry = {}
     metrics = profile.metrics
     for row in rsi_timing_registry_rows():
@@ -151,6 +243,7 @@ def _run_rsi_appeal(v1_dir: Path, *, feature_path: Path, profiles: dict, max_day
         horizons=profile.horizons,
         emit_quantile_rows=False,
         cluster_max_factors=0,
+        deadline_monotonic=deadline_monotonic,
     )
     validation = reports.get("governance_factor_validation_report", pd.DataFrame())
     return _summarize_appeal_validation(
@@ -162,6 +255,157 @@ def _run_rsi_appeal(v1_dir: Path, *, feature_path: Path, profiles: dict, max_day
     )
 
 
+def _run_pit_level2_appeals(
+    v1_dir: Path,
+    *,
+    feature_path: Path,
+    families: set[str],
+    profiles: dict,
+    max_days: int | None,
+    pit_level2_root,
+    pit_max_symbols: int,
+    deadline_monotonic: float,
+) -> list[pd.DataFrame]:
+    manifest = _read_manifest(v1_dir / "fast_factor_judge_manifest.csv")
+    data = _load_feature_window(
+        feature_path,
+        start_date=manifest.get("analysis_start_date") or None,
+        end_date=manifest.get("analysis_end_date") or None,
+        max_days=max_days,
+        max_symbols=pit_max_symbols,
+    )
+    specs = pit_factor_registry_rows(families=families)
+    data = attach_pit_level2_factors(
+        data,
+        requested_columns={row["raw_column"] for row in specs},
+        root=pit_level2_root,
+    )
+    data = _trim_analysis_days(data, max_days=max_days)
+    parts = []
+    profile_groups = {
+        "fundamental_medium": [row for row in specs if row["family"] != "event"],
+        "event_decay": [row for row in specs if row["family"] == "event"],
+    }
+    old_lookup = _old_decision_lookup(v1_dir / "fast_factor_summary.csv")
+    for profile_name, rows in profile_groups.items():
+        if not rows:
+            continue
+        profile = profiles[profile_name]
+        if profile_name == "event_decay":
+            parts.append(_summarize_event_window_appeal(
+                data,
+                rows=rows,
+                profile=profile,
+                old_decision_lookup=old_lookup,
+            ))
+            continue
+        metrics = profile.metrics
+        registry = {
+            row["factor_name"]: {
+                **row,
+                "horizons": "|".join(str(item) for item in profile.horizons),
+                "min_coverage": float(metrics.get("require_coverage", 0.0)),
+                "min_abs_rank_ic": float(metrics.get("min_rank_ic_abs", 0.0)),
+                "min_ic_ir": float(metrics.get("min_ic_ir", 0.0)),
+                "min_rank_ic_positive_ratio": float(metrics.get("min_positive_ic_ratio", 0.0)),
+                "min_top_bottom_spread_10d": -999.0,
+                "min_sample_count": int(metrics.get("min_event_count", 500)),
+            }
+            for row in rows
+        }
+        reports = build_factor_research_reports(
+            data,
+            registry=registry,
+            horizons=profile.horizons,
+            emit_quantile_rows=False,
+            cluster_max_factors=0,
+            deadline_monotonic=deadline_monotonic,
+        )
+        validation = reports.get("governance_factor_validation_report", pd.DataFrame())
+        for family in sorted({row["family"] for row in rows}):
+            names = {row["factor_name"] for row in rows if row["family"] == family}
+            family_validation = validation[validation["factor_name"].isin(names)].copy()
+            parts.append(_summarize_appeal_validation(
+                family_validation,
+                registry=registry,
+                judge_profile=profile.name,
+                factor_type=family,
+                old_decision_lookup=old_lookup,
+                parameter_version="pit_level2_v1",
+            ))
+    return parts
+
+
+def _summarize_event_window_appeal(
+    data: pd.DataFrame,
+    *,
+    rows: list[dict],
+    profile,
+    old_decision_lookup: dict[str, str],
+) -> pd.DataFrame:
+    """Judge sparse events on event onsets, not on the many zero-valued days."""
+    work = data.sort_values(["symbol", "date"]).copy()
+    close_col = "close_nominal" if "close_nominal" in work.columns else "close"
+    close = pd.to_numeric(work[close_col], errors="coerce")
+    metrics = profile.metrics
+    output = []
+    for meta in rows:
+        raw_column = meta["raw_column"]
+        signal = pd.to_numeric(work.get(raw_column), errors="coerce").fillna(0.0)
+        previous = signal.groupby(work["symbol"], sort=False).shift(1).fillna(0.0)
+        onset = signal.ne(0.0) & previous.eq(0.0)
+        event_count = int(onset.sum())
+        direction_sign = -1.0 if meta.get("direction") == "lower_better" else 1.0
+        horizon_rows = []
+        for horizon in profile.horizons:
+            future = close.groupby(work["symbol"], sort=False).shift(-int(horizon)) / close - 1.0
+            market = future.groupby(work["date"], sort=False).transform("mean")
+            directional_excess = (future - market) * direction_sign
+            sample = directional_excess[onset].dropna()
+            horizon_rows.append({
+                "horizon": int(horizon),
+                "count": int(len(sample)),
+                "win_rate": float(sample.gt(0.0).mean()) if not sample.empty else np.nan,
+                "avg_excess": float(sample.mean()) if not sample.empty else np.nan,
+            })
+        evidence = pd.DataFrame(horizon_rows)
+        ranked = evidence.sort_values(["avg_excess", "win_rate"], ascending=False, na_position="last")
+        best = ranked.iloc[0] if not ranked.empty else pd.Series(dtype=object)
+        enough = event_count >= int(metrics.get("min_event_count", 100))
+        win_pass = _num_or_nan(best.get("win_rate")) >= float(metrics.get("min_win_rate", 0.53))
+        return_pass = _num_or_nan(best.get("avg_excess")) >= float(metrics.get("min_avg_excess_return", 0.002))
+        positive_curve = int((pd.to_numeric(evidence.get("avg_excess"), errors="coerce") > 0.0).sum()) >= 2
+        if enough and win_pass and return_pass and positive_curve:
+            decision, promote, watch, reject = "promote_candidate", "event_decay_profile_pass", "", ""
+        elif event_count >= max(30, int(metrics.get("min_event_count", 100)) // 2) and (win_pass or return_pass):
+            decision, promote, watch, reject = "watchlist", "", "near_pass_under_event_decay", ""
+        else:
+            decision, promote, watch, reject = "reject_or_rework", "", "", "insufficient_event_window_evidence"
+        output.append({
+            "factor_name": meta["factor_name"], "raw_column": raw_column,
+            "direction": meta.get("direction", "higher_better"),
+            "parameter_version": "pit_level2_event_window_v1",
+            "factor_family": meta.get("family", "event"), "factor_type": "event",
+            "judge_profile": profile.name,
+            "old_decision": old_decision_lookup.get(meta["factor_name"], "not_in_v1"),
+            "new_decision": decision, "old_role": "not_in_v1",
+            "new_role": _final_role_for_factor(meta["factor_name"], meta, decision),
+            "rank_ic": np.nan, "ic_ir": np.nan,
+            "positive_ic_ratio": best.get("win_rate", np.nan),
+            "top_bottom_spread": best.get("avg_excess", np.nan),
+            "coverage": float(onset.mean()), "event_count": event_count,
+            "win_rate": best.get("win_rate", np.nan),
+            "avg_excess_return": best.get("avg_excess", np.nan),
+            "reject_reason": reject, "promote_reason": promote, "watchlist_reason": watch,
+        })
+    return pd.DataFrame(output)
+
+
+def _num_or_nan(value) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return float(numeric) if pd.notna(numeric) else float("nan")
+
+
 def _summarize_appeal_validation(
     validation: pd.DataFrame,
     *,
@@ -169,6 +413,7 @@ def _summarize_appeal_validation(
     judge_profile: str,
     factor_type: str,
     old_decision_lookup: dict[str, str],
+    parameter_version: str = "rsi_timing_v1",
 ) -> pd.DataFrame:
     rows = []
     if validation is None or validation.empty:
@@ -182,13 +427,13 @@ def _summarize_appeal_validation(
         pass_count = int(group["pass_flag"].sum())
         if pass_count >= 1:
             decision = "promote_candidate"
-            promote_reason = "technical_timing_profile_pass"
+            promote_reason = f"{judge_profile}_pass"
             watchlist_reason = ""
             reject_reason = ""
         elif _near_pass(group):
             decision = "watchlist"
             promote_reason = ""
-            watchlist_reason = "near_pass_under_technical_timing_profile"
+            watchlist_reason = f"near_pass_under_{judge_profile}"
             reject_reason = ""
         else:
             decision = "reject_or_rework"
@@ -201,7 +446,7 @@ def _summarize_appeal_validation(
                 "factor_name": factor_name,
                 "raw_column": meta.get("raw_column", ""),
                 "direction": meta.get("direction", "higher_better"),
-                "parameter_version": "rsi_timing_v1",
+                "parameter_version": parameter_version,
                 "factor_family": meta.get("family", factor_type),
                 "factor_type": factor_type,
                 "judge_profile": judge_profile,
@@ -337,14 +582,24 @@ def _final_role_for_factor(factor_name: str, meta: dict, decision: str) -> str:
         return "risk_override"
     if "percentile" in name:
         return "hold_validation"
-    return "timing_filter"
+    roles = [role for role in str(meta.get("allowed_roles", "")).split("|") if role]
+    return roles[0] if roles else "timing_filter"
 
 
-def _load_feature_window(feature_path: Path, *, start_date=None, end_date=None, max_days: int | None = None) -> pd.DataFrame:
+def _load_feature_window(
+    feature_path: Path,
+    *,
+    start_date=None,
+    end_date=None,
+    max_days: int | None = None,
+    max_symbols: int | None = None,
+) -> pd.DataFrame:
     import pyarrow.parquet as pq
 
     available = set(pq.read_schema(feature_path).names)
-    columns = [column for column in ["date", "symbol", "close_nominal", "close", "instrument_type"] if column in available]
+    columns = [column for column in [
+        "date", "symbol", "close_nominal", "close", "instrument_type", "sector_parent"
+    ] if column in available]
     filters = []
     effective_start = pd.Timestamp(start_date) if start_date else None
     effective_end = pd.Timestamp(end_date) if end_date else None
@@ -356,12 +611,43 @@ def _load_feature_window(feature_path: Path, *, start_date=None, end_date=None, 
         filters.append(("date", ">=", effective_start))
     if effective_end is not None:
         filters.append(("date", "<=", effective_end))
+    if max_symbols is not None:
+        if int(max_symbols) <= 0:
+            raise ValueError("max_symbols must be positive")
+        selector_columns = [column for column in ("symbol", "instrument_type") if column in available]
+        selector = pd.read_parquet(feature_path, columns=selector_columns, filters=filters or None)
+        if "instrument_type" in selector.columns:
+            selector = selector[selector["instrument_type"].astype(str).eq("stock")]
+        symbols = [
+            symbol for symbol in selector["symbol"].dropna().astype(str).unique()
+            if symbol.startswith(("sh", "sz"))
+        ]
+        symbols = sorted(
+            symbols,
+            key=lambda symbol: hashlib.sha256(symbol.encode("utf-8")).hexdigest(),
+        )[:int(max_symbols)]
+        if not symbols:
+            raise ValueError("PIT appeal symbol selection produced no Shanghai/Shenzhen stocks")
+        filters.append(("symbol", "in", symbols))
     data = pd.read_parquet(feature_path, columns=columns, filters=filters or None)
     if max_days is not None and not data.empty:
         dates = sorted(pd.to_datetime(data["date"], errors="coerce").dropna().unique())
         keep_dates = set(dates[-(int(max_days) + 280):])
         data = data[pd.to_datetime(data["date"], errors="coerce").isin(keep_dates)].copy()
     return data
+
+
+def _trim_analysis_days(data: pd.DataFrame, *, max_days: int | None) -> pd.DataFrame:
+    if max_days is None or data.empty:
+        return data
+    dates = sorted(pd.to_datetime(data["date"], errors="coerce").dropna().unique())
+    keep_dates = set(dates[-max(int(max_days), 1):])
+    return data[pd.to_datetime(data["date"], errors="coerce").isin(keep_dates)].copy()
+
+
+def _check_deadline(deadline_monotonic: float | None, stage: str) -> None:
+    if deadline_monotonic is not None and time.monotonic() > float(deadline_monotonic):
+        raise TimeoutError(f"factor appeal runtime limit exceeded during {stage}")
 
 
 def _old_decision_lookup(summary_path: Path) -> dict[str, str]:
@@ -397,9 +683,20 @@ def _write_distribution_outputs(appeal: pd.DataFrame, output: Path) -> None:
         frame.to_csv(output / name, index=False, encoding="utf-8-sig")
 
 
-def _write_pending_family_report(target_families: set[str], appeal: pd.DataFrame, output: Path) -> None:
+def _write_pending_family_report(
+    target_families: set[str],
+    appeal: pd.DataFrame,
+    output: Path,
+    *,
+    pending_reasons: dict[str, str] | None = None,
+) -> None:
     completed = set(appeal.get("factor_type", pd.Series(dtype=object)).astype(str))
-    rows = [{"factor_family": family, "status": "completed" if family in completed else "pending"} for family in sorted(target_families)]
+    reasons = pending_reasons or {}
+    rows = [{
+        "factor_family": family,
+        "status": "completed" if family in completed else "pending",
+        "reason": "" if family in completed else reasons.get(family, "not_implemented_or_no_valid_rows"),
+    } for family in sorted(target_families)]
     pd.DataFrame(rows).to_csv(output / "appeal_family_status.csv", index=False, encoding="utf-8-sig")
 
 
@@ -408,7 +705,7 @@ def _write_manifest(v1_dir: Path, manifest_path: Path, output: Path, run_id: str
         [
             {
                 "appeal_run_id": run_id,
-                "appeal_version": "v3_role_aware_rsi_orderflow_breakout",
+                "appeal_version": "v4_pit_level2_fundamental_event",
                 "v1_judge_version": "v1_fast_strict",
                 "v1_use_as": "first_pass_filter",
                 "v1_run_dir": str(v1_dir),
@@ -426,7 +723,7 @@ def _render_appeal_report(appeal: pd.DataFrame, output: Path) -> str:
         [
             "# Factor Appeal Judge v2 Report",
             "",
-            "Scope: RSI timing, orderflow proxy, and sparse breakout appeals. Fundamental, event, and alternative proxy appeals remain pending.",
+            "Scope: RSI timing, orderflow proxy, sparse breakout, and available PIT Level-2 fundamental/event appeals.",
             "",
             f"Output directory: `{output}`",
             f"Decision counts: {counts}",
@@ -499,7 +796,8 @@ def merge_appeal_artifacts(
     output.mkdir(parents=True, exist_ok=False)
     saved: dict[str, Path] = {"output_dir": output}
     for name, parts in frames.items():
-        combined = pd.concat(parts, ignore_index=True, sort=False) if parts else _empty_appeal_summary()
+        usable_parts = [part.dropna(axis=1, how="all") for part in parts if part is not None and not part.empty]
+        combined = pd.concat(usable_parts, ignore_index=True, sort=False) if usable_parts else _empty_appeal_summary()
         if "factor_name" in combined.columns:
             sort_columns = [column for column in ("research_score", "ic_ir", "rank_ic") if column in combined.columns]
             if sort_columns:

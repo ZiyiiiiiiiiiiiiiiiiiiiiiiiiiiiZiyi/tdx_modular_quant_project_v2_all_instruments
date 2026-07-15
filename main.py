@@ -347,6 +347,16 @@ def parse_args():
         help="Audit Level-1 PIT table availability and fail-closed readiness.",
     )
     parser.add_argument(
+        "--pit-level2-audit",
+        action="store_true",
+        help="Audit Level-2 PIT financial, valuation, and corporate-event readiness.",
+    )
+    parser.add_argument(
+        "--pit-level2-build",
+        action="store_true",
+        help="Build research-only PIT Level-2 tables from local TDX snapshots in low-memory mode.",
+    )
+    parser.add_argument(
         "--registered-mainline-v2-suite",
         action="store_true",
         help="Run the four pre-registered production_v1/mainline_v2 comparisons.",
@@ -1141,7 +1151,18 @@ def _run_single_governance_variant(
     output_dir = GOVERNANCE_OUTPUT_DIR / selected_universe_name / variant_name / output_alpha_bundle
     if _is_small_capital_profile(capital_profile):
         output_dir = output_dir / "small_capital_branch"
-    control_mode = _governance_control_mode_from_args(argparse.Namespace(governance_control_mode=governance_control_mode))
+    requested_control_mode = _governance_control_mode_from_args(
+        argparse.Namespace(governance_control_mode=governance_control_mode)
+    )
+    control_mode = requested_control_mode
+    if variant_name == "governance_layer_validation" and requested_control_mode == "normal":
+        control_mode = "factor_only"
+    if variant_name == "governance_layer_validation" and control_mode == "factor_only":
+        capital_profile = dict(capital_profile)
+        capital_profile["retail_min_entry_matrix_score"] = min(
+            float(capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0),
+            0.0,
+        )
     if control_mode != "normal":
         control_dir_names = {
             "factor_only": "ctrl_factor",
@@ -1151,6 +1172,12 @@ def _run_single_governance_variant(
         output_dir = output_dir / control_dir_names.get(control_mode, f"ctrl_{control_mode}")
     if not bool(alpha_collapse_exit_enabled):
         output_dir = output_dir / "no_alpha_collapse_exit"
+    if str(strategy_logic_version).strip().lower() != "production_v1":
+        logic_dir = {"mainline_v2": "v2"}.get(
+            str(strategy_logic_version).strip().lower(),
+            "logic_custom",
+        )
+        output_dir = output_dir / logic_dir
     output_dir = dated_run_dir(output_dir)
     return run_governance_backtest(
         start_date=start_date,
@@ -1160,6 +1187,7 @@ def _run_single_governance_variant(
         governance_variant=variant_name,
         enable_sector_cap=variant_spec.enable_sector_cap,
         enable_safety_agent=variant_spec.enable_safety_agent,
+        enable_market_regime_policy=variant_spec.enable_market_regime_policy,
         enable_reputation=variant_spec.enable_reputation,
         entry_confirmation_mode=variant_spec.extra.get("entry_confirmation_mode", "full"),
         policy_exit_mode=variant_spec.extra.get("exit_mode", "full"),
@@ -1297,6 +1325,8 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         "factor_cabinet_feature_cache",
         "orderflow_parameter_research",
         "pit_level1_audit",
+        "pit_level2_audit",
+        "pit_level2_build",
         "registered_mainline_v2_suite",
     }
     if not any(task in governance_tasks for task in tasks):
@@ -1339,6 +1369,7 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
     control_mode = str(governance.get("control_mode", "")).strip()
     if control_mode:
         runtime_args.governance_control_mode = control_mode
+        runtime_args.governance_control_mode = _governance_control_mode_from_args(runtime_args)
     if "alpha_collapse_exit_enabled" in governance:
         runtime_args.disable_alpha_collapse_exit = not bool(governance.get("alpha_collapse_exit_enabled"))
     alpha_bundle = str(governance.get("alpha_bundle", "")).strip()
@@ -1346,7 +1377,9 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         runtime_args.governance_alpha_bundle = alpha_bundle
     factor_source = str(governance.get("factor_source", "")).strip()
     if factor_source:
-        runtime_args.factor_source = factor_source
+        from functions.decision_council.factor_source import normalize_factor_source
+
+        runtime_args.factor_source = normalize_factor_source(factor_source)
     factor_cabinet_run_id = str(governance.get("factor_cabinet_run_id", "")).strip()
     if factor_cabinet_run_id:
         runtime_args.factor_cabinet_run_id = factor_cabinet_run_id
@@ -1355,6 +1388,8 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         runtime_args.factor_cabinet_path = factor_cabinet_path
     strategy_logic_version = str(governance.get("strategy_logic_version", "")).strip()
     if strategy_logic_version:
+        if strategy_logic_version not in {"production_v1", "mainline_v2"}:
+            raise ValueError(f"Invalid strategy logic version: {strategy_logic_version}")
         runtime_args.strategy_logic_version = strategy_logic_version
     pit_mode = str(governance.get("pit_mode", "")).strip()
     if pit_mode:
@@ -1791,12 +1826,20 @@ def run_fast_factor_judge_from_main(args):
 def run_factor_appeal_judge_from_main(args):
     """Run the v2 factor appeal judge for timing/fundamental/event proxy families."""
     from functions.decision_council.factor_appeal_judge import run_factor_appeal_judge
-    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
 
     reset_progress(task_name="factor_appeal_judge", total=1, message="starting factor appeal judge")
     try:
         saved = run_factor_appeal_judge(
             max_days=getattr(args, "governance_max_days", None),
+            pit_mode=getattr(args, "pit_mode", "research"),
+            progress_callback=lambda payload: write_progress(
+                task_name="factor_appeal_judge",
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+            ),
         )
         print("Factor appeal judge saved:")
         for name, path in sorted(saved.items()):
@@ -1811,7 +1854,7 @@ def run_factor_appeal_judge_from_main(args):
 def run_orderflow_parameter_research_from_main(args):
     """Run bounded executable order-flow proxy and sparse-breakout research."""
     from functions.decision_council.orderflow_parameter_research import run_orderflow_parameter_research
-    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
 
     task_name = "orderflow_parameter_research"
     reset_progress(task_name=task_name, total=1, message="starting bounded orderflow parameter research")
@@ -1826,6 +1869,16 @@ def run_orderflow_parameter_research_from_main(args):
             max_days=research_max_days,
             max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
             run_kind="production",
+            progress_callback=lambda payload: write_progress(
+                task_name=task_name,
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                current=payload.get("current"),
+                total=payload.get("total"),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+                detail=str(payload.get("detail", "")),
+            ),
         )
         print("Orderflow parameter research saved:")
         for name, path in sorted(saved.items()):
@@ -1843,7 +1896,7 @@ def run_pit_level1_audit_from_main(args):
 
     from functions.data.pit_level1_store import pit_store_status, run_pit_preflight
     from functions.data.pit_source_readiness import audit_existing_pit_sources
-    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
 
     task_name = "pit_level1_audit"
     reset_progress(task_name=task_name, total=1, message="auditing PIT Level-1 store")
@@ -1852,10 +1905,13 @@ def run_pit_level1_audit_from_main(args):
     )
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
+        write_progress(task_name=task_name, percent=15.0, step="table_status", message="checking PIT table availability")
         status_path = output_dir / "pit_table_status.csv"
         pit_store_status().to_csv(status_path, index=False, encoding="utf-8-sig")
+        write_progress(task_name=task_name, percent=45.0, step="source_readiness", message="checking local PIT source readiness")
         readiness_path = output_dir / "pit_source_readiness.csv"
         audit_existing_pit_sources().to_csv(readiness_path, index=False, encoding="utf-8-sig")
+        write_progress(task_name=task_name, percent=75.0, step="runtime_preflight", message="running PIT fail-closed preflight")
         audit_path = output_dir / "pit_runtime_audit.json"
         run_pit_preflight(mode=getattr(args, "pit_mode", "research"), output_path=audit_path)
         saved = {
@@ -1867,7 +1923,68 @@ def run_pit_level1_audit_from_main(args):
         print("PIT Level-1 audit saved:")
         for name, path in sorted(saved.items()):
             print(f"  {name}: {path}")
+        write_progress(task_name=task_name, percent=95.0, step="save_artifacts", message="PIT audit artifacts saved")
         complete_progress(task_name=task_name, message="PIT Level-1 audit complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_pit_level2_audit_from_main(args):
+    """Audit the three PIT Level-2 inputs required by the new factor families."""
+    from datetime import datetime
+
+    from functions.data.pit_level2_store import pit_level2_store_status, run_pit_level2_preflight
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    task_name = "pit_level2_audit"
+    reset_progress(task_name=task_name, total=1, message="auditing PIT Level-2 store")
+    output_dir = RESULT_DIR / "decision_council" / "pit_level2_audit" / datetime.now().strftime(
+        "run%Y%m%d_%H%M%S_%f"
+    )
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        write_progress(task_name=task_name, percent=25.0, step="table_status", message="checking PIT Level-2 tables")
+        status_path = output_dir / "pit_level2_table_status.csv"
+        pit_level2_store_status().to_csv(status_path, index=False, encoding="utf-8-sig")
+        write_progress(task_name=task_name, percent=70.0, step="runtime_preflight", message="running PIT Level-2 preflight")
+        audit_path = output_dir / "pit_level2_runtime_audit.json"
+        run_pit_level2_preflight(mode=getattr(args, "pit_mode", "research"), output_path=audit_path)
+        saved = {"output_dir": output_dir, "table_status": status_path, "runtime_audit": audit_path}
+        print("PIT Level-2 audit saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="PIT Level-2 audit complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_pit_level2_build_from_main(args):
+    """Build bounded research-only Level-2 tables from existing local artifacts."""
+    from functions.data.pit_level2_tdx_builder import publish_research_pit_level2_low_memory
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    task_name = "pit_level2_build"
+    reset_progress(task_name=task_name, total=1, message="building research-only PIT Level-2 tables")
+    try:
+        saved = publish_research_pit_level2_low_memory(
+            max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
+            progress_callback=lambda payload: write_progress(
+                task_name=task_name,
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+                detail=str(payload.get("detail", "")),
+            )
+        )
+        print("PIT Level-2 research tables saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="PIT Level-2 research build complete")
         return saved
     except Exception as exc:
         fail_progress(task_name=task_name, message=str(exc))
@@ -1877,7 +1994,7 @@ def run_pit_level1_audit_from_main(args):
 def run_registered_mainline_v2_suite_from_main(args):
     """Run the four fixed v1/v2 comparisons; no dynamic experiment expansion."""
     from run_governance_experiments import run_registered_mainline_v2_suite
-    from functions.runtime_progress import complete_progress, fail_progress, reset_progress
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
 
     task_name = "registered_mainline_v2_suite"
     reset_progress(task_name=task_name, total=4, message="starting registered mainline v2 suite")
@@ -1894,6 +2011,16 @@ def run_registered_mainline_v2_suite_from_main(args):
             capital_profile=_capital_profile_from_args(args),
             pit_mode=getattr(args, "pit_mode", "research"),
             max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
+            progress_callback=lambda payload: write_progress(
+                task_name=task_name,
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                current=payload.get("current"),
+                total=payload.get("total"),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+                detail=str(payload.get("detail", "")),
+            ),
         )
         complete_progress(task_name=task_name, message="registered mainline v2 suite complete")
         return saved
@@ -1905,12 +2032,23 @@ def run_registered_mainline_v2_suite_from_main(args):
 def run_factor_cabinet_from_main(args):
     """Build the final factor cabinet consumed by state-machine input adapters."""
     from functions.factor_selection.factor_cabinet_builder import build_factor_cabinet
+    from functions.decision_council.factor_source import resolve_factor_source
     from functions.runtime_progress import complete_progress, fail_progress, reset_progress
 
     reset_progress(task_name="factor_cabinet", total=1, message="starting factor cabinet build")
     try:
+        base_cabinet_path = None
+        factor_source = str(getattr(args, "factor_source", "") or "").strip()
+        if factor_source in {"latest_factor_cabinet", "selected_factor_cabinet"}:
+            base_spec = resolve_factor_source(
+                factor_source=factor_source,
+                factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
+                factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
+            )
+            base_cabinet_path = base_spec.factor_cabinet_path
         saved = build_factor_cabinet(
             appeal_run_dir=getattr(args, "factor_appeal_run_dir", None),
+            base_cabinet_path=base_cabinet_path,
         )
         print("Factor cabinet saved:")
         for name, path in sorted(saved.items()):
@@ -1924,7 +2062,10 @@ def run_factor_cabinet_from_main(args):
 
 def run_factor_cabinet_feature_cache_from_main(args):
     """Materialize generated candidate features required by a factor_cabinet run."""
-    from functions.decision_council.factor_cabinet_feature_cache import build_factor_cabinet_feature_cache
+    from functions.decision_council.factor_cabinet_feature_cache import (
+        build_factor_cabinet_feature_cache,
+        validate_factor_cabinet_feature_cache_artifacts,
+    )
     from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
 
     factor_source = getattr(args, "factor_source", "latest_factor_cabinet")
@@ -1951,7 +2092,7 @@ def run_factor_cabinet_feature_cache_from_main(args):
         )
 
     try:
-        build_factor_cabinet_feature_cache(
+        parquet_path, manifest_path = build_factor_cabinet_feature_cache(
             factor_source=factor_source,
             factor_cabinet_run_id=getattr(args, "factor_cabinet_run_id", ""),
             factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
@@ -1959,7 +2100,15 @@ def run_factor_cabinet_feature_cache_from_main(args):
             end_date=end_date,
             progress_callback=_progress,
         )
+        parquet_path, manifest_path = validate_factor_cabinet_feature_cache_artifacts(
+            parquet_path,
+            manifest_path,
+        )
         complete_progress(task_name="factor_cabinet_feature_cache", message="factor_cabinet feature cache complete")
+        return {
+            "factor_cabinet_feature_cache": Path(parquet_path),
+            "artifact_manifest": Path(manifest_path),
+        }
     except Exception as exc:
         fail_progress(task_name="factor_cabinet_feature_cache", message=str(exc))
         raise
@@ -2004,6 +2153,7 @@ def run_factor_cabinet_gap_report_from_main(args):
             factor_cabinet_path=getattr(args, "factor_cabinet_path", ""),
             start_date=start_date,
             end_date=end_date,
+            require_cache_metrics=True,
             progress_callback=_progress,
         )
         print("Factor cabinet gap report saved:")
@@ -2075,6 +2225,12 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
         "factor_cabinet_gap_report",
     }
     touches_governance = any(task in governance_tasks for task in tasks)
+    bounded_research = bool(set(tasks) & {
+        "factor_appeal_judge", "orderflow_parameter_research", "factor_cabinet",
+    })
+    if bounded_research and runtime_args.governance_max_days is None:
+        runtime_args.governance_max_days = 180
+        print("Research factor tasks: max_days was blank; defaulting to 180 for bounded memory.")
 
     if profile != "fast" or not touches_governance:
         if touches_governance and runtime_args.governance_shadow_portfolios is None:
@@ -2100,7 +2256,100 @@ def _apply_runtime_profile(args, profile_name: str, tasks: list[str]):
     )
 
 
+def _pin_runtime_factor_cabinet(runtime_args, saved: dict) -> Path:
+    """Route later tasks in one interactive run to the cabinet just produced."""
+    if not isinstance(saved, dict):
+        raise TypeError("factor_cabinet task result must be a dictionary")
+    standard_value = saved.get("factor_cabinet")
+    compatibility_value = saved.get("factor_cabinet_json")
+    if standard_value and compatibility_value:
+        if Path(standard_value).resolve() != Path(compatibility_value).resolve():
+            raise RuntimeError("factor_cabinet task returned conflicting artifact paths")
+    cabinet_value = standard_value or compatibility_value
+    if not cabinet_value:
+        raise RuntimeError(
+            "factor_cabinet task did not return a factor_cabinet artifact "
+            "(expected factor_cabinet or factor_cabinet_json)"
+        )
+    cabinet_path = Path(cabinet_value).resolve()
+    if not cabinet_path.is_file():
+        raise FileNotFoundError(f"factor_cabinet artifact does not exist: {cabinet_path}")
+    try:
+        payload = json.loads(cabinet_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"factor_cabinet artifact is not valid JSON: {cabinet_path}") from exc
+    payload_run_id = str(payload.get("run_id") or "").strip()
+    if not payload_run_id or payload_run_id != cabinet_path.parent.name:
+        raise ValueError(
+            "factor_cabinet run_id/path mismatch: "
+            f"payload={payload_run_id!r}, directory={cabinet_path.parent.name!r}"
+        )
+    if not isinstance(payload.get("factors"), list) or not payload["factors"]:
+        raise ValueError(f"factor_cabinet artifact has no factors: {cabinet_path}")
+    runtime_args.factor_source = "selected_factor_cabinet"
+    runtime_args.factor_cabinet_run_id = payload_run_id
+    runtime_args.factor_cabinet_path = str(cabinet_path)
+    return cabinet_path
+
+
+def _require_completed_research_output(saved: dict, *, task_name: str, artifact_type: str) -> Path:
+    """Validate a research artifact before it is handed to another task."""
+    if not isinstance(saved, dict):
+        raise TypeError(f"{task_name} result must be a dictionary")
+    output_value = saved.get("output_dir")
+    if not output_value:
+        raise RuntimeError(f"{task_name} did not return output_dir")
+    output_dir = Path(output_value).resolve()
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"{task_name} output_dir does not exist: {output_dir}")
+    manifest_value = saved.get("artifact_manifest") or (output_dir / "artifact_manifest.json")
+    manifest_path = Path(manifest_value).resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"{task_name} artifact manifest does not exist: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{task_name} artifact manifest is invalid JSON: {manifest_path}") from exc
+    actual_type = str(manifest.get("artifact_type") or "")
+    if actual_type != artifact_type:
+        raise ValueError(
+            f"{task_name} artifact_type mismatch: expected={artifact_type!r}, actual={actual_type!r}"
+        )
+    if str(manifest.get("status") or "").lower() != "complete":
+        raise RuntimeError(f"{task_name} artifact is not complete: {manifest_path}")
+    if str(manifest.get("run_kind") or "").lower() != "production":
+        raise RuntimeError(f"{task_name} artifact is not production output: {manifest_path}")
+    return output_dir
+
+
+_INTERACTIVE_LAUNCHER_PROCESS = None
+
+
+def _close_interactive_launcher_process() -> None:
+    global _INTERACTIVE_LAUNCHER_PROCESS
+    proc = _INTERACTIVE_LAUNCHER_PROCESS
+    _INTERACTIVE_LAUNCHER_PROCESS = None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        # Give the browser one final polling cycle so it can render 100% before
+        # the helper exits. The helper self-shuts down after serving terminal state.
+        proc.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=2.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def launch_interactive_main_menu():
+    global _INTERACTIVE_LAUNCHER_PROCESS
     state_dir = Path(tempfile.gettempdir()) / "tdx_main_launcher"
     state_dir.mkdir(parents=True, exist_ok=True)
     state_path = state_dir / f"selection_{os.getpid()}.json"
@@ -2119,6 +2368,7 @@ def launch_interactive_main_menu():
         [sys.executable, "-u", str(launcher_script), str(state_path)],
         cwd=str(Path(__file__).resolve().parent),
     )
+    _INTERACTIVE_LAUNCHER_PROCESS = proc
     print(f"主启动页已在外部浏览器模式启动（pid={proc.pid}）。")
 
     selection = {}
@@ -2149,7 +2399,14 @@ def launch_interactive_main_menu():
 
 
 def run_interactive_selection(selection, args):
-    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+    from functions.runtime_progress import (
+        clear_progress_context,
+        complete_progress,
+        fail_progress,
+        reset_progress,
+        set_progress_context,
+        write_progress,
+    )
 
     reset_run_timestamp()
     tasks = [] if not selection else selection.get("tasks", [])
@@ -2160,6 +2417,7 @@ def run_interactive_selection(selection, args):
     reset_progress(task_name="interactive_task_suite", total=len(tasks), message="starting selected tasks")
 
     def _mark_task(task_name: str, task_index: int, status: str = "running"):
+        clear_progress_context()
         write_progress(
             task_name="interactive_task_suite",
             status=status,
@@ -2169,8 +2427,14 @@ def run_interactive_selection(selection, args):
             step=task_name,
             message=f"running task {task_index}/{len(tasks)}: {task_name}",
         )
+        set_progress_context(
+            parent_task_name="interactive_task_suite",
+            task_index=task_index,
+            task_total=len(tasks),
+        )
 
     def _finish_task(task_name: str, task_index: int):
+        clear_progress_context()
         write_progress(
             task_name="interactive_task_suite",
             status="running",
@@ -2202,6 +2466,8 @@ def run_interactive_selection(selection, args):
         or "factor_cabinet_gap_report" in tasks
         or "orderflow_parameter_research" in tasks
         or "pit_level1_audit" in tasks
+        or "pit_level2_audit" in tasks
+        or "pit_level2_build" in tasks
         or "registered_mainline_v2_suite" in tasks
     ):
         selected_universes = _normalize_governance_universes(getattr(runtime_args, "governance_universes", None))
@@ -2232,17 +2498,23 @@ def run_interactive_selection(selection, args):
             task_counter += 1
             _mark_task("factor_appeal_judge", task_counter)
             appeal_saved = run_factor_appeal_judge_from_main(runtime_args)
-            latest_appeal_run_dir = appeal_saved.get("output_dir") if appeal_saved else None
-            if latest_appeal_run_dir:
-                appeal_run_dirs.append(latest_appeal_run_dir)
+            latest_appeal_run_dir = _require_completed_research_output(
+                appeal_saved,
+                task_name="factor_appeal_judge",
+                artifact_type="factor_appeal_judge",
+            )
+            appeal_run_dirs.append(latest_appeal_run_dir)
             _finish_task("factor_appeal_judge", task_counter)
         if "orderflow_parameter_research" in tasks:
             task_counter += 1
             _mark_task("orderflow_parameter_research", task_counter)
             orderflow_saved = run_orderflow_parameter_research_from_main(runtime_args)
-            latest_appeal_run_dir = orderflow_saved.get("output_dir") if orderflow_saved else latest_appeal_run_dir
-            if orderflow_saved and orderflow_saved.get("output_dir"):
-                appeal_run_dirs.append(orderflow_saved["output_dir"])
+            latest_appeal_run_dir = _require_completed_research_output(
+                orderflow_saved,
+                task_name="orderflow_parameter_research",
+                artifact_type="orderflow_parameter_research",
+            )
+            appeal_run_dirs.append(latest_appeal_run_dir)
             _finish_task("orderflow_parameter_research", task_counter)
         if "factor_cabinet" in tasks:
             task_counter += 1
@@ -2251,21 +2523,34 @@ def run_interactive_selection(selection, args):
                 from functions.decision_council.factor_appeal_judge import merge_appeal_artifacts
 
                 merged_appeal = merge_appeal_artifacts(appeal_run_dirs)
-                latest_appeal_run_dir = merged_appeal["output_dir"]
+                latest_appeal_run_dir = _require_completed_research_output(
+                    merged_appeal,
+                    task_name="factor_appeal_merge",
+                    artifact_type="factor_appeal_composite",
+                )
             runtime_args.factor_appeal_run_dir = latest_appeal_run_dir
-            run_factor_cabinet_from_main(runtime_args)
+            cabinet_saved = run_factor_cabinet_from_main(runtime_args)
+            _pin_runtime_factor_cabinet(runtime_args, cabinet_saved)
             _finish_task("factor_cabinet", task_counter)
+        gap_report_completed = False
+        if "factor_cabinet_gap_report" in tasks and "factor_cabinet_prune" in tasks:
+            task_counter += 1
+            _mark_task("factor_cabinet_gap_report", task_counter)
+            run_factor_cabinet_gap_report_from_main(runtime_args)
+            _finish_task("factor_cabinet_gap_report", task_counter)
+            gap_report_completed = True
         if "factor_cabinet_prune" in tasks:
             task_counter += 1
             _mark_task("factor_cabinet_prune", task_counter)
-            run_factor_cabinet_prune_from_main(runtime_args)
+            pruned_saved = run_factor_cabinet_prune_from_main(runtime_args)
+            _pin_runtime_factor_cabinet(runtime_args, pruned_saved)
             _finish_task("factor_cabinet_prune", task_counter)
         if "factor_cabinet_feature_cache" in tasks:
             task_counter += 1
             _mark_task("factor_cabinet_feature_cache", task_counter)
             run_factor_cabinet_feature_cache_from_main(runtime_args)
             _finish_task("factor_cabinet_feature_cache", task_counter)
-        if "factor_cabinet_gap_report" in tasks:
+        if "factor_cabinet_gap_report" in tasks and not gap_report_completed:
             task_counter += 1
             _mark_task("factor_cabinet_gap_report", task_counter)
             run_factor_cabinet_gap_report_from_main(runtime_args)
@@ -2275,6 +2560,16 @@ def run_interactive_selection(selection, args):
             _mark_task("pit_level1_audit", task_counter)
             run_pit_level1_audit_from_main(runtime_args)
             _finish_task("pit_level1_audit", task_counter)
+        if "pit_level2_audit" in tasks:
+            task_counter += 1
+            _mark_task("pit_level2_audit", task_counter)
+            run_pit_level2_audit_from_main(runtime_args)
+            _finish_task("pit_level2_audit", task_counter)
+        if "pit_level2_build" in tasks:
+            task_counter += 1
+            _mark_task("pit_level2_build", task_counter)
+            run_pit_level2_build_from_main(runtime_args)
+            _finish_task("pit_level2_build", task_counter)
         if "registered_mainline_v2_suite" in tasks:
             task_counter += 1
             _mark_task("registered_mainline_v2_suite", task_counter)
@@ -2320,8 +2615,10 @@ def run_interactive_selection(selection, args):
             _mark_task("governance_layer_ablation_suite", task_counter)
             run_governance_layer_ablation_suite_from_main(runtime_args)
             _finish_task("governance_layer_ablation_suite", task_counter)
+        clear_progress_context()
         complete_progress(task_name="interactive_task_suite", message="selected tasks complete")
     except Exception as exc:
+        clear_progress_context()
         fail_progress(task_name="interactive_task_suite", message=str(exc))
         raise
 
@@ -2763,6 +3060,10 @@ if __name__ == "__main__":
             run_orderflow_parameter_research_from_main(cli_args)
         elif cli_args.pit_level1_audit:
             run_pit_level1_audit_from_main(cli_args)
+        elif cli_args.pit_level2_audit:
+            run_pit_level2_audit_from_main(cli_args)
+        elif cli_args.pit_level2_build:
+            run_pit_level2_build_from_main(cli_args)
         elif cli_args.registered_mainline_v2_suite:
             run_registered_mainline_v2_suite_from_main(cli_args)
         elif cli_args.governance:
@@ -2792,5 +3093,6 @@ if __name__ == "__main__":
         else:
             main()
     finally:
+        _close_interactive_launcher_process()
         if show_runtime_disclosure:
             print_runtime_disclosure()

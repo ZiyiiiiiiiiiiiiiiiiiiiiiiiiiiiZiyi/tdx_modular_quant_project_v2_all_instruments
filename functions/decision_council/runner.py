@@ -576,7 +576,9 @@ class GovernanceBacktestRunner:
         self.retail_execution_rows = []
         self.entry_formula_audit_rows = []
         self.candidate_gate_rows = []
-        self._candidate_gate_spool_dir = self.output_dir / "_runtime_audit_spool" / "candidate_gates"
+        # Keep this internal path short: deep experiment paths can exceed the
+        # legacy Windows MAX_PATH limit before monthly CSV names are appended.
+        self._candidate_gate_spool_dir = self.output_dir / "_audit" / "cg"
         self.candidate_funnel_rows = []
         self.retail_executable_rank_rows = []
         self.defensive_sleeve_rows = []
@@ -783,6 +785,11 @@ class GovernanceBacktestRunner:
         self.trading_calendar = TradingCalendar(self._daily_feature_indices.keys())
         self._execute_pending(date, daily)
         self._prune_empty_positions()
+        if self._max_positions_override is not None and len(self.positions) > self._max_positions_override:
+            raise RuntimeError(
+                "governance position limit invariant failed at start of decision: "
+                f"positions={len(self.positions)}, max_positions={self._max_positions_override}"
+            )
         self._mature_alpha_collapse_diagnostics(date)
         exposure = self._record_exposure(date, daily)
         matured_reward = self._mature_reward(date)
@@ -1556,48 +1563,46 @@ class GovernanceBacktestRunner:
             return []
         end_date = pd.Timestamp(date)
         start_date = end_date - pd.Timedelta(days=270)
-        close_col = "close_nominal" if "close_nominal" in self.features.columns else "close"
-        prices = self.features[
-            self.features["symbol"].astype(str).isin(symbols)
-            & self.features["date"].between(start_date, end_date)
-        ].copy()
-        if prices.empty:
-            return []
-        prices[close_col] = pd.to_numeric(prices[close_col], errors="coerce")
-        prices = prices.dropna(subset=["date", "symbol", close_col]).sort_values(["symbol", "date"])
         paths = []
         lifecycle_by_symbol = {
             str(row.get("symbol", "")): row
             for row in getattr(self, "_last_position_mark_rows", []) or []
         }
-        for symbol, group in prices.groupby("symbol", sort=False):
-            group = group.tail(180)
-            close = pd.to_numeric(group[close_col], errors="coerce").dropna()
-            initial = float(close.iloc[0]) if not close.empty and float(close.iloc[0]) > 0 else 0.0
-            if initial <= 0:
+        for symbol in symbols:
+            history = self._close_history(symbol)
+            if history.empty:
+                continue
+            group = history[history["date"].between(start_date, end_date)].tail(180).copy()
+            close = pd.to_numeric(group["close"], errors="coerce").dropna()
+            if close.empty:
                 continue
             lifecycle = lifecycle_by_symbol.get(str(symbol), {})
             entry_date = pd.to_datetime(lifecycle.get("entry_date"), errors="coerce")
             entry_price = _safe_float(lifecycle.get("entry_price"), default=0.0)
             if entry_price <= 0.0:
                 entry_price = _safe_float(lifecycle.get("price"), default=0.0)
+            normalization_price = entry_price if entry_price > 0.0 else float(close.iloc[0])
+            if normalization_price <= 0.0:
+                continue
             latest_price = _safe_float(lifecycle.get("price"), default=0.0)
             entry_index = None
             points = [
                 {
                     "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
-                    "value": float(row[close_col]) / initial,
-                    "entry_value": float(row[close_col]) / entry_price if entry_price > 0.0 else None,
+                    "value": float(row["close"]) / normalization_price,
+                    "entry_value": float(row["close"]) / entry_price if entry_price > 0.0 else None,
                 }
                 for _, row in group.iterrows()
-                if pd.notna(row[close_col])
+                if pd.notna(row["close"])
             ]
             if pd.notna(entry_date):
                 entry_date_ts = pd.Timestamp(entry_date)
-                for idx, point in enumerate(points):
-                    if pd.Timestamp(point["date"]) >= entry_date_ts:
-                        entry_index = idx
-                        break
+                first_visible_date = pd.Timestamp(points[0]["date"]) if points else pd.NaT
+                if pd.notna(first_visible_date) and entry_date_ts >= first_visible_date:
+                    for idx, point in enumerate(points):
+                        if pd.Timestamp(point["date"]) >= entry_date_ts:
+                            entry_index = idx
+                            break
             if len(points) >= 2:
                 paths.append(
                     {
@@ -1607,6 +1612,7 @@ class GovernanceBacktestRunner:
                         "latest_price": float(latest_price) if latest_price > 0.0 else None,
                         "unrealized_return": _safe_float(lifecycle.get("unrealized_return"), default=float("nan")),
                         "entry_index": entry_index,
+                        "entry_visible": entry_index is not None,
                         "points": points,
                     }
                 )
@@ -2166,7 +2172,7 @@ class GovernanceBacktestRunner:
             day_rows.append(row)
         if day_rows:
             self._candidate_gate_spool_dir.mkdir(parents=True, exist_ok=True)
-            month_path = self._candidate_gate_spool_dir / f"candidate_gates_{pd.Timestamp(date):%Y%m}.csv"
+            month_path = self._candidate_gate_spool_dir / f"cg_{pd.Timestamp(date):%Y%m}.csv"
             pd.DataFrame(day_rows).to_csv(
                 month_path,
                 mode="a",
@@ -2178,13 +2184,16 @@ class GovernanceBacktestRunner:
     def _candidate_gate_part_paths(self) -> list[Path]:
         if not self._candidate_gate_spool_dir.exists():
             return []
-        return sorted(self._candidate_gate_spool_dir.glob("candidate_gates_*.csv"))
+        return sorted(self._candidate_gate_spool_dir.glob("cg_*.csv"))
 
     def _candidate_gate_partition_index(self) -> pd.DataFrame:
         rows = []
         for path in self._candidate_gate_part_paths():
             try:
-                row_count = sum(len(chunk) for chunk in pd.read_csv(path, usecols=["date"], chunksize=5000))
+                row_count = sum(
+                    len(chunk)
+                    for chunk in pd.read_csv(path, usecols=["signal_date"], chunksize=5000)
+                )
             except (OSError, pd.errors.EmptyDataError, ValueError):
                 row_count = 0
             rows.append({"path": str(path), "row_count": int(row_count), "size_bytes": int(path.stat().st_size)})
@@ -2410,13 +2419,14 @@ class GovernanceBacktestRunner:
             pivot = self._return_pivot
             if pivot is None or pivot.empty or symbol not in pivot.columns:
                 return pd.NA
-            dates = pivot.index
-            loc = dates.searchsorted(pd.Timestamp(date))
-            future_loc = loc + int(horizon_days)
-            if loc >= len(dates) or future_loc > len(dates):
+            horizon = int(horizon_days)
+            if horizon <= 0:
                 return pd.NA
-            returns = pd.to_numeric(pivot.iloc[loc:future_loc][symbol], errors="coerce").dropna()
-            if returns.empty:
+            returns = pd.to_numeric(
+                pivot.loc[pivot.index > pd.Timestamp(date), symbol],
+                errors="coerce",
+            ).dropna().head(horizon)
+            if len(returns) < horizon:
                 return pd.NA
             return float((1.0 + returns).prod() - 1.0)
         except Exception:
@@ -3003,7 +3013,21 @@ class GovernanceBacktestRunner:
         extra["governance_runtime_integrity_audit"] = build_runtime_integrity_audit(
             execution_ledger=extra["governance_execution_ledger"],
             account_audit=extra["governance_account_audit_ledger"],
+            daily_result=extra["governance_daily_result"],
+            max_positions=self._max_positions_override,
         )
+        if self.governance_variant == "governance_layer_validation":
+            self._log_save_stage("layer_validation_audit")
+            from functions.decision_council.layer_validation_audit import build_layer_validation_reports
+
+            extra.update(
+                build_layer_validation_reports(
+                    self._candidate_gate_part_paths(),
+                    close_history_getter=self._close_history,
+                    execution_ledger=extra["governance_execution_ledger"],
+                    trade_pairs=trade_pairs,
+                )
+            )
         self._log_save_stage("future_loss_duration_audit", trades=len(trade_pairs))
         extra["governance_future_loss_duration_audit"] = _future_loss_duration_audit(
             trade_pairs,
@@ -3187,6 +3211,7 @@ def run_governance_backtest(
     max_days=None,
     enable_sector_cap: bool = False,
     enable_safety_agent: bool = True,
+    enable_market_regime_policy: bool = ENABLE_MARKET_REGIME_POLICY,
     enable_reputation: bool = True,
     governance_variant: str = "rules_based_president",
     universe_name: str | None = None,
@@ -3238,6 +3263,15 @@ def run_governance_backtest(
 
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE) if (start_date or GOVERNANCE_START_DATE) else None
     effective_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE) if (end_date or GOVERNANCE_END_DATE) else None
+    if effective_start is not None and effective_end is not None:
+        from functions.data.trading_calendar import bounded_observed_feature_end
+
+        effective_end = bounded_observed_feature_end(
+            feature_path,
+            effective_start,
+            effective_end,
+            max_days,
+        )
     filters = []
     if effective_start is not None:
         filters.append(("date", ">=", effective_start - pd.Timedelta(days=GOVERNANCE_PRELOAD_CALENDAR_DAYS)))
@@ -3326,6 +3360,7 @@ def run_governance_backtest(
         governance_variant=governance_variant,
         enable_sector_cap=enable_sector_cap,
         enable_safety_agent=enable_safety_agent,
+        enable_market_regime_policy=enable_market_regime_policy,
         entry_confirmation_mode=entry_confirmation_mode,
         selection_weight_mode=selection_weight_mode,
         regime_overlay_mode=regime_overlay_mode,

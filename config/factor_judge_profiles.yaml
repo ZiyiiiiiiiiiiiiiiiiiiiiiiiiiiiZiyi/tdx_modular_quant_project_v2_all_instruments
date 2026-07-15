@@ -54,6 +54,7 @@ profiles:
       - barra_style
       - value
       - fundamental
+      - investment
     horizons: [20, 60, 120, 240]
     neutralize: [industry, size, beta]
     point_in_time_required: true

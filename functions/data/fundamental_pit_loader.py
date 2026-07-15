@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from functions.factors.fundamental_pit_factors import prepare_financial_report_factors
+
 
 BASE_COLUMNS = [
     "stock_code",
@@ -43,6 +45,16 @@ def build_pit_fundamental_daily(
         reports_out = _quality_reports(data, daily)
         _save_reports(reports_out, output_dir)
         return daily, reports_out
+    is_level2 = {"symbol", "known_at", "effective_from", "period_value_basis"}.issubset(data.columns)
+    if is_level2:
+        data = prepare_financial_report_factors(data)
+        data = data.rename(
+            columns={
+                "symbol": "stock_code",
+                "known_at": "publish_date",
+                "effective_from": "available_date",
+            }
+        )
     required = {"stock_code", "report_period"}
     missing = sorted(required - set(data.columns))
     if missing:
@@ -75,10 +87,14 @@ def build_pit_fundamental_daily(
         rows.append(merged)
     daily = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=BASE_COLUMNS)
     daily["available_date"] = daily.get("available_date").fillna(daily.get("publish_date"))
-    for column in BASE_COLUMNS:
+    output_columns = list(dict.fromkeys([
+        *BASE_COLUMNS,
+        *[column for column in data.columns if not str(column).startswith("_")],
+    ]))
+    for column in output_columns:
         if column not in daily.columns:
             daily[column] = pd.NA
-    daily = daily[BASE_COLUMNS].copy()
+    daily = daily[output_columns].copy()
     reports_out = _quality_reports(data, daily)
     _save_reports(reports_out, output_dir)
     return daily, reports_out

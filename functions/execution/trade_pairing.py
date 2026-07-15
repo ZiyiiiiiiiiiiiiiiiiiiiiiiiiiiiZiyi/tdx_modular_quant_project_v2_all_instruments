@@ -4,6 +4,23 @@ from __future__ import annotations
 import pandas as pd
 
 
+TRADE_PAIR_COLUMNS = (
+    "trade_id", "symbol", "entry_date", "exit_date", "entry_price", "cost_basis",
+    "exit_price", "exit_net_price", "entry_shares", "exit_shares", "holding_days",
+    "realized_pnl_amount", "realized_pnl_pct", "is_win", "entry_reason",
+    "entry_order_id", "entry_decision_id", "entry_matrix_score_at_buy",
+    "entry_add_layer", "add_layer_count", "sell_reason", "sell_order_id",
+    "sell_decision_id", "position_state_at_sell", "position_exit_reason_at_sell",
+    "close_reason", "pairing_method", "capital_profile",
+)
+OPEN_POSITION_COLUMNS = (
+    "symbol", "entry_date", "avg_cost", "shares", "latest_price", "market_value",
+    "unrealized_pnl_amount", "unrealized_pnl_pct", "valuation_date", "entry_reason",
+    "entry_order_id", "entry_decision_id", "entry_matrix_score_at_buy",
+    "entry_add_layer", "add_layer_count", "pairing_method", "capital_profile",
+)
+
+
 def build_trade_pairing_ledgers(
     order_ledger: pd.DataFrame,
     latest_prices: pd.DataFrame | None = None,
@@ -11,7 +28,7 @@ def build_trade_pairing_ledgers(
     capital_profile: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     if order_ledger is None or order_ledger.empty:
-        return pd.DataFrame(), pd.DataFrame(), _empty_trade_summary(capital_profile)
+        return _empty_trade_pairs(), _empty_open_positions(), _empty_trade_summary(capital_profile)
 
     data = order_ledger.copy()
     data["trade_date"] = pd.to_datetime(_series_or_default(data, "trade_date"), errors="coerce")
@@ -34,7 +51,7 @@ def build_trade_pairing_ledgers(
         & _series_or_default(data, "execution_status").astype(str).eq("filled")
     ].copy()
     if data.empty:
-        return pd.DataFrame(), pd.DataFrame(), _empty_trade_summary(capital_profile)
+        return _empty_trade_pairs(), _empty_open_positions(), _empty_trade_summary(capital_profile)
 
     data = data.sort_values(["trade_date", "symbol", "side"]).reset_index(drop=True)
     latest_price_map = _latest_price_map(latest_prices)
@@ -153,7 +170,7 @@ def build_trade_pairing_ledgers(
                 }
             )
 
-    trade_pairs = pd.DataFrame(trade_rows + unmatched_sell_rows)
+    trade_pairs = pd.DataFrame(trade_rows + unmatched_sell_rows, columns=TRADE_PAIR_COLUMNS)
     open_rows: list[dict] = []
     valuation_date = pd.Timestamp(data["trade_date"].max())
     for symbol, position in positions.items():
@@ -194,7 +211,7 @@ def build_trade_pairing_ledgers(
                 "capital_profile": capital_profile,
             }
         )
-    open_positions = pd.DataFrame(open_rows)
+    open_positions = pd.DataFrame(open_rows, columns=OPEN_POSITION_COLUMNS)
     summary = _trade_summary(trade_pairs, open_positions, capital_profile)
     return trade_pairs, open_positions, summary
 
@@ -288,3 +305,11 @@ def _empty_trade_summary(capital_profile: str) -> dict:
         "open_position_count": 0,
         "inventory_underflow_count": 0,
     }
+
+
+def _empty_trade_pairs() -> pd.DataFrame:
+    return pd.DataFrame(columns=TRADE_PAIR_COLUMNS)
+
+
+def _empty_open_positions() -> pd.DataFrame:
+    return pd.DataFrame(columns=OPEN_POSITION_COLUMNS)

@@ -46,6 +46,10 @@ ROLE_FAMILY_CAP = {
     "liquidity_filter": 5,
     "hold_validation": 4,
 }
+PROTECTED_ECONOMIC_FAMILY_MIN = {
+    "orderflow": 1,
+    "breakout": 1,
+}
 
 
 def build_factor_cabinet_pruned(
@@ -59,6 +63,7 @@ def build_factor_cabinet_pruned(
     output_root: str | Path = OUTPUT_ROOT,
     report_root: str | Path = REPORT_ROOT,
     progress_callback=None,
+    require_gap_metrics: bool | None = None,
 ) -> dict[str, Path]:
     """Write a pruned cabinet run by dropping redundant existing factors."""
 
@@ -77,18 +82,44 @@ def build_factor_cabinet_pruned(
         raise ValueError("factor_cabinet pruner requires latest_factor_cabinet or selected_factor_cabinet")
 
     source_payload = json.loads(Path(spec.factor_cabinet_path).read_text(encoding="utf-8"))
+    if str(source_payload.get("artifact_type") or "").strip() == "factor_cabinet_pruned":
+        raise ValueError(
+            "factor_cabinet is already pruned; select its unpruned base cabinet before pruning: "
+            f"run_id={spec.factor_cabinet_run_id}, "
+            f"base_source_run_id={source_payload.get('base_source_run_id') or ''}"
+        )
     source_factors = pd.DataFrame(source_payload.get("factors", []))
     if source_factors.empty:
         raise ValueError(f"factor_cabinet has no factors: {spec.factor_cabinet_path}")
     source_factors = _normalize_factor_frame(source_factors)
     progress("load_gap_metrics", 20.0, f"source_factors={len(source_factors)}")
     gap_dir = _resolve_gap_report_dir(spec.factor_cabinet_run_id, gap_report_dir)
+    if require_gap_metrics is None:
+        require_gap_metrics = (
+            str(source_payload.get("generation_policy") or "") == "pit_augmented_v2"
+            or str(source_payload.get("artifact_type") or "") == "factor_cabinet_pit_augmented"
+        )
+    if require_gap_metrics:
+        _require_loaded_gap_metrics(gap_dir, spec.factor_cabinet_run_id)
     corr_pairs = _load_pair_metric(gap_dir, "factor_value_spearman_corr.csv", "abs_corr", corr_threshold)
     overlap_pairs = _load_pair_metric(gap_dir, "top_quantile_overlap.csv", "avg_top_overlap", overlap_threshold)
     redundant_pairs = corr_pairs | overlap_pairs
 
     progress("rank_candidates", 35.0, f"redundant_pairs={len(redundant_pairs)}")
     ranked = _rank_candidates(source_factors)
+    protected_augmented_names = _augmented_family_representatives(ranked)
+    protected_economic_names = _economic_family_representatives(ranked)
+    protected_names = protected_augmented_names | protected_economic_names
+    # Reserve protected family representatives inside the normal role caps.
+    # Without this ordering, low-frequency breakout/orderflow evidence reaches
+    # the loop only after generic factors have already consumed the role quota.
+    ranked = pd.concat(
+        [
+            ranked[ranked["factor_name"].isin(protected_names)],
+            ranked[~ranked["factor_name"].isin(protected_names)],
+        ],
+        ignore_index=True,
+    )
     keep_names: set[str] = set()
     decisions: list[dict] = []
     family_counts: dict[tuple[str, str], int] = {}
@@ -110,6 +141,12 @@ def build_factor_cabinet_pruned(
         if role == "entry_alpha":
             keep = True
             reason = "kept_all_strict_entry_alpha"
+        elif name in protected_augmented_names:
+            keep = True
+            reason = "kept_augmented_family_representative"
+        elif name in protected_economic_names:
+            keep = True
+            reason = "kept_economic_family_representative"
         elif current_role_count >= role_max:
             keep = False
             reason = f"drop_role_cap_{role_max}"
@@ -130,6 +167,8 @@ def build_factor_cabinet_pruned(
                 "role": role,
                 "family": family,
                 "module": row.get("module", ""),
+                "augmentation_family": row.get("augmentation_family", ""),
+                "augmentation_action": row.get("augmentation_action", ""),
                 "score": _coerce_float(row.get("score")),
                 "best_rank_ic_mean": _coerce_float(row.get("best_rank_ic_mean")),
                 "best_ic_ir": _coerce_float(row.get("best_ic_ir")),
@@ -156,6 +195,7 @@ def build_factor_cabinet_pruned(
         "base_source_run_id": base_run_id,
         "source_factor_cabinet_path": spec.factor_cabinet_path,
         "artifact_type": "factor_cabinet_pruned",
+        "default_eligible": bool(source_payload.get("default_eligible", False)),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "prune_policy": {
             "corr_threshold": float(corr_threshold),
@@ -208,7 +248,10 @@ def _normalize_factor_frame(frame: pd.DataFrame) -> pd.DataFrame:
     data = frame.copy()
     if "role" not in data.columns and "cabinet_role" in data.columns:
         data["role"] = data["cabinet_role"]
-    for column in ("factor_name", "raw_column", "role", "family", "module", "near_relative_key", "source"):
+    for column in (
+        "factor_name", "raw_column", "role", "family", "module",
+        "near_relative_key", "source", "augmentation_family", "augmentation_action",
+    ):
         if column not in data.columns:
             data[column] = ""
         data[column] = data[column].fillna("").astype(str)
@@ -220,6 +263,30 @@ def _normalize_factor_frame(frame: pd.DataFrame) -> pd.DataFrame:
             data[column] = float("nan")
         data[column] = pd.to_numeric(data[column], errors="coerce")
     return data
+
+
+def _augmented_family_representatives(ranked: pd.DataFrame) -> set[str]:
+    """Keep one evidence-backed addition per economic family through pruning."""
+    added = ranked[
+        ranked["augmentation_action"].eq("added")
+        & ranked["augmentation_family"].ne("")
+    ]
+    if added.empty:
+        return set()
+    representatives = added.drop_duplicates("augmentation_family", keep="first")
+    return set(representatives["factor_name"].astype(str))
+
+
+def _economic_family_representatives(ranked: pd.DataFrame) -> set[str]:
+    """Protect bounded evidence representatives for required cabinet families."""
+    representatives: set[str] = set()
+    family_values = ranked["family"].fillna("").astype(str).str.lower()
+    for family, minimum in PROTECTED_ECONOMIC_FAMILY_MIN.items():
+        family_rows = ranked[family_values.eq(str(family).lower())]
+        representatives.update(
+            family_rows.head(max(int(minimum), 0))["factor_name"].astype(str).tolist()
+        )
+    return representatives
 
 
 def _base_source_run_id(payload: dict, fallback: str) -> str:
@@ -247,6 +314,25 @@ def _resolve_gap_report_dir(run_id: str, explicit: str | Path | None) -> Path | 
         and (path / "top_quantile_overlap.csv").exists()
     ]
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def _require_loaded_gap_metrics(gap_dir: Path | None, run_id: str) -> None:
+    if gap_dir is None:
+        raise FileNotFoundError(
+            "PIT-augmented cabinet cannot be pruned before its cache-backed gap audit. "
+            f"Build the feature cache, then run the gap audit for run_id={run_id}."
+        )
+    summary_path = gap_dir / "factor_cabinet_gap_summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Gap audit summary is missing or invalid: {summary_path}") from exc
+    status = str((summary.get("cache_status") or {}).get("status") or "")
+    if status != "loaded_sampled":
+        raise ValueError(
+            "PIT-augmented cabinet gap audit did not load cache metrics; pruning is prohibited. "
+            f"run_id={run_id}, cache_status={status or 'missing'}"
+        )
 
 
 def _load_pair_metric(gap_dir: Path | None, filename: str, metric: str, threshold: float) -> set[frozenset[str]]:
@@ -327,11 +413,28 @@ def _build_summary(
         "entry_alpha_count": int(role_distribution.get("entry_alpha", 0)),
         "entry_alpha_proxy_count": int(role_distribution.get("entry_alpha_proxy", 0)),
         "liquidity_filter_count": int(role_distribution.get("liquidity_filter", 0)),
+        "augmented_family_representatives": sorted(
+            decisions.loc[
+                decisions["decision_reason"].eq("kept_augmented_family_representative"),
+                "factor_name",
+            ].astype(str).tolist()
+        ),
+        "economic_family_representatives": sorted(
+            decisions.loc[
+                decisions["decision_reason"].eq("kept_economic_family_representative"),
+                "factor_name",
+            ].astype(str).tolist()
+        ),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "invariants": {
             "no_new_factors": bool(set(kept_frame["factor_name"]) <= set(source_factors["factor_name"])),
             "source_not_modified": True,
             "strict_entry_alpha_preserved": int(role_distribution.get("entry_alpha", 0)) == int(source_role_distribution.get("entry_alpha", 0)),
+            "protected_economic_families_preserved": all(
+                int((kept_frame["family"].str.lower() == family).sum()) >= minimum
+                for family, minimum in PROTECTED_ECONOMIC_FAMILY_MIN.items()
+                if int((source_factors["family"].str.lower() == family).sum()) >= minimum
+            ),
         },
     }
 

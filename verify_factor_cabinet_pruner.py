@@ -83,6 +83,21 @@ def main() -> int:
     _pass("prune summary invariants pass")
 
     try:
+        build_factor_cabinet_pruned(
+            factor_source=FACTOR_SOURCE_SELECTED_CABINET,
+            factor_cabinet_run_id=str(payload.get("run_id")),
+            factor_cabinet_path=pruned_path,
+            output_root=Path("reports") / "verify_factor_cabinet_pruner" / "factor_cabinet",
+            report_root=Path("reports") / "verify_factor_cabinet_pruner" / "reports",
+        )
+    except ValueError as exc:
+        if "already pruned" not in str(exc):
+            raise
+        _pass("already-pruned cabinet is rejected instead of producing a duplicate run")
+    else:
+        _fail("pruner accepted an already-pruned cabinet")
+
+    try:
         resolve_factor_source(factor_source="legacy_bundle", alpha_bundle="validation_core_bundle")
     except ValueError:
         _pass("legacy resolver still rejects validation_core_bundle fallback")

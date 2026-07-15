@@ -252,7 +252,14 @@ def build_rule_alpha_proposals(
             continue
         score = pd.to_numeric(data[feature_col], errors="coerce")
         if factor_judged:
-            direction = float(GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS.get(model_name, 1.0))
+            runtime_directions = getattr(runtime_context, "direction_map", None) or {}
+            if model_name in runtime_directions:
+                direction_value = str(runtime_directions[model_name]).strip().lower()
+                if direction_value not in {"higher_better", "lower_better"}:
+                    raise ValueError(f"Unsupported runtime factor direction: {direction_value!r}")
+                direction = -1.0 if direction_value == "lower_better" else 1.0
+            else:
+                direction = float(GOVERNANCE_FACTOR_JUDGED_ALPHA_DIRECTIONS.get(model_name, 1.0))
             score = score * (-1.0 if direction < 0.0 else 1.0)
         volatility = pd.to_numeric(data.get("volatility_20"), errors="coerce").fillna(0.0)
         non_null_abs_score = score.abs().dropna()
