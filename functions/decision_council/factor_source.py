@@ -55,6 +55,9 @@ class FactorRuntimeContext:
     strict_entry_alpha_map: object
     diversity_gate: object
     direction_map: object = None
+    primary_role_map: object = None
+    near_relative_map: object = None
+    horizon_map: object = None
 
     @property
     def alpha_models(self) -> tuple[str, ...]:
@@ -82,6 +85,8 @@ class FactorSourceSpec:
     strict_entry_alpha_map: dict[str, bool] | None = None
     direction_map: dict[str, str] | None = None
     cabinet_manifest_hash: str = ""
+    near_relative_map: dict[str, str] | None = None
+    horizon_map: dict[str, int] | None = None
 
     @property
     def uses_factor_cabinet(self) -> bool:
@@ -118,6 +123,9 @@ class FactorSourceSpec:
                 strict_entry_alpha_map=MappingProxyType(dict(self.strict_entry_alpha_map or {})),
                 diversity_gate=MappingProxyType(gate),
                 direction_map=MappingProxyType(dict(self.direction_map or {})),
+                primary_role_map=MappingProxyType(dict(self.role_map or {})),
+                near_relative_map=MappingProxyType(dict(self.near_relative_map or {})),
+                horizon_map=MappingProxyType(dict(self.horizon_map or {})),
             )
         return FactorRuntimeContext(
             factor_source=self.factor_source,
@@ -127,6 +135,8 @@ class FactorSourceSpec:
             module_map=MappingProxyType({}), family_map=MappingProxyType({}),
             strict_entry_alpha_map=MappingProxyType({}), diversity_gate=MappingProxyType({}),
             direction_map=MappingProxyType({}),
+            primary_role_map=MappingProxyType({}), near_relative_map=MappingProxyType({}),
+            horizon_map=MappingProxyType({}),
         )
 
     def summary_dict(self) -> dict:
@@ -328,6 +338,16 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
         str(name): str(direction)
         for name, direction in zip(factor_name.tolist(), direction_series.tolist())
     }
+    near_relative_series = frame.get("near_relative_key", pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+    near_relative_map = {
+        str(name): (str(relative) or f"{module_map[str(name)]}:{family_map[str(name)]}:{name}")
+        for name, relative in zip(factor_name.tolist(), near_relative_series.tolist())
+    }
+    horizon_values = pd.to_numeric(
+        frame.get("best_horizon_days", frame.get("horizon_days", pd.Series(0, index=frame.index))),
+        errors="coerce",
+    ).fillna(0).astype(int)
+    horizon_map = {str(name): int(value) for name, value in zip(factor_name.tolist(), horizon_values.tolist())}
     strict_flags = frame.get("strict_entry_alpha", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
     strict_map = {str(name): bool(flag) for name, flag in zip(factor_name.tolist(), strict_flags.tolist())}
     invalid_strict = [name for name, flag in strict_map.items() if flag and role_map.get(name) != "entry_alpha"]
@@ -353,4 +373,6 @@ def _spec_from_cabinet_path(path: Path, *, factor_source: str) -> FactorSourceSp
         direction_map=direction_map,
         strict_entry_alpha_map=strict_map,
         cabinet_manifest_hash=hashlib.sha256(path.read_bytes()).hexdigest(),
+        near_relative_map=near_relative_map,
+        horizon_map=horizon_map,
     )

@@ -94,6 +94,20 @@ def execute_pending(runner, date, daily):
             "reversal_entry_score": order.get("reversal_entry_score", pd.NA),
             "breakout_gate_score": order.get("breakout_gate_score", pd.NA),
             "trend_hold_score": order.get("trend_hold_score", pd.NA),
+            "strategy_logic_version": order.get("strategy_logic_version", ""),
+            "cabinet_native_final_score": order.get("cabinet_native_final_score", pd.NA),
+            "cabinet_base_entry_score": order.get("cabinet_base_entry_score", pd.NA),
+            "cabinet_strict_entry_score": order.get("cabinet_strict_entry_score", pd.NA),
+            "cabinet_proxy_entry_score": order.get("cabinet_proxy_entry_score", pd.NA),
+            "cabinet_timing_score": order.get("cabinet_timing_score", pd.NA),
+            "cabinet_liquidity_health_score": order.get("cabinet_liquidity_health_score", pd.NA),
+            "cabinet_risk_safety_score": order.get("cabinet_risk_safety_score", pd.NA),
+            "cabinet_hold_support_score": order.get("cabinet_hold_support_score", pd.NA),
+            "cabinet_entry_thesis": order.get("cabinet_entry_thesis", ""),
+            "cabinet_entry_thesis_support": order.get("cabinet_entry_thesis_support", pd.NA),
+            "mainline_v3_one_lot_cash_required": order.get("mainline_v3_one_lot_cash_required", pd.NA),
+            "mainline_v3_one_lot_weight": order.get("mainline_v3_one_lot_weight", pd.NA),
+            "mainline_v3_lot_feasible": order.get("mainline_v3_lot_feasible", pd.NA),
         }
         rows.append(row)
     if not rows:
@@ -237,6 +251,17 @@ def register_orders(runner, orders, daily, nominal_nav):
             continue
         shares = abs(float(order["delta_weight"])) * float(nominal_nav) / order_price
         shares = float(int(shares // MIN_LOT_SIZE) * MIN_LOT_SIZE)
+        cabinet_native_new_entry = (
+            str(getattr(runner, "strategy_logic_version", "")) == "mainline_v3_cabinet_native"
+            and str(order["side"]).strip().lower() == "buy"
+            and float(pd.to_numeric(pd.Series([order.get("current_weight", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
+            <= 1e-12
+        )
+        if cabinet_native_new_entry:
+            # V3 entry admission already performs its factual one-lot cash and
+            # position-cap checks.  Do not let target-weight sizing recreate a
+            # multi-lot order when the optional retail adapter is disabled.
+            shares = float(MIN_LOT_SIZE)
         strategy_target_notional = abs(float(order["delta_weight"])) * float(nominal_nav)
         retail_action = "unchanged"
         retail_block_reason = ""
@@ -321,6 +346,20 @@ def register_orders(runner, orders, daily, nominal_nav):
             "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
             "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
             "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
+            "strategy_logic_version": order.get("strategy_logic_version", ""),
+            "cabinet_native_final_score": order.get("cabinet_native_final_score", pd.NA),
+            "cabinet_base_entry_score": order.get("cabinet_base_entry_score", pd.NA),
+            "cabinet_strict_entry_score": order.get("cabinet_strict_entry_score", pd.NA),
+            "cabinet_proxy_entry_score": order.get("cabinet_proxy_entry_score", pd.NA),
+            "cabinet_timing_score": order.get("cabinet_timing_score", pd.NA),
+            "cabinet_liquidity_health_score": order.get("cabinet_liquidity_health_score", pd.NA),
+            "cabinet_risk_safety_score": order.get("cabinet_risk_safety_score", pd.NA),
+            "cabinet_hold_support_score": order.get("cabinet_hold_support_score", pd.NA),
+            "cabinet_entry_thesis": order.get("cabinet_entry_thesis", ""),
+            "cabinet_entry_thesis_support": order.get("cabinet_entry_thesis_support", pd.NA),
+            "mainline_v3_one_lot_cash_required": order.get("mainline_v3_one_lot_cash_required", pd.NA),
+            "mainline_v3_one_lot_weight": order.get("mainline_v3_one_lot_weight", pd.NA),
+            "mainline_v3_lot_feasible": order.get("mainline_v3_lot_feasible", pd.NA),
         }
         if order["side"] == "sell":
             runner.engine.pending_orders.upsert_sell_intent(payload)

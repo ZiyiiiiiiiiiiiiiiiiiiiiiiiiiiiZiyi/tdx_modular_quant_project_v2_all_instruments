@@ -93,6 +93,10 @@ def allocate_constrained_inverse_vol(
             raw = (1.0 / data["volatility_20"]) * (1.0 + edge.clip(upper=2.0))
         else:
             raw = 1.0 / data["volatility_20"]
+        if "cabinet_risk_safety_score" in data.columns:
+            safety = pd.to_numeric(data["cabinet_risk_safety_score"], errors="coerce").fillna(0.5).clip(0.0, 1.0)
+            # Risk role changes position preference, never candidate admission.
+            raw = raw * (0.5 + safety)
     raw = raw / raw.sum()
     data["raw_inverse_vol_weight"] = raw * float(exposure_cap)
     data["target_weight"] = 0.0

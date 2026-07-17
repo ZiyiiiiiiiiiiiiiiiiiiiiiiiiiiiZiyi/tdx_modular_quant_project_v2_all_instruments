@@ -6,7 +6,8 @@ import pandas as pd
 
 PRODUCTION_V1 = "production_v1"
 MAINLINE_V2 = "mainline_v2"
-STRATEGY_LOGIC_VERSIONS = (PRODUCTION_V1, MAINLINE_V2)
+MAINLINE_V3 = "mainline_v3_cabinet_native"
+STRATEGY_LOGIC_VERSIONS = (PRODUCTION_V1, MAINLINE_V2, MAINLINE_V3)
 
 
 def normalize_strategy_logic_version(value: str | None) -> str:

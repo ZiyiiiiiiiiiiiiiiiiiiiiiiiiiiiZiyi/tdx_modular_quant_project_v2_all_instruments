@@ -44,6 +44,20 @@ PENDING_ORDER_COLUMNS = [
     "planned_entry_lots",
     "downtrend_decay_score",
     "post_entry_failure_score",
+    "strategy_logic_version",
+    "cabinet_native_final_score",
+    "cabinet_base_entry_score",
+    "cabinet_strict_entry_score",
+    "cabinet_proxy_entry_score",
+    "cabinet_timing_score",
+    "cabinet_liquidity_health_score",
+    "cabinet_risk_safety_score",
+    "cabinet_hold_support_score",
+    "cabinet_entry_thesis",
+    "cabinet_entry_thesis_support",
+    "mainline_v3_one_lot_cash_required",
+    "mainline_v3_one_lot_weight",
+    "mainline_v3_lot_feasible",
 ]
 
 SELL_RETRY_REASONS = {"safety_deleveraging", "qualification_exit", "alpha_collapse_consensus"}

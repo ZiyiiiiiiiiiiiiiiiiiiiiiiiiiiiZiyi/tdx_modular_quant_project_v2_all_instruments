@@ -1034,6 +1034,17 @@ HTML = """<!doctype html>
         ...summaryLines(ms.entry_block_summary || [], "暂无拦截数据")
       ].join("\\n");
 
+      if (String(ms.strategy_logic_version || "") === "mainline_v3_cabinet_native") {
+        document.getElementById("entryGateText").textContent += [
+          "", "Cabinet-native v3",
+          `Strict entry family : ${fmtNum(Number(ms.cabinet_strict_entry_score_mean), 3)}`,
+          `Proxy entry family  : ${fmtNum(Number(ms.cabinet_proxy_entry_score_mean), 3)}`,
+          `Timing role         : ${fmtNum(Number(ms.cabinet_timing_score_mean), 3)}`,
+          `Liquidity health    : ${fmtNum(Number(ms.cabinet_liquidity_health_score_mean), 3)}`,
+          `Risk safety         : ${fmtNum(Number(ms.cabinet_risk_safety_score_mean), 3)}`,
+          `Hold support        : ${fmtNum(Number(ms.cabinet_hold_support_score_mean), 3)}`,
+        ].join("\\n");
+      }
       document.getElementById("tradeQualityText").textContent = [
         `买入5日准确率         : ${fmtPct(Number(ms.trailing_buy_accuracy_5d))}`,
         `卖出5日准确率         : ${fmtPct(Number(ms.trailing_sell_accuracy_5d))}`,

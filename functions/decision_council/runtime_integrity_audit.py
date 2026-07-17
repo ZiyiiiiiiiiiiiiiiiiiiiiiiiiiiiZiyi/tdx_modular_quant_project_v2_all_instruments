@@ -14,6 +14,8 @@ def build_runtime_integrity_audit(
     execution_ledger: pd.DataFrame,
     account_audit: pd.DataFrame,
     daily_result: pd.DataFrame | None = None,
+    holdings_ledger: pd.DataFrame | None = None,
+    position_state_ledger: pd.DataFrame | None = None,
     max_positions: int | None = None,
 ) -> pd.DataFrame:
     rows = []
@@ -100,6 +102,33 @@ def build_runtime_integrity_audit(
                 f"{int(observed.max()) if observed.notna().any() else 'missing'}, "
                 f"violation_days={int(violations.sum())}"
             ),
+        ))
+    holdings = holdings_ledger.copy() if holdings_ledger is not None else pd.DataFrame()
+    states = position_state_ledger.copy() if position_state_ledger is not None else pd.DataFrame()
+    required = {"date", "symbol"}
+    if holdings.empty:
+        rows.append(_row("held_state_coverage", True, "no holding rows"))
+    elif not required.issubset(holdings.columns) or not required.issubset(states.columns):
+        rows.append(_row("held_state_coverage", False, "holding/state date-symbol columns missing"))
+    else:
+        holdings["date"] = pd.to_datetime(holdings["date"], errors="coerce")
+        holdings["symbol"] = holdings["symbol"].astype(str)
+        if "entry_date" in holdings.columns:
+            entry_date = pd.to_datetime(holdings["entry_date"], errors="coerce")
+            holdings = holdings[entry_date.isna() | entry_date.lt(holdings["date"])]
+        expected = holdings[["date", "symbol"]].dropna().drop_duplicates()
+        states["date"] = pd.to_datetime(states["date"], errors="coerce")
+        states["symbol"] = states["symbol"].astype(str)
+        if "held" in states.columns:
+            held = states["held"].fillna(False).astype(bool)
+            states = states[held]
+        observed = states[["date", "symbol"]].dropna().drop_duplicates()
+        missing = expected.merge(observed, on=["date", "symbol"], how="left", indicator=True)
+        missing_count = int(missing["_merge"].eq("left_only").sum())
+        rows.append(_row(
+            "held_state_coverage",
+            missing_count == 0,
+            f"expected_overnight_holding_rows={len(expected)}, missing_state_rows={missing_count}",
         ))
     return pd.DataFrame(rows)
 

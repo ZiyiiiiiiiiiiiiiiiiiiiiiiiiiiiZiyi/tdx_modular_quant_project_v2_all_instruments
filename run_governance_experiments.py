@@ -65,6 +65,7 @@ from functions.alpha_bundles import (
 from functions.decision_council.candidate_factor_cache import (
     attach_pre_screen_candidate_factor_cache,
 )
+from functions.decision_council.audit_price_history import load_audit_price_history
 from functions.decision_council.factor_cabinet_feature_cache import (
     attach_factor_cabinet_feature_cache,
 )
@@ -498,7 +499,7 @@ def run_single_experiment(
         if safe_suffix:
             output_dir = output_dir / safe_suffix
     if str(strategy_logic_version).strip().lower() != "production_v1":
-        logic_dir = {"mainline_v2": "v2"}.get(
+        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3"}.get(
             str(strategy_logic_version).strip().lower(),
             "logic_custom",
         )
@@ -542,6 +543,13 @@ def run_single_experiment(
         factor_spec=factor_spec,
         progress_callback=progress_callback,
     )
+    audit_prices = load_audit_price_history(
+        FEATURE_DAILY_PARQUET,
+        decision_start=effective_start,
+        decision_end=effective_end,
+        horizon_days=20,
+        allowed_instrument_types=tuple(universe_spec.allowed_instrument_types),
+    )
     if low_memory:
         _emit_progress(
             progress_callback,
@@ -569,6 +577,7 @@ def run_single_experiment(
     )
     runner = GovernanceBacktestRunner(
         features,
+        audit_price_df=audit_prices,
         initial_cash=float(initial_cash),
         safety_proxy_mode=safety_proxy_mode,
         output_dir=output_dir,
@@ -951,7 +960,7 @@ def parse_args():
     parser.add_argument("--factor-cabinet-path", default="")
     parser.add_argument(
         "--strategy-logic-version",
-        choices=["production_v1", "mainline_v2"],
+        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native"],
         default="production_v1",
     )
     parser.add_argument("--experiment-plan", type=str, help="Path to experiment plan JSON file")
