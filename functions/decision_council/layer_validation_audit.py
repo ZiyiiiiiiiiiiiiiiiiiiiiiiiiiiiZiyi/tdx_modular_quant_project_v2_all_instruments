@@ -34,8 +34,10 @@ SOURCE_COLUMNS = (
     "p_win_10d_calibrated",
     "entry_confirmed",
     "mainline_v2_entry_confirmed",
+    "mainline_v3_entry_confirmed",
     "state_machine_role_pass",
     "cooldown_active",
+    "lifecycle_held_row",
     "position_state",
     "entry_block_reason",
 )
@@ -69,10 +71,15 @@ def build_layer_validation_reports(
     for column in (
         "entry_confirmed",
         "mainline_v2_entry_confirmed",
+        "mainline_v3_entry_confirmed",
         "state_machine_role_pass",
         "cooldown_active",
+        "lifecycle_held_row",
     ):
         candidates[column] = _as_bool(candidates.get(column, pd.Series(False, index=candidates.index)))
+    # Held rows exist here only for lifecycle evaluation. They are not fresh
+    # entry opportunities and must not enter entry-effect statistics.
+    candidates = candidates[~candidates["lifecycle_held_row"]].reset_index(drop=True)
 
     candidates = _attach_forward_returns(candidates, close_history_getter=close_history_getter)
     candidates["l0_primary_rank"] = candidates.groupby("signal_date")["primary_score"].rank(
@@ -80,6 +87,8 @@ def build_layer_validation_reports(
     )
     candidates["l0_primary_top3"] = candidates["l0_primary_rank"].le(3)
     current_confirmed = candidates["mainline_v2_entry_confirmed"]
+    if candidates["mainline_v3_entry_confirmed"].any():
+        current_confirmed = candidates["mainline_v3_entry_confirmed"]
     if not current_confirmed.any() and candidates["entry_confirmed"].any():
         current_confirmed = candidates["entry_confirmed"]
     candidates["l1_current_role_confirmation"] = current_confirmed & candidates["state_machine_role_pass"]
@@ -460,7 +469,8 @@ def _contract_frame() -> pd.DataFrame:
 def _as_bool(values: pd.Series) -> pd.Series:
     if pd.api.types.is_bool_dtype(values):
         return values.fillna(False).astype(bool)
-    return values.fillna(False).astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+    normalized = values.astype("string").fillna("").str.strip().str.lower()
+    return normalized.isin({"true", "1", "yes"})
 
 
 def _selection_hash(selected: pd.DataFrame) -> str:

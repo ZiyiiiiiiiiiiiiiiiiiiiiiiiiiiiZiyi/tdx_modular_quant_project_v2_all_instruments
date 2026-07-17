@@ -118,8 +118,13 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         "orderflow": _safe_float(signal.get("orderflow_candidate_score") if hasattr(signal, "get") else pd.NA, 0.0),
         "breakout": _safe_float(signal.get("breakout_gate_score") if hasattr(signal, "get") else pd.NA, 0.0),
     }
-    entry_thesis = max(support_scores, key=support_scores.get) if max(support_scores.values()) > 0.0 else "composite"
-    entry_support = float(support_scores.get(entry_thesis, 0.0))
+    cabinet_thesis = str(signal.get("cabinet_entry_thesis", "") if hasattr(signal, "get") else "").strip()
+    if cabinet_thesis:
+        entry_thesis = cabinet_thesis
+        entry_support = _safe_float(signal.get("cabinet_entry_thesis_support"), 0.5)
+    else:
+        entry_thesis = max(support_scores, key=support_scores.get) if max(support_scores.values()) > 0.0 else "composite"
+        entry_support = float(support_scores.get(entry_thesis, 0.0))
     runner.position_lifecycle[symbol] = {
         "entry_date": pd.Timestamp(entry_date),
         "entry_price": float(entry_price),
@@ -138,6 +143,7 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         "entry_size_tier": str(signal.get("entry_size_tier", "") if hasattr(signal, "get") else ""),
         "entry_thesis": str(existing.get("entry_thesis", entry_thesis)) if existing and previous_shares > 0.0 else entry_thesis,
         "entry_module_support": float(existing.get("entry_module_support", entry_support)) if existing and previous_shares > 0.0 else entry_support,
+        "entry_logic_version": str(getattr(runner, "strategy_logic_version", "production_v1")),
     }
 
 def mark_lifecycle(runner, symbol: str, *, date, price: float) -> dict:
@@ -388,6 +394,11 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "breakout": _safe_float(row.get("breakout_gate_score"), default=0.0),
             "composite": entry_score,
         }
+        cabinet_family_column = "cabinet_family_" + "".join(
+            char if char.isalnum() else "_" for char in entry_thesis.lower()
+        ).strip("_") + "_score"
+        if cabinet_family_column in row.index:
+            current_support_by_thesis[entry_thesis] = _safe_float(row.get(cabinet_family_column), default=0.5)
         current_module_support = _clip01(current_support_by_thesis.get(entry_thesis, entry_score))
         support_decay = max(entry_module_support - current_module_support, 0.0)
         orderflow_decay_score = max(0.55 - orderflow_score, 0.0) / 0.55
@@ -466,15 +477,18 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             and trend_direction_score < 0.48
             and giveback >= max(dynamic_giveback_limit * 0.75, 0.18)
         )
+        thesis_grace_days = 20 if entry_thesis in {
+            "value", "growth", "cashflow_quality", "profitability_quality"
+        } else int(GOVERNANCE_STALE_WATCH_DAYS)
         signal_failure = bool(
             is_held
-            and holding_days >= int(GOVERNANCE_STALE_WATCH_DAYS)
+            and holding_days >= int(thesis_grace_days)
             and entry_score < float(GOVERNANCE_ENTRY_MATRIX_EXIT_DECAY_THRESHOLD)
             and trend_score < 0.45
         )
         thesis_failure = bool(
             is_held
-            and holding_days >= int(GOVERNANCE_STALE_WATCH_DAYS)
+            and holding_days >= int(thesis_grace_days)
             and entry_module_support >= 0.45
             and current_module_support < 0.35
             and support_decay >= 0.20
@@ -482,6 +496,10 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         signal_failure = bool(signal_failure or thesis_failure)
         downtrend_exit = bool(
             is_held
+            and (
+                str(getattr(runner, "strategy_logic_version", "")) != "mainline_v3_cabinet_native"
+                or holding_days >= int(thesis_grace_days)
+            )
             and downtrend_score >= float(GOVERNANCE_DOWNTREND_DECAY_EXIT)
             and follow_through_score < 0.45
         )
@@ -543,6 +561,11 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         elif signal_failure:
             exit_reason = "signal_failure_exit"
         paper_exit_reason = exit_reason
+        if (
+            str(getattr(runner, "strategy_logic_version", "")) == "mainline_v3_cabinet_native"
+            and exit_reason == "post_entry_failure_exit"
+        ):
+            exit_reason = ""
         if exit_reason in {"hard_stop_exit", "profit_hard_stop_exit"} and not runner._control_enabled("hard_stop_exit"):
             exit_reason = ""
         elif exit_reason == "profit_giveback_exit" and not runner._control_enabled("profit_giveback_exit"):
@@ -667,6 +690,7 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "signal_failure_exit": bool(signal_failure or downtrend_exit) and runner._control_enabled("signal_failure_exit"),
             "paper_signal_failure_exit": bool(signal_failure or downtrend_exit),
             "entry_thesis": entry_thesis,
+            "entry_logic_version": str(lifecycle.get("entry_logic_version", "")),
             "entry_module_support": entry_module_support,
             "current_module_support": current_module_support,
             "support_decay": support_decay,
@@ -794,5 +818,3 @@ def register_position_cooldown(runner, symbol: str, *, date, reason: str) -> Non
         "reason": reason,
         "cooldown_days": days,
     }
-
-

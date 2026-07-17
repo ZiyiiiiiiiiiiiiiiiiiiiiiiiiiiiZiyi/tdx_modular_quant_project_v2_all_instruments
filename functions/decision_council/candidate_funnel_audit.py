@@ -215,7 +215,7 @@ def build_control_trigger_summary(
         versions = gates.get("strategy_logic_version", pd.Series("production_v1", index=gates.index)).astype(str)
         active_probability = gates.get(
             "probability_gate_changed_decision", pd.Series(False, index=gates.index)
-        ).fillna(False).astype(bool) & versions.ne("mainline_v2")
+        ).fillna(False).astype(bool) & ~versions.isin({"mainline_v2", "mainline_v3_cabinet_native"})
         rows.append({
             "control": "probability_gate",
             "evaluated_count": _true_count(gates, "probability_gate_evaluated"),

@@ -456,7 +456,7 @@ def parse_args():
     parser.add_argument("--factor-cabinet-path", default="", help="Explicit factor_cabinet.json path.")
     parser.add_argument(
         "--strategy-logic-version",
-        choices=["production_v1", "mainline_v2"],
+        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native"],
         default="production_v1",
         help="Versioned governance decision logic; v2 outputs are isolated from production_v1.",
     )
@@ -1173,7 +1173,7 @@ def _run_single_governance_variant(
     if not bool(alpha_collapse_exit_enabled):
         output_dir = output_dir / "no_alpha_collapse_exit"
     if str(strategy_logic_version).strip().lower() != "production_v1":
-        logic_dir = {"mainline_v2": "v2"}.get(
+        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3"}.get(
             str(strategy_logic_version).strip().lower(),
             "logic_custom",
         )
@@ -1388,7 +1388,7 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         runtime_args.factor_cabinet_path = factor_cabinet_path
     strategy_logic_version = str(governance.get("strategy_logic_version", "")).strip()
     if strategy_logic_version:
-        if strategy_logic_version not in {"production_v1", "mainline_v2"}:
+        if strategy_logic_version not in {"production_v1", "mainline_v2", "mainline_v3_cabinet_native"}:
             raise ValueError(f"Invalid strategy logic version: {strategy_logic_version}")
         runtime_args.strategy_logic_version = strategy_logic_version
     pit_mode = str(governance.get("pit_mode", "")).strip()

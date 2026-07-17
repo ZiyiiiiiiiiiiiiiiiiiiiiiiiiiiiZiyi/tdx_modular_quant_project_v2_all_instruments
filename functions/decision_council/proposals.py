@@ -338,13 +338,29 @@ def build_daily_candidates(
         min_score_percentile = STRATEGY_MIN_SCORE_PERCENTILE
     if enable_quality_filters is None:
         enable_quality_filters = ENABLE_BUY_QUALITY_FILTERS
+    held_symbols = {str(symbol) for symbol in (holding_days or {})}
+
+    def preserve_held(before: pd.DataFrame, after: pd.DataFrame) -> pd.DataFrame:
+        """Keep held rows visible to the lifecycle state machine.
+
+        Entry eligibility columns retain their original false values, so this
+        does not turn an ineligible holding into a new buy candidate.
+        """
+        if before.empty or not held_symbols or "symbol" not in before.columns:
+            return after
+        present = set(after["symbol"].astype(str)) if not after.empty else set()
+        missing = held_symbols - present
+        if not missing:
+            return after
+        held_rows = before[before["symbol"].astype(str).isin(missing)]
+        return pd.concat([after, held_rows], ignore_index=True)
     
     funnel_counts = {"universe_count": int(len(daily_features))}
     proposals = build_rule_alpha_proposals(
         daily_features,
         reputation_weights=reputation_weights,
         model_names=model_names,
-        factor_judged=str(selection_weight_mode or "").strip().lower() == "factor_judged",
+        factor_judged=str(selection_weight_mode or "").strip().lower() in {"factor_judged", "cabinet_native"},
         runtime_context=runtime_context,
     )
     funnel_counts["proposal_symbol_count"] = int(proposals["symbol"].nunique()) if not proposals.empty else 0
@@ -397,49 +413,90 @@ def build_daily_candidates(
     ]
     source = source[[column for column in keep if column in source.columns]].copy()
     candidates = source.merge(combined, on="symbol", how="inner")
+    candidates["_entry_eligible"] = ~candidates["symbol"].astype(str).isin(held_symbols)
     funnel_counts["factor_valid_count"] = int(len(candidates))
     candidates["expected_return_5d"] = (
         proposals.groupby("symbol")["predicted_return_5d"].mean().reindex(candidates["symbol"]).to_numpy()
     )
     candidates["alpha_collapse_exit"] = candidates["symbol"].isin(collapses)
     instrument_types = tuple(allowed_instrument_types or GOVERNANCE_ALLOWED_INSTRUMENT_TYPES)
-    candidates = candidates[
-        candidates["instrument_type"].astype(str).isin(instrument_types)
-    ]
-    funnel_counts["instrument_type_pass_count"] = int(len(candidates))
+    before = candidates
+    eligible = candidates["instrument_type"].astype(str).isin(instrument_types)
+    before["_entry_eligible"] = before["_entry_eligible"] & eligible
+    candidates = preserve_held(before, before[eligible])
+    funnel_counts["instrument_type_pass_count"] = int(candidates["_entry_eligible"].sum())
     # Filter to target index pools (沪深300/中证500/中证100/上证50/中证A500) + all ETFs
-    candidates = _apply_index_pool_filter_registry(
-        candidates,
+    before = candidates
+    filtered = _apply_index_pool_filter_registry(
+        before,
         target_index_codes=tuple(target_index_codes),
         universe_mode=universe_mode,
         require_constituents=require_constituents,
         allow_fallback=allow_fallback,
     )
-    funnel_counts["universe_membership_pass_count"] = int(len(candidates))
+    passed_symbols = set(filtered["symbol"].astype(str))
+    before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
+    if "_entry_eligible" in filtered.columns:
+        filtered["_entry_eligible"] = filtered["_entry_eligible"] & filtered["symbol"].astype(str).isin(passed_symbols)
+    candidates = preserve_held(before, filtered)
+    funnel_counts["universe_membership_pass_count"] = int(candidates["_entry_eligible"].sum())
     if "is_trading" in candidates.columns:
-        candidates = candidates[candidates["is_trading"].fillna(False)]
-    funnel_counts["trading_pass_count"] = int(len(candidates))
+        before = candidates
+        eligible = candidates["is_trading"].fillna(False).astype(bool)
+        before["_entry_eligible"] = before["_entry_eligible"] & eligible
+        candidates = preserve_held(before, before[eligible])
+        funnel_counts["trading_pass_count"] = int(candidates["_entry_eligible"].sum())
+    else:
+        funnel_counts["trading_pass_count"] = int(len(candidates))
     if "abnormal_jump" in candidates.columns:
-        candidates = candidates[~candidates["abnormal_jump"].fillna(True)]
-    funnel_counts["price_quality_pass_count"] = int(len(candidates))
+        before = candidates
+        eligible = ~candidates["abnormal_jump"].fillna(True).astype(bool)
+        before["_entry_eligible"] = before["_entry_eligible"] & eligible
+        candidates = preserve_held(before, before[eligible])
+        funnel_counts["price_quality_pass_count"] = int(candidates["_entry_eligible"].sum())
+    else:
+        funnel_counts["price_quality_pass_count"] = int(len(candidates))
     amount = pd.to_numeric(candidates.get("amount"), errors="coerce").fillna(0.0)
     rolling_amount = pd.to_numeric(candidates.get("amount_ma20", amount), errors="coerce").fillna(amount)
     candidates["liquidity_eligible"] = (
         (amount >= float(GOVERNANCE_MIN_DAILY_AMOUNT))
         & (rolling_amount >= float(GOVERNANCE_MIN_DAILY_AMOUNT))
     )
-    candidates = candidates[candidates["liquidity_eligible"]]
-    funnel_counts["liquidity_pass_count"] = int(len(candidates))
+    before = candidates
+    before["_entry_eligible"] = before["_entry_eligible"] & before["liquidity_eligible"]
+    candidates = preserve_held(before, before[before["liquidity_eligible"]])
+    funnel_counts["liquidity_pass_count"] = int(candidates["_entry_eligible"].sum())
     
     # Apply buy quality filters to improve selection accuracy
     if enable_quality_filters:
-        candidates = _apply_buy_quality_filters(candidates)
-    funnel_counts["buy_quality_pass_count"] = int(len(candidates))
+        before = candidates
+        filtered = _apply_buy_quality_filters(before)
+        passed_symbols = set(filtered["symbol"].astype(str))
+        before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
+        if "_entry_eligible" in filtered.columns:
+            filtered["_entry_eligible"] = filtered["_entry_eligible"] & filtered["symbol"].astype(str).isin(passed_symbols)
+        candidates = preserve_held(before, filtered)
+        funnel_counts["buy_quality_pass_count"] = int(candidates["_entry_eligible"].sum())
+    else:
+        funnel_counts["buy_quality_pass_count"] = int(len(candidates))
     
-    candidates = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
-    funnel_counts["required_value_pass_count"] = int(len(candidates))
+    before = candidates
+    filtered = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
+    passed_symbols = set(filtered["symbol"].astype(str))
+    before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
+    if "_entry_eligible" in filtered.columns:
+        filtered["_entry_eligible"] = filtered["_entry_eligible"] & filtered["symbol"].astype(str).isin(passed_symbols)
+    candidates = preserve_held(before, filtered)
+    funnel_counts["required_value_pass_count"] = int(candidates["_entry_eligible"].sum())
     selection_mode = str(selection_weight_mode or "reputation_weighted").strip().lower()
-    if selection_mode == "factor_judged":
+    if selection_mode == "cabinet_native":
+        from functions.decision_council.cabinet_native_scoring import attach_cabinet_native_scores
+        candidates, _family_evidence = attach_cabinet_native_scores(
+            candidates,
+            proposals,
+            runtime_context=runtime_context,
+        )
+    elif selection_mode == "factor_judged":
         candidates["primary_score"] = pd.to_numeric(candidates["alpha_percentile"], errors="coerce")
         candidates["score_authority"] = "factor_judged_alpha_ensemble"
     elif selection_mode == "role_balanced":
@@ -454,8 +511,14 @@ def build_daily_candidates(
     else:
         candidates["primary_score"] = candidates["alpha_score"]
         candidates["score_authority"] = "exploratory_alpha_fallback"
-    candidates = candidates.dropna(subset=["primary_score"])
-    funnel_counts["primary_score_pass_count"] = int(len(candidates))
+    before = candidates
+    filtered = candidates.dropna(subset=["primary_score"])
+    passed_symbols = set(filtered["symbol"].astype(str))
+    before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
+    if "_entry_eligible" in filtered.columns:
+        filtered["_entry_eligible"] = filtered["_entry_eligible"] & filtered["symbol"].astype(str).isin(passed_symbols)
+    candidates = preserve_held(before, filtered)
+    funnel_counts["primary_score_pass_count"] = int(candidates["_entry_eligible"].sum())
     candidates = candidates.sort_values(["primary_score", "symbol"], ascending=[False, True])
     candidates["candidate_rank"] = range(1, len(candidates) + 1)
 
@@ -463,19 +526,22 @@ def build_daily_candidates(
     if min_score_percentile > 0 and "primary_score" in candidates.columns:
         score_threshold = candidates["primary_score"].quantile(min_score_percentile)
         qualified_mask = candidates["primary_score"] >= score_threshold
+        candidates["_entry_eligible"] = candidates["_entry_eligible"] & qualified_mask
         # Always keep currently held positions even if below threshold
-        held = set((holding_days or {}).keys())
-        candidates = candidates[qualified_mask | candidates["symbol"].astype(str).isin(held)]
-    funnel_counts["score_percentile_pass_count"] = int(len(candidates))
+        candidates = candidates[qualified_mask | candidates["symbol"].astype(str).isin(held_symbols)]
+    funnel_counts["score_percentile_pass_count"] = int(candidates["_entry_eligible"].sum())
 
     if candidate_limit is not None:
-        held = set((holding_days or {}).keys())
+        candidates["_entry_eligible"] = candidates["_entry_eligible"] & candidates["candidate_rank"].le(int(candidate_limit))
         candidates = candidates[
             (candidates["candidate_rank"] <= int(candidate_limit))
-            | candidates["symbol"].astype(str).isin(held)
+            | candidates["symbol"].astype(str).isin(held_symbols)
         ]
-    funnel_counts["candidate_limit_pass_count"] = int(len(candidates))
-    result = candidates.reset_index(drop=True)
+    funnel_counts["candidate_limit_pass_count"] = int(candidates["_entry_eligible"].sum())
+    funnel_counts["held_lifecycle_visible_count"] = int(
+        candidates["symbol"].astype(str).isin(held_symbols).sum()
+    )
+    result = candidates.drop(columns=["_entry_eligible"], errors="ignore").reset_index(drop=True)
     result.attrs["candidate_funnel_counts"] = funnel_counts
     return result, proposals
 

@@ -356,6 +356,7 @@ RUN_HTML = """<!doctype html>
           <select id="strategy_logic_version">
             <option value="production_v1">production_v1 - 冻结生产对照</option>
             <option value="mainline_v2" selected>mainline_v2 - 简化入场实验主线</option>
+            <option value="mainline_v3_cabinet_native">mainline_v3_cabinet_native - 因子柜原生实验主线</option>
           </select>
         </div>
         <div class="field">

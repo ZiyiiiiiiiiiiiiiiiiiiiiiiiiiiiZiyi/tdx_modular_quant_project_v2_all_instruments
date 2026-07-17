@@ -1,6 +1,7 @@
 """Historical daily runner for the phase-one rules-based governance strategy."""
 from __future__ import annotations
 
+import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -133,10 +134,12 @@ from functions.decision_council.leakage import validate_governance_split
 from functions.decision_council.market_regime_policy import MarketRegimePolicy
 from functions.decision_council.mainline_v2 import (
     MAINLINE_V2,
+    MAINLINE_V3,
     apply_mainline_v2_entry_policy,
     calibration_runtime_state,
     normalize_strategy_logic_version,
 )
+from functions.decision_council.mainline_v3 import apply_mainline_v3_entry_policy
 from functions.decision_council.runtime_maturity import (
     combined_runtime_maturity,
     covariance_runtime_state,
@@ -155,6 +158,11 @@ from functions.decision_council.factor_runtime_audit import (
     build_factor_runtime_audit,
     print_factor_runtime_audit,
     save_factor_runtime_audit,
+)
+from functions.decision_council.factor_semantic_contract import (
+    build_factor_semantic_contracts,
+    semantic_contract_rows,
+    validate_factor_semantic_contracts,
 )
 from functions.decision_council.candidate_factor_cache import attach_pre_screen_candidate_factor_cache
 from functions.decision_council.candidate_funnel_audit import (
@@ -264,6 +272,20 @@ EXECUTION_LEDGER_COLUMNS = [
     "alpha_quality_drop_from_entry",
     "downtrend_decay_score",
     "post_entry_failure_score",
+    "strategy_logic_version",
+    "cabinet_native_final_score",
+    "cabinet_base_entry_score",
+    "cabinet_strict_entry_score",
+    "cabinet_proxy_entry_score",
+    "cabinet_timing_score",
+    "cabinet_liquidity_health_score",
+    "cabinet_risk_safety_score",
+    "cabinet_hold_support_score",
+    "cabinet_entry_thesis",
+    "cabinet_entry_thesis_support",
+    "mainline_v3_one_lot_cash_required",
+    "mainline_v3_one_lot_weight",
+    "mainline_v3_lot_feasible",
 ]
 
 HOLDINGS_LEDGER_COLUMNS = [
@@ -333,6 +355,7 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "signal_failure_exit",
     "paper_signal_failure_exit",
     "entry_thesis",
+    "entry_logic_version",
     "entry_module_support",
     "current_module_support",
     "support_decay",
@@ -448,6 +471,7 @@ class GovernanceBacktestRunner:
         self,
         feature_df: pd.DataFrame,
         *,
+        audit_price_df: pd.DataFrame | None = None,
         initial_cash: float = GOVERNANCE_INITIAL_CASH,
         safety_proxy_mode: str = SAFETY_PROXY_MODE,
         output_dir=GOVERNANCE_OUTPUT_DIR,
@@ -492,6 +516,18 @@ class GovernanceBacktestRunner:
     ):
         self.features = feature_df if prepared_features else _prepare_features(feature_df)
         self.features["date"] = pd.to_datetime(self.features["date"], errors="coerce")
+        audit_source = audit_price_df if audit_price_df is not None else self.features
+        audit_close = "close_nominal" if "close_nominal" in audit_source.columns else "close"
+        if {"date", "symbol", audit_close}.issubset(audit_source.columns):
+            self.audit_prices = audit_source[["date", "symbol", audit_close]].copy()
+            if audit_close != "close":
+                self.audit_prices = self.audit_prices.rename(columns={audit_close: "close"})
+            self.audit_prices["date"] = pd.to_datetime(self.audit_prices["date"], errors="coerce")
+            self.audit_prices["symbol"] = self.audit_prices["symbol"].astype(str)
+            self.audit_prices["close"] = pd.to_numeric(self.audit_prices["close"], errors="coerce")
+            self.audit_prices = self.audit_prices.dropna().drop_duplicates(["date", "symbol"], keep="last")
+        else:
+            self.audit_prices = pd.DataFrame(columns=["date", "symbol", "close"])
         self.output_dir = Path(output_dir)
         self.cash = float(initial_cash)
         self.initial_cash = float(initial_cash)
@@ -528,6 +564,16 @@ class GovernanceBacktestRunner:
         self.strategy_logic_version = normalize_strategy_logic_version(strategy_logic_version)
         self.pit_runtime_state = str(pit_runtime_state or "degraded")
         self.factor_runtime_context = self.factor_source_spec.runtime_context()
+        self.factor_semantic_contracts = {}
+        self.factor_semantic_contract_audit = {}
+        if self.strategy_logic_version == MAINLINE_V3:
+            if not self.factor_source_spec.uses_factor_cabinet:
+                raise ValueError("mainline_v3_cabinet_native requires a resolved factor_cabinet source")
+            self.factor_semantic_contracts = build_factor_semantic_contracts(self.factor_runtime_context)
+            self.factor_semantic_contract_audit = validate_factor_semantic_contracts(
+                self.factor_semantic_contracts,
+                expected_models=self.alpha_models,
+            )
         self.factor_runtime_audit = build_factor_runtime_audit(
             self.factor_source_spec,
             available_columns=self.features.columns,
@@ -586,6 +632,8 @@ class GovernanceBacktestRunner:
         # a copied DataFrame for every symbol in the full feature universe.
         self._feature_indices_by_symbol: dict[str, object] | None = None
         self._close_history_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
+        self._audit_price_indices_by_symbol: dict[str, object] | None = None
+        self._audit_close_history_cache: OrderedDict[str, pd.DataFrame] = OrderedDict()
         self.engine = PhaseOneDecisionCouncilEngine(
             self.features,
             safety_proxy_mode=safety_proxy_mode,
@@ -814,7 +862,7 @@ class GovernanceBacktestRunner:
             regime_params = None
         current_turnover_budget = regime_params.default_turnover_budget if regime_params else GOVERNANCE_DEFAULT_TURNOVER_BUDGET
         current_min_score_percentile = regime_params.min_score_percentile if regime_params else None
-        if self.strategy_logic_version == MAINLINE_V2:
+        if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}:
             # V2 keeps regime as an account-level exposure/risk overlay. It must
             # not also alter candidate admission or portfolio operating cadence.
             current_turnover_budget = GOVERNANCE_DEFAULT_TURNOVER_BUDGET
@@ -835,7 +883,10 @@ class GovernanceBacktestRunner:
             require_constituents=self._require_constituents,
             allow_fallback=self._allow_fallback,
             enable_quality_filters=self._enable_quality_filters,
-            selection_weight_mode=self.selection_weight_mode,
+            selection_weight_mode=(
+                "cabinet_native" if self.strategy_logic_version == MAINLINE_V3
+                else self.selection_weight_mode
+            ),
             runtime_context=self.factor_runtime_context,
         )
         candidate_build_counts = dict(candidates.attrs.get("candidate_funnel_counts", {}))
@@ -856,6 +907,22 @@ class GovernanceBacktestRunner:
             confirmation_mode=confirmation_mode,
             capital_usage_mode=self.capital_usage_mode,
         )
+        if self.strategy_logic_version == MAINLINE_V3:
+            # Establish cabinet-native compatibility fields before lifecycle
+            # evaluation so old entry-matrix scores cannot drive V3 exits.
+            candidates = apply_mainline_v3_entry_policy(
+                candidates,
+                max_new_candidates=self._max_positions_override or 5,
+                available_cash=self.cash,
+                nominal_nav=exposure.get("nominal_nav"),
+                min_cash_buffer=float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0),
+                max_single_position_weight=float(
+                    self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT)
+                    or GOVERNANCE_MAX_POSITION_WEIGHT
+                ),
+                held_symbols=self.positions,
+                lot_size=MIN_LOT_SIZE,
+            )
         candidates = self._apply_candidate_risk_penalty(candidates, exposure=exposure)
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
         candidates = self._apply_position_state_constraints(candidates, date=date, exposure=exposure)
@@ -869,6 +936,20 @@ class GovernanceBacktestRunner:
                 candidates,
                 risk_level=risk_level,
                 max_new_candidates=self._max_positions_override or 5,
+            )
+        elif self.strategy_logic_version == MAINLINE_V3:
+            candidates = apply_mainline_v3_entry_policy(
+                candidates,
+                max_new_candidates=self._max_positions_override or 5,
+                available_cash=self.cash,
+                nominal_nav=exposure.get("nominal_nav"),
+                min_cash_buffer=float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0),
+                max_single_position_weight=float(
+                    self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT)
+                    or GOVERNANCE_MAX_POSITION_WEIGHT
+                ),
+                held_symbols=self.positions,
+                lot_size=MIN_LOT_SIZE,
             )
         self._record_candidate_gate_audit(date=date, candidates=candidates)
         entry_confirmed = candidates.get("entry_confirmed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
@@ -992,7 +1073,7 @@ class GovernanceBacktestRunner:
                 self._max_positions_override
                 or (
                     GOVERNANCE_DEFAULT_TOP_N
-                    if self.strategy_logic_version == MAINLINE_V2
+                    if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}
                     else (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N)
                 )
             ),
@@ -1208,6 +1289,15 @@ class GovernanceBacktestRunner:
                 "position_exit_reason",
                 "cooldown_active",
                 "entry_block_reason",
+                "cabinet_base_entry_score",
+                "cabinet_strict_entry_score",
+                "cabinet_proxy_entry_score",
+                "cabinet_timing_score",
+                "cabinet_liquidity_health_score",
+                "cabinet_risk_safety_score",
+                "cabinet_hold_support_score",
+                "cabinet_entry_thesis",
+                "cabinet_entry_thesis_support",
             ]
             if column in candidates.columns
         ]
@@ -1315,6 +1405,7 @@ class GovernanceBacktestRunner:
             "normal_turnover_weight": float(diagnostics.get("normal_turnover_weight", 0.0)),
             "total_target_drift": float(diagnostics.get("total_target_drift", 0.0)),
             "candidate_count": int(len(candidates)),
+            "strategy_logic_version": self.strategy_logic_version,
             "entry_confirmed_count": int(diagnostics.get("qualified_entry_count", 0)),
             "entry_block_summary": entry_block_summary,
             "orderflow_candidate_score_mean": _safe_numeric_mean(candidates.get("orderflow_candidate_score")),
@@ -1328,6 +1419,12 @@ class GovernanceBacktestRunner:
             "entry_timing_score_mean": _safe_numeric_mean(candidates.get("entry_timing_score")),
             "entry_liquidity_score_mean": _safe_numeric_mean(candidates.get("entry_liquidity_score")),
             "entry_matrix_score_mean": _safe_numeric_mean(candidates.get("entry_matrix_score")),
+            "cabinet_strict_entry_score_mean": _safe_numeric_mean(candidates.get("cabinet_strict_entry_score")),
+            "cabinet_proxy_entry_score_mean": _safe_numeric_mean(candidates.get("cabinet_proxy_entry_score")),
+            "cabinet_timing_score_mean": _safe_numeric_mean(candidates.get("cabinet_timing_score")),
+            "cabinet_liquidity_health_score_mean": _safe_numeric_mean(candidates.get("cabinet_liquidity_health_score")),
+            "cabinet_risk_safety_score_mean": _safe_numeric_mean(candidates.get("cabinet_risk_safety_score")),
+            "cabinet_hold_support_score_mean": _safe_numeric_mean(candidates.get("cabinet_hold_support_score")),
             "alpha_quality_score_mean": _safe_numeric_mean(candidates.get("alpha_quality_score")),
             "surge_capture_score_mean": _safe_numeric_mean(candidates.get("surge_capture_score")),
             "follow_through_score_mean": _safe_numeric_mean(candidates.get("follow_through_score")),
@@ -2138,13 +2235,23 @@ class GovernanceBacktestRunner:
             "profit_giveback_exit", "post_entry_failure_exit", "signal_failure_exit",
             "production_v1_entry_confirmed", "mainline_v2_eligible",
             "mainline_v2_entry_confirmed", "mainline_v2_changed_decision",
+            "mainline_v3_eligible", "mainline_v3_entry_confirmed", "mainline_v3_changed_decision",
+            "lifecycle_held_row",
         )
         score_fields = (
             "primary_score", "alpha_percentile", "entry_alpha_score", "entry_timing_score",
             "entry_liquidity_score", "entry_matrix_score", "final_entry_score",
             "p_win_10d_calibrated", "p_win_10d_wilson_lower",
             "production_v1_target_weight", "target_weight",
+            "cabinet_base_entry_score", "cabinet_strict_entry_score", "cabinet_proxy_entry_score",
+            "cabinet_timing_score", "cabinet_liquidity_health_score",
+            "cabinet_risk_safety_score", "cabinet_hold_support_score",
         )
+        family_score_fields = tuple(
+            column for column in candidates.columns
+            if column.startswith("cabinet_family_") and column.endswith("_score")
+        )
+        score_fields = score_fields + family_score_fields
         day_rows = []
         for _, candidate in candidates.iterrows():
             row = {
@@ -2157,6 +2264,7 @@ class GovernanceBacktestRunner:
                 "entry_block_reason": str(candidate.get("entry_block_reason", "")),
                 "state_machine_role_block_reason": str(candidate.get("state_machine_role_block_reason", "")),
                 "position_state": str(candidate.get("position_state", "")),
+                "cabinet_entry_thesis": str(candidate.get("cabinet_entry_thesis", "")),
             }
             for field in bool_fields:
                 value = candidate.get(field, pd.NA)
@@ -2464,6 +2572,34 @@ class GovernanceBacktestRunner:
             self._close_history_cache.popitem(last=False)
         return history
 
+    def _audit_close_history(self, symbol: str) -> pd.DataFrame:
+        """Return post-run outcome prices, never strategy-decision features."""
+        symbol_key = str(symbol)
+        cached = self._audit_close_history_cache.pop(symbol_key, None)
+        if cached is not None:
+            self._audit_close_history_cache[symbol_key] = cached
+            return cached
+        if self.audit_prices.empty:
+            return pd.DataFrame(columns=["date", "close"])
+        if self._audit_price_indices_by_symbol is None:
+            self._audit_price_indices_by_symbol = {
+                str(key): value
+                for key, value in self.audit_prices.groupby("symbol", sort=False).indices.items()
+            }
+        indices = self._audit_price_indices_by_symbol.get(symbol_key)
+        if indices is None:
+            return pd.DataFrame(columns=["date", "close"])
+        history = (
+            self.audit_prices.iloc[indices][["date", "close"]]
+            .dropna()
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        self._audit_close_history_cache[symbol_key] = history
+        while len(self._audit_close_history_cache) > int(GOVERNANCE_AUDIT_PRICE_HISTORY_CACHE_SYMBOL_LIMIT):
+            self._audit_close_history_cache.popitem(last=False)
+        return history
+
     def _post_entry_price_diagnostics(self, symbol: str, date, entry_price) -> dict:
         result = {
             "best_buy_after_entry_date": pd.NaT,
@@ -2626,7 +2762,7 @@ class GovernanceBacktestRunner:
     def _allow_normal_rebalance(self, date, day_index):
         if self._normal_rebalance_dates:
             return pd.Timestamp(date) in self._normal_rebalance_dates
-        if self.strategy_logic_version == MAINLINE_V2:
+        if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}:
             return int(day_index) % 5 == 0
         # Use regime-adjusted rebalancing interval
         regime_params = self._get_regime_params(date)
@@ -2934,6 +3070,20 @@ class GovernanceBacktestRunner:
                     "future_loss_risk_score",
                     "downtrend_decay_score",
                     "post_entry_failure_score",
+                    "strategy_logic_version",
+                    "cabinet_native_final_score",
+                    "cabinet_base_entry_score",
+                    "cabinet_strict_entry_score",
+                    "cabinet_proxy_entry_score",
+                    "cabinet_timing_score",
+                    "cabinet_liquidity_health_score",
+                    "cabinet_risk_safety_score",
+                    "cabinet_hold_support_score",
+                    "cabinet_entry_thesis",
+                    "cabinet_entry_thesis_support",
+                    "mainline_v3_one_lot_cash_required",
+                    "mainline_v3_one_lot_weight",
+                    "mainline_v3_lot_feasible",
                     "retail_action",
                     "retail_block_reason",
                     "capital_profile",
@@ -2946,6 +3096,9 @@ class GovernanceBacktestRunner:
             "governance_defensive_sleeve_diagnostics": pd.DataFrame(self.defensive_sleeve_rows),
             "governance_factor_weight_ledger": pd.DataFrame(self.factor_weight_rows),
             "governance_factor_source_report": pd.DataFrame([self.factor_source_spec.summary_dict()]),
+            "governance_factor_semantic_contract": pd.DataFrame(
+                semantic_contract_rows(self.factor_semantic_contracts)
+            ),
             "governance_alpha_proposals": pd.concat(self.alpha_rows, ignore_index=True) if self.alpha_rows else pd.DataFrame(),
             "governance_alpha_collapse_exit_diagnostics": pd.DataFrame(self.alpha_collapse_exit_rows),
             "governance_account_audit_ledger": pd.DataFrame(self.account_audit_rows),
@@ -3014,6 +3167,8 @@ class GovernanceBacktestRunner:
             execution_ledger=extra["governance_execution_ledger"],
             account_audit=extra["governance_account_audit_ledger"],
             daily_result=extra["governance_daily_result"],
+            holdings_ledger=extra["governance_holdings_ledger"],
+            position_state_ledger=extra["governance_position_state_ledger"],
             max_positions=self._max_positions_override,
         )
         if self.governance_variant == "governance_layer_validation":
@@ -3023,7 +3178,7 @@ class GovernanceBacktestRunner:
             extra.update(
                 build_layer_validation_reports(
                     self._candidate_gate_part_paths(),
-                    close_history_getter=self._close_history,
+                    close_history_getter=self._audit_close_history,
                     execution_ledger=extra["governance_execution_ledger"],
                     trade_pairs=trade_pairs,
                 )
@@ -3042,6 +3197,20 @@ class GovernanceBacktestRunner:
         extra["governance_control_avoided_loss_summary"] = _control_avoided_loss_summary_frame(
             extra["governance_control_avoided_loss_ledger"]
         )
+        if self.strategy_logic_version == MAINLINE_V3:
+            from functions.decision_council.cabinet_thesis_audit import build_cabinet_thesis_counterfactual
+            from functions.decision_council.factor_ic_transfer_audit import build_factor_ic_transfer_audit
+
+            extra["governance_cabinet_thesis_counterfactual"] = build_cabinet_thesis_counterfactual(
+                extra["governance_position_state_ledger"],
+                self.audit_prices,
+            )
+            extra["governance_factor_ic_transfer_audit"] = build_factor_ic_transfer_audit(
+                extra["governance_alpha_proposals"],
+                self.audit_prices,
+                factor_source_spec=self.factor_source_spec,
+                candidate_universe=extra.get("governance_layer_validation_candidate_detail"),
+            )
         self._log_save_stage("attribution")
         extra["governance_attribution_ledger"] = build_governance_attribution(
             daily_result=extra["governance_daily_result"],
@@ -3111,6 +3280,22 @@ class GovernanceBacktestRunner:
         )
         saved["governance_strategy_report"] = save_strategy_report(report_text, report_path)
         saved["factor_runtime_audit"] = save_factor_runtime_audit(self.factor_runtime_audit, self.output_dir)
+        if self.factor_semantic_contracts:
+            semantic_path = self.output_dir / "factor_semantic_contract_audit.json"
+            saved["factor_semantic_contract_audit"] = write_governance_text(
+                json.dumps(
+                    {
+                        **self.factor_semantic_contract_audit,
+                        "strategy_logic_version": self.strategy_logic_version,
+                        "factor_cabinet_run_id": self.factor_source_spec.factor_cabinet_run_id,
+                        "factor_cabinet_hash": self.factor_source_spec.cabinet_manifest_hash,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                semantic_path,
+                encoding="utf-8",
+            )
         self._log_save_stage("shadow_diagnostics")
         shadow_diagnostics = build_shadow_factor_diagnostics(
             self.engine.ledgers.frame("shadow_portfolio_ledger"),
@@ -3341,8 +3526,20 @@ def run_governance_backtest(
         if still_missing:
             raise ValueError(f"Candidate factor cache did not provide required columns: {still_missing}")
     features = _prepare_features(features, copy=False)
+    audit_prices = pd.DataFrame(columns=["date", "symbol", "close"])
+    if effective_start is not None and effective_end is not None:
+        from functions.decision_council.audit_price_history import load_audit_price_history
+
+        audit_prices = load_audit_price_history(
+            feature_path,
+            decision_start=effective_start,
+            decision_end=effective_end,
+            horizon_days=20,
+            allowed_instrument_types=allowed_instrument_types,
+        )
     runner = GovernanceBacktestRunner(
         features,
+        audit_price_df=audit_prices,
         initial_cash=float(initial_cash),
         output_dir=output_dir,
         alpha_models=alpha_models,

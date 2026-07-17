@@ -63,6 +63,7 @@ def adapt_retail_buy_order(
     min_entry_score = float(runner.capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0)
     tier = str(order.get("entry_size_tier", "") or "").strip().lower()
     force_deploy = runner.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
+    cabinet_native = str(getattr(runner, "strategy_logic_version", "")) == "mainline_v3_cabinet_native"
     if force_deploy and tier == "diversify_1_lot":
         min_entry_score = min(min_entry_score, float(GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN))
     elif tier == "starter_1_lot":
@@ -104,13 +105,15 @@ def adapt_retail_buy_order(
         return 0.0, "blocked", "target_notional_zero"
     if entry_score < min_entry_score:
         return 0.0, "blocked", "entry_matrix_score"
-    if exhaustion >= float(GOVERNANCE_EXHAUSTION_BUY_MAX):
+    if not cabinet_native and exhaustion >= float(GOVERNANCE_EXHAUSTION_BUY_MAX):
         return 0.0, "blocked", "exhaustion_block"
-    if downtrend >= float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK):
+    if not cabinet_native and downtrend >= float(GOVERNANCE_DOWNTREND_DECAY_ADD_BLOCK):
         return 0.0, "blocked", "downtrend_decay_block"
 
     planned_lots = int(max(_safe_float(order.get("planned_entry_lots"), default=1.0), 1.0))
-    if tier == "starter_strong" or (
+    if cabinet_native:
+        planned_lots = 1
+    elif tier == "starter_strong" or (
         entry_score >= max(strong_threshold, float(GOVERNANCE_ENTRY_MATRIX_STRONG_STARTER))
         and alpha_quality >= 0.70
         and follow_through >= float(GOVERNANCE_FOLLOW_THROUGH_STRONG)
@@ -225,9 +228,22 @@ def record_retail_execution_diagnostic(
             "future_loss_risk_score": order.get("future_loss_risk_score", pd.NA),
             "downtrend_decay_score": order.get("downtrend_decay_score", pd.NA),
             "post_entry_failure_score": order.get("post_entry_failure_score", pd.NA),
+            "strategy_logic_version": order.get("strategy_logic_version", ""),
+            "cabinet_native_final_score": order.get("cabinet_native_final_score", pd.NA),
+            "cabinet_base_entry_score": order.get("cabinet_base_entry_score", pd.NA),
+            "cabinet_strict_entry_score": order.get("cabinet_strict_entry_score", pd.NA),
+            "cabinet_proxy_entry_score": order.get("cabinet_proxy_entry_score", pd.NA),
+            "cabinet_timing_score": order.get("cabinet_timing_score", pd.NA),
+            "cabinet_liquidity_health_score": order.get("cabinet_liquidity_health_score", pd.NA),
+            "cabinet_risk_safety_score": order.get("cabinet_risk_safety_score", pd.NA),
+            "cabinet_hold_support_score": order.get("cabinet_hold_support_score", pd.NA),
+            "cabinet_entry_thesis": order.get("cabinet_entry_thesis", ""),
+            "cabinet_entry_thesis_support": order.get("cabinet_entry_thesis_support", pd.NA),
+            "mainline_v3_one_lot_cash_required": order.get("mainline_v3_one_lot_cash_required", pd.NA),
+            "mainline_v3_one_lot_weight": order.get("mainline_v3_one_lot_weight", pd.NA),
+            "mainline_v3_lot_feasible": order.get("mainline_v3_lot_feasible", pd.NA),
             "retail_action": str(retail_action),
             "retail_block_reason": str(retail_block_reason),
             "capital_profile": str(runner.capital_profile.get("name", "")),
         }
     )
-

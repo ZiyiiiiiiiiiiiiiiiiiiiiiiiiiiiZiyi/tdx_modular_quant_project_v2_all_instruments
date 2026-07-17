@@ -216,11 +216,19 @@ def _plot_model_scores(plt, reputation_ledger, output_path):
     data["score_ema"] = pd.to_numeric(data["score_ema"], errors="coerce")
     data["active_reputation_weight"] = pd.to_numeric(data["active_reputation_weight"], errors="coerce")
     data = data.dropna(subset=["date", "model_name", "score_ema"]).sort_values("date")
+    if data.empty:
+        return
+    latest = data.groupby("model_name", as_index=False).tail(1).copy()
+    latest["_plot_priority"] = latest["active_reputation_weight"].fillna(0.0).abs()
+    if float(latest["_plot_priority"].sum()) <= 1e-12:
+        latest["_plot_priority"] = latest["score_ema"].fillna(0.0).abs()
+    plotted_models = latest.nlargest(12, "_plot_priority")["model_name"].astype(str)
+    data = data[data["model_name"].astype(str).isin(set(plotted_models))].copy()
     fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
     for model_name, rows in data.groupby("model_name"):
         axes[0].plot(rows["date"], rows["score_ema"], linewidth=1.2, label=str(model_name))
         axes[1].plot(rows["date"], rows["active_reputation_weight"], linewidth=1.2, label=str(model_name))
-    axes[0].set_title("Governance model reputation scores")
+    axes[0].set_title("Governance model reputation scores (top 12 by latest active weight)")
     axes[0].set_ylabel("Reward EWMA score")
     axes[1].set_ylabel("Active voting weight")
     axes[1].set_xlabel("Date")
