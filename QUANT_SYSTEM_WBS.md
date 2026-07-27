@@ -1430,3 +1430,15 @@
 - 验证要求：提交前执行`git diff --check`、核心变更文件`py_compile`及与最终20日验收相匹配的专项回归；推送后核对远端分支与提交哈希。
 - 发布记录：快照提交`3bcb747b254b2fdec503350221bdb0dfe4ac80a2`已与远端同名分支核对一致；用户随后明确授权合并主干，采用从`main@56908d7`到快照分支的快进合并，合并前再次确认未跟踪运行产物不在提交范围。
 - 准入语义：该分支是开发复原基线，不等同于盈利准入或实盘授权；任何后续参数/逻辑修正必须另立WBS变更并使用受控窗口重验。
+
+### CHANGE-20260727-27：27日晚间180日run第130日normal仓位约56%诊断
+
+- 诊断对象：`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1200/v3/run20260727_213603`；完成时间2026-07-27 22:51，`COMPLETE.json=complete`，实际180个交易日，最后日期2025-09-25。该run为`aggressive_lean`、2万元、最多5只、E4、止损-12%、固定74因子柜；不是普通保守策略。
+- 第130个交易日：2025-07-17，`risk_level=normal`、`structural_regime_level=bull`、4只持仓；实际暴露56.4659%。真正的安全/授权链为`raw_safety_exposure_cap=100%`、`safety_exposure_cap=100%`、`exposure_cap=90%`、`strategic_exposure_budget=90%`、`effective_target_exposure_cap=90%`，因此不存在“normal状态被安全模块硬压到50%”。
+- 字段语义：页面/日表的`target_exposure=56.4659%`来自Lean唯一ActionPlan的`planned_exposure`，表示“优化器本日选完动作后的计划仓位”，不是风险上限。当天没有选中买单，计划仓位自然等于实际仓位；把它理解为“仓位上限”会得到错误结论。
+- 购买漏斗：同日Lean权威诊断有197个正收益原始信号、168个结构可行、168个现金可行、168个slot可行；信号支持暴露64.3602%、整数可行暴露64.3602%，但唯一优化器从419个动作提案中选择0个、拒绝419个，`solver_status=optimal_bounded_exhaustive`。因此50%附近停滞发生在“整数ActionPlan约束选择”，不是因子无信号、现金不足、安全上限或normal状态。
+- 接线缺陷一：`runner.py`在调用Lean唯一优化器前仍用旧`_scap_entry_stage_counts(candidates)`驱动`_authorize_exposure_by_regime()`和`decide_exposure_catchup()`；同一日旧口径记录raw/structural/cash/slot全0、`too_few_confirmed_entries`、`insufficient_confirmed_entries`和旧授权55%，而Lean权威口径为197/168/168/168。Lean随后把真实战略上限改回90%，所以该断链主要污染页面、追仓诊断和旧授权字段，但造成“有168个候选却显示0个”的自相矛盾。
+- 接线缺陷二：`integer_action_optimizer.py`把所有当前持仓和新候选按`thesis_by_symbol`重新计数，并硬要求每个论点族不超过2只；`scap_v3_lean.py`传入的是当日动态`cabinet_entry_thesis`，而生命周期账本保存的是买入时锁定的`entry_thesis`。2025-07-17生命周期账本为3只`size_style`加1只`momentum`，已是继承性超限；当前代码没有“既有超限不得恶化、但允许其他论点新增”的过渡规则，且没有把419条拒绝原因保存成正式产物。结合单股权重均低于40%、4/5槽位、现金约43.5%、90%风险上限、单笔压力预算和单买不产生相关性交互惩罚，论点族硬约束/持仓论点口径漂移是当天全部可行买单归零的唯一剩余硬约束，属于高置信根因；由于拒绝明细未落盘，不能伪称已有逐提案直接证据。
+- 影响链：上游为cabinet动态经济族、生命周期锁定论点和候选是否包含全部持仓；中游为Lean提案、`current_lots`、论点族计数和唯一整数优化器；下游为买入/补仓可达性、`planned_exposure`、页面目标仓位、追仓原因和候选漏斗。安全退出、T+1、现金非负、费用、PIT和真实90%上限本次未发现异常。
+- 建议修复合同：持仓约束使用锁定`entry_thesis`，新候选使用当日候选论点；若组合已有同族超限，只禁止继续增加该族，允许不恶化现状的其他论点买入或减仓方案；所有活跃持仓必须独立于候选当日一手字段进入`current_lots/current_symbols`；Lean模式下授权、追仓、日表和Web只消费Lean五级漏斗；`target_exposure`在Web明确标为“计划后仓位”，把`effective_target_exposure_cap`保留为“授权上限”；优化器按原因保存每个拒绝提案。
+- 当前处置：本项只做只读诊断和WBS登记，没有修改交易逻辑，也没有用历史结果临时调参。修复必须新增专项性质测试（继承性论点超限、动态论点漂移、4/5槽位仍可买其他族、拒绝原因守恒、Lean计数单一权威），再跑20日工程窗和覆盖2025-07-17的受控窗口。
