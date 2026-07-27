@@ -1,7 +1,6 @@
 """Normalize free-source snapshots into validated Level-1 PIT tables."""
 from __future__ import annotations
 
-from hashlib import sha256
 import json
 from pathlib import Path
 
@@ -47,7 +46,10 @@ def build_index_membership_pit(source: pd.DataFrame, *, downloaded_at=None, sour
     effective = pd.to_datetime(_column(data, "effective_from", "updateDate", "date"), errors="coerce")
     frame = pd.DataFrame({
         "symbol": _column(data, "symbol", "code").astype(str),
-        "effective_from": effective, "effective_to": pd.NaT,
+        "effective_from": effective,
+        "effective_to": pd.to_datetime(
+            _column(data, "effective_to", "out_date", "removal_effective_date"), errors="coerce"
+        ),
         "known_at": pd.to_datetime(_column(data, "known_at", "announcement_date", "updateDate", "date"), errors="coerce"),
         "source": source_name, "source_document_id": _column(data, "source_document_id", default="").astype(str),
         "downloaded_at": pd.Timestamp(downloaded_at or pd.Timestamp.utcnow()),
@@ -55,7 +57,6 @@ def build_index_membership_pit(source: pd.DataFrame, *, downloaded_at=None, sour
         "membership_weight": pd.to_numeric(_column(data, "membership_weight", "weight", default=1.0), errors="coerce"),
     })
     frame = frame.sort_values(["index_code", "symbol", "effective_from", "known_at"])
-    frame["effective_to"] = frame.groupby(["index_code", "symbol"], sort=False)["effective_from"].shift(-1)
     return _finish(frame, "index_membership_pit")
 
 
@@ -113,8 +114,12 @@ def write_pit_table_atomic(
 
 def _finish(frame: pd.DataFrame, table_name: str) -> pd.DataFrame:
     data = frame.dropna(subset=["symbol", "effective_from", "known_at"]).copy()
-    identity = data.astype(str).agg("|".join, axis=1)
-    data["revision_id"] = identity.map(lambda value: sha256(value.encode("utf-8")).hexdigest()[:20])
+    # pandas' vectorised stable row hash avoids a Python string join and SHA
+    # call for every daily status row (tens of millions in a real build).
+    identity = pd.util.hash_pandas_object(
+        data.fillna("<NA>").astype(str), index=False
+    ).astype("uint64")
+    data["revision_id"] = identity.map(lambda value: f"{int(value):016x}")
     for column in PIT_LEVEL1_SCHEMAS[table_name]:
         if column not in data.columns:
             data[column] = pd.NA

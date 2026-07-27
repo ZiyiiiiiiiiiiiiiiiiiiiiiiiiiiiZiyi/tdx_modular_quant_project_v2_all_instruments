@@ -26,6 +26,11 @@ LEDGER_FILENAMES = {
 
 CSV_WRITE_RETRIES = 3
 CSV_WRITE_CHUNK_ROWS = 50_000
+EMPTY_ARTIFACT_COLUMNS = (
+    "artifact_status",
+    "schema_version",
+    "status_reason",
+)
 
 
 def write_governance_text(text: str, path: str | Path, *, encoding: str = "utf-8") -> Path:
@@ -36,7 +41,12 @@ def write_governance_text(text: str, path: str | Path, *, encoding: str = "utf-8
         try:
             io_target = _windows_extended_path(target)
             Path(io_target).parent.mkdir(parents=True, exist_ok=True)
-            Path(io_target).write_text(str(text), encoding=encoding)
+            temporary = target.with_name(
+                f"{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            io_temporary = _windows_extended_path(temporary)
+            Path(io_temporary).write_text(str(text), encoding=encoding)
+            os.replace(io_temporary, io_target)
             return target
         except OSError as exc:
             last_error = exc
@@ -56,17 +66,26 @@ def write_governance_csv(frame: pd.DataFrame, path: str | Path) -> Path:
     serialization, and a short retry are added.
     """
     target = Path(path)
+    if frame is None:
+        frame = pd.DataFrame(columns=EMPTY_ARTIFACT_COLUMNS)
+    elif len(frame.columns) == 0:
+        frame = pd.DataFrame(columns=EMPTY_ARTIFACT_COLUMNS)
     last_error: OSError | None = None
     for attempt in range(1, CSV_WRITE_RETRIES + 1):
         try:
             io_target = _windows_extended_path(target)
             Path(io_target).parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(
+                f"{target.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            io_temporary = _windows_extended_path(temporary)
             frame.to_csv(
-                io_target,
+                io_temporary,
                 index=False,
                 encoding="utf-8-sig",
                 chunksize=CSV_WRITE_CHUNK_ROWS,
             )
+            os.replace(io_temporary, io_target)
             return target
         except FileNotFoundError as exc:
             last_error = exc
@@ -104,9 +123,17 @@ class GovernanceLedgerBundle:
     def frame(self, ledger_name: str) -> pd.DataFrame:
         parts = self.frames[ledger_name]
         if not parts:
-            return pd.DataFrame()
+            return pd.DataFrame(
+                columns=("ledger_status", "schema_version", "status_reason")
+            )
         cleaned = [part.dropna(axis=1, how="all") for part in parts if part is not None and not part.empty]
-        return pd.concat(cleaned, ignore_index=True) if cleaned else pd.DataFrame()
+        return (
+            pd.concat(cleaned, ignore_index=True)
+            if cleaned
+            else pd.DataFrame(
+                columns=("ledger_status", "schema_version", "status_reason")
+            )
+        )
 
     def save(self, output_dir=GOVERNANCE_OUTPUT_DIR) -> dict[str, Path]:
         output = Path(output_dir)

@@ -1,0 +1,271 @@
+"""Typed contracts for the SCAP-V2 decision boundary.
+
+The legacy pipeline moves values through pandas columns, so Python's type
+checker cannot prevent a probability, return rate, score, and yuan amount from
+being assigned to the same field.  These contracts provide one runtime
+boundary shared by scoring, forecasting, action planning, risk authorization,
+execution, and reporting.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from typing import Mapping
+
+import math
+import pandas as pd
+
+
+SCAP_V2_CONTRACT_VERSION = "scap_v3_lean_contracts_v1"
+
+
+def _finite(value, *, name: str) -> float:
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return numeric
+
+
+def _unit_interval(value, *, name: str) -> float:
+    numeric = _finite(value, name=name)
+    if numeric < -1e-12 or numeric > 1.0 + 1e-12:
+        raise ValueError(f"{name} must be in [0, 1], got {numeric!r}")
+    return min(max(numeric, 0.0), 1.0)
+
+
+@dataclass(frozen=True)
+class ScoreContract:
+    symbol: str
+    as_of_date: pd.Timestamp
+    ranking_score: float
+    score_authority: str
+    coverage: float
+    thesis: str = ""
+    family_scores: Mapping[str, float] = field(default_factory=dict)
+    contract_version: str = SCAP_V2_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "as_of_date", pd.Timestamp(self.as_of_date))
+        object.__setattr__(
+            self, "ranking_score", _unit_interval(self.ranking_score, name="ranking_score")
+        )
+        object.__setattr__(self, "coverage", _unit_interval(self.coverage, name="coverage"))
+        if not str(self.symbol).strip():
+            raise ValueError("ScoreContract.symbol is required")
+        if not str(self.score_authority).strip():
+            raise ValueError("ScoreContract.score_authority is required")
+        for key, value in dict(self.family_scores).items():
+            _unit_interval(value, name=f"family_scores[{key!r}]")
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ForecastDistribution:
+    symbol: str
+    as_of_date: pd.Timestamp
+    entry_price_basis: str
+    horizon_sessions: int
+    gross_return_mean: float
+    gross_return_se: float
+    downside_cvar: float
+    p_win_posterior_mean: float
+    p_win_lower: float
+    effective_sample_size: float
+    authority_weight: float
+    state: str
+    gross_return_quantiles: Mapping[str, float] = field(default_factory=dict)
+    rank_ic: float = float("nan")
+    rank_ic_lower: float = float("nan")
+    calibration_slope: float = float("nan")
+    calibration_ece: float = float("nan")
+    cost_inclusion_state: str = "gross_only"
+    contract_version: str = SCAP_V2_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "as_of_date", pd.Timestamp(self.as_of_date))
+        if int(self.horizon_sessions) <= 0:
+            raise ValueError("horizon_sessions must be positive")
+        _finite(self.gross_return_mean, name="gross_return_mean")
+        if _finite(self.gross_return_se, name="gross_return_se") < 0.0:
+            raise ValueError("gross_return_se must be non-negative")
+        _unit_interval(self.p_win_posterior_mean, name="p_win_posterior_mean")
+        _unit_interval(self.p_win_lower, name="p_win_lower")
+        _unit_interval(self.authority_weight, name="authority_weight")
+        if _finite(self.effective_sample_size, name="effective_sample_size") < 0.0:
+            raise ValueError("effective_sample_size must be non-negative")
+        if str(self.cost_inclusion_state) != "gross_only":
+            raise ValueError("ForecastDistribution must contain gross returns only")
+        if str(self.state) != "calibrated" and float(self.authority_weight) > 0.0:
+            raise ValueError("non-calibrated forecasts cannot have trading authority")
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ActionProposal:
+    proposal_id: str
+    decision_id: str
+    symbol: str
+    action_type: str
+    source_module: str
+    requested_lots: int
+    baseline_action: str
+    horizon_sessions: int
+    expected_net_profit_amount: float
+    robust_net_profit_amount: float
+    downside_cvar_amount: float
+    exact_cost_amount: float
+    funding_cash_amount: float
+    exposure_delta: float = 0.0
+    scenario_delta_wealth: tuple[float, ...] = ()
+    hard_veto_reasons: tuple[str, ...] = ()
+    replacement_pair_id: str = ""
+    score_contract_id: str = ""
+    forecast_contract_id: str = ""
+    contract_version: str = SCAP_V2_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.proposal_id or not self.decision_id or not self.symbol:
+            raise ValueError("proposal_id, decision_id and symbol are required")
+        if int(self.requested_lots) < 0:
+            raise ValueError("requested_lots must be non-negative")
+        if int(self.horizon_sessions) <= 0:
+            raise ValueError("horizon_sessions must be positive")
+        for name in (
+            "expected_net_profit_amount",
+            "robust_net_profit_amount",
+            "downside_cvar_amount",
+            "exact_cost_amount",
+            "funding_cash_amount",
+            "exposure_delta",
+        ):
+            _finite(getattr(self, name), name=name)
+        if self.exact_cost_amount < 0.0 or self.funding_cash_amount < 0.0:
+            raise ValueError("cost and funding amounts must be non-negative")
+        for value in self.scenario_delta_wealth:
+            _finite(value, name="scenario_delta_wealth")
+
+    @property
+    def executable(self) -> bool:
+        return not self.hard_veto_reasons and self.requested_lots > 0
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ExposureAuthorization:
+    decision_id: str
+    nav_amount: float
+    risk_exposure_ceiling: float
+    cash_buffer_amount: float
+    per_name_structural_cap: float
+    per_name_stress_budget_amount: float
+    portfolio_stress_budget_amount: float
+    new_entry_allowed: bool
+    add_allowed: bool
+    replacement_allowed: bool
+    current_cash_amount: float = 0.0
+    strategic_exposure_budget: float = 0.0
+    signal_supported_exposure: float = 0.0
+    integer_feasible_exposure: float = 0.0
+    blocking_reasons: tuple[str, ...] = ()
+    covariance_state: str = "unavailable"
+    fallback_risk_model: str = "per_name_stress_cap"
+    contract_version: str = SCAP_V2_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if _finite(self.nav_amount, name="nav_amount") <= 0.0:
+            raise ValueError("nav_amount must be positive")
+        _unit_interval(self.risk_exposure_ceiling, name="risk_exposure_ceiling")
+        _unit_interval(self.per_name_structural_cap, name="per_name_structural_cap")
+        for name in (
+            "current_cash_amount",
+            "cash_buffer_amount",
+            "per_name_stress_budget_amount",
+            "portfolio_stress_budget_amount",
+        ):
+            if _finite(getattr(self, name), name=name) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        for name in (
+            "strategic_exposure_budget",
+            "signal_supported_exposure",
+            "integer_feasible_exposure",
+        ):
+            _unit_interval(getattr(self, name), name=name)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ActionPlan:
+    decision_id: str
+    selected_proposal_ids: tuple[str, ...]
+    rejected_proposals: tuple[dict, ...]
+    target_lots_by_symbol: Mapping[str, int]
+    expected_net_profit_amount: float
+    robust_net_profit_amount: float
+    downside_cvar_amount: float
+    exact_cost_amount: float
+    projected_cash: float
+    projected_exposure: float
+    projected_stress_loss: float
+    objective_lexicographic_rank: tuple[float, ...]
+    constraint_slacks: Mapping[str, float]
+    solver_status: str
+    plan_id: str = ""
+    optimizer_invocation_count: int = 1
+    contract_version: str = SCAP_V2_CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.decision_id:
+            raise ValueError("decision_id is required")
+        if int(self.optimizer_invocation_count) != 1:
+            raise ValueError("each ActionPlan must be produced by exactly one optimizer invocation")
+        if len(self.selected_proposal_ids) != len(set(self.selected_proposal_ids)):
+            raise ValueError("selected_proposal_ids must be unique")
+        if any(int(lots) < 0 for lots in self.target_lots_by_symbol.values()):
+            raise ValueError("target lots must be non-negative")
+        _unit_interval(self.projected_exposure, name="projected_exposure")
+        if _finite(self.projected_cash, name="projected_cash") < -1e-8:
+            raise ValueError("projected_cash must be non-negative")
+        for name in (
+            "expected_net_profit_amount",
+            "robust_net_profit_amount",
+            "downside_cvar_amount",
+            "exact_cost_amount",
+            "projected_stress_loss",
+        ):
+            _finite(getattr(self, name), name=name)
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def validate_score_columns(
+    frame: pd.DataFrame,
+    *,
+    score_columns: tuple[str, ...] = (
+        "entry_matrix_score",
+        "final_entry_score",
+        "primary_score",
+    ),
+) -> None:
+    """Fail closed when a legacy score field contains a non-score unit."""
+    if frame is None or frame.empty:
+        return
+    violations: dict[str, tuple[float, float]] = {}
+    for column in score_columns:
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        low, high = float(values.min()), float(values.max())
+        if low < -1e-12 or high > 1.0 + 1e-12:
+            violations[column] = (low, high)
+    if violations:
+        raise ValueError(f"SCAP score-unit contract violation: {violations}")

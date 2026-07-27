@@ -10,12 +10,17 @@ def main() -> int:
     for token in (
         'id="orderflow_parameter_research"',
         'id="pit_level1_audit"',
+        'id="pit_index_membership_build"',
+        'id="index_a500_history_file"',
         'id="pit_level2_audit"',
         'id="pit_level2_build"',
         'id="registered_mainline_v2_suite"',
         'id="pit_mode"',
         'value="research" selected',
         'id="research_max_runtime_seconds"',
+        'id="performance_benchmark_top_n"',
+        'id="performance_benchmark_rebalance"',
+        'performance_benchmark_top_n: performanceBenchmarkTopN',
         'value="1800"',
         'research_max_runtime_seconds: researchMaxRuntimeSeconds',
         'id="progress_task"',
@@ -35,6 +40,17 @@ def main() -> int:
         {"tasks": ["pit_level1_audit", "pit_level1_audit"], "profile": "fast"}
     )
     assert clean["tasks"] == ["pit_level1_audit"]
+    historical = main_launcher_web._sanitize_selection_payload({
+        "tasks": ["pit_index_membership_build"],
+        "profile": "full",
+        "governance": {
+            "validation_window_preset": "short_5",
+            "max_days": "5",
+            "index_a500_history_file": r"F:\data\a500_history.parquet",
+        },
+    })
+    assert historical["tasks"] == ["pit_index_membership_build"]
+    assert historical["governance"]["index_a500_history_file"].endswith("a500_history.parquet")
     cabinet_flow = main_launcher_web._sanitize_selection_payload({
         "tasks": ["factor_cabinet"],
         "governance": {
@@ -61,6 +77,58 @@ def main() -> int:
         }
     )
     assert valid_selected["governance"]["factor_cabinet_run_id"] == "run20260713_213546_273503"
+    long_window = main_launcher_web._sanitize_selection_payload({
+        "tasks": ["governance_layer_validation"],
+        "profile": "full",
+        "governance": {
+            "validation_window_preset": "long_180",
+            "max_days": "180",
+            "factor_source": "selected_factor_cabinet",
+            "factor_cabinet_run_id": "run20260713_213546_273503",
+        },
+    })
+    assert long_window["governance"]["max_days"] == "180"
+    unlimited = main_launcher_web._sanitize_selection_payload({
+        "tasks": ["pit_level1_audit"], "profile": "full",
+        "governance": {"validation_window_preset": "custom", "max_days": ""},
+    })
+    assert unlimited["governance"]["max_days"] == ""
+    assert unlimited["governance"]["performance_benchmark_top_n"] == "100"
+    assert unlimited["governance"]["performance_benchmark_rebalance"] == "monthly"
+    for bad_benchmark in (
+        {"performance_benchmark_top_n": "30"},
+        {"performance_benchmark_rebalance": "quarterly"},
+    ):
+        try:
+            main_launcher_web._sanitize_selection_payload({
+                "tasks": ["pit_level1_audit"], "governance": bad_benchmark,
+            })
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid benchmark setting was accepted: {bad_benchmark}")
+    for bad in (
+        {"validation_window_preset": "long_180", "max_days": "20"},
+        {"validation_window_preset": "custom", "max_days": "5"},
+        {"validation_window_preset": "unknown", "max_days": "180"},
+    ):
+        try:
+            main_launcher_web._sanitize_selection_payload({
+                "tasks": ["pit_level1_audit"], "profile": "full", "governance": bad,
+            })
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid validation preset was accepted: {bad}")
+    try:
+        main_launcher_web._sanitize_selection_payload({
+            "tasks": ["pit_level1_audit"], "profile": "fast",
+            "governance": {"validation_window_preset": "long_180", "max_days": "180"},
+        })
+    except ValueError as exc:
+        assert "requires full profile" in str(exc)
+    else:
+        raise AssertionError("registered validation preset was accepted in fast mode")
     try:
         main_launcher_web._sanitize_selection_payload(
             {

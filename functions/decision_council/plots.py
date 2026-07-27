@@ -1,13 +1,14 @@
 """Diagnostic charts emitted after an exploratory governance backtest."""
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from functions.decision_council.outputs import CSV_WRITE_RETRIES
+from functions.decision_council.outputs import CSV_WRITE_RETRIES, _windows_extended_path
 
 
 def save_governance_diagnostic_plots(
@@ -20,6 +21,9 @@ def save_governance_diagnostic_plots(
     attribution_ledger: pd.DataFrame | None = None,
     bucket_attribution: pd.DataFrame | None = None,
     factor_weight_ledger: pd.DataFrame | None = None,
+    ml_iteration_metrics: pd.DataFrame | None = None,
+    ml_treatment_effect: pd.DataFrame | None = None,
+    role_reliability_audit: pd.DataFrame | None = None,
     feature_data: pd.DataFrame,
     output_dir,
 ) -> dict[str, Path]:
@@ -62,6 +66,14 @@ def save_governance_diagnostic_plots(
         path = output / "governance_factor_module_weights.png"
         if _plot_factor_module_weights(plt, factor_weight_ledger, path):
             saved["governance_factor_module_weight_plot"] = path
+    if any(frame is not None and not frame.empty for frame in (
+        ml_iteration_metrics, ml_treatment_effect, role_reliability_audit
+    )):
+        path = output / "governance_ml_learning_and_treatment.png"
+        if _plot_ml_learning_and_treatment(
+            plt, ml_iteration_metrics, ml_treatment_effect, role_reliability_audit, path
+        ):
+            saved["governance_ml_learning_and_treatment_plot"] = path
     if not reputation_ledger.empty:
         path = output / "governance_model_reputation_scores.png"
         _plot_model_scores(plt, reputation_ledger, path)
@@ -87,13 +99,56 @@ def save_governance_diagnostic_plots(
     return saved
 
 
+def _plot_ml_learning_and_treatment(plt, iteration_metrics, treatment_effect, reliability, output_path):
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    drew = False
+    curves = iteration_metrics.copy() if iteration_metrics is not None else pd.DataFrame()
+    if not curves.empty and {"boosting_iteration", "value", "dataset", "metric"}.issubset(curves.columns):
+        if "training_month" in curves:
+            curves = curves[curves["training_month"].astype(str).eq(curves["training_month"].astype(str).max())]
+        curves = curves[curves["metric"].astype(str).eq("ndcg@5")]
+        for keys, group in curves.groupby([column for column in ("model_purpose", "dataset") if column in curves], dropna=False):
+            label = " / ".join(map(str, keys if isinstance(keys, tuple) else (keys,)))
+            axes[0].plot(group["boosting_iteration"], group["value"], label=label)
+            drew = True
+        axes[0].set_title("Latest LightGBM train / locked-validation NDCG@5")
+        axes[0].set_xlabel("Boosting iteration")
+        axes[0].legend(loc="best")
+    effect = treatment_effect.copy() if treatment_effect is not None else pd.DataFrame()
+    if not effect.empty and "ml_incremental_top_k_net_alpha" in effect:
+        effect["date"] = pd.to_datetime(effect["date"], errors="coerce")
+        effect["incremental"] = pd.to_numeric(effect["ml_incremental_top_k_net_alpha"], errors="coerce").fillna(0.0)
+        effect = effect.sort_values("date")
+        axes[1].plot(effect["date"], effect["incremental"].cumsum(), color="#2ca02c")
+        axes[1].axhline(0.0, color="black", linewidth=0.8)
+        axes[1].set_title("Cumulative synchronized ML-minus-Native Top-K net alpha")
+        drew = True
+    rel = reliability.copy() if reliability is not None else pd.DataFrame()
+    if not rel.empty and "reliability_blend" in rel:
+        rel["as_of"] = pd.to_datetime(rel["as_of"], errors="coerce")
+        rel["reliability_blend"] = pd.to_numeric(rel["reliability_blend"], errors="coerce")
+        axes[2].plot(rel["as_of"], rel["reliability_blend"], marker="o", color="#9467bd")
+        axes[2].set_ylim(0.0, 1.0)
+        axes[2].set_title("Rolling role-reliability blend (0 = exact Cabinet Native)")
+        drew = True
+    for axis in axes:
+        axis.grid(alpha=0.25)
+    if not drew:
+        plt.close(fig)
+        return False
+    fig.tight_layout()
+    _safe_savefig(fig, output_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def _safe_savefig(fig, output_path, *, dpi=220, bbox_inches="tight"):
     path = Path(output_path)
     last_error: OSError | None = None
     for attempt in range(1, CSV_WRITE_RETRIES + 1):
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+            os.makedirs(_windows_extended_path(path.parent), exist_ok=True)
+            fig.savefig(_windows_extended_path(path), dpi=dpi, bbox_inches=bbox_inches)
             return path
         except OSError as exc:
             last_error = exc

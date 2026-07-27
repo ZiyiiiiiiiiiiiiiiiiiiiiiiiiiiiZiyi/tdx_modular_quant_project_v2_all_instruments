@@ -31,7 +31,7 @@ from config import (
     ABNORMAL_RETURN_THRESHOLD,
     ADJUSTMENT_FACTORS_PARQUET,
     ADJUSTMENT_DATA_VERSION,
-    BASELINE_VERSION,
+     BASELINE_VERSION,
     BACKTEST_CAPITAL_PROFILES,
     BACKTEST_INITIAL_CASH,
     BACKTEST_RISK_FREE_RATE,
@@ -89,6 +89,8 @@ from config import (
     CLI_GOVERNANCE_END_DATE,
     CLI_GOVERNANCE_MAX_DAYS,
     CLI_GOVERNANCE_START_DATE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
     DEFAULT_BACKTEST_CAPITAL_PROFILE,
     assert_valid_configuration,
     backtest_profile_suffix,
@@ -347,6 +349,21 @@ def parse_args():
         help="Audit Level-1 PIT table availability and fail-closed readiness.",
     )
     parser.add_argument(
+        "--pit-level1-build",
+        action="store_true",
+        help="Build conservative research-only Level-1 PIT tables from local artifacts.",
+    )
+    parser.add_argument(
+        "--pit-index-membership-build",
+        action="store_true",
+        help="Fetch dated HS300/CSI500 snapshots and publish PIT membership after A500 coverage validation.",
+    )
+    parser.add_argument(
+        "--index-a500-history-file",
+        default="",
+        help="CSV/XLSX/Parquet containing dated CSI A500 historical constituent snapshots.",
+    )
+    parser.add_argument(
         "--pit-level2-audit",
         action="store_true",
         help="Audit Level-2 PIT financial, valuation, and corporate-event readiness.",
@@ -398,6 +415,11 @@ def parse_args():
         help="Disable per-alpha shadow backtests and keep reputation weights static for a faster governance run.",
     )
     parser.add_argument("--no-live-monitor", action="store_true", help="Disable the low-memory governance metrics window.")
+    parser.add_argument(
+        "--interactive-selection-file",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=CLI_MAIN_SAFETY_PROXY_MODE)
     parser.add_argument(
         "--capital-profile",
@@ -436,9 +458,21 @@ def parse_args():
     )
     parser.add_argument(
         "--governance-control-mode",
-        choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
+        choices=["normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit", "aggressive_lean"],
         default="normal",
         help="Governance control switch for stop-mode experiments.",
+    )
+    parser.add_argument(
+        "--scap-exit-stage",
+        choices=["E0", "E1", "E2", "E3", "E4"],
+        default=None,
+        help="SCAP-V1 registered exit experiment stage.",
+    )
+    parser.add_argument(
+        "--scap-loss-stop",
+        type=float,
+        default=None,
+        help="SCAP-V1 E3 loss boundary as a negative return, for example -0.12.",
     )
     parser.add_argument(
         "--governance-alpha-bundle",
@@ -456,15 +490,34 @@ def parse_args():
     parser.add_argument("--factor-cabinet-path", default="", help="Explicit factor_cabinet.json path.")
     parser.add_argument(
         "--strategy-logic-version",
-        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native"],
+        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native", "mainline_v3_monthly_lgbm_hybrid", "mainline_v3_reliability_weighted"],
         default="production_v1",
         help="Versioned governance decision logic; v2 outputs are isolated from production_v1.",
+    )
+    parser.add_argument(
+        "--monthly-lgbm-maximum-weight",
+        type=float,
+        default=None,
+        help="Pre-registered upper bound for formula-calibrated ML rank weight (required for hybrid v3).",
     )
     parser.add_argument(
         "--pit-mode",
         choices=["off", "research", "formal"],
         default="research",
         help="PIT policy: research records degradation; formal fails closed when tables are missing.",
+    )
+    parser.add_argument(
+        "--performance-benchmark-top-n",
+        type=int,
+        choices=[50, 100, 300],
+        default=GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+        help="Fixed number of prior-period top-liquidity stocks in the research performance benchmark.",
+    )
+    parser.add_argument(
+        "--performance-benchmark-rebalance",
+        choices=["daily", "weekly", "monthly"],
+        default=GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+        help="Rebalance cadence of the fixed-N research performance benchmark.",
     )
     parser.add_argument(
         "--disable-alpha-collapse-exit",
@@ -573,7 +626,7 @@ def _build_strategy_signature():
 
 
 def _capital_profile_from_args(args):
-    return get_backtest_capital_profile(
+    profile = get_backtest_capital_profile(
         getattr(args, "capital_profile", DEFAULT_BACKTEST_CAPITAL_PROFILE),
         initial_cash=getattr(args, "initial_cash", None),
         max_positions_override=(
@@ -584,6 +637,19 @@ def _capital_profile_from_args(args):
         min_cash_buffer=getattr(args, "min_cash_buffer", None),
         capital_usage_mode=getattr(args, "capital_usage_mode", None),
     )
+    scap_exit_stage = getattr(args, "scap_exit_stage", None)
+    if scap_exit_stage not in (None, ""):
+        stage = str(scap_exit_stage).strip().upper()
+        if stage not in {"E0", "E1", "E2", "E3", "E4"}:
+            raise ValueError(f"Invalid SCAP exit stage: {stage}")
+        profile["scap_exit_stage"] = stage
+    scap_loss_stop = getattr(args, "scap_loss_stop", None)
+    if scap_loss_stop not in (None, ""):
+        value = float(scap_loss_stop)
+        if not -0.50 <= value <= -0.01:
+            raise ValueError("SCAP loss stop must be between -0.50 and -0.01")
+        profile["scap_loss_stop"] = value
+    return profile
 
 
 def _is_small_capital_profile(capital_profile: dict | None) -> bool:
@@ -606,9 +672,13 @@ def _governance_control_mode_from_args(args) -> str:
         "paper": "paper_controls",
         "safe_factor": "safe_factor_only",
         "safe_stop": "safe_factor_only",
+        "scap": "aggressive_profit",
+        "profit": "aggressive_profit",
+        "lean": "aggressive_lean",
+        "scap_v3": "aggressive_lean",
     }
     mode = aliases.get(mode, mode)
-    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit", "aggressive_lean"}
     if mode not in allowed:
         raise ValueError(f"Invalid governance control mode: {mode}. Available: {sorted(allowed)}")
     return mode
@@ -1128,7 +1198,10 @@ def _run_single_governance_variant(
     factor_cabinet_run_id: str = "",
     factor_cabinet_path: str = "",
     strategy_logic_version: str = "production_v1",
+    monthly_lgbm_maximum_weight: float | None = None,
     pit_mode: str = "research",
+    performance_benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    performance_benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ):
     from config import REGISTRY_FRAMEWORK_VERSION
     from functions.decision_council.factor_source import factor_source_output_label, resolve_factor_source
@@ -1168,12 +1241,29 @@ def _run_single_governance_variant(
             "factor_only": "ctrl_factor",
             "safe_factor_only": "ctrl_safe_factor",
             "paper_controls": "ctrl_paper",
+            "aggressive_profit": "ctrl_aggressive_profit",
+            "aggressive_lean": "ctrl_aggressive_lean",
         }
         output_dir = output_dir / control_dir_names.get(control_mode, f"ctrl_{control_mode}")
+    if control_mode in {"aggressive_profit", "aggressive_lean"}:
+        exit_stage = str(capital_profile.get("scap_exit_stage", "E0") or "E0").strip().upper()
+        loss_stop = abs(float(capital_profile.get("scap_loss_stop", -0.12)))
+        # Keep the experiment identity in one compact directory. Deep governance
+        # paths otherwise exceed the legacy Windows MAX_PATH limit when long
+        # audit filenames are appended.
+        loss_basis_points = int(round(loss_stop * 10_000))
+        # SCAP has a dedicated short root. The full universe, variant, capital,
+        # factor, stage and code identity remains frozen in the manifest.
+        output_dir = (
+            GOVERNANCE_OUTPUT_DIR
+            / "scap"
+            / output_alpha_bundle
+            / f"{exit_stage.lower()}_l{loss_basis_points}"
+        )
     if not bool(alpha_collapse_exit_enabled):
         output_dir = output_dir / "no_alpha_collapse_exit"
     if str(strategy_logic_version).strip().lower() != "production_v1":
-        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3"}.get(
+        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3", "mainline_v3_monthly_lgbm_hybrid": "v3_ml", "mainline_v3_reliability_weighted": "v31_reliability"}.get(
             str(strategy_logic_version).strip().lower(),
             "logic_custom",
         )
@@ -1215,7 +1305,10 @@ def _run_single_governance_variant(
         governance_control_mode=control_mode,
         alpha_collapse_exit_enabled=bool(alpha_collapse_exit_enabled),
         strategy_logic_version=strategy_logic_version,
+        monthly_lgbm_maximum_weight=monthly_lgbm_maximum_weight,
         pit_mode=pit_mode,
+        performance_benchmark_top_n=performance_benchmark_top_n,
+        performance_benchmark_rebalance=performance_benchmark_rebalance,
     )
 
 
@@ -1236,7 +1329,10 @@ def run_registry_suite(args):
         governance_control_mode=_governance_control_mode_from_args(args),
         alpha_collapse_exit_enabled=not bool(getattr(args, "disable_alpha_collapse_exit", False)),
         strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+        monthly_lgbm_maximum_weight=getattr(args, "monthly_lgbm_maximum_weight", None),
         pit_mode=getattr(args, "pit_mode", "research"),
+        performance_benchmark_top_n=getattr(args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+        performance_benchmark_rebalance=getattr(args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
     )
 
 
@@ -1325,6 +1421,8 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
         "factor_cabinet_feature_cache",
         "orderflow_parameter_research",
         "pit_level1_audit",
+        "pit_level1_build",
+        "pit_index_membership_build",
         "pit_level2_audit",
         "pit_level2_build",
         "registered_mainline_v2_suite",
@@ -1370,6 +1468,17 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
     if control_mode:
         runtime_args.governance_control_mode = control_mode
         runtime_args.governance_control_mode = _governance_control_mode_from_args(runtime_args)
+    scap_exit_stage = str(governance.get("scap_exit_stage", "")).strip().upper()
+    if scap_exit_stage:
+        if scap_exit_stage not in {"E0", "E1", "E2", "E3", "E4"}:
+            raise ValueError(f"Invalid SCAP exit stage: {scap_exit_stage}")
+        runtime_args.scap_exit_stage = scap_exit_stage
+    scap_loss_stop = governance.get("scap_loss_stop")
+    if scap_loss_stop not in (None, ""):
+        value = float(scap_loss_stop)
+        if not -0.50 <= value <= -0.01:
+            raise ValueError("SCAP loss stop must be between -0.50 and -0.01")
+        runtime_args.scap_loss_stop = value
     if "alpha_collapse_exit_enabled" in governance:
         runtime_args.disable_alpha_collapse_exit = not bool(governance.get("alpha_collapse_exit_enabled"))
     alpha_bundle = str(governance.get("alpha_bundle", "")).strip()
@@ -1386,16 +1495,36 @@ def _apply_interactive_governance_params(args, selection: dict, tasks: list[str]
     factor_cabinet_path = str(governance.get("factor_cabinet_path", "")).strip()
     if factor_cabinet_path:
         runtime_args.factor_cabinet_path = factor_cabinet_path
+    index_a500_history_file = str(governance.get("index_a500_history_file", "")).strip()
+    if index_a500_history_file:
+        runtime_args.index_a500_history_file = index_a500_history_file
     strategy_logic_version = str(governance.get("strategy_logic_version", "")).strip()
     if strategy_logic_version:
-        if strategy_logic_version not in {"production_v1", "mainline_v2", "mainline_v3_cabinet_native"}:
+        if strategy_logic_version not in {"production_v1", "mainline_v2", "mainline_v3_cabinet_native", "mainline_v3_monthly_lgbm_hybrid", "mainline_v3_reliability_weighted"}:
             raise ValueError(f"Invalid strategy logic version: {strategy_logic_version}")
         runtime_args.strategy_logic_version = strategy_logic_version
+    monthly_lgbm_maximum_weight = governance.get("monthly_lgbm_maximum_weight")
+    if monthly_lgbm_maximum_weight not in (None, ""):
+        value = float(monthly_lgbm_maximum_weight)
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("monthly_lgbm_maximum_weight must be in [0, 1]")
+        runtime_args.monthly_lgbm_maximum_weight = value
     pit_mode = str(governance.get("pit_mode", "")).strip()
     if pit_mode:
         if pit_mode not in {"off", "research", "formal"}:
             raise ValueError(f"Invalid PIT mode: {pit_mode}")
         runtime_args.pit_mode = pit_mode
+    benchmark_top_n = governance.get("performance_benchmark_top_n")
+    if benchmark_top_n not in (None, ""):
+        benchmark_top_n = int(benchmark_top_n)
+        if benchmark_top_n not in {50, 100, 300}:
+            raise ValueError("performance_benchmark_top_n must be one of 50, 100, 300")
+        runtime_args.performance_benchmark_top_n = benchmark_top_n
+    benchmark_rebalance = str(governance.get("performance_benchmark_rebalance", "")).strip().lower()
+    if benchmark_rebalance:
+        if benchmark_rebalance not in {"daily", "weekly", "monthly"}:
+            raise ValueError("performance_benchmark_rebalance must be daily, weekly, or monthly")
+        runtime_args.performance_benchmark_rebalance = benchmark_rebalance
     max_runtime = governance.get("research_max_runtime_seconds")
     if max_runtime is not None and str(max_runtime).strip():
         max_runtime_value = float(max_runtime)
@@ -1516,7 +1645,10 @@ def run_governance_mainline_review_from_main(args):
             factor_cabinet_path=factor_cabinet_path,
             progress_callback=_progress,
             strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+            monthly_lgbm_maximum_weight=getattr(args, "monthly_lgbm_maximum_weight", None),
             pit_mode=getattr(args, "pit_mode", "research"),
+            performance_benchmark_top_n=getattr(args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+            performance_benchmark_rebalance=getattr(args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
         )
     report_path, comparison_path = build_report(
         alpha_bundle=alpha_bundle,
@@ -1616,7 +1748,10 @@ def run_governance_layer_validation_from_main(args):
             factor_cabinet_path=factor_cabinet_path,
             progress_callback=_progress,
             strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+            monthly_lgbm_maximum_weight=getattr(args, "monthly_lgbm_maximum_weight", None),
             pit_mode=getattr(args, "pit_mode", "research"),
+            performance_benchmark_top_n=getattr(args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+            performance_benchmark_rebalance=getattr(args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
         )
 
 
@@ -1721,7 +1856,10 @@ def run_governance_layer_ablation_suite_from_main(args):
                 factor_cabinet_run_id=factor_cabinet_run_id,
                 factor_cabinet_path=factor_cabinet_path,
                 strategy_logic_version=getattr(args, "strategy_logic_version", "production_v1"),
+                monthly_lgbm_maximum_weight=getattr(args, "monthly_lgbm_maximum_weight", None),
                 pit_mode=getattr(args, "pit_mode", "research"),
+                performance_benchmark_top_n=getattr(args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+                performance_benchmark_rebalance=getattr(args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
             )
             summary_path = saved.get("governance_strategy_summary")
             if summary_path is None:
@@ -1931,6 +2069,69 @@ def run_pit_level1_audit_from_main(args):
         raise
 
 
+def run_pit_level1_build_from_main(args):
+    """Build conservative research-only Level-1 tables from local artifacts."""
+    from functions.data.pit_level1_pipeline import publish_research_pit_level1_low_memory
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    task_name = "pit_level1_build"
+    reset_progress(task_name=task_name, total=1, message="building research-only PIT Level-1 tables")
+    try:
+        saved = publish_research_pit_level1_low_memory(
+            max_runtime_seconds=float(getattr(args, "research_max_runtime_seconds", 1800.0)),
+            progress_callback=lambda payload: write_progress(
+                task_name=task_name,
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+                detail=str(payload.get("detail", "")),
+            ),
+        )
+        print("PIT Level-1 research tables saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="PIT Level-1 research build complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
+def run_pit_index_membership_build_from_main(args):
+    """Build dated target-index membership without backfilling current snapshots."""
+    from config import FEATURE_DAILY_PARQUET
+    from functions.data_sources.historical_index_membership import build_historical_index_membership
+    from functions.runtime_progress import complete_progress, fail_progress, reset_progress, write_progress
+
+    task_name = "pit_index_membership_build"
+    reset_progress(task_name=task_name, total=1, message="building historical PIT index membership")
+    try:
+        saved = build_historical_index_membership(
+            feature_path=FEATURE_DAILY_PARQUET,
+            start_date=getattr(args, "governance_start_date", None),
+            end_date=getattr(args, "governance_end_date", None),
+            max_days=getattr(args, "governance_max_days", None),
+            a500_history_path=str(getattr(args, "index_a500_history_file", "") or "").strip() or None,
+            progress_callback=lambda payload: write_progress(
+                task_name=task_name,
+                status="running",
+                percent=float(payload.get("percent", 0.0)),
+                step=str(payload.get("step", "")),
+                message=str(payload.get("message", "")),
+                detail=str(payload.get("detail", "")),
+            ),
+        )
+        print("Historical PIT index membership saved:")
+        for name, path in sorted(saved.items()):
+            print(f"  {name}: {path}")
+        complete_progress(task_name=task_name, message="historical PIT index membership complete")
+        return saved
+    except Exception as exc:
+        fail_progress(task_name=task_name, message=str(exc))
+        raise
+
+
 def run_pit_level2_audit_from_main(args):
     """Audit the three PIT Level-2 inputs required by the new factor families."""
     from datetime import datetime
@@ -2073,6 +2274,16 @@ def run_factor_cabinet_feature_cache_from_main(args):
         factor_source = "latest_factor_cabinet"
     start_date = getattr(args, "governance_start_date", CLI_GOVERNANCE_START_DATE)
     end_date = getattr(args, "governance_end_date", CLI_GOVERNANCE_END_DATE)
+    max_days = getattr(args, "governance_max_days", None)
+    if max_days is not None:
+        from functions.data.trading_calendar import bounded_observed_feature_end
+
+        end_date = bounded_observed_feature_end(
+            FEATURE_DAILY_PARQUET,
+            start_date,
+            end_date,
+            max_days,
+        ).strftime("%Y-%m-%d")
     reset_progress(
         task_name="factor_cabinet_feature_cache",
         total=1,
@@ -2365,7 +2576,13 @@ def launch_interactive_main_menu():
         return {}
 
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(launcher_script), str(state_path)],
+        [
+            sys.executable,
+            "-u",
+            str(launcher_script),
+            str(state_path),
+            "--spawn-worker",
+        ],
         cwd=str(Path(__file__).resolve().parent),
     )
     _INTERACTIVE_LAUNCHER_PROCESS = proc
@@ -2395,6 +2612,10 @@ def launch_interactive_main_menu():
         state_path.unlink()
     except Exception:
         pass
+    if bool(selection.get("_worker_delegated")):
+        # The browser launcher now owns a separate worker. Keep the launcher
+        # alive when the short-lived Spyder/IPython host returns.
+        _INTERACTIVE_LAUNCHER_PROCESS = None
     return selection
 
 
@@ -2466,6 +2687,8 @@ def run_interactive_selection(selection, args):
         or "factor_cabinet_gap_report" in tasks
         or "orderflow_parameter_research" in tasks
         or "pit_level1_audit" in tasks
+        or "pit_level1_build" in tasks
+        or "pit_index_membership_build" in tasks
         or "pit_level2_audit" in tasks
         or "pit_level2_build" in tasks
         or "registered_mainline_v2_suite" in tasks
@@ -2555,6 +2778,16 @@ def run_interactive_selection(selection, args):
             _mark_task("factor_cabinet_gap_report", task_counter)
             run_factor_cabinet_gap_report_from_main(runtime_args)
             _finish_task("factor_cabinet_gap_report", task_counter)
+        if "pit_level1_build" in tasks:
+            task_counter += 1
+            _mark_task("pit_level1_build", task_counter)
+            run_pit_level1_build_from_main(runtime_args)
+            _finish_task("pit_level1_build", task_counter)
+        if "pit_index_membership_build" in tasks:
+            task_counter += 1
+            _mark_task("pit_index_membership_build", task_counter)
+            run_pit_index_membership_build_from_main(runtime_args)
+            _finish_task("pit_index_membership_build", task_counter)
         if "pit_level1_audit" in tasks:
             task_counter += 1
             _mark_task("pit_level1_audit", task_counter)
@@ -2597,7 +2830,10 @@ def run_interactive_selection(selection, args):
                 factor_cabinet_run_id=getattr(runtime_args, "factor_cabinet_run_id", ""),
                 factor_cabinet_path=getattr(runtime_args, "factor_cabinet_path", ""),
                 strategy_logic_version=getattr(runtime_args, "strategy_logic_version", "production_v1"),
+                monthly_lgbm_maximum_weight=getattr(runtime_args, "monthly_lgbm_maximum_weight", None),
                 pit_mode=getattr(runtime_args, "pit_mode", "research"),
+                performance_benchmark_top_n=getattr(runtime_args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+                performance_benchmark_rebalance=getattr(runtime_args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
             )
             _finish_task("governance_active", task_counter)
         if "governance_mainline_review" in tasks:
@@ -2617,6 +2853,23 @@ def run_interactive_selection(selection, args):
             _finish_task("governance_layer_ablation_suite", task_counter)
         clear_progress_context()
         complete_progress(task_name="interactive_task_suite", message="selected tasks complete")
+    except KeyboardInterrupt:
+        from functions.runtime_progress import read_progress
+
+        clear_progress_context()
+        existing = read_progress(owner_pid=os.getpid())
+        write_progress(
+            task_name="interactive_task_suite",
+            status="interrupted",
+            percent=float(existing.get("percent", 0.0) or 0.0),
+            current=existing.get("current"),
+            total=existing.get("total"),
+            step="keyboard_interrupt",
+            message="任务已由命令窗口 Ctrl+C 安全中断；请查看运行 checkpoint。",
+            started_at=existing.get("started_at"),
+        )
+        print("Interactive task suite interrupted by Ctrl+C.", flush=True)
+        raise
     except Exception as exc:
         clear_progress_context()
         fail_progress(task_name="interactive_task_suite", message=str(exc))
@@ -3034,10 +3287,24 @@ if __name__ == "__main__":
             cli_args = parse_args()
             print("正在浏览器中打开主启动页。")
             tasks = launch_interactive_main_menu()
-            run_interactive_selection(tasks, cli_args)
+            if tasks.get("_worker_delegated"):
+                print(
+                    "任务已交给独立worker运行，"
+                    f"worker_pid={tasks.get('_worker_pid')}；Spyder可以恢复响应或关闭。"
+                )
+            else:
+                run_interactive_selection(tasks, cli_args)
             sys.exit(0)
         cli_args = parse_args()
-        if cli_args.auto_complete:
+        if cli_args.interactive_selection_file:
+            selection_path = Path(cli_args.interactive_selection_file).resolve()
+            selection = json.loads(selection_path.read_text(encoding="utf-8"))
+            try:
+                selection_path.unlink()
+            except OSError:
+                pass
+            run_interactive_selection(selection, cli_args)
+        elif cli_args.auto_complete:
             from auto_complete_after_vpn import main as run_auto_completion
 
             print("Running explicit auto-complete workflow.")
@@ -3060,6 +3327,10 @@ if __name__ == "__main__":
             run_orderflow_parameter_research_from_main(cli_args)
         elif cli_args.pit_level1_audit:
             run_pit_level1_audit_from_main(cli_args)
+        elif cli_args.pit_level1_build:
+            run_pit_level1_build_from_main(cli_args)
+        elif cli_args.pit_index_membership_build:
+            run_pit_index_membership_build_from_main(cli_args)
         elif cli_args.pit_level2_audit:
             run_pit_level2_audit_from_main(cli_args)
         elif cli_args.pit_level2_build:
@@ -3082,7 +3353,10 @@ if __name__ == "__main__":
                 governance_control_mode=_governance_control_mode_from_args(cli_args),
                 alpha_collapse_exit_enabled=not bool(getattr(cli_args, "disable_alpha_collapse_exit", False)),
                 strategy_logic_version=getattr(cli_args, "strategy_logic_version", "production_v1"),
+                monthly_lgbm_maximum_weight=getattr(cli_args, "monthly_lgbm_maximum_weight", None),
                 pit_mode=getattr(cli_args, "pit_mode", "research"),
+                performance_benchmark_top_n=getattr(cli_args, "performance_benchmark_top_n", GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N),
+                performance_benchmark_rebalance=getattr(cli_args, "performance_benchmark_rebalance", GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE),
                 alpha_bundle=getattr(cli_args, "governance_alpha_bundle", None),
                 factor_source=getattr(cli_args, "factor_source", "legacy_bundle"),
                 factor_cabinet_run_id=getattr(cli_args, "factor_cabinet_run_id", ""),
@@ -3092,6 +3366,29 @@ if __name__ == "__main__":
             run_low_memory(cli_args)
         else:
             main()
+    except KeyboardInterrupt:
+        print(
+            "Process interrupted by Ctrl+C. "
+            "The governance checkpoint records the last completed trading day.",
+            flush=True,
+        )
+        raise SystemExit(130)
+    except Exception:
+        if str(os.environ.get("TDX_INTERACTIVE_VISIBLE_WORKER", "")).strip() == "1":
+            import traceback
+
+            traceback.print_exc()
+            print(
+                "\nThe worker failed. The console is being kept open so the "
+                "error remains visible.",
+                flush=True,
+            )
+            try:
+                input("Press Enter to close this worker window...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            raise SystemExit(1)
+        raise
     finally:
         _close_interactive_launcher_process()
         if show_runtime_disclosure:

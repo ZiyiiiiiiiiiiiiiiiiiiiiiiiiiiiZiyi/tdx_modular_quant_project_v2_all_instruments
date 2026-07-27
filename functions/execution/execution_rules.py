@@ -3,10 +3,17 @@ import pandas as pd
 from decimal import Decimal, ROUND_HALF_UP
 
 from config import (
+    ALLOW_BSE_MARKET,
+    ALLOW_STAR_MARKET,
     ENABLE_PRICE_LIMIT_CHECK,
     ENABLE_SUSPENSION_CHECK,
     ENABLE_T_PLUS_ONE,
     MIN_LOT_SIZE,
+)
+from functions.execution.security_trading_rules import (
+    date_effective_price_limit_rule,
+    is_legal_order_quantity,
+    permission_allows,
 )
 
 
@@ -74,6 +81,36 @@ def build_price_limit_metadata(symbol, *, is_st=None, name=None) -> dict:
     }
 
 
+def build_date_effective_price_limit_metadata(
+    symbol,
+    *,
+    trade_date,
+    is_st=None,
+    name=None,
+    listing_date=None,
+    trading_sessions_since_listing=None,
+    security_status="normal",
+) -> dict:
+    st_flag = infer_st_flag(is_st=is_st, name=name)
+    rule = date_effective_price_limit_rule(
+        symbol,
+        trade_date=trade_date,
+        is_st=st_flag,
+        listing_date=listing_date,
+        trading_sessions_since_listing=trading_sessions_since_listing,
+        security_status=security_status,
+    )
+    return {
+        "board_type": rule.board_type,
+        "is_st": bool(st_flag),
+        "price_limit_ratio": rule.price_limit_ratio,
+        "has_daily_price_limit": rule.has_daily_price_limit,
+        "price_limit_rule_state": rule.rule_state,
+        "price_limit_rule_degraded": rule.degraded,
+        "price_limit_rule_version": rule.rule_version,
+    }
+
+
 def rounded_price_limit(previous_close, ratio, direction):
     """Exchange-style decimal rounding for displayed price limits."""
     base = Decimal(str(previous_close))
@@ -104,6 +141,21 @@ def classify_daily_limit_feasibility(
     return "tradable_daily_proxy"
 
 
+def open_price_limit_blocked(*, side, open_price, limit_up_price=None, limit_down_price=None) -> bool:
+    """Conservative open-only limit check without using execution-day close data."""
+    try:
+        opening = float(open_price)
+    except (TypeError, ValueError):
+        return True
+    if str(side).lower() == "buy":
+        if limit_up_price is None or pd.isna(limit_up_price):
+            return False
+        return opening >= float(limit_up_price) - 1e-9
+    if limit_down_price is None or pd.isna(limit_down_price):
+        return False
+    return opening <= float(limit_down_price) + 1e-9
+
+
 def normalize_order_frame(order_df):
     data = order_df.copy()
     data["trade_date"] = pd.to_datetime(data["trade_date"], errors="coerce")
@@ -120,10 +172,29 @@ def apply_a_share_constraints(
     enable_price_limit_check=ENABLE_PRICE_LIMIT_CHECK,
     enable_suspension_check=ENABLE_SUSPENSION_CHECK,
     min_lot_size=MIN_LOT_SIZE,
+    allow_star_market=ALLOW_STAR_MARKET,
+    allow_bse_market=ALLOW_BSE_MARKET,
 ):
     data = normalize_order_frame(order_df)
 
-    data["lot_size_valid"] = (data["target_shares"] % min_lot_size == 0) | (data["target_shares"] == 0)
+    del min_lot_size  # retained in the public signature for compatibility
+    data["lot_size_valid"] = data.apply(
+        lambda row: is_legal_order_quantity(
+            row.get("symbol"),
+            row.get("side"),
+            row.get("target_shares"),
+            trade_date=row.get("trade_date"),
+            current_position_shares=row.get("current_position_shares"),
+        ),
+        axis=1,
+    )
+    data["market_permission_blocked"] = ~data["symbol"].map(
+        lambda symbol: permission_allows(
+            symbol,
+            allow_star_market=allow_star_market,
+            allow_bse_market=allow_bse_market,
+        )
+    )
     data["t_plus_one_blocked"] = False
     data["price_limit_blocked"] = False
     data["suspension_blocked"] = False
@@ -139,6 +210,7 @@ def apply_a_share_constraints(
 
     data["constraint_blocked"] = (
         (~data["lot_size_valid"])
+        | data["market_permission_blocked"]
         | data["t_plus_one_blocked"]
         | data["price_limit_blocked"]
         | data["suspension_blocked"]

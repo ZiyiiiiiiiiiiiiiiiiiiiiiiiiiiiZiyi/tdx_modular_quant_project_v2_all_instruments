@@ -347,11 +347,11 @@ def build_daily_candidates(
         does not turn an ineligible holding into a new buy candidate.
         """
         if before.empty or not held_symbols or "symbol" not in before.columns:
-            return after
+            return after.copy()
         present = set(after["symbol"].astype(str)) if not after.empty else set()
         missing = held_symbols - present
         if not missing:
-            return after
+            return after.copy()
         held_rows = before[before["symbol"].astype(str).isin(missing)]
         return pd.concat([after, held_rows], ignore_index=True)
     
@@ -433,7 +433,7 @@ def build_daily_candidates(
         universe_mode=universe_mode,
         require_constituents=require_constituents,
         allow_fallback=allow_fallback,
-    )
+    ).copy()
     passed_symbols = set(filtered["symbol"].astype(str))
     before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
     if "_entry_eligible" in filtered.columns:
@@ -470,7 +470,7 @@ def build_daily_candidates(
     # Apply buy quality filters to improve selection accuracy
     if enable_quality_filters:
         before = candidates
-        filtered = _apply_buy_quality_filters(before)
+        filtered = _apply_buy_quality_filters(before).copy()
         passed_symbols = set(filtered["symbol"].astype(str))
         before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
         if "_entry_eligible" in filtered.columns:
@@ -481,7 +481,7 @@ def build_daily_candidates(
         funnel_counts["buy_quality_pass_count"] = int(len(candidates))
     
     before = candidates
-    filtered = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"])
+    filtered = candidates.dropna(subset=["symbol", "volatility_20", "alpha_score"]).copy()
     passed_symbols = set(filtered["symbol"].astype(str))
     before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
     if "_entry_eligible" in filtered.columns:
@@ -512,7 +512,7 @@ def build_daily_candidates(
         candidates["primary_score"] = candidates["alpha_score"]
         candidates["score_authority"] = "exploratory_alpha_fallback"
     before = candidates
-    filtered = candidates.dropna(subset=["primary_score"])
+    filtered = candidates.dropna(subset=["primary_score"]).copy()
     passed_symbols = set(filtered["symbol"].astype(str))
     before["_entry_eligible"] = before["_entry_eligible"] & before["symbol"].astype(str).isin(passed_symbols)
     if "_entry_eligible" in filtered.columns:

@@ -44,10 +44,21 @@ def main() -> None:
     selected = result[result["entry_confirmed"]]
     _check(selected["entry_size_tier"].eq("starter_1_lot").all(), "v3 replaces legacy blocked tiers with deterministic one-lot entries")
     _check(pd.to_numeric(selected["planned_entry_lots"], errors="coerce").eq(1).all(), "v3 selected entries plan exactly one lot")
-    _check(result.loc[result["symbol"].eq("B"), "position_state"].iloc[0] == "building", "v3 can re-evaluate a legacy entry-matrix block")
+    _check(result.loc[result["symbol"].eq("B"), "position_state"].iloc[0] == "flat", "unfilled v3 candidate is not recorded as a position")
+    _check(result.loc[result["symbol"].eq("B"), "candidate_state"].iloc[0] == "entry_selected", "v3 keeps pre-fill selection in candidate state")
     _check(result["state_machine_role_pass"].sum() == 3, "legacy role diversity is not a duplicate hard gate")
     _check(result.loc[result["symbol"].eq("C"), "entry_block_reason"].iloc[0] == "mainline_v3_position_state", "position hard block remains active")
     _check(result.loc[result["symbol"].eq("D"), "entry_block_reason"].iloc[0] == "mainline_v3_strict_entry_unavailable", "missing strict entry fails closed")
+
+    full_account = apply_mainline_v3_entry_policy(
+        _candidates(), max_new_candidates=5, held_symbols={"H1", "H2", "H3", "H4", "H5"},
+        available_cash=0.0, nominal_nav=20_000.0, decision_date="2025-01-02",
+    )
+    _check(not full_account["entry_confirmed"].any(), "full account blocks ordinary cash-funded entries")
+    _check(
+        bool(full_account.loc[full_account["symbol"].eq("A"), "replacement_challenger_eligible"].iloc[0]),
+        "full account preserves structurally eligible replacement challengers",
+    )
 
     allocated, _ = allocate_constrained_inverse_vol(
         result[result["symbol"].isin(["A", "B"])], exposure_cap=0.4, max_position_weight=0.4

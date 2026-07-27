@@ -7,7 +7,14 @@ import pandas as pd
 PRODUCTION_V1 = "production_v1"
 MAINLINE_V2 = "mainline_v2"
 MAINLINE_V3 = "mainline_v3_cabinet_native"
-STRATEGY_LOGIC_VERSIONS = (PRODUCTION_V1, MAINLINE_V2, MAINLINE_V3)
+MAINLINE_V3_MONTHLY_LGBM_HYBRID = "mainline_v3_monthly_lgbm_hybrid"
+MAINLINE_V31_RELIABILITY = "mainline_v3_reliability_weighted"
+MAINLINE_V3_VERSIONS = (MAINLINE_V3, MAINLINE_V3_MONTHLY_LGBM_HYBRID, MAINLINE_V31_RELIABILITY)
+STRATEGY_LOGIC_VERSIONS = (PRODUCTION_V1, MAINLINE_V2, *MAINLINE_V3_VERSIONS)
+
+
+def is_mainline_v3_version(value: str | None) -> bool:
+    return str(value or "").strip().lower() in MAINLINE_V3_VERSIONS
 
 
 def normalize_strategy_logic_version(value: str | None) -> str:

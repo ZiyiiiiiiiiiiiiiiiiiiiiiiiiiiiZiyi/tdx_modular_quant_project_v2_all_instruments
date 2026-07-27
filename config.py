@@ -159,9 +159,14 @@ MARKET_CAP_PARQUET = PROCESSED_DIR / "market_cap_history.parquet"
 MARKET_CAP_QUALITY_CSV = dated_artifact_path(REPORT_DIR / "market_cap_quality_report.csv")
 
 COMMISSION_RATE = 0.0003
-STAMP_DUTY_RATE = 0.001
+# Current default. Historical simulations use the date-effective schedule in
+# functions.execution.fee_schedule (0.1% before 2023-08-28, 0.05% after).
+STAMP_DUTY_RATE = 0.0005
 SLIPPAGE_RATE = 0.0005
 MIN_LOT_SIZE = 100
+MINIMUM_COMMISSION = 0.0  # Broker-specific; set via the execution profile when known.
+ALLOW_STAR_MARKET = False
+ALLOW_BSE_MARKET = False
 BACKTEST_INITIAL_CASH = 1_000_000.0
 BACKTEST_RISK_FREE_RATE = 0.0
 BACKTEST_SHOW_PLOT = False
@@ -228,7 +233,7 @@ BACKTEST_CAPITAL_PROFILES = {
         "label": "20,000 small-capital branch",
         "initial_cash": 20_000.0,
         "min_cash_buffer": 2_000.0,
-        "max_positions": 3,
+        "max_positions": 5,
         "affordability_first": True,
         "skip_unaffordable_symbols": True,
         "retail_lot_adapter": True,
@@ -244,7 +249,77 @@ BACKTEST_CAPITAL_PROFILES = {
         "retail_max_lot_upgrade_multiplier": 4.0,
         "retail_strong_lot_upgrade_multiplier": 8.0,
         "retail_strong_entry_matrix_threshold": 0.75,
-        "notes": "Small-capital branch. Keeps the governance strategy but adapts buy orders to A-share 100-share lot constraints.",
+        # 2026-07-23 historical evidence found negative replacement rewards.
+        # The 2026-07-25 user-authorized special version re-enables the module
+        # only behind one-pair/day, complete-pair, cost-LCB and unified-action
+        # controls.  It remains economically unvalidated until a matched rerun.
+        "active_replacement_enabled": True,
+        "objective_metric": "terminal_net_profit_after_cost",
+        "trade_quality_gate": "terminal_net_profit_primary_profit_factor_health",
+        "risk_tolerance": "aggressive_drawdown_tolerant_no_leverage",
+        "special_strategy_version": "small_capital_aggressive_profit_v1",
+        "scap_exit_stage": "E4",
+        "scap_loss_stop": -0.12,
+        "scap_drawdown_warning": 0.35,
+        "scap_new_entry_freeze_drawdown": 0.45,
+        "scap_profit_factor_admission": 1.15,
+        "scap_loser_averaging_enabled": True,
+        "scap_winner_pyramiding_enabled": True,
+        "scap_active_replacement_max_pairs_per_day": 1,
+        "scap_winner_pyramiding_trigger_returns": (0.05, 0.10),
+        "scap_signal_failure_confirmation_days": 3,
+        "scap_reentry_cooldown_days": 10,
+        "scap_cooldown_override_enabled": False,
+        "scap_single_position_soft_cap": 0.25,
+        "scap_candidate_minimum_commission": 5.0,
+        # This special branch maximizes expected cost-after profit and accepts
+        # model risk/drawdown. The conservative LCB remains disclosed, while
+        # new-entry reward uses the point forecast plus explicit cash risk and
+        # cost penalties. Other profiles/actions keep the LCB basis.
+        "scap_candidate_reward_basis": "point",
+        "notes": "Small-capital profit-seeking special branch. Unified action arbitration; E4 cumulative exit rights; bounded loser averaging, winner pyramiding and one paired active replacement per day are enabled for controlled validation.",
+    },
+    "small_capital_lean": {
+        "label": "20,000 SCAP-V3 aggressive lean",
+        "initial_cash": 20_000.0,
+        "min_cash_buffer": 1_000.0,
+        "max_positions": 5,
+        "soft_target_positions": 4,
+        "affordability_first": True,
+        "skip_unaffordable_symbols": True,
+        "retail_lot_adapter": True,
+        "retail_single_position_cap": 0.40,
+        "retail_one_lot_position_cap": 0.40,
+        "scap_single_position_soft_cap": 0.30,
+        "capital_usage_mode": "allow_cash",
+        "min_holdings": 0,
+        "force_deploy_target_exposure_normal": 0.90,
+        "force_deploy_target_exposure_weak": 0.65,
+        "force_deploy_target_exposure_high": 0.35,
+        "active_replacement_enabled": False,
+        "objective_metric": "terminal_net_profit_after_all_costs",
+        "trade_quality_gate": "terminal_net_profit_primary_profit_factor_health",
+        "risk_tolerance": "aggressive_drawdown_tolerant_no_leverage",
+        "special_strategy_version": "small_capital_aggressive_profit_v3_lean",
+        "scap_contract_version": "scap_v3_lean_contracts_v1",
+        "scap_exit_stage": "E4",
+        "scap_loss_stop": -0.15,
+        "scap_drawdown_warning": 0.30,
+        "scap_new_entry_freeze_drawdown": 0.40,
+        "scap_loser_averaging_enabled": False,
+        "scap_winner_pyramiding_enabled": True,
+        "scap_active_replacement_max_pairs_per_day": 0,
+        "scap_winner_pyramiding_trigger_returns": (0.04, 0.08),
+        "scap_max_winner_add_layers": 2,
+        "scap_forecast_horizon_days": 10,
+        "scap_forecast_kappa": 0.50,
+        "scap_warmup_sessions": 252,
+        "scap_candidate_minimum_commission": 5.0,
+        "scap_candidate_reward_basis": "shrunk_point_minus_0.50_cluster_se",
+        "strategic_exposure_normal": 0.90,
+        "strategic_exposure_weak": 0.65,
+        "strategic_exposure_high": 0.35,
+        "notes": "Isolated SCAP-V3 Lean research identity: PIT warm-up, one proposal factory, one integer ActionPlan, winner adds on, loser adds and replacement off.",
     },
 }
 
@@ -973,6 +1048,11 @@ GOVERNANCE_PRELOAD_CALENDAR_DAYS = 60
 # signal filtering, turnover budget) will be dynamically adjusted.
 ENABLE_MARKET_REGIME_POLICY = True
 MARKET_REGIME_BENCHMARK_SYMBOL = "sh510300"  # CSI 300 ETF as benchmark
+# Performance attribution uses a separate, fixed-cardinality opportunity-set
+# benchmark.  Free-float market-cap weights are not formally PIT-ready, so the
+# research default is prior-period top-liquidity selection with equal weights.
+GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N = 100
+GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE = "monthly"
 MARKET_REGIME_MA_PERIOD = 20
 MARKET_REGIME_MA_SLOPE_LOOKBACK = 5
 MARKET_REGIME_VOLATILITY_THRESHOLD = 0.025
@@ -1417,6 +1497,10 @@ def validate_configuration() -> list[str]:
         errors.append("MULTI_WINDOW_DEFAULT_MONTHS must be positive")
     if int(MULTI_WINDOW_DEFAULT_STEP_MONTHS) <= 0:
         errors.append("MULTI_WINDOW_DEFAULT_STEP_MONTHS must be positive")
+    if int(GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N) <= 0:
+        errors.append("GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N must be positive")
+    if str(GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE).lower() not in {"daily", "weekly", "monthly"}:
+        errors.append("GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE must be daily, weekly, or monthly")
     if errors:
         return errors
     return []

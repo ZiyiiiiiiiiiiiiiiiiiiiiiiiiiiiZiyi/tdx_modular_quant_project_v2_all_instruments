@@ -41,6 +41,8 @@ from config import (
     GOVERNANCE_INITIAL_CASH,
     GOVERNANCE_OUTPUT_DIR,
     GOVERNANCE_PRE_SCREEN_FACTOR_JUDGE_RUN_ID,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
     GOVERNANCE_START_DATE,
     RESULT_DIR,
     SAFETY_PROXY_MODE,
@@ -82,6 +84,7 @@ from functions.decision_council.runner import (
     GovernanceBacktestRunner,
     _governance_feature_columns,
     _prepare_features,
+    governance_preload_calendar_days,
 )
 from functions.decision_council.policy import RulesBasedPresidentPolicy
 from functions.output_naming import dated_run_dir, run_suffix
@@ -153,9 +156,13 @@ def _normalize_governance_control_mode(value) -> str:
         "paper": "paper_controls",
         "safe_factor": "safe_factor_only",
         "safe_stop": "safe_factor_only",
+        "scap": "aggressive_profit",
+        "profit": "aggressive_profit",
+        "lean": "aggressive_lean",
+        "scap_v3": "aggressive_lean",
     }
     mode = aliases.get(mode, mode)
-    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit", "aggressive_lean"}
     if mode not in allowed:
         raise ValueError(f"Invalid governance control mode: {mode}. Available: {sorted(allowed)}")
     return mode
@@ -254,19 +261,26 @@ def _load_governance_features(
     *,
     alpha_models: tuple[str, ...],
     allowed_instrument_types: tuple[str, ...],
+    governance_control_mode: str = "normal",
     factor_spec=None,
     progress_callback=None,
 ) -> pd.DataFrame:
     """Load only the feature columns required by governance experiments."""
+    preload_calendar_days = governance_preload_calendar_days(governance_control_mode)
+    load_start = start_date - pd.Timedelta(days=preload_calendar_days)
     _emit_progress(
         progress_callback,
         percent=18.0,
         step="load_features",
         message="preparing governance feature filters",
-        detail=f"window={start_date.date()}..{end_date.date()}, alpha_models={len(alpha_models)}",
+        detail=(
+            f"trade_window={start_date.date()}..{end_date.date()}, "
+            f"feature_window={load_start.date()}..{end_date.date()}, "
+            f"preload_calendar_days={preload_calendar_days}, alpha_models={len(alpha_models)}"
+        ),
     )
     filters = [
-        ("date", ">=", start_date - pd.Timedelta(days=60)),
+        ("date", ">=", load_start),
         ("date", "<=", end_date),
     ]
     if allowed_instrument_types:
@@ -343,14 +357,14 @@ def _load_governance_features(
             data = attach_factor_cabinet_feature_cache(
                 data,
                 spec=factor_spec,
-                start_date=start_date,
+                start_date=load_start,
                 end_date=end_date,
                 feature_path=FEATURE_DAILY_PARQUET,
             )
         else:
             data = attach_pre_screen_candidate_factor_cache(
                 data,
-                start_date=start_date - pd.Timedelta(days=60),
+                start_date=load_start,
                 end_date=end_date,
                 alpha_models=alpha_models,
                 feature_path=FEATURE_DAILY_PARQUET,
@@ -427,10 +441,13 @@ def run_single_experiment(
     factor_cabinet_path: str = "",
     progress_callback=None,
     strategy_logic_version: str = "production_v1",
+    monthly_lgbm_maximum_weight: float | None = None,
     regime_overlay_mode_override: str | None = None,
     exit_mode_override: str | None = None,
     enable_market_regime_policy_override: bool | None = None,
     pit_mode: str = "research",
+    performance_benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    performance_benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ) -> dict[str, Path]:
     """运行单个治理实验"""
     _emit_progress(
@@ -440,6 +457,10 @@ def run_single_experiment(
         message="resolving governance factor source",
         detail=f"factor_source={factor_source}, alpha_bundle={alpha_bundle}",
     )
+    if strategy_logic_version == "mainline_v3_monthly_lgbm_hybrid" and monthly_lgbm_maximum_weight is None:
+        raise ValueError(
+            "mainline_v3_monthly_lgbm_hybrid requires a pre-registered monthly_lgbm_maximum_weight"
+        )
     variant_spec = get_governance_variant_spec(variant_name)
     universe_spec = get_universe_spec(universe_name)
     factor_spec = resolve_factor_source(
@@ -490,8 +511,20 @@ def run_single_experiment(
             "factor_only": "ctrl_factor",
             "safe_factor_only": "ctrl_safe_factor",
             "paper_controls": "ctrl_paper",
+            "aggressive_profit": "ctrl_aggressive_profit",
+            "aggressive_lean": "ctrl_aggressive_lean",
         }
         output_dir = output_dir / control_dir_names.get(control_mode, f"ctrl_{control_mode}")
+    if control_mode in {"aggressive_profit", "aggressive_lean"}:
+        exit_stage = str((capital_profile or {}).get("scap_exit_stage", "E0") or "E0").strip().upper()
+        loss_stop = abs(float((capital_profile or {}).get("scap_loss_stop", -0.12)))
+        loss_basis_points = int(round(loss_stop * 10_000))
+        output_dir = (
+            GOVERNANCE_OUTPUT_DIR
+            / "scap"
+            / factor_source_output_label(factor_spec)
+            / f"{exit_stage.lower()}_l{loss_basis_points}"
+        )
     if not bool(alpha_collapse_exit_enabled):
         output_dir = output_dir / "no_alpha_collapse_exit"
     if output_dir_suffix:
@@ -499,7 +532,7 @@ def run_single_experiment(
         if safe_suffix:
             output_dir = output_dir / safe_suffix
     if str(strategy_logic_version).strip().lower() != "production_v1":
-        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3"}.get(
+        logic_dir = {"mainline_v2": "v2", "mainline_v3_cabinet_native": "v3", "mainline_v3_monthly_lgbm_hybrid": "v3_ml", "mainline_v3_reliability_weighted": "v31_reliability"}.get(
             str(strategy_logic_version).strip().lower(),
             "logic_custom",
         )
@@ -511,6 +544,11 @@ def run_single_experiment(
     pit_audit = run_pit_preflight(
         mode=pit_mode,
         output_path=output_dir / "pit_runtime_audit.json",
+    )
+    from functions.data.pit_level2_store import run_pit_level2_preflight
+    pit_level2_audit = run_pit_level2_preflight(
+        mode=pit_mode,
+        output_path=output_dir / "pit_level2_runtime_audit.json",
     )
 
     print(f"\n{'=' * 60}")
@@ -527,6 +565,14 @@ def run_single_experiment(
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE)
     requested_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE)
     effective_end = _bounded_feature_end_date(effective_start, requested_end, max_days)
+    temporal_pass = False
+    if factor_spec.uses_factor_cabinet:
+        from functions.research.temporal_contract import audit_artifact_lineage, write_temporal_audit
+        temporal_evidence, temporal_summary = audit_artifact_lineage(
+            factor_spec.factor_cabinet_path, oos_start=effective_start
+        )
+        write_temporal_audit(output_dir, temporal_evidence, temporal_summary)
+        temporal_pass = bool(temporal_summary["temporal_isolation_pass"])
     if effective_end < requested_end:
         _emit_progress(
             progress_callback,
@@ -540,6 +586,7 @@ def run_single_experiment(
         effective_end,
         alpha_models=alpha_models,
         allowed_instrument_types=tuple(universe_spec.allowed_instrument_types),
+        governance_control_mode=control_mode,
         factor_spec=factor_spec,
         progress_callback=progress_callback,
     )
@@ -613,7 +660,12 @@ def run_single_experiment(
         alpha_collapse_exit_enabled=bool(alpha_collapse_exit_enabled),
         factor_source_spec=factor_spec,
         strategy_logic_version=strategy_logic_version,
+        monthly_lgbm_maximum_weight=monthly_lgbm_maximum_weight,
         pit_runtime_state=str(pit_audit["pit_runtime_state"]),
+        pit_level2_runtime_state=str(pit_level2_audit["pit_runtime_state"]),
+        factor_temporal_isolation_pass=temporal_pass,
+        performance_benchmark_top_n=performance_benchmark_top_n,
+        performance_benchmark_rebalance=performance_benchmark_rebalance,
     )
 
     _emit_progress(
@@ -678,6 +730,9 @@ def run_single_experiment(
         "low_memory": low_memory,
         "initial_cash": float(initial_cash),
         "max_positions": max_positions,
+        "performance_benchmark_top_n": int(performance_benchmark_top_n),
+        "performance_benchmark_rebalance": str(performance_benchmark_rebalance),
+        "performance_benchmark_status": "research_equal_weight_until_pit_free_float_market_cap_available",
         **factor_judge_status,
     }
     metadata_path = output_dir / "experiment_metadata.json"
@@ -942,7 +997,7 @@ def parse_args():
     parser.add_argument("--safety-proxy-mode", choices=["strict", "degraded_backtest"], default=SAFETY_PROXY_MODE)
     parser.add_argument(
         "--governance-control-mode",
-        choices=["normal", "factor_only", "paper_controls", "safe_factor_only"],
+        choices=["normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit", "aggressive_lean"],
         default="normal",
         help="Governance control switch for stop-mode experiments.",
     )
@@ -960,8 +1015,14 @@ def parse_args():
     parser.add_argument("--factor-cabinet-path", default="")
     parser.add_argument(
         "--strategy-logic-version",
-        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native"],
+        choices=["production_v1", "mainline_v2", "mainline_v3_cabinet_native", "mainline_v3_monthly_lgbm_hybrid", "mainline_v3_reliability_weighted"],
         default="production_v1",
+    )
+    parser.add_argument(
+        "--monthly-lgbm-maximum-weight",
+        type=float,
+        default=None,
+        help="Pre-registered upper bound for formula-calibrated ML rank weight (required for hybrid v3).",
     )
     parser.add_argument("--experiment-plan", type=str, help="Path to experiment plan JSON file")
     parser.add_argument("--list-variants", action="store_true", help="List all governance variants")
@@ -1050,6 +1111,7 @@ def main():
             factor_cabinet_run_id=args.factor_cabinet_run_id,
             factor_cabinet_path=args.factor_cabinet_path,
             strategy_logic_version=args.strategy_logic_version,
+            monthly_lgbm_maximum_weight=args.monthly_lgbm_maximum_weight,
         )
         return
 

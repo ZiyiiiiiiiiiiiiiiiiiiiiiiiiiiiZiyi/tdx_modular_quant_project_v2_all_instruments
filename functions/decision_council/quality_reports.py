@@ -22,8 +22,10 @@ from config import (
     GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM,
     GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N,
     GOVERNANCE_FACTOR_JUDGED_ALPHA_WEIGHTS,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
 )
-from functions.decision_council.analytics import build_top_strength_benchmark_series, factor_module
+from functions.decision_council.analytics import build_top_pool_benchmark_series, factor_module
 from functions.decision_council.factor_validation import build_factor_research_reports
 
 
@@ -43,10 +45,16 @@ def build_governance_quality_reports(
     attribution_ledger: pd.DataFrame | None = None,
     return_pivot: pd.DataFrame | None = None,
     runtime_context=None,
+    benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ) -> dict[str, pd.DataFrame]:
     _log_quality_stage("prepare_price_frames")
     close_pivot = _close_pivot(feature_data)
-    benchmark_returns = _top_strength_benchmark_forward_returns(feature_data)
+    benchmark_returns = _top_pool_benchmark_forward_returns(
+        feature_data,
+        top_n=benchmark_top_n,
+        rebalance=benchmark_rebalance,
+    )
     if all(series.empty for series in benchmark_returns.values()):
         benchmark_returns = _benchmark_forward_returns(close_pivot, benchmark_symbol)
     _log_quality_stage("trade_quality_reports")
@@ -248,6 +256,8 @@ def build_portfolio_constraint_report(
     columns = [
         "date",
         "account_effective_n",
+        "configured_max_positions",
+        "effective_n_required",
         "top1_account_weight",
         "top5_account_weight_sum",
         "industry_top1_weight",
@@ -279,8 +289,24 @@ def build_portfolio_constraint_report(
         data[column] = pd.to_numeric(data.get(column, pd.Series(np.nan, index=data.index)), errors="coerce")
     rows = []
     for _, row in data.dropna(subset=["date"]).iterrows():
+        configured_max_positions = int(
+            _coerce_float(
+                row.get(
+                    "configured_max_positions",
+                    row.get("target_holding_count", row.get("holding_count", 0)),
+                )
+            )
+            or 0
+        )
+        # Cash is included in account effective N for transparent capital-use
+        # reporting, but it must not increase the diversification requirement.
+        # Requiring K+1 for a K-position account would demand the unattainable
+        # boundary case of perfectly equal cash and security weights.  Scale the
+        # global gate to the configured security capacity instead.
+        effective_n_required = float(max(configured_max_positions, 1))
         fail_reasons = []
-        if pd.notna(row["account_effective_n"]) and float(row["account_effective_n"]) < float(min_effective_n):
+        scaled_min_effective_n = min(float(min_effective_n), effective_n_required)
+        if pd.notna(row["account_effective_n"]) and float(row["account_effective_n"]) < scaled_min_effective_n:
             fail_reasons.append("effective_n_below_research_min")
         if pd.notna(row["top1_account_weight"]) and float(row["top1_account_weight"]) > float(max_top1_account_weight):
             fail_reasons.append("top1_account_weight_above_cap")
@@ -290,6 +316,8 @@ def build_portfolio_constraint_report(
             {
                 "date": pd.Timestamp(row["date"]),
                 "account_effective_n": row["account_effective_n"],
+                "configured_max_positions": configured_max_positions,
+                "effective_n_required": scaled_min_effective_n,
                 "top1_account_weight": row["top1_account_weight"],
                 "top5_account_weight_sum": row["top5_account_weight_sum"],
                 "industry_top1_weight": row["industry_top1_weight"],
@@ -550,9 +578,15 @@ def build_research_gate_report(reports: dict[str, pd.DataFrame]) -> pd.DataFrame
     if constraints is not None and not constraints.empty:
         latest = constraints.sort_values("date").iloc[-1]
         effective_n = _coerce_float(latest.get("account_effective_n", np.nan))
+        effective_n_required = _coerce_float(latest.get("effective_n_required", 5.0))
         top1_weight = _coerce_float(latest.get("top1_account_weight", np.nan))
         top5_weight = _coerce_float(latest.get("top5_account_weight_sum", np.nan))
-        rows.append(_research_gate_row("latest_account_effective_n", np.isfinite(effective_n) and effective_n >= 5.0, effective_n, ">= 5"))
+        rows.append(_research_gate_row(
+            "latest_account_effective_n",
+            np.isfinite(effective_n) and np.isfinite(effective_n_required) and effective_n >= effective_n_required,
+            effective_n,
+            f">= {effective_n_required:g} (capital-profile scaled)",
+        ))
         rows.append(_research_gate_row("latest_top1_account_weight", np.isfinite(top1_weight) and top1_weight <= 0.25, top1_weight, "<= 0.25"))
         rows.append(_research_gate_row("latest_top5_account_weight_sum", np.isfinite(top5_weight) and top5_weight <= 0.80, top5_weight, "<= 0.80"))
     else:
@@ -644,7 +678,7 @@ def build_strategy_validation_matrix(reports: dict[str, pd.DataFrame]) -> pd.Dat
     if not roll60.empty:
         beat = float(pd.to_numeric(roll60.get("account_beat_ratio"), errors="coerce").iloc[0])
         if np.isfinite(beat):
-            rows.append(_gate_row("rolling_60d_top_strength_beat", beat >= 0.50, beat, ">=0.50 vs top-strength benchmark"))
+            rows.append(_gate_row("rolling_60d_top_pool_beat", beat >= 0.50, beat, ">=0.50 vs fixed-N top-liquidity benchmark"))
 
     if not lifecycle.empty:
         giveback_ratio = float(pd.to_numeric(lifecycle.get("paper_profit_giveback_flag"), errors="coerce").fillna(0.0).mean())
@@ -1150,8 +1184,20 @@ def build_risk_contribution_ledger(
         return pd.DataFrame()
     data = ideal_portfolio_plan.copy()
     data["decision_date"] = pd.to_datetime(data.get("decision_date"), errors="coerce")
-    data["symbol"] = data.get("symbol", pd.Series(dtype=object)).astype(str)
-    data["ideal_weight"] = pd.to_numeric(data.get("ideal_weight"), errors="coerce").fillna(0.0)
+    data["symbol"] = data.get(
+        "symbol", pd.Series("", index=data.index, dtype=object)
+    ).astype(str)
+    # Legacy plans call this quantity ``ideal_weight``.  SCAP-V3 Lean's
+    # authoritative ActionPlan calls the same post-plan quantity
+    # ``target_weight``.  Keep the reporting adapter here and always provide a
+    # Series default: pd.to_numeric(np.nan) is a scalar and cannot be fillna'd.
+    weight_source = data.get(
+        "ideal_weight",
+        data.get("target_weight", pd.Series(0.0, index=data.index, dtype=float)),
+    )
+    data["ideal_weight"] = pd.to_numeric(
+        weight_source, errors="coerce"
+    ).fillna(0.0)
     rows = []
     for date, group in data.groupby("decision_date", sort=True):
         symbols = [s for s in group["symbol"].astype(str).tolist() if s in return_pivot.columns]
@@ -1525,8 +1571,14 @@ def _benchmark_forward_returns(close_pivot: pd.DataFrame, benchmark_symbol: str 
     return {int(h): close.shift(-int(h)) / close - 1.0 for h in horizons}
 
 
-def _top_strength_benchmark_forward_returns(feature_data: pd.DataFrame, horizons=(5, 10, 20)) -> dict[int, pd.Series]:
-    benchmark = build_top_strength_benchmark_series(feature_data)
+def _top_pool_benchmark_forward_returns(
+    feature_data: pd.DataFrame,
+    horizons=(5, 10, 20),
+    *,
+    top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+) -> dict[int, pd.Series]:
+    benchmark = build_top_pool_benchmark_series(feature_data, top_n=top_n, rebalance=rebalance)
     if benchmark.empty:
         return {int(h): pd.Series(dtype=float) for h in horizons}
     data = benchmark.copy()

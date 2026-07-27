@@ -5,6 +5,8 @@ import pandas as pd
 
 from config import *  # noqa: F403 - retail rules are config-driven.
 from functions.execution.cost_model import estimate_trade_costs
+from functions.execution.security_trading_rules import legal_buy_quantity, trading_rule_for
+from functions.decision_council.mainline_v2 import is_mainline_v3_version
 
 
 def _safe_float(value, default=0.0) -> float:
@@ -45,7 +47,20 @@ def adapt_retail_buy_order(
     one_lot_cash_required: float | None = None,
 ) -> tuple[float, str, str]:
     state = str(order.get("position_state", "") or "").strip().lower()
-    if state in {"blocked", "cooldown", "exiting", "protecting_profit"} or bool(order.get("exit_state", False)):
+    action_plan_authorized = bool(order.get("action_plan_selected", False)) and bool(
+        str(order.get("action_plan_id", "") or "").strip()
+    )
+    # SCAP-V3 Lean consumes factual cooldown/exit states before optimization.
+    # The legacy ``blocked`` state is derived from the old entry-confirmation
+    # score/tier and is not an execution fact.  Re-reading it here would turn
+    # one authoritative ActionPlan into a second, hidden soft-score veto.
+    if (
+        not action_plan_authorized
+        and (
+            state in {"blocked", "cooldown", "exiting", "protecting_profit"}
+            or bool(order.get("exit_state", False))
+        )
+    ):
         return 0.0, "blocked", "position_state"
     if order_price <= 0.0 or nominal_nav <= 0.0:
         return 0.0, "blocked", "invalid_price_or_nav"
@@ -62,8 +77,10 @@ def adapt_retail_buy_order(
     entry_probability = _safe_float(order.get("entry_success_probability"), default=0.0)
     min_entry_score = float(runner.capital_profile.get("retail_min_entry_matrix_score", 0.0) or 0.0)
     tier = str(order.get("entry_size_tier", "") or "").strip().lower()
+    rule = trading_rule_for(order.get("symbol"), trade_date=order.get("execution_date"))
+    minimum_buy_quantity = float(rule.minimum_buy_quantity)
     force_deploy = runner.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY
-    cabinet_native = str(getattr(runner, "strategy_logic_version", "")) == "mainline_v3_cabinet_native"
+    cabinet_native = is_mainline_v3_version(getattr(runner, "strategy_logic_version", ""))
     if force_deploy and tier == "diversify_1_lot":
         min_entry_score = min(min_entry_score, float(GOVERNANCE_DIVERSIFY_ENTRY_MATRIX_MIN))
     elif tier == "starter_1_lot":
@@ -71,11 +88,11 @@ def adapt_retail_buy_order(
     one_lot_position_cap = float(
         runner.capital_profile.get("retail_one_lot_position_cap", single_cap) or single_cap
     )
-    one_lot_cost = float(order_price) * float(MIN_LOT_SIZE)
+    one_lot_cost = float(order_price) * minimum_buy_quantity
     one_lot_cash_required = (
         float(one_lot_cash_required)
         if one_lot_cash_required is not None
-        else runner._retail_cash_required(side="buy", price=order_price, shares=float(MIN_LOT_SIZE))
+        else runner._retail_cash_required(side="buy", price=order_price, shares=minimum_buy_quantity)
     )
     available_cash = max(float(runner.cash) - float(reserved_cash), 0.0)
     affordable_cash = max(available_cash - min_buffer, 0.0)
@@ -86,7 +103,7 @@ def adapt_retail_buy_order(
     one_lot_weight = one_lot_cash_required / max(float(nominal_nav), 1e-12)
     if current_weight + one_lot_weight > single_cap + 1e-12:
         return 0.0, "blocked", "single_position_cap"
-    if initial_shares < float(MIN_LOT_SIZE) and one_lot_weight > one_lot_position_cap + 1e-12:
+    if initial_shares < minimum_buy_quantity and one_lot_weight > one_lot_position_cap + 1e-12:
         return 0.0, "blocked", "one_lot_position_cap"
 
     target_exposure = 0.0
@@ -98,7 +115,15 @@ def adapt_retail_buy_order(
     if target_exposure > 1e-12 and current_exposure + one_lot_weight > target_exposure + exposure_tolerance + 1e-12:
         return 0.0, "blocked", "target_exposure_tolerance"
 
-    if initial_shares >= float(MIN_LOT_SIZE):
+    if action_plan_authorized:
+        # The unique ActionPlan already consumed every soft score, forecast,
+        # and action conflict. Execution may still reject factual cash, lot,
+        # position-state, or exposure violations above, but cannot re-score.
+        if initial_shares >= minimum_buy_quantity:
+            return initial_shares, "action_plan_unchanged", ""
+        return minimum_buy_quantity, "action_plan_one_lot", ""
+
+    if initial_shares >= minimum_buy_quantity:
         return initial_shares, "unchanged", ""
     one_lot_tiers = {"basket_1_lot", "diversify_1_lot", "starter_1_lot", "starter_2_lot", "starter_strong"}
     if strategy_target_notional <= 0.0 and not (force_deploy and tier in one_lot_tiers) and tier != "basket_1_lot":
@@ -132,7 +157,8 @@ def adapt_retail_buy_order(
     executable_lots = max(min(planned_lots, max_cash_lots, max_cap_lots), 0)
     if executable_lots <= 0:
         return 0.0, "blocked", "lot_size_cash_or_cap"
-    shares = float(executable_lots) * float(MIN_LOT_SIZE)
+    requested = float(executable_lots) * minimum_buy_quantity
+    shares = legal_buy_quantity(order.get("symbol"), requested, trade_date=order.get("execution_date"))
     if executable_lots >= 3:
         return shares, "upgraded_to_three_lots_strong", ""
     if executable_lots >= 2:
@@ -171,7 +197,9 @@ def record_retail_execution_diagnostic(
     retail_block_reason: str,
     one_lot_cash_required=None,
 ) -> None:
-    if not runner._retail_lot_adapter_enabled:
+    # Zero-lot diagnostics are factual exchange-feasibility evidence and must
+    # remain visible even when the optional retail buy adapter is disabled.
+    if not runner._retail_lot_adapter_enabled and str(retail_action) != "blocked_zero_lot":
         return
     min_buffer = float(runner.capital_profile.get("min_cash_buffer", 0.0) or 0.0)
     adjusted_notional = _safe_float(adjusted_target_notional, default=0.0)

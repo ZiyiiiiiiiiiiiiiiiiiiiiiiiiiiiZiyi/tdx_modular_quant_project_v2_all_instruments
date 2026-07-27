@@ -11,7 +11,9 @@ from config import (
     SLIPPAGE_RATE,
     STAMP_DUTY_RATE,
     TRANSFER_FEE_RATE,
+    MINIMUM_COMMISSION,
 )
+from functions.execution.fee_schedule import commission_cost, stamp_duty_rate_for
 
 
 def estimate_trade_costs(
@@ -21,6 +23,7 @@ def estimate_trade_costs(
     stamp_duty_rate=STAMP_DUTY_RATE,
     slippage_rate=SLIPPAGE_RATE,
     transfer_fee_rate=TRANSFER_FEE_RATE,
+    minimum_commission=MINIMUM_COMMISSION,
     shares_col=None,
 ):
     data = order_df.copy()
@@ -34,9 +37,16 @@ def estimate_trade_costs(
     charged_shares = pd.to_numeric(data[share_source], errors="coerce").fillna(0.0)
     notional = (data["price"] * charged_shares.abs()).fillna(0.0)
     data["trade_notional"] = notional
-    data["commission_cost"] = notional * float(commission_rate)
+    data["commission_cost"] = notional.map(
+        lambda value: commission_cost(value, rate=commission_rate, minimum=minimum_commission)
+    )
     data["slippage_cost"] = notional * float(slippage_rate)
-    data["stamp_duty_cost"] = notional.where(data["side"] == "sell", 0.0) * float(stamp_duty_rate)
+    trade_dates = data.get("trade_date", pd.Series(pd.NaT, index=data.index))
+    effective_stamp_rates = trade_dates.map(
+        lambda value: stamp_duty_rate_for(value, fallback_rate=stamp_duty_rate)
+    )
+    data["stamp_duty_rate_effective"] = effective_stamp_rates
+    data["stamp_duty_cost"] = notional.where(data["side"] == "sell", 0.0) * effective_stamp_rates
     data["transfer_fee_cost"] = notional * float(transfer_fee_rate)
     market_amount = pd.to_numeric(
         data.get("market_amount", pd.Series(0.0, index=data.index)),

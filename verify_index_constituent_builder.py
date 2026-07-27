@@ -5,7 +5,12 @@ from __future__ import annotations
 import pandas as pd
 
 from functions.data_sources.index_constituents_provider import merge_constituent_snapshot
-from functions.investable_universe import build_index_universe_quality_report, normalize_index_constituents
+from functions.investable_universe import (
+    active_index_members,
+    build_index_universe_quality_report,
+    normalize_index_constituents,
+    validate_constituent_temporal_contract,
+)
 
 
 def main():
@@ -83,6 +88,16 @@ def main():
     assert pd.Timestamp(new_added["first_trade_date"]) == pd.Timestamp("2024-02-02")
     report = build_index_universe_quality_report(merged, start_date="2024-01-02", end_date="2024-02-05")
     assert "coverage_ratio" in report.columns
+    malformed_current = normalize_index_constituents(pd.DataFrame([{
+        "index_code": "000300", "symbol": "sh600000",
+        "first_trade_date": "2020-01-01", "asof_date": "2026-06-11",
+        "source": "akshare_csindex", "out_date": pd.NaT,
+    }]))
+    temporal = validate_constituent_temporal_contract(
+        malformed_current, start_date="2025-01-01", end_date="2025-12-31"
+    )
+    assert set(temporal["status"]) == {"blocked"}
+    assert active_index_members(malformed_current, as_of_date="2025-01-02").empty
     print("Index constituent builder verification passed.")
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import config
@@ -86,8 +87,15 @@ def _verify_no_duplicated_core_parameters(failures):
         "SLIPPAGE_RATE",
         "AUTO_COMPLETE_MAX_STRATEGY_WORKERS",
     }
-    for path in ROOT.rglob("*.py"):
-        if path.name == "config.py" or any(part in {"data", "results", "runs"} for part in path.parts):
+    excluded_trees = {"data", "results", "runs", "reports", ".git", "__pycache__"}
+    python_files = []
+    for directory, dirnames, filenames in os.walk(ROOT, topdown=True):
+        dirnames[:] = [name for name in dirnames if name not in excluded_trees]
+        python_files.extend(
+            Path(directory) / name for name in filenames if name.endswith(".py")
+        )
+    for path in python_files:
+        if path.name == "config.py":
             continue
         tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
         for node in tree.body:

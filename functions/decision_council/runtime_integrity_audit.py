@@ -74,6 +74,19 @@ def build_runtime_integrity_audit(
         if "order_id" in filled.columns:
             duplicate_fills = int(filled["order_id"].astype(str).duplicated().sum())
             rows.append(_row("unique_filled_order_id", duplicate_fills == 0, f"duplicates={duplicate_fills}"))
+        pair_id = filled.get("replacement_pair_id", pd.Series("", index=filled.index)).fillna("").astype(str)
+        paired = filled[pair_id.ne("")].copy()
+        orphan_buys = 0
+        if not paired.empty:
+            for _, group in paired.groupby("replacement_pair_id", sort=False):
+                sides = set(group["side"].astype(str).str.lower())
+                if "buy" in sides and "sell" not in sides:
+                    orphan_buys += 1
+        rows.append(_row(
+            "replacement_pair_execution_contract",
+            orphan_buys == 0,
+            f"paired_fills={len(paired)}, orphan_buy_pairs={orphan_buys}",
+        ))
 
     accounts = account_audit.copy() if account_audit is not None else pd.DataFrame()
     if accounts.empty:
@@ -103,6 +116,71 @@ def build_runtime_integrity_audit(
                 f"violation_days={int(violations.sum())}"
             ),
         ))
+    exposure_columns = {"date", "actual_exposure", "effective_target_exposure_cap"}
+    if daily.empty or not exposure_columns.issubset(daily.columns):
+        rows.append(_row(
+            "execution_exposure_authorization",
+            False,
+            f"missing={sorted(exposure_columns - set(daily.columns))}",
+        ))
+    else:
+        exposure_daily = daily.copy()
+        exposure_daily["date"] = pd.to_datetime(exposure_daily["date"], errors="coerce")
+        exposure_daily = exposure_daily.sort_values("date")
+        actual = pd.to_numeric(exposure_daily["actual_exposure"], errors="coerce")
+        # Today's opening/settled holdings are produced by the preceding
+        # decision. Compare them with that decision's executable cap. A small
+        # absolute allowance covers overnight price gaps, not sizing mistakes.
+        authorized = pd.to_numeric(
+            exposure_daily["effective_target_exposure_cap"],
+            errors="coerce",
+        ).shift(1)
+        comparable = actual.notna() & authorized.notna()
+        base_tolerance = 0.02
+        tolerance = pd.Series(base_tolerance, index=exposure_daily.index, dtype=float)
+        holding_granularity = (
+            holdings_ledger.copy()
+            if holdings_ledger is not None
+            else pd.DataFrame()
+        )
+        if (
+            not holding_granularity.empty
+            and {"date", "account_weight"}.issubset(holding_granularity.columns)
+        ):
+            holding_granularity["date"] = pd.to_datetime(
+                holding_granularity["date"],
+                errors="coerce",
+            )
+            holding_granularity["account_weight"] = pd.to_numeric(
+                holding_granularity["account_weight"],
+                errors="coerce",
+            )
+            minimum_lot_weight = (
+                holding_granularity[
+                    holding_granularity["account_weight"].gt(0.0)
+                ]
+                .groupby("date")["account_weight"]
+                .min()
+            )
+            mapped = exposure_daily["date"].map(minimum_lot_weight)
+            # A small-capital account cannot trim less than one held lot.
+            # Bound this allowance at ten percentage points so a genuine
+            # sizing violation cannot be hidden by one very large position.
+            lot_allowance = mapped.clip(lower=base_tolerance, upper=0.10)
+            tolerance = lot_allowance.fillna(base_tolerance)
+        excess = actual - authorized
+        violations = comparable & excess.gt(tolerance + 1e-12)
+        rows.append(_row(
+            "execution_exposure_authorization",
+            bool(not violations.any()),
+            (
+                f"comparable_days={int(comparable.sum())}, "
+                f"violation_days={int(violations.sum())}, "
+                f"max_excess={float(excess[comparable].max()) if comparable.any() else 'missing'}, "
+                f"max_granularity_allowance={float(tolerance[comparable].max()) if comparable.any() else 'missing'}, "
+                f"base_overnight_gap_tolerance={base_tolerance}"
+            ),
+        ))
     holdings = holdings_ledger.copy() if holdings_ledger is not None else pd.DataFrame()
     states = position_state_ledger.copy() if position_state_ledger is not None else pd.DataFrame()
     required = {"date", "symbol"}
@@ -130,6 +208,28 @@ def build_runtime_integrity_audit(
             missing_count == 0,
             f"expected_overnight_holding_rows={len(expected)}, missing_state_rows={missing_count}",
         ))
+        score_columns = [
+            column for column in (
+                "cabinet_native_final_score", "comparable_expected_alpha",
+                "comparable_alpha_lcb", "comparable_value_horizon_days",
+            ) if column in states.columns
+        ]
+        joined = expected.merge(states, on=["date", "symbol"], how="left")
+        logic = joined.get(
+            "entry_logic_version",
+            joined.get("strategy_logic_version", pd.Series("", index=joined.index)),
+        ).fillna("").astype(str)
+        v3 = logic.str.startswith("mainline_v3")
+        if not v3.any():
+            rows.append(_row("held_score_coverage", True, "no v3 overnight holdings"))
+        elif not score_columns:
+            rows.append(_row("held_score_coverage", False, "v3 held rows have no comparable score fields"))
+        else:
+            complete = joined.loc[v3, score_columns].notna().all(axis=1)
+            rows.append(_row(
+                "held_score_coverage", bool(complete.all()),
+                f"v3_held_rows={int(v3.sum())}, complete_rows={int(complete.sum())}, fields={'|'.join(score_columns)}",
+            ))
     return pd.DataFrame(rows)
 
 

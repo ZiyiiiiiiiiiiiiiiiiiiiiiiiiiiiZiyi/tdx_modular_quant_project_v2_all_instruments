@@ -97,6 +97,12 @@ Governance outputs go to `results/decision_council/`.
 6. **Config validation**: `assert_valid_configuration()` runs at startup. Invalid config raises `ValueError`.
 7. **File deletion**: Never use `Remove-Item -Recurse`, `rm -rf`, `del /s`, or `rd /s`. Delete one file at a time with explicit path. If batch deletion needed, stop and ask user.
 
+## WBS Change Control
+
+- Before changing strategy logic, formulas, data timing, execution, accounting, reports, or Web controls, inspect `QUANT_SYSTEM_WBS.md` for an existing leaf.
+- Every such change must update the corresponding WBS leaf or add a new leaf, append a dated change record, and check the documented upstream/downstream impact chain.
+- Verification evidence and run comparability must be recorded in the WBS change entry. Do not compare results from different dates, code states, capital profiles, factor cabinets, cost models, or PIT states as if they were a controlled experiment.
+
 ## Config Thresholds (report/resource warnings)
 
 ```python

@@ -8,11 +8,11 @@ import numpy as np
 import pandas as pd
 
 from config import PROCESSED_DIR, REPORT_DIR
-from functions.decision_council.position_management import evaluate_index_constituent_coverage
 from functions.output_naming import run_suffix
 
 
 INDEX_CONSTITUENTS_PARQUET = PROCESSED_DIR / "index_constituents.parquet"
+PIT_INDEX_MEMBERSHIP_PARQUET = PROCESSED_DIR / "pit_level1" / "index_membership_pit.parquet"
 INDEX_UNIVERSE_QUALITY_CSV = REPORT_DIR / f"index_universe_quality_report{run_suffix()}.csv"
 
 TARGET_INDEX_POOLS = {
@@ -97,6 +97,13 @@ def active_index_members(constituents: pd.DataFrame, *, as_of_date, index_codes=
         wanted = {str(code).zfill(6) for code in index_codes}
         data = data[data["index_code"].astype(str).str.zfill(6).isin(wanted)]
     data["first_trade_date"] = pd.to_datetime(data["first_trade_date"], errors="coerce")
+    data["asof_date"] = pd.to_datetime(data.get("asof_date"), errors="coerce")
+    source = data.get("source", pd.Series("", index=data.index)).fillna("").astype(str).str.lower()
+    current_snapshot = source.str.contains("snapshot|akshare_csindex", regex=True)
+    # A current provider snapshot is knowledge acquired on ``asof_date``.  It
+    # cannot establish membership before that date, even when a malformed
+    # artifact carries an earlier synthetic first_trade_date.
+    data.loc[current_snapshot, "first_trade_date"] = data.loc[current_snapshot, ["first_trade_date", "asof_date"]].max(axis=1)
     data["out_date"] = pd.to_datetime(data["out_date"], errors="coerce").fillna(pd.Timestamp.max.normalize())
     return data[(data["first_trade_date"] <= date) & (data["out_date"] > date)].copy()
 
@@ -197,6 +204,10 @@ def filter_investable_universe(
 
 
 def build_index_universe_quality_report(constituents: pd.DataFrame, *, start_date, end_date) -> pd.DataFrame:
+    # Lazy import avoids decision_council.__init__ -> runner -> proposals ->
+    # investable_universe circular initialization.
+    from functions.decision_council.position_management import evaluate_index_constituent_coverage
+
     rows = []
     normalized = normalize_index_constituents(constituents) if not _has_normalized_columns(constituents) else constituents
     for pool_id, spec in TARGET_INDEX_POOLS.items():
@@ -210,8 +221,130 @@ def build_index_universe_quality_report(constituents: pd.DataFrame, *, start_dat
     return pd.DataFrame(rows)
 
 
-def load_index_constituents(path: Path = INDEX_CONSTITUENTS_PARQUET) -> pd.DataFrame:
-    if not Path(path).exists():
+def validate_constituent_temporal_contract(
+    constituents: pd.DataFrame,
+    *,
+    start_date,
+    end_date,
+) -> pd.DataFrame:
+    """Return row-level temporal violations that invalidate historical use."""
+    if constituents is None or constituents.empty:
+        return pd.DataFrame([{"status": "blocked", "reason": "constituents_missing"}])
+    data = normalize_index_constituents(constituents)
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    source = data["source"].fillna("").astype(str).str.lower()
+    asof = pd.to_datetime(data["asof_date"], errors="coerce")
+    first = pd.to_datetime(data["first_trade_date"], errors="coerce")
+    rows = []
+    snapshot = source.str.contains("snapshot|akshare_csindex", regex=True)
+    invalid_backfill = snapshot & first.lt(asof)
+    if invalid_backfill.any():
+        rows.append({
+            "status": "blocked",
+            "reason": "current_snapshot_backfilled_before_asof",
+            "violation_rows": int(invalid_backfill.sum()),
+            "requested_start": start,
+            "requested_end": end,
+            "earliest_asof": asof[invalid_backfill].min(),
+        })
+    known_too_late = snapshot & asof.gt(start)
+    if known_too_late.any():
+        rows.append({
+            "status": "blocked",
+            "reason": "snapshot_not_known_at_requested_start",
+            "violation_rows": int(known_too_late.sum()),
+            "requested_start": start,
+            "requested_end": end,
+            "earliest_asof": asof[known_too_late].min(),
+        })
+    if not rows:
+        rows.append({
+            "status": "pass",
+            "reason": "point_in_time_membership_contract_satisfied",
+            "violation_rows": 0,
+            "requested_start": start,
+            "requested_end": end,
+            "earliest_asof": asof.min(),
+        })
+    return pd.DataFrame(rows)
+
+
+def validate_pit_membership_manifest_coverage(
+    *,
+    start_date,
+    end_date,
+    pit_path: Path = PIT_INDEX_MEMBERSHIP_PARQUET,
+) -> dict:
+    """Fail closed when a historical membership build does not cover the run.
+
+    The last compressed membership interval is intentionally open ended.  The
+    build manifest is therefore the authority for how far that interval may be
+    used; treating it as valid beyond ``coverage_end`` would silently introduce
+    stale-universe bias.
+    """
+    path = Path(pit_path)
+    manifest_path = path.with_suffix(".manifest.json")
+    result = {
+        "status": "blocked",
+        "reason": "pit_membership_manifest_missing",
+        "requested_start": str(pd.Timestamp(start_date).date()),
+        "requested_end": str(pd.Timestamp(end_date).date()),
+        "coverage_start": "",
+        "coverage_end": "",
+        "manifest_path": str(manifest_path),
+    }
+    if not manifest_path.exists():
+        return result
+    try:
+        import json
+
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result["reason"] = f"pit_membership_manifest_unreadable:{type(exc).__name__}"
+        return result
+    provenance = payload.get("provenance", {}) if isinstance(payload, dict) else {}
+    coverage_start = pd.to_datetime(provenance.get("coverage_start"), errors="coerce")
+    coverage_end = pd.to_datetime(provenance.get("coverage_end"), errors="coerce")
+    result["coverage_start"] = "" if pd.isna(coverage_start) else str(coverage_start.date())
+    result["coverage_end"] = "" if pd.isna(coverage_end) else str(coverage_end.date())
+    if pd.isna(coverage_start) or pd.isna(coverage_end):
+        result["reason"] = "pit_membership_manifest_coverage_missing"
+        return result
+    requested_start = pd.Timestamp(start_date).normalize()
+    requested_end = pd.Timestamp(end_date).normalize()
+    if requested_start < coverage_start.normalize() or requested_end > coverage_end.normalize():
+        result["reason"] = "pit_membership_coverage_outside_requested_window"
+        return result
+    result["status"] = "pass"
+    result["reason"] = "pit_membership_manifest_covers_requested_window"
+    return result
+
+
+def load_index_constituents(
+    path: Path | None = None,
+    *,
+    pit_path: Path = PIT_INDEX_MEMBERSHIP_PARQUET,
+) -> pd.DataFrame:
+    """Load the PIT membership table first; explicit paths retain legacy behavior."""
+    if path is None and Path(pit_path).exists():
+        pit = pd.read_parquet(pit_path)
+        if not pit.empty:
+            names = {value["index_code"]: value["index_name"] for value in TARGET_INDEX_POOLS.values()}
+            return normalize_index_constituents(pd.DataFrame({
+                "index_code": pit["index_code"].astype(str).str.zfill(6),
+                "index_name": pit["index_code"].astype(str).str.zfill(6).map(names),
+                "symbol": pit["symbol"].astype(str),
+                "announcement_date": pd.to_datetime(pit["known_at"], errors="coerce"),
+                "effective_after_close_date": pd.NaT,
+                "first_trade_date": pd.to_datetime(pit["effective_from"], errors="coerce"),
+                "in_date": pd.to_datetime(pit["effective_from"], errors="coerce"),
+                "out_date": pd.to_datetime(pit["effective_to"], errors="coerce"),
+                "source": pit.get("source", pd.Series("pit_level1", index=pit.index)).astype(str),
+                "asof_date": pd.to_datetime(pit["known_at"], errors="coerce"),
+            }), source="pit_level1_index_membership")
+    selected_path = Path(path) if path is not None else INDEX_CONSTITUENTS_PARQUET
+    if not selected_path.exists():
         return pd.DataFrame(
             columns=[
                 "index_code",
@@ -226,7 +359,7 @@ def load_index_constituents(path: Path = INDEX_CONSTITUENTS_PARQUET) -> pd.DataF
                 "asof_date",
             ]
         )
-    return pd.read_parquet(path)
+    return pd.read_parquet(selected_path)
 
 
 def save_index_universe_quality_report(report: pd.DataFrame, output_path=INDEX_UNIVERSE_QUALITY_CSV):

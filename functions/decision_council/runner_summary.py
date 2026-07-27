@@ -668,9 +668,11 @@ def _normalize_governance_control_mode(value) -> str:
         "paper_control": "paper_controls",
         "safe_factor": "safe_factor_only",
         "safe_stop": "safe_factor_only",
+        "scap": "aggressive_profit",
+        "profit": "aggressive_profit",
     }
     mode = aliases.get(mode, mode)
-    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit"}
     if mode not in allowed:
         raise ValueError(f"Unknown governance_control_mode '{value}'. Available: {sorted(allowed)}")
     return mode
@@ -908,7 +910,8 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
     mfe = pd.to_numeric(candidates.get("position_mfe", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     mae = pd.to_numeric(candidates.get("position_mae", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     downtrend_decay = pd.to_numeric(candidates.get("downtrend_decay_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
-    flow_count = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
+    flow_raw = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(float("nan"), index=candidates.index)), errors="coerce")
+    flow_count = flow_raw.fillna(0.0)
     holding_days = pd.to_numeric(candidates.get("position_holding_days", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
     alpha_collapse = (
         alpha.lt(0.45).astype(float) * 0.35
@@ -920,7 +923,7 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
         + ret20.lt(-0.04).astype(float) * 0.35
         + close_to_ma20.lt(-0.03).astype(float) * 0.30
     ).clip(0.0, 1.0)
-    orderflow_bad = flow_count.le(1).astype(float)
+    orderflow_bad = flow_count.le(1).astype(float).where(flow_raw.notna(), 0.5)
     loss_bad = ((-unrealized - 0.015) / 0.055).clip(0.0, 1.0)
     poor_excursion = (
         mfe.lt(0.02).astype(float) * 0.45
@@ -935,7 +938,8 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
         + 0.15 * orderflow_bad
         + 0.15 * trend_weak
         + 0.05 * stale_bad
-    ).clip(0.0, 1.0)
+    ) / 1.05
+    score = score.clip(0.0, 1.0)
     return score.where(watch | holding_days.ge(3), 0.0)
 
 
@@ -1294,6 +1298,23 @@ def build_governance_summary(
     pwin10_ece = _calibration_ece(calibration, horizon_days=10)
     pwin10_wilson_lower = _calibration_best_wilson(calibration, horizon_days=10)
     buy_expectancy_10d = _payoff_metric(payoff, horizon_days=10, side="buy", metric="expectancy")
+    buy_excess_10d = _payoff_metric(
+        payoff,
+        horizon_days=10,
+        side="buy",
+        metric="avg_directional_excess_return",
+    )
+    round_trip_variable_cost_proxy = _governance_round_trip_cost_rate()
+    buy_after_variable_cost_10d = (
+        float(buy_expectancy_10d) - float(round_trip_variable_cost_proxy)
+        if pd.notna(buy_expectancy_10d)
+        else pd.NA
+    )
+    buy_excess_after_variable_cost_10d = (
+        float(buy_excess_10d) - float(round_trip_variable_cost_proxy)
+        if pd.notna(buy_excess_10d)
+        else pd.NA
+    )
     buy_hit_rate_10d = _payoff_metric(payoff, horizon_days=10, side="buy", metric="hit_rate")
     sell_expectancy_10d = _payoff_metric(payoff, horizon_days=10, side="sell", metric="expectancy")
     normal_sell_expectancy_10d = _payoff_reason_metric(payoff, horizon_days=10, side="sell", reason="normal_sell", metric="expectancy")
@@ -1354,6 +1375,12 @@ def build_governance_summary(
                 "p_win_10d_ece": pwin10_ece,
                 "p_win_10d_best_bucket_wilson_lower": pwin10_wilson_lower,
                 "buy_expectancy_10d": buy_expectancy_10d,
+                "buy_forward_return_10d_gross": buy_expectancy_10d,
+                "buy_forward_return_10d_after_variable_cost_proxy": buy_after_variable_cost_10d,
+                "buy_forward_excess_return_10d_gross": buy_excess_10d,
+                "buy_forward_excess_return_10d_after_variable_cost_proxy": buy_excess_after_variable_cost_10d,
+                "buy_forward_return_10d_full_cost_status": "use_governance_scap_cost_stress_report_for_minimum_commission",
+                "buy_forward_return_10d_metric_source": "governance_entry_payoff_report.expectancy_gross",
                 "buy_hit_rate_10d": buy_hit_rate_10d,
                 "sell_expectancy_10d": sell_expectancy_10d,
                 "normal_sell_expectancy_10d": normal_sell_expectancy_10d,
@@ -1440,13 +1467,46 @@ def build_governance_summary(
                 "ml_runtime_mode": "not_applicable",
                 "requested_model": "",
                 "runtime_model": "",
-                "benchmark_status": "exploratory: top_strength_30pct_equal_weight synthetic benchmark, PIT prior-day strength, not directly investable",
+                "benchmark_status": (
+                    "exploratory: "
+                    f"top_liquidity_{int(runner.performance_benchmark_top_n)}_equal_weight_"
+                    f"{runner.performance_benchmark_rebalance}; prior-period fixed-N stock pool; "
+                    "equal-weight research fallback until PIT free-float market capitalisation is available"
+                ),
+                "performance_benchmark_top_n": int(runner.performance_benchmark_top_n),
+                "performance_benchmark_rebalance": str(runner.performance_benchmark_rebalance),
+                "safety_benchmark_symbol": str(runner.engine.safety_agent.proxy_symbol),
                 "governance_variant": runner.governance_variant,
                 "safety_proxy_mode": runner.engine.safety_agent.proxy_mode,
                 "exposure_cap_mode": "rule_based_safety_agent" if runner.enable_safety_agent else "disabled",
                 "safety_agent_enabled": runner.enable_safety_agent,
                 "reputation_enabled": runner.enable_reputation,
                 "governance_control_mode": runner.governance_control_mode,
+                "capital_profile_name": str(runner.capital_profile.get("name", "custom")),
+                "objective_metric": str(runner.capital_profile.get("objective_metric", "")),
+                "special_strategy_version": str(
+                    runner.capital_profile.get("special_strategy_version", "")
+                ),
+                "scap_exit_stage": str(
+                    runner.capital_profile.get("scap_exit_stage", "E0") or "E0"
+                ).upper(),
+                "scap_loss_stop": float(
+                    runner.capital_profile.get("scap_loss_stop", -0.12)
+                ),
+                "runtime_identity_hash": str(
+                    getattr(runner, "runtime_identity", {}).get("runtime_identity_hash", "")
+                ),
+                "code_fingerprint": str(
+                    getattr(runner, "runtime_identity", {}).get("code_fingerprint", "")
+                ),
+                "runtime_identity_schema_version": str(
+                    getattr(runner, "runtime_identity", {}).get("schema_version", "")
+                ),
+                "experiment_sample_role": str(
+                    getattr(runner, "runtime_identity", {}).get(
+                        "experiment_sample_role", ""
+                    )
+                ),
                 "reputation_control_enabled": runner._control_enabled("reputation"),
                 "regime_control_enabled": runner._control_enabled("regime"),
                 "cooldown_control_enabled": runner._control_enabled("cooldown"),

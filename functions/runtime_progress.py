@@ -179,6 +179,22 @@ def read_progress(*, owner_pid: int | None = None) -> dict:
         payload = json.loads(progress_path.read_text(encoding="utf-8"))
         if owner_pid is not None and int(payload.get("owner_pid", -1)) != int(owner_pid):
             raise ValueError(f"progress owner mismatch for pid={owner_pid}")
+        now = time.time()
+        age = max(now - float(payload.get("updated_at", 0.0) or 0.0), 0.0)
+        payload["freshness_seconds"] = round(age, 1)
+        payload["is_stale"] = (
+            str(payload.get("status", "")).lower() == "running" and age > 120.0
+        )
+        payload["owner_pid_alive"] = _pid_alive(payload.get("owner_pid"))
+        if payload["is_stale"]:
+            payload["display_status"] = "stale"
+        elif (
+            str(payload.get("status", "")).lower() == "running"
+            and payload["owner_pid_alive"] is False
+        ):
+            payload["display_status"] = "orphaned"
+        else:
+            payload["display_status"] = str(payload.get("status", "unknown"))
         return payload
     except Exception as exc:
         return {
@@ -187,3 +203,41 @@ def read_progress(*, owner_pid: int | None = None) -> dict:
             "percent": 0.0,
             "message": f"progress read failed: {exc}",
         }
+
+
+def _pid_alive(pid) -> bool | None:
+    try:
+        process_id = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if process_id <= 0:
+        return False
+    if process_id == os.getpid():
+        return True
+    if os.name == "nt":
+        # os.kill(pid, 0) is a harmless existence probe on POSIX. On Windows
+        # Python routes it through TerminateProcess, so it can terminate the
+        # very worker whose health we are checking. Query a process handle
+        # instead and never signal the target.
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            process_id,
+        )
+        if handle:
+            exit_code = ctypes.c_ulong()
+            queried = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+            return bool(queried) and int(exit_code.value) == 259
+        return ctypes.get_last_error() == 5
+    try:
+        os.kill(process_id, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False

@@ -22,7 +22,8 @@ def attach_cabinet_native_scores(
     proposals: pd.DataFrame,
     *,
     runtime_context,
-    strict_weight: float = 0.60,
+    strict_weight: float = 1.0,
+    timing_weight: float = 0.0,
     max_family_share: float = 0.25,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Attach role scores without allowing factor-count or missingness inflation."""
@@ -34,6 +35,8 @@ def attach_cabinet_native_scores(
     strict_weight = float(strict_weight)
     if not 0.0 <= strict_weight <= 1.0:
         raise ValueError("strict_weight must be between zero and one")
+    if not -1.0 <= float(timing_weight) <= 1.0:
+        raise ValueError("timing_weight must be between minus one and one")
     if not 0.0 < float(max_family_share) <= 1.0:
         raise ValueError("max_family_share must be in (0, 1]")
 
@@ -128,9 +131,28 @@ def attach_cabinet_native_scores(
 
     strict = output["cabinet_strict_entry_score"]
     proxy = output["cabinet_proxy_entry_score"]
-    timing_adjustment = (output["cabinet_timing_score"] - 0.5).clip(-0.15, 0.15)
+    strict_coverage = output["cabinet_strict_entry_score_coverage"].clip(0.0, 1.0)
+    proxy_coverage = output["cabinet_proxy_entry_score_coverage"].clip(0.0, 1.0)
+    # Proxy evidence is a fallback for missing strict evidence, not a permanent
+    # second vote over the same information.  ``strict_weight`` is retained as
+    # an explicit experimental shrinkage control, with 1.0 as the safe default.
+    strict_authority = strict_coverage * float(strict_weight)
+    proxy_authority = (1.0 - strict_coverage) * proxy_coverage
+    entry_authority = (strict_authority + proxy_authority).replace(0.0, float("nan"))
+    base_entry = (
+        strict * strict_authority + proxy * proxy_authority
+    ) / entry_authority
+    base_entry = base_entry.fillna(0.5)
+    timing_adjustment = (
+        float(timing_weight) * (output["cabinet_timing_score"] - 0.5)
+    ).clip(-0.15, 0.15)
     liquidity_penalty = ((0.5 - output["cabinet_liquidity_health_score"]).clip(lower=0.0) * 0.20).clip(0.0, 0.10)
-    output["cabinet_base_entry_score"] = strict_weight * strict + (1.0 - strict_weight) * proxy
+    output["cabinet_base_entry_score"] = base_entry
+    output["cabinet_entry_score_coverage"] = (
+        strict_authority + proxy_authority
+    ).clip(0.0, 1.0)
+    output["cabinet_proxy_fallback_authority"] = proxy_authority.clip(0.0, 1.0)
+    output["cabinet_timing_weight"] = float(timing_weight)
     output["cabinet_timing_adjustment"] = timing_adjustment
     output["cabinet_liquidity_penalty"] = liquidity_penalty
     output["cabinet_native_final_score"] = (

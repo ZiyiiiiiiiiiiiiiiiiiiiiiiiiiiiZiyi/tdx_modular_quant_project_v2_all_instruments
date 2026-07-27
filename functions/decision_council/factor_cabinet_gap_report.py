@@ -21,6 +21,11 @@ from functions.decision_council.factor_source import (
     FactorSourceSpec,
     resolve_factor_source,
 )
+from functions.factor_selection.factor_family_contract import (
+    canonical_family,
+    candidate_catalog_frame,
+    family_contract_frame,
+)
 
 
 REPORT_ROOT = Path("results/factor_cabinet_gap_report")
@@ -32,7 +37,6 @@ TARGET_ROLE_RANGES = {
     "liquidity_filter": (10, 15),
     "hold_validation": (10, 20),
 }
-EXPECTED_FAMILIES = ("rsi", "growth", "profit", "roe", "roa", "cash", "ocf", "event", "announcement")
 
 
 def build_factor_cabinet_gap_report(
@@ -82,6 +86,12 @@ def build_factor_cabinet_gap_report(
     )
     saved["cabinet_role_gap"] = _write_csv(role_gap, run_dir / "cabinet_role_gap.csv")
     saved["cabinet_missing_family_gap"] = _write_csv(missing_family, run_dir / "cabinet_missing_family_gap.csv")
+    saved["factor_family_contract"] = _write_csv(
+        family_contract_frame(), run_dir / "factor_family_contract.csv"
+    )
+    saved["factor_candidate_catalog"] = _write_csv(
+        candidate_catalog_frame(), run_dir / "factor_candidate_catalog.csv"
+    )
 
     corr = pd.DataFrame()
     overlap = pd.DataFrame()
@@ -211,20 +221,38 @@ def _build_role_gap_report(structure: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_missing_family_report(frame: pd.DataFrame) -> pd.DataFrame:
-    text = " ".join(
-        frame[["factor_name", "raw_column", "family", "module"]]
-        .fillna("")
-        .astype(str)
-        .agg(" ".join, axis=1)
-        .tolist()
-    ).lower()
+    canonical = pd.Series(
+        [
+            canonical_family(family, factor_name=name, module=module)
+            for family, name, module in zip(frame["family"], frame["factor_name"], frame["module"])
+        ],
+        index=frame.index,
+    )
+    counts = canonical.value_counts().to_dict()
     rows = []
-    for family in EXPECTED_FAMILIES:
+    for contract in family_contract_frame().to_dict("records"):
+        family = str(contract["family"])
+        count = int(counts.get(family, 0))
+        target_min = int(contract["target_min"])
+        if count >= target_min:
+            status = "FULL"
+        elif count > 0:
+            status = "PARTIAL"
+        elif bool(contract["formal_pit_required"]):
+            status = "BLOCKED_OR_VACANT_PIT"
+        else:
+            status = "VACANT"
         rows.append(
             {
                 "expected_family": family,
-                "present": bool(family in text),
-                "status": "present" if family in text else "missing_or_not_integrated",
+                "present": bool(count > 0),
+                "factor_count": count,
+                "target_min": target_min,
+                "target_max": int(contract["target_max"]),
+                "gap_to_min": max(target_min - count, 0),
+                "formal_pit_required": bool(contract["formal_pit_required"]),
+                "selection_mode": str(contract["selection_mode"]),
+                "status": status,
             }
         )
     return pd.DataFrame(rows)

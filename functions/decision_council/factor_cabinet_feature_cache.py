@@ -211,12 +211,23 @@ def _build_factor_cabinet_feature_cache_chunked(
             message="computing factor_cabinet candidate factors",
             detail=f"chunk={index}/{len(chunks)}, rows={len(data)}, raw_columns={len(raw_columns)}",
         )
-        data = append_candidate_factors(
-            data,
-            close_col="close",
-            include_columns=set(raw_columns),
-            include_ultra_grid=True,
+        # PIT fundamentals, RSI timing fields, and passthrough score columns
+        # have dedicated materializers below (or already exist in the source).
+        # Feeding them to the broad candidate generator disables its focused
+        # path and needlessly computes the entire candidate library.
+        candidate_columns = (
+            set(raw_columns)
+            - set(FACTOR_CABINET_PASSTHROUGH_COLUMNS)
+            - set(rsi_timing_raw_columns())
+            - set(pit_factor_raw_columns())
         )
+        if candidate_columns:
+            data = append_candidate_factors(
+                data,
+                close_col="close",
+                include_columns=candidate_columns,
+                include_ultra_grid=True,
+            )
         if set(raw_columns) & set(rsi_timing_raw_columns()):
             data = append_rsi_timing_factors(data, close_col="close")
         if set(raw_columns) & set(pit_factor_raw_columns()):
@@ -355,26 +366,94 @@ def load_factor_cabinet_feature_cache(
         end_date,
         feature_path=feature_path,
     )
-    if found is None:
-        raise FileNotFoundError(
-            "factor_cabinet feature cache is required but missing or stale. "
-            "Build it first with the Web task 'factor_cabinet 特征缓存/物化' "
-            f"or CLI --factor-cabinet-feature-cache. Detail: {status}"
-        )
-    parquet_path, _manifest = found
     raw_columns = _factor_cabinet_raw_columns(spec)
     if requested_columns is not None:
         unknown = sorted(set(requested_columns) - set(raw_columns))
         if unknown:
             raise ValueError(f"requested columns are not part of factor_cabinet: {unknown}")
         raw_columns = tuple(dict.fromkeys(str(column) for column in requested_columns))
-    cache = pd.read_parquet(
-        parquet_path,
-        columns=list(FACTOR_CACHE_INDEX_COLUMNS) + list(raw_columns),
-        filters=[("date", ">=", pd.Timestamp(start_date)), ("date", "<=", pd.Timestamp(end_date))],
+    artifacts = [found] if found is not None else _find_factor_cabinet_feature_cache_cover(
+        spec,
+        start_date,
+        end_date,
+        feature_path=feature_path,
     )
+    if not artifacts:
+        raise FileNotFoundError(
+            "factor_cabinet feature cache is required but missing or stale. "
+            "Build it first with the Web task 'factor_cabinet 特征缓存/物化' "
+            f"or CLI --factor-cabinet-feature-cache. Detail: {status}"
+        )
+    frames = [
+        pd.read_parquet(
+            parquet_path,
+            columns=list(FACTOR_CACHE_INDEX_COLUMNS) + list(raw_columns),
+            filters=[("date", ">=", pd.Timestamp(start_date)), ("date", "<=", pd.Timestamp(end_date))],
+        )
+        for parquet_path, _manifest in artifacts
+    ]
+    cache = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
     cache["date"] = pd.to_datetime(cache["date"], errors="coerce")
+    if len(frames) > 1:
+        cache = cache.sort_values(list(FACTOR_CACHE_INDEX_COLUMNS)).drop_duplicates(
+            list(FACTOR_CACHE_INDEX_COLUMNS),
+            keep="last",
+        )
     return cache
+
+
+def _find_factor_cabinet_feature_cache_cover(
+    spec: FactorSourceSpec,
+    start_date,
+    end_date,
+    *,
+    feature_path: Path = FEATURE_DAILY_PARQUET,
+    root: str | Path = FACTOR_CABINET_FEATURE_CACHE_ROOT,
+) -> list[tuple[Path, dict]]:
+    """Find an identity-consistent set of adjacent cache artifacts covering a window."""
+    requested_start = pd.Timestamp(start_date).normalize()
+    requested_end = pd.Timestamp(end_date).normalize()
+    raw_columns = _factor_cabinet_raw_columns(spec)
+    cache_dir = Path(root) / str(spec.factor_cabinet_run_id)
+    candidates: list[tuple[pd.Timestamp, pd.Timestamp, Path, dict]] = []
+    if not cache_dir.exists():
+        return []
+    for manifest_path in cache_dir.glob("factor_cabinet_features_*.manifest.json"):
+        manifest = _read_manifest(manifest_path)
+        parquet_path = _resolve_cache_artifact_path(
+            manifest_path,
+            manifest.get("parquet_path", ""),
+        )
+        if not parquet_path.exists():
+            parquet_path = manifest_path.with_suffix("").with_suffix(".parquet")
+        if not parquet_path.exists() or not _manifest_identity_matches(
+            manifest,
+            spec=spec,
+            raw_columns=raw_columns,
+            feature_path=feature_path,
+        ):
+            continue
+        if not _parquet_has_columns(
+            parquet_path,
+            set(FACTOR_CACHE_INDEX_COLUMNS) | set(raw_columns),
+        ):
+            continue
+        if not str(manifest.get("cabinet_manifest_hash") or "").strip():
+            _migrate_legacy_manifest_hash(manifest_path, manifest, spec)
+        usable_start, usable_end = _manifest_usable_window(manifest)
+        if usable_end >= requested_start and usable_start <= requested_end:
+            candidates.append((usable_start, usable_end, parquet_path, manifest))
+
+    selected: list[tuple[Path, dict]] = []
+    cursor = requested_start
+    while cursor <= requested_end:
+        eligible = [item for item in candidates if item[0] <= cursor <= item[1]]
+        if not eligible:
+            return []
+        chosen = max(eligible, key=lambda item: (item[1], item[3].get("created_at", "")))
+        selected.append((chosen[2], chosen[3]))
+        cursor = chosen[1] + pd.Timedelta(days=1)
+    return selected
 
 
 def attach_factor_cabinet_feature_cache(
@@ -505,6 +584,24 @@ def _manifest_matches(
     raw_columns: tuple[str, ...],
     feature_path: Path,
 ) -> bool:
+    if not _manifest_identity_matches(
+        manifest,
+        spec=spec,
+        raw_columns=raw_columns,
+        feature_path=feature_path,
+    ):
+        return False
+    usable_date_min, usable_date_max = _manifest_usable_window(manifest)
+    return usable_date_min <= pd.Timestamp(start_date) and usable_date_max >= pd.Timestamp(end_date)
+
+
+def _manifest_identity_matches(
+    manifest: dict,
+    *,
+    spec: FactorSourceSpec,
+    raw_columns: tuple[str, ...],
+    feature_path: Path,
+) -> bool:
     if manifest.get("artifact_type") != "factor_cabinet_feature_cache":
         return False
     if manifest.get("factor_cabinet_run_id") != spec.factor_cabinet_run_id:
@@ -516,11 +613,15 @@ def _manifest_matches(
         return False
     if not _same_feature_fingerprint(manifest.get("feature_input", {}), file_fingerprint(feature_path)):
         return False
+    return True
+
+
+def _manifest_usable_window(manifest: dict) -> tuple[pd.Timestamp, pd.Timestamp]:
     usable_date_min = pd.Timestamp(
         manifest.get("requested_date_min") or manifest.get("usable_date_min", manifest.get("date_min"))
     )
     usable_date_max = pd.Timestamp(manifest.get("requested_date_max") or manifest.get("date_max"))
-    return usable_date_min <= pd.Timestamp(start_date) and usable_date_max >= pd.Timestamp(end_date)
+    return usable_date_min.normalize(), usable_date_max.normalize()
 
 
 def _migrate_legacy_manifest_hash(manifest_path: Path, manifest: dict, spec: FactorSourceSpec) -> None:

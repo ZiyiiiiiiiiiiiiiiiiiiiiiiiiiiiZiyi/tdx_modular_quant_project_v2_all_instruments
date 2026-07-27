@@ -72,6 +72,8 @@ def main() -> int:
             "top1_account_weight": [0.40] * len(dates),
             "top5_account_weight_sum": [0.90] * len(dates),
             "holding_count": [3] * len(dates),
+            "configured_max_positions": [3] * len(dates),
+            "target_holding_count": [2] * len(dates),
             "actual_exposure": [0.50] * len(dates),
         }
     )
@@ -112,6 +114,10 @@ def main() -> int:
     constraints = reports.get("governance_portfolio_constraint_report", pd.DataFrame())
     if constraints.empty or bool(constraints["constraint_pass"].iloc[-1]):
         failures.append("portfolio constraint report should fail concentrated sample")
+    elif int(constraints["configured_max_positions"].iloc[-1]) != 3:
+        failures.append("portfolio constraint report confused max positions with target holdings")
+    elif float(constraints["effective_n_required"].iloc[-1]) != 3.0:
+        failures.append("cash component incorrectly increased the effective-N requirement")
     validation = reports.get("governance_factor_validation_report", pd.DataFrame())
     expected_validation_cols = {"max_drawdown_top_bucket", "industry_exposure_max", "size_corr", "liquidity_corr"}
     if not expected_validation_cols.issubset(set(validation.columns)):

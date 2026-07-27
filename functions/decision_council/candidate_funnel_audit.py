@@ -21,6 +21,62 @@ FUNNEL_METADATA_COLUMNS = (
     "risk_stage_mode", "reputation_stage_mode", "regime_stage_mode",
     "candidate_detail_scope", "candidate_detail_count",
 )
+SCAP_FUNNEL_COUNT_COLUMNS = (
+    "scap_raw_signal_count",
+    "scap_structural_feasible_count",
+    "scap_cash_feasible_count",
+    "scap_slot_feasible_count",
+    "scap_optimizer_selected_count",
+    "scap_registered_buy_count",
+)
+SCAP_ACTION_COUNT_COLUMNS = (
+    "scap_registered_add_buy_count",
+    "scap_registered_replacement_buy_count",
+)
+
+
+def assert_scap_funnel_monotonic(row: dict) -> None:
+    """Fail a product run when one decision violates the subset chain."""
+    counts = [int(row.get(column, 0) or 0) for column in SCAP_FUNNEL_COUNT_COLUMNS]
+    if any(right > left for left, right in zip(counts, counts[1:])):
+        raise RuntimeError(
+            "SCAP candidate funnel is non-monotonic: "
+            + ", ".join(
+                f"{column}={count}"
+                for column, count in zip(SCAP_FUNNEL_COUNT_COLUMNS, counts)
+            )
+        )
+
+
+def classify_scap_registered_buys(orders: pd.DataFrame) -> dict[str, int]:
+    """Split entry, add and replacement buys before funnel reconciliation."""
+    if orders is None or orders.empty:
+        return {
+            "entry_buy_count": 0,
+            "add_buy_count": 0,
+            "replacement_buy_count": 0,
+        }
+    buys = orders[
+        orders.get("side", pd.Series("", index=orders.index))
+        .astype(str)
+        .str.lower()
+        .eq("buy")
+    ].copy()
+    reasons = buys.get("reason", pd.Series("", index=buys.index)).astype(str)
+    current_weights = pd.to_numeric(
+        buys.get("current_weight", pd.Series(0.0, index=buys.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    replacement = reasons.eq("replacement_opportunity_buy")
+    add = (
+        current_weights.gt(1e-12)
+        | reasons.isin({"loser_averaging_buy", "winner_pyramiding_buy"})
+    ) & ~replacement
+    return {
+        "entry_buy_count": int((~replacement & ~add).sum()),
+        "add_buy_count": int(add.sum()),
+        "replacement_buy_count": int(replacement.sum()),
+    }
 
 
 def terminal_block_reason(row: pd.Series) -> tuple[str, str, str]:
@@ -98,14 +154,25 @@ def reconcile_funnel_daily(
             ]
         counts = sample.groupby(key).size()
         data[output] = data["decision_id"].map(counts).fillna(0).astype(int)
-    for column in FUNNEL_COUNT_COLUMNS:
+    for column in (
+        *FUNNEL_COUNT_COLUMNS,
+        *SCAP_FUNNEL_COUNT_COLUMNS,
+        *SCAP_ACTION_COUNT_COLUMNS,
+    ):
         if column not in data.columns:
             data[column] = 0
         data[column] = pd.to_numeric(data[column], errors="coerce").fillna(0).astype(int)
     for column in FUNNEL_METADATA_COLUMNS:
         if column not in data.columns:
             data[column] = pd.NA
-    ordered = ["decision_id", "date", *FUNNEL_COUNT_COLUMNS, *FUNNEL_METADATA_COLUMNS]
+    ordered = [
+        "decision_id",
+        "date",
+        *FUNNEL_COUNT_COLUMNS,
+        *SCAP_FUNNEL_COUNT_COLUMNS,
+        *SCAP_ACTION_COUNT_COLUMNS,
+        *FUNNEL_METADATA_COLUMNS,
+    ]
     return data[ordered].sort_values("date").reset_index(drop=True)
 
 
@@ -113,23 +180,34 @@ def summarize_funnel(daily: pd.DataFrame) -> pd.DataFrame:
     if daily is None or daily.empty:
         return pd.DataFrame()
     rows = []
-    previous = None
     stage_notes = {
         "risk_pass_count": "score_or_size_only; not a standalone removal filter",
         "reputation_pass_count": "diagnostics_only; not a candidate admission filter",
         "regime_pass_count": "confirmation_or_exposure overlay; not a standalone removal filter",
         "capital_pass_count": "full count only when candidate detail scope covers all candidates",
     }
-    for stage in FUNNEL_COUNT_COLUMNS:
-        count = int(pd.to_numeric(daily[stage], errors="coerce").fillna(0).sum())
-        rows.append({
-            "stage": stage,
-            "total_count": count,
-            "rejected_from_previous": max(int(previous - count), 0) if previous is not None else 0,
-            "pass_rate_from_previous": count / previous if previous and previous > 0 else np.nan,
-            "stage_note": stage_notes.get(stage, ""),
-        })
-        previous = count
+    for stage_group in (FUNNEL_COUNT_COLUMNS, SCAP_FUNNEL_COUNT_COLUMNS):
+        previous = None
+        for stage in stage_group:
+            values = (
+                daily[stage]
+                if stage in daily.columns
+                else pd.Series(0, index=daily.index)
+            )
+            count = int(pd.to_numeric(values, errors="coerce").fillna(0).sum())
+            comparable = previous is None or count <= previous
+            note = stage_notes.get(stage, "")
+            if previous is not None and not comparable:
+                note = "|".join(filter(None, (note, "count scope differs from previous stage; rate suppressed")))
+            rows.append({
+                "stage": stage,
+                "total_count": count,
+                "rejected_from_previous": max(int(previous - count), 0) if previous is not None and comparable else pd.NA,
+                "pass_rate_from_previous": count / previous if previous and previous > 0 and comparable else np.nan,
+                "comparable_to_previous": bool(comparable),
+                "stage_note": note,
+            })
+            previous = count
     return pd.DataFrame(rows)
 
 
@@ -215,7 +293,10 @@ def build_control_trigger_summary(
         versions = gates.get("strategy_logic_version", pd.Series("production_v1", index=gates.index)).astype(str)
         active_probability = gates.get(
             "probability_gate_changed_decision", pd.Series(False, index=gates.index)
-        ).fillna(False).astype(bool) & ~versions.isin({"mainline_v2", "mainline_v3_cabinet_native"})
+        ).fillna(False).astype(bool) & ~versions.isin({
+            "mainline_v2", "mainline_v3_cabinet_native", "mainline_v3_monthly_lgbm_hybrid",
+            "mainline_v3_reliability_weighted"
+        })
         rows.append({
             "control": "probability_gate",
             "evaluated_count": _true_count(gates, "probability_gate_evaluated"),
@@ -228,7 +309,10 @@ def build_control_trigger_summary(
         ("profit_giveback_exit", "paper_profit_giveback_exit", "profit_giveback_exit"),
         ("post_entry_failure_exit", "paper_post_entry_failure_exit", "post_entry_failure_exit"),
         ("signal_failure_exit", "paper_signal_failure_exit", "signal_failure_exit"),
-        ("hard_stop_exit", "paper_hard_stop_exit", "hard_stop_exit"),
+        ("thesis_failure_exit", "paper_thesis_failure_exit", "thesis_failure_exit"),
+        ("stale_time_exit", "paper_stale_time_exit", "stale_time_exit"),
+        ("loss_containment_exit", "paper_loss_containment_exit", "loss_containment_exit"),
+        ("profit_hard_stop_exit", "paper_profit_hard_stop_exit", "profit_hard_stop_exit"),
     )
     for control, paper_column, active_column in exit_controls:
         order_reason = orders.get("reason", pd.Series("", index=orders.index)).astype(str)

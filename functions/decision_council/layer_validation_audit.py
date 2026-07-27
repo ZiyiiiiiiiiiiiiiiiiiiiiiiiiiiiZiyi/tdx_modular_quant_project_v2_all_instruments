@@ -40,6 +40,13 @@ SOURCE_COLUMNS = (
     "lifecycle_held_row",
     "position_state",
     "entry_block_reason",
+    "cabinet_strict_entry_score",
+    "cabinet_proxy_entry_score",
+    "cabinet_timing_score",
+    "cabinet_risk_safety_score",
+    "cabinet_liquidity_health_score",
+    "cabinet_hold_support_score",
+    "cabinet_sell_safety_score",
 )
 
 
@@ -419,6 +426,9 @@ def _candidate_detail_columns() -> list[str]:
     return [
         "decision_id", "signal_date", "symbol", "candidate_rank", *SCORE_COLUMNS,
         "entry_confirmed", "state_machine_role_pass", "position_state", "entry_block_reason",
+        "cabinet_strict_entry_score", "cabinet_proxy_entry_score", "cabinet_timing_score",
+        "cabinet_risk_safety_score", "cabinet_liquidity_health_score",
+        "cabinet_hold_support_score", "cabinet_sell_safety_score",
         "l0_primary_rank", "l0_primary_top3", "l1_current_role_confirmation",
         "l2_primary_top3", "l2_primary_entry_alpha_top3", "l3_executed_buy",
         *(f"forward_return_{horizon}d" for horizon in HORIZONS),

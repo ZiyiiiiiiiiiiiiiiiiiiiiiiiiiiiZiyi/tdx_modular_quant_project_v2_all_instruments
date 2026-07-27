@@ -15,6 +15,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 
 HTML = """<!doctype html>
@@ -182,7 +183,7 @@ HTML = """<!doctype html>
         <div class="metrics" id="metrics"></div>
       </div>
       <div class="panel" style="margin-top:16px;">
-        <h3>账户表现 vs 强度前 30% 基准</h3>
+        <h3>账户表现 vs 固定 Top-N 流动性股票池基准</h3>
         <div class="chart-wrap">
           <canvas id="perfChart" width="900" height="420"></canvas>
         </div>
@@ -344,6 +345,10 @@ HTML = """<!doctype html>
       ["holdings", "持仓数"],
       ["risk_level", "风险等级"],
       ["exposure_cap", "仓位上限"],
+      ["strategic_exposure_budget", "战略暴露预算"],
+      ["signal_supported_exposure", "信号支持仓位"],
+      ["integer_feasible_exposure", "整手可行仓位"],
+      ["planned_exposure", "计划后仓位"],
       ["target_exposure", "目标仓位"],
       ["actual_exposure", "实际仓位"],
       ["exposure_gap", "仓位缺口"],
@@ -449,7 +454,7 @@ HTML = """<!doctype html>
 
       ctx.fillStyle = "#6c675d";
       ctx.font = "12px Microsoft YaHei UI";
-      ctx.fillText("账户 vs 强度前30%基准", left, top + 2);
+      ctx.fillText("账户 vs 固定Top-N流动性基准", left, top + 2);
       ctx.fillStyle = "#147a54";
       ctx.fillText("账户", left, top + 18);
       ctx.fillStyle = "#b3403a";
@@ -894,6 +899,10 @@ HTML = """<!doctype html>
       setMetric("holdings", String(Number(exposure.holding_count || 0)), 0);
       setMetric("risk_level", String(ms.risk_level || "--").toUpperCase(), riskDir(ms.risk_level));
       setMetric("exposure_cap", fmtPct(Number(ms.exposure_cap || 0)), -Number(ms.exposure_cap || 0));
+      setMetric("strategic_exposure_budget", fmtPct(Number(ms.strategic_exposure_budget || 0)), Number(ms.strategic_exposure_budget || 0));
+      setMetric("signal_supported_exposure", fmtPct(Number(ms.signal_supported_exposure || 0)), Number(ms.signal_supported_exposure || 0));
+      setMetric("integer_feasible_exposure", fmtPct(Number(ms.integer_feasible_exposure || 0)), Number(ms.integer_feasible_exposure || 0));
+      setMetric("planned_exposure", fmtPct(Number(ms.planned_exposure || 0)), Number(ms.planned_exposure || 0));
       setMetric("target_exposure", fmtPct(Number(ms.target_exposure || 0)), Number(ms.target_exposure || 0));
       setMetric("actual_exposure", fmtPct(actualExposure), actualExposure);
       setMetric("exposure_gap", fmtPct(exposureGap), -exposureGap);
@@ -958,18 +967,20 @@ HTML = """<!doctype html>
 
       document.getElementById("benchmarkText").textContent = [
         `账户净值              : ${fmtNum(navMultiple, 4)} (${fmtPct(totalReturn)})`,
-        `基准ID                : top_strength_30pct_equal_weight`,
+        `绩效基准ID            : ${String(ms.performance_benchmark_id || "top_liquidity_100_equal_weight_monthly")}`,
+        `基准成分/收益覆盖      : ${Number(ms.performance_benchmark_member_count || 0)} / ${fmtPct(Number(ms.performance_benchmark_return_coverage || 0))}`,
+        `本日重平衡/换手        : ${Boolean(ms.performance_benchmark_rebalanced) ? "是" : "否"} / ${fmtPct(Number(ms.performance_benchmark_turnover || 0))}`,
         `基准净值              : ${fmtNum(benchmarkNav, 4)} (${fmtPct(benchmarkNav - 1.0)})`,
         `超额净值              : ${fmtNum(excessNav, 4)} (${fmtPct(excessNav - 1.0)})`,
         `账户最大回撤          : ${fmtPct(maxDrawdown)}`,
         `持仓最大回撤          : ${fmtPct(holdingMaxDrawdown)}`,
         `基准最大回撤          : ${fmtPct(benchmarkMaxDrawdown)}`,
         `超额最大回撤          : ${fmtPct(excessMaxDrawdown)}`,
-        `基准5日收益           : ${fmtPct(Number(ms.benchmark_return_5d))}`,
-        `基准20日收益          : ${fmtPct(Number(ms.benchmark_return_20d))}`,
-        `基准5日回撤           : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
-        `基准20日回撤          : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
-        `距峰值回撤            : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
+        `安全ETF(${String(ms.safety_benchmark_id || "sh510300")}) 5日收益 : ${fmtPct(Number(ms.benchmark_return_5d))}`,
+        `安全ETF 20日收益      : ${fmtPct(Number(ms.benchmark_return_20d))}`,
+        `安全ETF 5日回撤       : ${fmtPct(Number(ms.benchmark_drawdown_5d))}`,
+        `安全ETF 20日回撤      : ${fmtPct(Number(ms.benchmark_drawdown_20d))}`,
+        `安全ETF距峰值回撤     : ${fmtPct(Number(ms.benchmark_underwater_from_peak))}`,
         `20日跑赢比例          : ${fmtPct(rollingBeatRatio(20))}`,
         `60日跑赢比例          : ${fmtPct(rollingBeatRatio(60))}`,
         `120日跑赢比例         : ${fmtPct(rollingBeatRatio(120))}`
@@ -1014,7 +1025,7 @@ HTML = """<!doctype html>
         `冲高衰竭均分          : ${fmtNum(Number(ms.exhaustion_score_mean), 3)}`,
         `入场成功概率均分      : ${fmtPct(Number(ms.entry_success_probability_mean || 0))}`,
         `阴跌衰减均分          : ${fmtNum(Number(ms.downtrend_decay_score_mean), 3)}`,
-        `买后失败均分          : ${fmtNum(Number(ms.post_entry_failure_score_mean), 3)}`,
+        `买后表现失败均分      : ${fmtNum(Number(ms.post_entry_failure_score_mean), 3)}`,
         `急涨候选数量          : ${String(ms.surge_candidate_count ?? 0)}`,
         `强启动候选数量        : ${String(ms.strong_starter_count ?? 0)}`,
         `两手首买候选数量      : ${String(ms.starter_2_lot_count ?? 0)}`,
@@ -1034,15 +1045,20 @@ HTML = """<!doctype html>
         ...summaryLines(ms.entry_block_summary || [], "暂无拦截数据")
       ].join("\\n");
 
-      if (String(ms.strategy_logic_version || "") === "mainline_v3_cabinet_native") {
+      if (String(ms.strategy_logic_version || "").startsWith("mainline_v3")) {
         document.getElementById("entryGateText").textContent += [
-          "", "Cabinet-native v3",
+          "", `Cabinet-native v3 (${String(ms.strategy_logic_version || "not_initialized")})`,
           `Strict entry family : ${fmtNum(Number(ms.cabinet_strict_entry_score_mean), 3)}`,
           `Proxy entry family  : ${fmtNum(Number(ms.cabinet_proxy_entry_score_mean), 3)}`,
           `Timing role         : ${fmtNum(Number(ms.cabinet_timing_score_mean), 3)}`,
           `Liquidity health    : ${fmtNum(Number(ms.cabinet_liquidity_health_score_mean), 3)}`,
           `Risk safety         : ${fmtNum(Number(ms.cabinet_risk_safety_score_mean), 3)}`,
           `Hold support        : ${fmtNum(Number(ms.cabinet_hold_support_score_mean), 3)}`,
+          `ML fusion weight    : ${fmtNum(Number(ms.monthly_lgbm_effective_weight || 0), 3)}`,
+          `Temporal isolation  : ${String(ms.factor_temporal_isolation_status || "NOT_EVALUATED")}`,
+          `Family replacement  : ${String(ms.factor_family_replacement_status || "NOT_EVALUATED")}`,
+          `Causal audit        : ${String(ms.factor_causal_audit_status || "NOT_EVALUATED")}`,
+          `PIT Level-2         : ${String(ms.pit_level2_runtime_state || "degraded")}`,
         ].join("\\n");
       }
       document.getElementById("tradeQualityText").textContent = [
@@ -1051,7 +1067,7 @@ HTML = """<!doctype html>
         `最佳替换优势          : ${fmtPct(Number(ms.best_replacement_edge_10d || 0))}`,
         `替换卖出数量          : ${String(ms.replacement_opportunity_sell_count ?? 0)}`,
         `利润回吐观察数        : ${String(ms.profit_giveback_observation_count ?? 0)}`,
-        `入场失败卖出数        : ${String(ms.post_entry_failure_exit_count ?? 0)}`,
+        `买后表现失败卖出数    : ${String(ms.post_entry_failure_exit_count ?? 0)}`,
         `趋势破坏观察数        : ${String(ms.trend_break_observation_count ?? 0)}`,
         `量能分布观察数        : ${String(ms.volume_distribution_observation_count ?? 0)}`,
         `生命周期警报数        : ${String(ms.lifecycle_alert_count ?? 0)}`,
@@ -1111,7 +1127,14 @@ HTML = """<!doctype html>
       lifecycleBody.innerHTML = "";
       const lifecycleRows = (ms.holding_lifecycle_preview || []).slice(0, 12);
       for (const item of lifecycleRows) {
-        const alert = item.position_exit_reason ? String(item.position_exit_reason) : item.profit_giveback_flag ? "利润回吐" : item.post_entry_failure_flag ? "入场失败" : "";
+        const paperReasons = {profit_giveback_exit: "利润回吐", profit_hard_stop_exit: "利润保护", loss_containment_exit: "损失控制", signal_failure_exit: "信号失效", thesis_failure_exit: "投资逻辑失效", post_entry_failure_exit: "买后表现失败", stale_time_exit: "持仓陈旧"};
+        const alert = item.position_exit_reason
+          ? String(item.position_exit_reason)
+          : item.paper_exit_reason
+            ? `纸面观察：${paperReasons[item.paper_exit_reason] || item.paper_exit_reason}（未执行）`
+            : item.profit_giveback_flag
+              ? "利润回吐观察"
+              : item.post_entry_failure_flag ? "买后表现失败观察" : "";
         const stateText = `${String(item.position_state || "--")}${item.add_allowed ? " / 可补仓" : ""}`;
         const tr = document.createElement("tr");
         tr.innerHTML = [
@@ -1120,7 +1143,7 @@ HTML = """<!doctype html>
           `<td>${fmtPct(Number(item.unrealized_return || 0))}</td>`,
           `<td>${fmtPct(Number(item.mfe || 0))}</td>`,
           `<td>${fmtPct(Number(item.mae || 0))}</td>`,
-          `<td>${fmtPct(Number(item.giveback_from_peak || 0))}</td>`,
+          `<td>${item.giveback_armed ? fmtPct(Number(item.giveback_from_peak || 0)) : "--"}</td>`,
           `<td>${fmtNum(Number(item.trend_direction_score || 0), 2)}</td>`,
           `<td>${fmtNum(Number(item.peak_decay_score || 0), 2)}</td>`,
           `<td>${fmtNum(Number(item.future_loss_risk_score || 0), 2)}</td>`,
@@ -1156,7 +1179,7 @@ HTML = """<!doctype html>
 
       const pendingLines = [`未完成订单（${Number(ms.pending_order_count || 0)}）`, ""];
       for (const item of (ms.pending_preview || [])) {
-        pendingLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} shares=${fmtNum(Number(item.remaining_shares || 0),0).padStart(10)} ${String(item.status || "").padEnd(14)} lock=${fmtNum(Number(item.lock_days || 0),0)} ${String(item.reason || "")}`);
+        pendingLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} shares=${fmtNum(Number(item.remaining_shares || 0),0).padStart(10)} ${String(item.status || "").padEnd(14)} lock=${fmtNum(Number(item.lock_days || 0),0)} 当前=${String(item.reason || "")} 历史=${String(item.reason_history || item.reason || "")}`);
       }
       if ((ms.pending_preview || []).length === 0) pendingLines.push("暂无有效未完成订单。");
       document.getElementById("pendingText").textContent = pendingLines.join("\\n");
@@ -1286,6 +1309,22 @@ except ModuleNotFoundError:
 
 HTML = PROFESSIONAL_HTML
 
+try:
+    from functions.decision_council.factor_curve_web import (
+        FactorStore,
+        HTML as FACTOR_HTML,
+    )
+    from functions.decision_council.holding_factor_products import (
+        FACTOR_PRODUCT_DIRNAME,
+        FACTOR_WORKBOOK_NAME,
+    )
+except ModuleNotFoundError:
+    from factor_curve_web import FactorStore, HTML as FACTOR_HTML
+    from holding_factor_products import (
+        FACTOR_PRODUCT_DIRNAME,
+        FACTOR_WORKBOOK_NAME,
+    )
+
 
 def _pick_port() -> int:
     with socket.socket() as sock:
@@ -1310,6 +1349,31 @@ def main(argv: list[str]) -> int:
     state_path = Path(argv[1])
     stop_event = threading.Event()
     port = _pick_port()
+    factor_store_cache = {"data_dir": "", "store": None}
+
+    def factor_product_paths() -> tuple[Path | None, Path | None]:
+        payload = _read_payload(state_path)
+        output_value = str(payload.get("output_dir", "") or "").strip()
+        if not output_value:
+            return None, None
+        data_dir = Path(output_value) / FACTOR_PRODUCT_DIRNAME
+        return data_dir, data_dir / FACTOR_WORKBOOK_NAME
+
+    def factor_store():
+        data_dir, _ = factor_product_paths()
+        if data_dir is None:
+            return None
+        required = (
+            data_dir / "holding_factor_scores_long.csv",
+            data_dir / "holding_daily.csv",
+        )
+        if not all(path.is_file() for path in required):
+            return None
+        data_token = str(data_dir.resolve())
+        if factor_store_cache["data_dir"] != data_token:
+            factor_store_cache["store"] = FactorStore(data_dir)
+            factor_store_cache["data_dir"] = data_token
+        return factor_store_cache["store"]
 
     class Handler(BaseHTTPRequestHandler):
         def _send_bytes(self, body: bytes, content_type: str) -> None:
@@ -1321,11 +1385,80 @@ def main(argv: list[str]) -> int:
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path.startswith("/state"):
+            parsed = urlparse(self.path)
+            if parsed.path == "/state":
                 body = json.dumps(_read_payload(state_path), ensure_ascii=False).encode("utf-8")
                 self._send_bytes(body, "application/json; charset=utf-8")
                 return
-            if self.path not in ("/", "/index.html"):
+            if parsed.path in {"/factors", "/factors/"}:
+                self._send_bytes(FACTOR_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if parsed.path == "/api/meta":
+                store = factor_store()
+                if store is None:
+                    body = json.dumps(
+                        {
+                            "status": "pending",
+                            "message": "运行尚未保存完成，逐因子曲线将在保存阶段自动生成。",
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(202)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self._send_bytes(
+                    json.dumps(store.meta(), ensure_ascii=False).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if parsed.path == "/api/series":
+                store = factor_store()
+                if store is None:
+                    self.send_error(404, "factor product is not ready")
+                    return
+                query = parse_qs(parsed.query)
+                symbol = str(query.get("symbol", [store.symbols[0]])[0])
+                metric = str(query.get("metric", ["predicted_return_5d"])[0])
+                factors = [
+                    item
+                    for item in str(query.get("factors", [""])[0]).split("|")
+                    if item
+                ]
+                if symbol not in store.symbols:
+                    self.send_error(404, "unknown symbol")
+                    return
+                self._send_bytes(
+                    json.dumps(
+                        store.series(symbol, metric, factors),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if parsed.path == "/factor-workbook":
+                _, workbook_path = factor_product_paths()
+                if workbook_path is None or not workbook_path.is_file():
+                    self.send_error(404, "factor workbook is not ready")
+                    return
+                body = workbook_path.read_bytes()
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+                self.send_header(
+                    "Content-Disposition",
+                    'attachment; filename="SCAP_holding_factor_curves.xlsx"',
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if parsed.path not in ("/", "/index.html"):
                 self.send_error(404)
                 return
             self._send_bytes(HTML.encode("utf-8"), "text/html; charset=utf-8")

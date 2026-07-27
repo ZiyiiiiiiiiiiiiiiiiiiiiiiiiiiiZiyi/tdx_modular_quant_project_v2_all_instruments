@@ -401,6 +401,9 @@ def append_candidate_factors(
         "cand_idiosyncratic_vol_60_neg",
         "cand_volatility_60_neg",
         "cand_volatility_20_neg",
+        "cand_size_float_cap_neg",
+        "cand_size_total_cap_neg",
+        "cand_size_float_cap_rank_small",
     }
     if include_set is not None and include_set and all(
         column.startswith("cand_grid_") or column in focused_simple_columns
@@ -415,6 +418,12 @@ def append_candidate_factors(
             market_ret = ret_1.groupby(frame["date"], sort=False).transform("mean")
             beta60 = _rolling_beta(ret_1, market_ret, frame, 60)
             generated["cand_idiosyncratic_vol_60_neg"] = -_rolling_std(ret_1 - beta60 * market_ret, frame, 60)
+        if "cand_size_float_cap_neg" in include_set:
+            generated["cand_size_float_cap_neg"] = -np.log1p(safe_float_cap)
+        if "cand_size_total_cap_neg" in include_set:
+            generated["cand_size_total_cap_neg"] = -np.log1p(safe_total_cap)
+        if "cand_size_float_cap_rank_small" in include_set:
+            generated["cand_size_float_cap_rank_small"] = 1.0 - safe_float_cap.groupby(frame["date"], sort=False).rank(pct=True)
         if generated:
             frame = pd.concat(
                 [frame, pd.DataFrame({key: pd.to_numeric(value, errors="coerce").astype("float32") for key, value in generated.items()}, index=frame.index)],

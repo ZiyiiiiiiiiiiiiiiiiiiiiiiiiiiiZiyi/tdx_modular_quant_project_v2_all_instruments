@@ -96,6 +96,7 @@ def build_environment_manifest(
         "package_versions": _package_versions(),
         "pip_freeze": _all_package_versions(),
         "config_hash": hashlib.sha256(encoded).hexdigest(),
+        "frozen_config": frozen_config,
         "random_seed": int(random_seed),
         "calendar_version": calendar_version,
         "feature_snapshot_date": dates.max().date().isoformat() if not dates.empty else None,

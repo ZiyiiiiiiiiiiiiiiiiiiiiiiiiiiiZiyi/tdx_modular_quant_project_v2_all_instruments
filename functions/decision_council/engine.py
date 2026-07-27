@@ -79,8 +79,22 @@ class PhaseOneDecisionCouncilEngine:
         hard_qualification_symbols=(),
         catchup_buy_budget: float = 0.0,
         catchup_allowed: bool = False,
+        active_replacement_enabled: bool = True,
+        active_replacement_max_pairs_per_day: int = 1,
         target_exposure_cap: float | None = None,
         covariance_matrix: pd.DataFrame | None = None,
+        nav_amount: float = 1.0,
+        cash_amount: float = 0.0,
+        cash_buffer_amount: float = 0.0,
+        per_name_structural_cap: float = 1.0,
+        portfolio_stress_budget_amount: float = 1.0e18,
+        control_mode: str = "normal",
+        winner_add_enabled: bool = False,
+        loser_add_enabled: bool = False,
+        soft_exit_enabled: bool = True,
+        forecast_horizon_sessions: int = 10,
+        forecast_kappa: float = 0.50,
+        soft_target_positions: int = 4,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         decision_date = pd.Timestamp(decision_date)
         if decision_date not in self.safety_signals.index:
@@ -111,8 +125,28 @@ class PhaseOneDecisionCouncilEngine:
             catchup_buy_budget=float(catchup_buy_budget),
             catchup_allowed=bool(catchup_allowed),
             transition_only=bool(transition_only),
+            active_replacement_enabled=bool(active_replacement_enabled),
+            active_replacement_max_pairs_per_day=max(
+                int(active_replacement_max_pairs_per_day), 0
+            ),
             hard_qualification_symbols=frozenset(str(symbol) for symbol in hard_qualification_symbols),
             covariance_matrix=covariance_matrix,
+            nav_amount=max(float(nav_amount), 1e-12),
+            cash_amount=max(float(cash_amount), 0.0),
+            cash_buffer_amount=max(float(cash_buffer_amount), 0.0),
+            per_name_structural_cap=min(
+                max(float(per_name_structural_cap), 0.0), 1.0
+            ),
+            portfolio_stress_budget_amount=max(
+                float(portfolio_stress_budget_amount), 0.0
+            ),
+            control_mode=str(control_mode or "normal").strip().lower(),
+            winner_add_enabled=bool(winner_add_enabled),
+            loser_add_enabled=bool(loser_add_enabled),
+            soft_exit_enabled=bool(soft_exit_enabled),
+            forecast_horizon_sessions=max(int(forecast_horizon_sessions), 1),
+            forecast_kappa=max(float(forecast_kappa), 0.0),
+            soft_target_positions=max(int(soft_target_positions), 0),
         )
         ideal, orders, diagnostics = self.policy.decide(context)
         diagnostics["raw_safety_exposure_cap"] = raw_safety_exposure_cap

@@ -36,6 +36,7 @@ class GovernanceLiveMonitor:
         self._write_counter = 0
         self._run_id = ""
         self._title = ""
+        self._output_dir = ""
         self._last_day_index = -1
         self._chart_history: list[dict] = []
         self._last_update_payload: dict = {}
@@ -45,12 +46,20 @@ class GovernanceLiveMonitor:
     def available(self) -> bool:
         return not self._closed and self._proc is not None and self._proc.poll() is None
 
-    def start_session(self, *, title: str, total_days: int, initial_nav: float) -> None:
+    def start_session(
+        self,
+        *,
+        title: str,
+        total_days: int,
+        initial_nav: float,
+        output_dir: str | Path | None = None,
+    ) -> None:
         if self._closed:
             return
         self._ensure_monitor_process()
         self._run_id = f"{os.getpid()}_{time.time_ns()}_{id(self)}"
         self._title = str(title)
+        self._output_dir = str(Path(output_dir).resolve()) if output_dir else ""
         self._last_day_index = -1
         self._chart_history = []
         self._last_update_payload = {}
@@ -65,6 +74,9 @@ class GovernanceLiveMonitor:
                 "initial_nav": self.initial_nav,
                 "max_chart_points": self.max_chart_points,
                 "max_holdings": self.max_holdings,
+                "output_dir": self._output_dir,
+                "factor_curves_path": "/factors",
+                "factor_workbook_path": "/factor-workbook",
             }
         )
 
@@ -117,6 +129,9 @@ class GovernanceLiveMonitor:
                 "holdings": list(holdings or []),
                 "monitor_state": monitor_values,
                 "chart_history": list(self._chart_history),
+                "output_dir": self._output_dir,
+                "factor_curves_path": "/factors",
+                "factor_workbook_path": "/factor-workbook",
             }
         self._last_update_payload = update_payload
         self._write_state(update_payload)
@@ -163,6 +178,9 @@ class GovernanceLiveMonitor:
                 "completed": completed_days >= self.total_days,
                 "message": message or "回测完成。窗口会保持打开，关闭浏览器标签即可。",
                 "chart_history": list(self._chart_history),
+                "output_dir": self._output_dir,
+                "factor_curves_path": "/factors",
+                "factor_workbook_path": "/factor-workbook",
             }
         )
         self._write_state(finish_payload)

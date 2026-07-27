@@ -9,9 +9,13 @@ import html
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
+import time
 import webbrowser
+import calendar
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -28,6 +32,12 @@ OPEN_POSITION_PREFIX = "backtest_open_positions_"
 METRICS_PREFIX = "backtest_metrics_"
 MAX_SUBMIT_BODY_BYTES = 1024 * 1024
 DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID = "pruned_run20260714_184846_581132_20260715_230524"
+VALIDATION_WINDOW_PRESETS = {
+    "custom": None,
+    "short_5": 5,
+    "short_20": 20,
+    "long_180": 180,
+}
 ALLOWED_INTERACTIVE_TASKS = frozenset(
     {
         "main_pipeline",
@@ -43,6 +53,8 @@ ALLOWED_INTERACTIVE_TASKS = frozenset(
         "factor_cabinet_gap_report",
         "orderflow_parameter_research",
         "pit_level1_audit",
+        "pit_level1_build",
+        "pit_index_membership_build",
         "pit_level2_audit",
         "pit_level2_build",
         "registered_mainline_v2_suite",
@@ -281,8 +293,8 @@ RUN_HTML = """<!doctype html>
       <label class="item"><input type="checkbox" id="main_pipeline">主策略流水线/回测：使用下面账户参数运行普通策略路径。</label>
       <label class="item"><input type="checkbox" id="governance_active">治理主线单次运行：只跑默认股票池，适合观察弹窗监控和排查行为问题。</label>
       <label class="item recommended"><input type="checkbox" id="governance_layer_ablation_suite">增强控制层诊断：factor_cabinet 模式运行核心基线、市场状态、概率校准、复杂退出和完整主线对照。旧趋势/反转/订单流 bundle 消融不会冒充 cabinet 消融。</label>
-      <label class="item"><input type="checkbox" id="governance_layer_validation">层验证线：紧凑 8 因子等权测试，关闭声誉/影子组合和市场状态叠加，保留安全模块。用于先判断基础信号有没有边际收益。</label>
-      <label class="item"><input type="checkbox" id="governance_mainline_review" checked>治理主线复核：模块诊断证明候选策略更干净后，再运行偏生产风格的复核。</label>
+      <label class="item recommended"><input type="checkbox" id="governance_layer_validation" checked>层验证线：20日工程验收已通过，当前默认运行180日SCAP-V2受控开发验证；复核真实成交、仓位漏斗和模块边际贡献。</label>
+      <label class="item"><input type="checkbox" id="governance_mainline_review">治理主线复核：短窗口通过后，再运行偏生产风格的长窗口复核。</label>
       <label class="item recommended"><input type="checkbox" id="fast_factor_judge">快速因子审判：只读现有特征和股票池，计算 IC/分层/换手成本/冗余，不跑状态机、不下单、不跑完整回测。</label>
       <label class="item recommended"><input type="checkbox" id="factor_appeal_judge">因子申诉审判：对 RSI、基本面、事件和另类代理等被旧门槛误杀的非 grid 因子单独复核。</label>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet">因子柜生成：完整保留所选基柜，只追加申诉审判正式晋级的价值、质量、成长、事件、RSI、订单流和突破因子；无证据家族不会强制入柜。</label>
@@ -291,14 +303,16 @@ RUN_HTML = """<!doctype html>
       <label class="item recommended"><input type="checkbox" id="factor_cabinet_prune">factor_cabinet 去重/瘦身：按相关性、top overlap、角色和家族上限生成 pruned cabinet，不新增因子。</label>
       <label class="item recommended"><input type="checkbox" id="orderflow_parameter_research">订单流/突破参数重审：在限定窗口和时限内重审可执行日线代理，输出独立申诉结果，不改旧 cabinet。</label>
       <label class="item"><input type="checkbox" id="pit_level1_audit">PIT Level-1 状态审计：检查四类 PIT 表是否可用；正式模式缺失时拒绝运行。</label>
+      <label class="item"><input type="checkbox" id="pit_level1_build">PIT Level-1 本地构建：从现有日线、当前成分和公司行动低内存生成 research-only 四表；不倒填当前快照、不伪造公告时间。</label>
+      <label class="item"><input type="checkbox" id="pit_index_membership_build">中证历史成分拉取/重建：BaoStock拉取沪深300和中证500；A500优先读取带日期文件，否则使用本地当前基线与官方定期调整名单逆向重建。覆盖不完整时拒绝发布。</label>
       <label class="item"><input type="checkbox" id="pit_level2_audit">PIT Level-2 状态审计：检查财报、每日估值和公司事件表；正式模式缺失时拒绝运行。</label>
       <label class="item"><input type="checkbox" id="pit_level2_build">PIT Level-2 本地构建：低内存读取本地 TDX 财务快照和市值历史，生成 research-only 财报、估值和事件表。</label>
       <label class="item"><input type="checkbox" id="registered_mainline_v2_suite">预登记主线 v1/v2 对照：固定运行四组实验，不临时扩充消融组合。</label>
 
       <div class="hint">
-        当前建议：先运行“增强模块诊断”。<br>
-        目的不是追求一次跑出好看收益，而是定位问题来自趋势、反转、订单流、突破、市场状态、校准诊断、简单退出、复杂退出，还是主线叠加。<br>
-        “治理主线复核”建议在诊断结果明确后再跑。
+        20日SCAP-V2全链工程验收已通过。下一步默认运行“层验证线”的180日受控开发窗口，固定当前因子柜、2万元、5只、允许现金、E4和全A研究池。<br>
+        用于复核真实成交→pending→T+1→费用→账户→保存，并检查空仓、加仓和完整替换的真实触发；不要同时勾选其他任务。<br>
+        180日仍是开发证据，不是最终样本外证据或实盘授权。
       </div>
 
       <div class="section-title">回测账户</div>
@@ -306,7 +320,8 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="capital_profile">资金档位</label>
           <select id="capital_profile">
-            <option value="small_capital_branch" selected>小资金支线（2万，一手适配）</option>
+            <option value="small_capital_lean" selected>SCAP-V3 Lean（2万，1,000元缓冲）</option>
+            <option value="small_capital_branch">小资金支线旧版（2万，一手适配）</option>
             <option value="institutional_1m">100万基线账户</option>
             <option value="institutional_10m">1000万对照账户</option>
             <option value="retail_20k">2万小资金账户</option>
@@ -314,15 +329,15 @@ RUN_HTML = """<!doctype html>
         </div>
         <div class="field">
           <label for="initial_cash">初始资金，可选覆盖</label>
-          <input type="number" id="initial_cash" min="1" step="1000" placeholder="留空=使用所选档位">
+          <input type="number" id="initial_cash" min="1" step="1000" value="20000" placeholder="留空=使用所选档位">
         </div>
         <div class="field">
           <label for="max_positions_account">最多买入/持有股票数量</label>
-          <input type="number" id="max_positions_account" min="0" step="1" placeholder="小资金建议 3-5；留空=档位默认；0=不限制">
+          <input type="number" id="max_positions_account" min="0" step="1" value="5" placeholder="小资金建议 3-5；留空=档位默认；0=不限制">
         </div>
         <div class="field">
           <label for="min_cash_buffer">现金缓冲，可选</label>
-          <input type="number" id="min_cash_buffer" min="0" step="100" placeholder="留空=档位默认">
+          <input type="number" id="min_cash_buffer" min="0" step="100" value="2000" placeholder="留空=档位默认">
         </div>
         <div class="field">
           <label for="capital_usage_mode">资金使用模式</label>
@@ -337,7 +352,8 @@ RUN_HTML = """<!doctype html>
       </div>
 
       <div class="section-title">治理诊断参数</div>
-      <label class="item"><input type="checkbox" name="universe" value="hs300_csi500_a500_strict" checked>hs300_csi500_a500_strict：沪深300 + 中证500 + A500，当前建议的宽研究池。</label>
+      <label class="item"><input type="checkbox" name="universe" value="all_a_share_research" checked>all_a_share_research：与已通过的20日SCAP产品运行保持一致，作为下一步180日受控基线。</label>
+      <label class="item"><input type="checkbox" name="universe" value="hs300_csi500_a500_strict">hs300_csi500_a500_strict：沪深300 + 中证500 + A500；本轮不要与全A研究池同时选择。</label>
       <label class="item"><input type="checkbox" name="universe" value="hs300_strict">hs300_strict：只看沪深300，偏防守的大盘对照池。第一次增强诊断可先不选以节省时间。</label>
       <label class="item"><input type="checkbox" name="universe" value="hs300_csi300_a500_strict">hs300_csi300_a500_strict：沪深300/CSI300 + A500 旧口径对照池。</label>
       <label class="item"><input type="checkbox" name="universe" value="csi500_strict">csi500_strict：只看中证500，适合第二层股票池隔离测试。</label>
@@ -345,22 +361,40 @@ RUN_HTML = """<!doctype html>
         <div class="field">
           <label for="governance_control_mode">控制层模式</label>
           <select id="governance_control_mode">
-            <option value="normal" selected>正常治理：全部控制启用</option>
+            <option value="normal">正常治理：全部控制启用</option>
             <option value="factor_only">因子裸跑：暂停 reputation/regime/复杂卖出/冷却/硬止损</option>
             <option value="paper_controls">纸面控制：控制层只记录，不实际支配买卖</option>
             <option value="safe_factor_only">安全裸跑：因子裸跑，但保留硬止损</option>
+            <option value="aggressive_profit">SCAP-V1 小资金进攻盈利（旧兼容研究）</option>
+            <option value="aggressive_lean" selected>SCAP-V3 Lean 小资金激进精简版（研究候选）</option>
           </select>
+        </div>
+        <div class="field">
+          <label for="scap_exit_stage">SCAP退出实验阶段</label>
+          <select id="scap_exit_stage">
+            <option value="E0">E0 安全基线（复杂退出仅记录）</option>
+            <option value="E1">E1 + Alpha/信号失败退出</option>
+            <option value="E2">E2 + 买后失败/时间退出</option>
+            <option value="E3">E3 + 损失控制</option>
+            <option value="E4" selected>E4 + 右尾利润保护</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="scap_loss_stop">SCAP E3损失边界</label>
+          <input type="number" id="scap_loss_stop" min="-0.50" max="-0.01" step="0.01" value="-0.12">
         </div>
         <div class="field">
           <label for="strategy_logic_version">主线策略逻辑版本</label>
           <select id="strategy_logic_version">
             <option value="production_v1">production_v1 - 冻结生产对照</option>
-            <option value="mainline_v2" selected>mainline_v2 - 简化入场实验主线</option>
-            <option value="mainline_v3_cabinet_native">mainline_v3_cabinet_native - 因子柜原生实验主线</option>
+            <option value="mainline_v2">mainline_v2 - 简化入场实验主线</option>
+            <option value="mainline_v3_cabinet_native" selected>mainline_v3_cabinet_native - 因子柜原生默认基线</option>
+            <option value="mainline_v3_monthly_lgbm_hybrid">mainline_v3_monthly_lgbm_hybrid - 双期限月度 LightGBM（研究对照）</option>
+            <option value="mainline_v3_reliability_weighted">mainline_v3_reliability_weighted - 滚动成熟标签可靠性（研究对照）</option>
           </select>
         </div>
         <div class="field">
-          <label for="governance_alpha_bundle">治理主线因子包</label>
+          <label for="governance_alpha_bundle">治理主线因子包（仅 legacy_bundle 来源生效）</label>
           <select id="governance_alpha_bundle">
             <option value="diversified_pre_screen_bundle_v2" selected>legacy: diversified_pre_screen_bundle_v2 - 24 candidate diversified alpha</option>
             <option value="pre_screen_promote_bundle">7月2号预筛产品化包（28个 cand 因子）</option>
@@ -382,16 +416,47 @@ RUN_HTML = """<!doctype html>
           </select>
         </div>
         <div class="field">
+          <label for="validation_window_preset">验证窗口预设</label>
+          <select id="validation_window_preset">
+            <option value="custom">不限天数 - 使用完整月份范围</option>
+            <option value="short_5">5 日 - 产品/状态机冒烟</option>
+            <option value="short_20">20 日 - 已通过的全产品链烟雾基线</option>
+            <option value="long_180" selected>180 日 - 下一步固定中期开发验证</option>
+          </select>
+          <div class="mini">当前默认180日；5/20/180 日档位只修改交易日上限，不改变月份范围。</div>
+        </div>
+        <div class="field">
           <label for="start_month">开始月份</label>
-          <input type="month" id="start_month" value="2021-01">
+          <input type="month" id="start_month" value="2025-01">
         </div>
         <div class="field">
           <label for="end_month">结束月份</label>
-          <input type="month" id="end_month" value="2024-12">
+          <input type="month" id="end_month" value="2026-05">
         </div>
         <div class="field">
-          <label for="max_days">最多交易日，可选</label>
-          <input type="number" id="max_days" min="1" step="1" placeholder="留空=使用完整选择区间">
+          <label for="max_days">最多交易日（由预设自动填写）</label>
+          <input type="number" id="max_days" min="1" step="1" readonly placeholder="留空=不限制，使用完整月份范围">
+        </div>
+        <div class="field">
+          <label for="monthly_lgbm_maximum_weight">月度 ML 最大融合权重</label>
+          <input type="number" id="monthly_lgbm_maximum_weight" min="0" max="1" step="0.05" value="0.20">
+          <div class="mini">这是预登记上限，不是固定权重。5日模型负责入场排序，20日模型负责持有/替换价值；实际权重由锁定验证收缩。运行后查看逐轮 NDCG、最佳迭代、Top-5 处理效应和成本后反事实收益。</div>
+        </div>
+        <div class="field">
+          <label for="performance_benchmark_top_n">绩效基准固定股票数</label>
+          <select id="performance_benchmark_top_n">
+            <option value="50">流动性 Top 50</option>
+            <option value="100" selected>流动性 Top 100（默认研究口径）</option>
+            <option value="300">流动性 Top 300</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="performance_benchmark_rebalance">绩效基准调仓频率</label>
+          <select id="performance_benchmark_rebalance">
+            <option value="daily">每日</option>
+            <option value="weekly">每周</option>
+            <option value="monthly" selected>每月（默认）</option>
+          </select>
         </div>
         <div class="field">
           <label for="fast_factor_max_count">快速因子审判数量</label>
@@ -409,8 +474,19 @@ RUN_HTML = """<!doctype html>
           <label for="research_max_runtime_seconds">研究任务最长运行秒数</label>
           <input type="number" id="research_max_runtime_seconds" min="30" step="30" value="1800">
         </div>
+        <div class="field">
+          <label for="index_a500_history_file">中证A500历史成员文件</label>
+          <input type="text" id="index_a500_history_file" placeholder="CSV/XLSX/Parquet绝对路径；必须包含日期和成分代码">
+          <div class="mini">可选覆盖。留空时使用官方21对21定期调整名单逆向还原A500，并标记为research；不会把当前500只直接倒填。</div>
+        </div>
       </div>
+      <div id="data_preflight" class="mini" style="margin:10px 0;padding:10px;border:1px solid var(--line);border-radius:6px">
+        正在核验特征数据日期、历史成分股与 PIT 时间合同…
+      </div>
+      <div class="mini">绩效归因与卖出反事实使用前一期流动性固定 Top-N 股票池；默认月度等权，缺价成分保留并按零收益审计。沪深300 ETF 只用于安全/市场状态，不与绩效基准混用。当前等权口径为 research，待 PIT 自由流通市值完备后再升级为正式自由流通市值加权。</div>
       <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>
+      <label class="item"><input type="checkbox" id="active_replacement_enabled" checked disabled>主动整手换仓由资金档案唯一控制；20,000元小资金特殊版已开启，每日最多一组完整卖买配对，并进入统一动作仲裁与归因账本。</label>
+      <div class="mini">主动换仓不是追求高换手率。没有同期限校准收益、保守下界或可执行整手时，系统继续持有并在反事实奖励账本中记录错过机会。</div>
       <label class="item"><input type="checkbox" id="shadow_portfolios">启用单因子影子组合：非常慢的诊断模式。普通全历史复核建议关闭。</label>
       <label class="item"><input type="checkbox" id="timestamped_diagnostics" checked disabled>增强诊断后生成带时间戳的表格、图、增量贡献文件和 Markdown 报告。</label>
       <div class="mini">
@@ -424,8 +500,8 @@ RUN_HTML = """<!doctype html>
       </div>
 
       <div class="section-title">运行模式</div>
-      <label class="item"><input type="radio" name="profile" value="fast" checked>快速模式：最近约 1 年，最多 180 个治理交易日，并关闭单因子影子回测。</label>
-      <label class="item"><input type="radio" name="profile" value="full">完整模式：使用选择的月份。影子组合仍按上面的勾选决定，除非明确要慢速因子影子运行，否则建议关闭。</label>
+      <label class="item"><input type="radio" name="profile" value="fast">快速模式：最近约 1 年，最多 180 个治理交易日，并关闭单因子影子回测。</label>
+      <label class="item"><input type="radio" name="profile" value="full" checked>完整模式：严格使用所选月份和最多交易日；180/252 日预设默认使用此模式。</label>
 
       <div class="actions">
         <div>
@@ -461,23 +537,116 @@ RUN_HTML = """<!doctype html>
   </div>
   <script>
     window.addEventListener("DOMContentLoaded", () => {
+      // Back/refresh may restore old checkbox state. Reset to the single
+      // preregistered 180-day SCAP baseline task.
+      TASK_CHECKBOX_IDS.forEach((id) => {
+        const taskNode = document.getElementById(id);
+        if (taskNode) {
+          const isDefaultTask = id === "governance_layer_validation";
+          taskNode.checked = isDefaultTask;
+          taskNode.defaultChecked = isDefaultTask;
+        }
+      });
       const capitalProfile = document.getElementById("capital_profile");
       if (capitalProfile) {
         Array.from(capitalProfile.options).forEach((option) => {
           option.selected = false;
           option.defaultSelected = false;
         });
-        capitalProfile.value = "small_capital_branch";
+        capitalProfile.value = "small_capital_lean";
       }
       const factorSource = document.getElementById("governance_factor_source");
       if (factorSource) {
         factorSource.value = "selected_factor_cabinet";
       }
+      const validationPreset = document.getElementById("validation_window_preset");
+      if (validationPreset) {
+        validationPreset.addEventListener("change", () => applyValidationWindowPreset(false));
+        applyValidationWindowPreset(true);
+      }
       startProgressPolling();
+      loadDataPreflight();
+      document.getElementById("start_month").addEventListener("change", loadDataPreflight);
+      document.getElementById("end_month").addEventListener("change", loadDataPreflight);
+      document.getElementById("pit_mode").addEventListener("change", loadDataPreflight);
+      document.querySelectorAll('input[name="universe"]').forEach((node) => {
+        node.addEventListener("change", loadDataPreflight);
+      });
+      TASK_CHECKBOX_IDS.forEach((id) => {
+        const taskNode = document.getElementById(id);
+        if (taskNode) taskNode.addEventListener("change", enforceMembershipBuildIsolation);
+      });
     });
+    const TASK_CHECKBOX_IDS = Object.freeze([
+      "main_pipeline", "governance_active", "governance_mainline_review",
+      "governance_layer_validation", "governance_layer_ablation_suite",
+      "fast_factor_judge", "factor_appeal_judge", "factor_cabinet",
+      "factor_cabinet_prune", "factor_cabinet_feature_cache",
+      "factor_cabinet_gap_report", "orderflow_parameter_research",
+      "pit_level1_audit", "pit_level1_build", "pit_index_membership_build",
+      "pit_level2_audit", "pit_level2_build", "registered_mainline_v2_suite"
+    ]);
+    function enforceMembershipBuildIsolation(event) {
+      const membershipId = "pit_index_membership_build";
+      const changed = event && event.target ? event.target : null;
+      const membershipNode = document.getElementById(membershipId);
+      if (!membershipNode) return;
+      if (changed && changed.id === membershipId && membershipNode.checked) {
+        TASK_CHECKBOX_IDS.forEach((id) => {
+          if (id !== membershipId) {
+            const node = document.getElementById(id);
+            if (node) node.checked = false;
+          }
+        });
+        document.getElementById("status").textContent = "已切换为独立历史成分构建；完成后再单独运行审计或回测。";
+        loadDataPreflight();
+      } else if (changed && changed.id !== membershipId && changed.checked) {
+        membershipNode.checked = false;
+        loadDataPreflight();
+      }
+    }
+    const VALIDATION_WINDOW_PRESETS = Object.freeze({
+      custom: {maxDays: "", profile: "full"},
+      short_5: {maxDays: "5", profile: "full"},
+      short_20: {maxDays: "20", profile: "full"},
+      long_180: {maxDays: "180", profile: "full"},
+    });
+    function applyValidationWindowPreset(initializing) {
+      const node = document.getElementById("validation_window_preset");
+      const preset = node ? VALIDATION_WINDOW_PRESETS[node.value] : null;
+      if (!preset) return;
+      document.getElementById("max_days").value = preset.maxDays;
+      const profile = document.querySelector(`input[name="profile"][value="${preset.profile}"]`);
+      if (profile) profile.checked = true;
+      if (!initializing) {
+        document.getElementById("status").textContent = `已载入验证预设：${node.options[node.selectedIndex].text}`;
+        loadDataPreflight();
+      }
+    }
     function currentProfile() {
       const node = document.querySelector('input[name="profile"]:checked');
       return node ? node.value : "full";
+    }
+    async function loadDataPreflight() {
+      const node = document.getElementById("data_preflight");
+      const startMonth = document.getElementById("start_month").value;
+      const endMonth = document.getElementById("end_month").value;
+      const maxDays = document.getElementById("max_days").value.trim();
+      const universes = Array.from(document.querySelectorAll('input[name="universe"]:checked')).map((item) => item.value).join(",");
+      const pitMode = document.getElementById("pit_mode").value;
+      try {
+        const response = await fetch(`/api/governance-preflight?start_month=${encodeURIComponent(startMonth)}&end_month=${encodeURIComponent(endMonth)}&max_days=${encodeURIComponent(maxDays)}&universes=${encodeURIComponent(universes)}&pit_mode=${encodeURIComponent(pitMode)}`);
+        const data = await response.json();
+        const membershipOnly = document.getElementById("pit_index_membership_build").checked;
+        const displayState = data.status === "pass" ? "可运行" : (membershipOnly ? "可构建历史成分" : "已阻止回测");
+        node.textContent = `${displayState}｜特征数据 ${data.feature_date_min || "-"} 至 ${data.feature_date_max || "-"}｜有效截止 ${data.effective_end || data.requested_end || "-"}｜成分股 ${data.constituent_status}｜${(data.reasons || []).join("；") || "时间合同通过"}`;
+        node.style.color = data.status === "pass" || membershipOnly ? "var(--success)" : "var(--danger)";
+        node.dataset.status = data.status;
+      } catch (err) {
+        node.textContent = `预检失败：${err.message || err}`;
+        node.style.color = "var(--danger)";
+        node.dataset.status = "blocked";
+      }
     }
     function backtestParams() {
       const capitalProfile = document.getElementById("capital_profile").value;
@@ -508,19 +677,33 @@ RUN_HTML = """<!doctype html>
       const startMonth = document.getElementById("start_month").value;
       const endMonth = document.getElementById("end_month").value;
       const maxDays = document.getElementById("max_days").value.trim();
+      const validationPresetNode = document.getElementById("validation_window_preset");
+      const validationWindowPreset = validationPresetNode ? validationPresetNode.value : "custom";
       const fastFactorMaxCountNode = document.getElementById("fast_factor_max_count");
       const fastFactorMaxCount = fastFactorMaxCountNode ? fastFactorMaxCountNode.value.trim() : "";
       const pitModeNode = document.getElementById("pit_mode");
       const pitMode = pitModeNode ? pitModeNode.value : "research";
       const researchRuntimeNode = document.getElementById("research_max_runtime_seconds");
       const researchMaxRuntimeSeconds = researchRuntimeNode ? researchRuntimeNode.value.trim() : "1800";
+      const a500HistoryNode = document.getElementById("index_a500_history_file");
+      const indexA500HistoryFile = a500HistoryNode ? a500HistoryNode.value.trim() : "";
       const shadowPortfolios = document.getElementById("shadow_portfolios").checked;
       const alphaCollapseExitNode = document.getElementById("alpha_collapse_exit_enabled");
       const alphaCollapseExitEnabled = alphaCollapseExitNode ? alphaCollapseExitNode.checked : true;
       const controlModeNode = document.getElementById("governance_control_mode");
-      const controlMode = controlModeNode ? controlModeNode.value : "normal";
+      const controlMode = controlModeNode ? controlModeNode.value : "factor_only";
+      const scapExitStageNode = document.getElementById("scap_exit_stage");
+      const scapExitStage = scapExitStageNode ? scapExitStageNode.value : "E4";
+      const scapLossStopNode = document.getElementById("scap_loss_stop");
+      const scapLossStop = scapLossStopNode ? scapLossStopNode.value.trim() : "-0.12";
       const strategyLogicNode = document.getElementById("strategy_logic_version");
-      const strategyLogicVersion = strategyLogicNode ? strategyLogicNode.value : "production_v1";
+      const strategyLogicVersion = strategyLogicNode ? strategyLogicNode.value : "mainline_v3_cabinet_native";
+      const monthlyWeightNode = document.getElementById("monthly_lgbm_maximum_weight");
+      const monthlyLgbmMaximumWeight = monthlyWeightNode ? monthlyWeightNode.value.trim() : "0.20";
+      const benchmarkTopNNode = document.getElementById("performance_benchmark_top_n");
+      const performanceBenchmarkTopN = benchmarkTopNNode ? benchmarkTopNNode.value : "100";
+      const benchmarkRebalanceNode = document.getElementById("performance_benchmark_rebalance");
+      const performanceBenchmarkRebalance = benchmarkRebalanceNode ? benchmarkRebalanceNode.value : "monthly";
       const alphaBundleNode = document.getElementById("governance_alpha_bundle");
       let alphaBundle = alphaBundleNode ? alphaBundleNode.value : "diversified_pre_screen_bundle_v2";
       const factorSourceNode = document.getElementById("governance_factor_source");
@@ -528,7 +711,7 @@ RUN_HTML = """<!doctype html>
       const cabinetNode = document.getElementById("factor_cabinet_run_id");
       const cabinetRunId = cabinetNode ? cabinetNode.value : "";
       const cabinetPath = cabinetNode && cabinetNode.selectedOptions.length ? (cabinetNode.selectedOptions[0].dataset.path || "") : "";
-      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "orderflow_parameter_research" || task === "pit_level1_audit" || task === "pit_level2_audit" || task === "pit_level2_build" || task === "registered_mainline_v2_suite");
+      const touchesGovernance = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "orderflow_parameter_research" || task === "pit_level1_audit" || task === "pit_level1_build" || task === "pit_index_membership_build" || task === "pit_level2_audit" || task === "pit_level2_build" || task === "registered_mainline_v2_suite");
       const requiresUniverse = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "fast_factor_judge" || task === "factor_appeal_judge" || task === "orderflow_parameter_research" || task === "registered_mainline_v2_suite");
       const requiresFactorSource = tasks.some((task) => task === "governance_active" || task === "governance_mainline_review" || task === "governance_layer_validation" || task === "governance_layer_ablation_suite" || task === "factor_cabinet" || task === "factor_cabinet_prune" || task === "factor_cabinet_feature_cache" || task === "factor_cabinet_gap_report" || task === "registered_mainline_v2_suite");
       if (tasks.some((task) => task === "governance_layer_validation")) {
@@ -540,20 +723,38 @@ RUN_HTML = """<!doctype html>
       if (requiresFactorSource && factorSource === "selected_factor_cabinet" && !cabinetRunId) {
         throw new Error("selected_factor_cabinet requires an available factor cabinet run_id.");
       }
+      const preflightNode = document.getElementById("data_preflight");
+      if (requiresUniverse && preflightNode && preflightNode.dataset.status === "blocked") {
+        throw new Error(`运行前数据/PIT 预检未通过：${preflightNode.textContent}`);
+      }
       if (startMonth && endMonth && startMonth > endMonth) {
         throw new Error("开始月份不能晚于结束月份。");
+      }
+      const registeredWindow = VALIDATION_WINDOW_PRESETS[validationWindowPreset];
+      if (registeredWindow && maxDays !== registeredWindow.maxDays) {
+        throw new Error("验证窗口预设与最多交易日不一致；请选择“自定义”后再手工修改。");
+      }
+      if (["custom", "long_180"].includes(validationWindowPreset) && currentProfile() !== "full") {
+        throw new Error("不限天数和 180 日验证必须使用完整模式。");
       }
       return {
         universes,
         start_month: startMonth,
         end_month: endMonth,
         max_days: maxDays,
+        validation_window_preset: validationWindowPreset,
         fast_factor_max_count: fastFactorMaxCount,
         pit_mode: pitMode,
         research_max_runtime_seconds: researchMaxRuntimeSeconds,
+        index_a500_history_file: indexA500HistoryFile,
         shadow_portfolios: shadowPortfolios,
         control_mode: controlMode,
+        scap_exit_stage: scapExitStage,
+        scap_loss_stop: scapLossStop,
         strategy_logic_version: strategyLogicVersion,
+        monthly_lgbm_maximum_weight: monthlyLgbmMaximumWeight,
+        performance_benchmark_top_n: performanceBenchmarkTopN,
+        performance_benchmark_rebalance: performanceBenchmarkRebalance,
         alpha_bundle: alphaBundle,
         factor_source: factorSource,
         factor_cabinet_run_id: cabinetRunId,
@@ -573,7 +774,9 @@ RUN_HTML = """<!doctype html>
       const governance = payload && payload.governance ? payload.governance : {};
       const sourceText = governance.factor_source ? ` factor_source=${governance.factor_source}` : "";
       const runText = governance.factor_cabinet_run_id ? ` factor_cabinet_run_id=${governance.factor_cabinet_run_id}` : "";
-      status.textContent = (result.message || "已提交。") + sourceText + runText;
+      const windowText = governance.max_days ? ` max_days=${governance.max_days}` : "";
+      const logicText = governance.strategy_logic_version ? ` logic=${governance.strategy_logic_version}` : "";
+      status.textContent = (result.message || "已提交。") + sourceText + runText + windowText + logicText;
       if (response.ok) {
         startProgressPolling();
       }
@@ -597,7 +800,8 @@ RUN_HTML = """<!doctype html>
       const childName = data.child_task_name || data.step || "";
       document.getElementById("progress_task").textContent = childName || data.task_name || "等待任务";
       document.getElementById("progress_message").textContent = data.message || "等待任务写入进度";
-      document.getElementById("progress_status").textContent = String(data.status || "idle").toUpperCase();
+      const displayStatus = String(data.display_status || data.status || "idle").toUpperCase();
+      document.getElementById("progress_status").textContent = displayStatus;
       document.getElementById("progress_title").textContent = data.task_name === "interactive_task_suite" ? "所选任务总体进度" : (data.task_name || "运行进度");
       document.getElementById("progress_percent").textContent = `${percent.toFixed(1)}%`;
       document.getElementById("progress_fill").style.width = `${Math.max(0, Math.min(percent, 100))}%`;
@@ -605,7 +809,13 @@ RUN_HTML = """<!doctype html>
       document.getElementById("progress_count").textContent = data.current && data.total ? `${data.current} / ${data.total}` : "-";
       document.getElementById("progress_time").textContent = `${formatDuration(data.elapsed_seconds)} / ${formatDuration(data.eta_seconds)}`;
       document.getElementById("progress_updated").textContent = data.updated_at_text || "-";
-      document.getElementById("progress_detail").textContent = data.detail || (data.child_status ? `子任务状态：${data.child_status}` : "进度接口已连接");
+      let detailText = data.detail || (data.child_status ? `子任务状态：${data.child_status}` : "进度接口已连接");
+      if (data.owner_pid_alive === false && !["COMPLETE", "FAILED"].includes(displayStatus)) {
+        detailText = `任务进程已不存在；${detailText}`;
+      } else if (data.is_stale) {
+        detailText = `心跳已陈旧（${formatDuration(data.freshness_seconds)}未更新）；${detailText}`;
+      }
+      document.getElementById("progress_detail").textContent = detailText;
       const connection = document.getElementById("progress_connection");
       connection.textContent = "接口正常";
       connection.classList.remove("error");
@@ -639,7 +849,7 @@ RUN_HTML = """<!doctype html>
     }
     async function submitSelected() {
       const tasks = [];
-      ["main_pipeline", "governance_active", "governance_mainline_review", "governance_layer_validation", "governance_layer_ablation_suite", "fast_factor_judge", "factor_appeal_judge", "factor_cabinet", "factor_cabinet_prune", "factor_cabinet_feature_cache", "factor_cabinet_gap_report", "orderflow_parameter_research", "pit_level1_audit", "pit_level2_audit", "pit_level2_build", "registered_mainline_v2_suite"].forEach((id) => {
+      TASK_CHECKBOX_IDS.forEach((id) => {
         const node = document.getElementById(id);
         if (node && node.checked) tasks.push(id);
       });
@@ -786,7 +996,7 @@ RESULTS_HTML = """<!doctype html>
     }
     .controls {
       display: grid;
-      grid-template-columns: minmax(260px, 1fr) auto auto;
+      grid-template-columns: minmax(260px, 1fr) auto auto auto auto;
       gap: 12px;
       align-items: end;
     }
@@ -812,6 +1022,15 @@ RESULTS_HTML = """<!doctype html>
     button.secondary {
       background: #eadfca;
       color: var(--ink);
+    }
+    .product-button {
+      display: inline-block;
+      border-radius: 10px;
+      padding: 10px 14px;
+      color: white;
+      background: #246b9e;
+      text-decoration: none;
+      font-size: 14px;
     }
     .cards {
       display: grid;
@@ -900,6 +1119,8 @@ RESULTS_HTML = """<!doctype html>
         </div>
         <button class="secondary" onclick="loadRuns()">刷新列表</button>
         <button class="primary" onclick="loadDetail()">查看盈亏</button>
+        <a class="product-button" id="factor_link" href="#" target="_blank">逐因子曲线</a>
+        <a class="product-button" id="factor_workbook_link" href="#" target="_blank">下载因子Excel</a>
       </div>
       <div id="status"></div>
     </div>
@@ -925,6 +1146,9 @@ RESULTS_HTML = """<!doctype html>
         <div class="card"><div class="name">Range Grid Share</div><div class="value" id="range_grid_weight_share">-</div></div>
         <div class="card"><div class="name">Redundancy Ratio</div><div class="value" id="redundancy_flag_ratio">-</div></div>
         <div class="card"><div class="name">Trading Evidence</div><div class="value" id="has_trading_evidence">-</div></div>
+        <div class="card"><div class="name">ML Best Iteration</div><div class="value" id="ml_best_iteration">-</div></div>
+        <div class="card"><div class="name">ML Changed Top-K</div><div class="value" id="ml_changed_topk_days">-</div></div>
+        <div class="card"><div class="name">ML Incremental Alpha</div><div class="value" id="ml_incremental_alpha">-</div></div>
         <div class="card"><div class="name">Factor Passes</div><div class="value" id="factor_validation_pass_count">-</div></div>
         <div class="card"><div class="name">Portfolio Constraint</div><div class="value" id="portfolio_constraint_pass">-</div></div>
         <div class="card"><div class="name">Effective N</div><div class="value" id="account_effective_n">-</div></div>
@@ -1032,6 +1256,9 @@ RESULTS_HTML = """<!doctype html>
       setText("range_grid_weight_share", pct(summary.range_grid_weight_share), Number(summary.range_grid_weight_share || 0) > 0.35 ? "neg" : "");
       setText("redundancy_flag_ratio", pct(summary.redundancy_flag_ratio), Number(summary.redundancy_flag_ratio || 0) > 0.40 ? "neg" : "");
       setText("has_trading_evidence", evidenceText, evidenceClass);
+      setText("ml_best_iteration", textValue(summary.ml_best_iteration));
+      setText("ml_changed_topk_days", textValue(summary.ml_changed_topk_days));
+      setText("ml_incremental_alpha", pct(summary.ml_incremental_alpha), Number(summary.ml_incremental_alpha || 0));
       setText("factor_validation_pass_count", textValue(summary.factor_validation_pass_count));
       setText("portfolio_constraint_pass", constraintText, constraintClass);
       setText("account_effective_n", num(summary.account_effective_n));
@@ -1065,7 +1292,7 @@ RESULTS_HTML = """<!doctype html>
       data.runs.forEach((run) => {
         const opt = document.createElement("option");
         opt.value = run.key;
-        opt.textContent = `${run.strategy} | ${run.profile} | ${run.modified_time}`;
+        opt.textContent = `${run.strategy} | ${run.profile} | 保存:${run.save_status||"unknown"} | ${run.modified_time}`;
         select.appendChild(opt);
       });
       status.textContent = `找到 ${data.runs.length} 组回测结果。`;
@@ -1076,6 +1303,8 @@ RESULTS_HTML = """<!doctype html>
       if (!select.value) return;
       const status = document.getElementById("status");
       status.textContent = "正在汇总已平仓和未平仓盈亏...";
+      document.getElementById("factor_link").href = `/factors?key=${encodeURIComponent(select.value)}`;
+      document.getElementById("factor_workbook_link").href = `/factor-workbook?key=${encodeURIComponent(select.value)}`;
       const response = await fetch(`/api/result-detail?key=${encodeURIComponent(select.value)}`);
       const data = await response.json();
       if (!response.ok) {
@@ -1111,7 +1340,7 @@ RESULTS_HTML = """<!doctype html>
       renderStockRows(data.stock_summary || []);
       renderClosedRows(data.closed_trades || []);
       renderOpenRows(data.open_positions || []);
-      status.textContent = `当前结果：${data.run.strategy}，资金档位 ${data.run.profile}。`;
+      status.textContent = `当前结果：${data.run.strategy}，资金档位 ${data.run.profile}；保存状态 ${data.run.save_status||"unknown"} / ${data.run.save_stage||"--"}。`;
     }
     function renderStockRows(rows) {
       document.getElementById("stock_rows").innerHTML = rows.map((r) => {
@@ -1163,7 +1392,7 @@ RESULTS_HTML = """<!doctype html>
         data.runs.forEach((run) => {
           const opt = document.createElement("option");
           opt.value = run.key;
-          opt.textContent = `${run.strategy} | ${run.profile} | ${run.modified_time}`;
+          opt.textContent = `${run.strategy} | ${run.profile} | 保存:${run.save_status||"unknown"} | ${run.modified_time}`;
           select.appendChild(opt);
         });
         status.textContent = `找到 ${data.runs.length} 组回测结果。`;
@@ -1177,6 +1406,8 @@ RESULTS_HTML = """<!doctype html>
       if (!select.value) return;
       const status = document.getElementById("status");
       status.textContent = "正在汇总已平仓和未平仓盈亏...";
+      document.getElementById("factor_link").href = `/factors?key=${encodeURIComponent(select.value)}`;
+      document.getElementById("factor_workbook_link").href = `/factor-workbook?key=${encodeURIComponent(select.value)}`;
       try {
         const data = await fetchJsonWithTimeout(`/api/result-detail?key=${encodeURIComponent(select.value)}`, 30000);
         document.getElementById("summary_panel").style.display = "";
@@ -1208,7 +1439,7 @@ RESULTS_HTML = """<!doctype html>
         renderStockRows(data.stock_summary || []);
         renderClosedRows(data.closed_trades || []);
         renderOpenRows(data.open_positions || []);
-        status.textContent = `当前结果：${data.run.strategy}，资金档位 ${data.run.profile}。`;
+        status.textContent = `当前结果：${data.run.strategy}，资金档位 ${data.run.profile}；保存状态 ${data.run.save_status||"unknown"} / ${data.run.save_stage||"--"}。`;
       } catch (err) {
         status.textContent = `读取盈亏明细失败：${err.message || err}`;
       }
@@ -1222,9 +1453,92 @@ RESULTS_HTML = """<!doctype html>
 
 def _write_selection(state_path: Path, payload: dict) -> None:
     payload = _sanitize_selection_payload(payload)
+    _atomic_write_json(state_path, payload)
+
+
+def _atomic_write_json(state_path: Path, payload: dict) -> None:
     tmp_path = state_path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp_path.replace(state_path)
+
+
+def _worker_log_paths(state_path: Path) -> tuple[Path, Path]:
+    log_dir = Path(__file__).resolve().parent / "reports" / "interactive_workers"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"worker_{stamp}_{os.getpid()}"
+    return log_dir / f"{stem}.stdout.log", log_dir / f"{stem}.stderr.log"
+
+
+def _visible_worker_console_enabled() -> bool:
+    """Open delegated Windows workers in a real console unless explicitly disabled."""
+    configured = str(
+        os.environ.get("TDX_WEB_VISIBLE_WORKER_CONSOLE", "1")
+    ).strip().lower()
+    return os.name == "nt" and configured not in {"0", "false", "no", "off"}
+
+
+def _start_interactive_worker(state_path: Path, selection: dict) -> dict:
+    worker_selection_path = state_path.with_name(
+        f"{state_path.stem}_worker_{time.time_ns()}.json"
+    )
+    _atomic_write_json(worker_selection_path, selection)
+    stdout_path, stderr_path = _worker_log_paths(state_path)
+    main_script = Path(__file__).with_name("main.py")
+    visible_console = _visible_worker_console_enabled()
+    if visible_console:
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        stdin_target = None
+        stdout_target = None
+        stderr_target = None
+        worker_environment = dict(os.environ)
+        worker_environment["TDX_INTERACTIVE_VISIBLE_WORKER"] = "1"
+        stdout_handle = None
+        stderr_handle = None
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        stdin_target = subprocess.DEVNULL
+        worker_environment = None
+        stdout_handle = stdout_path.open("w", encoding="utf-8")
+        stderr_handle = stderr_path.open("w", encoding="utf-8")
+        stdout_target = stdout_handle
+        stderr_target = stderr_handle
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(main_script),
+                "--interactive-selection-file",
+                str(worker_selection_path),
+            ],
+            cwd=str(main_script.parent),
+            stdin=stdin_target,
+            stdout=stdout_target,
+            stderr=stderr_target,
+            creationflags=creationflags,
+            env=worker_environment,
+        )
+    except Exception:
+        try:
+            worker_selection_path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if stdout_handle is not None:
+            stdout_handle.close()
+        if stderr_handle is not None:
+            stderr_handle.close()
+    return {
+        "process": process,
+        "pid": int(process.pid),
+        "selection_path": str(worker_selection_path),
+        "stdout_path": "" if visible_console else str(stdout_path),
+        "stderr_path": "" if visible_console else str(stderr_path),
+        "console_mode": "visible_interruptible" if visible_console else "background_logged",
+        "started_at": time.time(),
+    }
 
 
 def _sanitize_selection_payload(payload: dict) -> dict:
@@ -1246,10 +1560,56 @@ def _sanitize_selection_payload(payload: dict) -> dict:
             if task in ALLOWED_INTERACTIVE_TASKS
         ]
         tasks = list(dict.fromkeys(tasks))
+    allow_multi_task = bool(clean.get("allow_multi_task", False))
+    # Historical membership is a prerequisite. A restored browser can submit
+    # it together with an old governance checkbox; preflighting against the old
+    # incomplete table would otherwise block the very task that repairs it.
+    if not allow_multi_task and "pit_index_membership_build" in tasks and len(tasks) > 1:
+        tasks = ["pit_index_membership_build"]
+        clean["sanitized_task_note"] = "isolated_pit_index_membership_build_from_stale_multi_task_selection"
     governance = clean.get("governance", {})
     if governance is not None and not isinstance(governance, dict):
         raise ValueError("Selection governance settings must be a JSON object.")
     governance = governance or {}
+    benchmark_top_n = str(governance.get("performance_benchmark_top_n") or "100").strip()
+    if benchmark_top_n not in {"50", "100", "300"}:
+        raise ValueError("performance_benchmark_top_n must be 50, 100, or 300")
+    benchmark_rebalance = str(
+        governance.get("performance_benchmark_rebalance") or "monthly"
+    ).strip().lower()
+    if benchmark_rebalance not in {"daily", "weekly", "monthly"}:
+        raise ValueError("performance_benchmark_rebalance must be daily, weekly, or monthly")
+    governance["performance_benchmark_top_n"] = benchmark_top_n
+    governance["performance_benchmark_rebalance"] = benchmark_rebalance
+    scap_exit_stage = str(governance.get("scap_exit_stage") or "E4").strip().upper()
+    if scap_exit_stage not in {"E0", "E1", "E2", "E3", "E4"}:
+        raise ValueError(f"Unsupported SCAP exit stage: {scap_exit_stage!r}")
+    scap_loss_stop = float(governance.get("scap_loss_stop") or -0.12)
+    if not -0.50 <= scap_loss_stop <= -0.01:
+        raise ValueError("SCAP loss stop must be between -0.50 and -0.01")
+    governance["scap_exit_stage"] = scap_exit_stage
+    governance["scap_loss_stop"] = scap_loss_stop
+    if str(governance.get("control_mode") or "").strip().lower() == "aggressive_profit":
+        logic = str(governance.get("strategy_logic_version") or "").strip().lower()
+        if not logic.startswith("mainline_v3"):
+            raise ValueError("SCAP aggressive_profit requires a mainline_v3 strategy")
+    clean["governance"] = governance
+    validation_preset = str(governance.get("validation_window_preset") or "").strip()
+    if validation_preset:
+        if validation_preset not in VALIDATION_WINDOW_PRESETS:
+            raise ValueError(f"Unsupported validation window preset: {validation_preset!r}")
+        max_days = str(governance.get("max_days") or "").strip()
+        expected_days = VALIDATION_WINDOW_PRESETS[validation_preset]
+        expected_text = "" if expected_days is None else str(expected_days)
+        if max_days != expected_text:
+            raise ValueError(
+                f"Validation preset {validation_preset} requires max_days={expected_text!r}, got {max_days!r}"
+            )
+        if (
+            validation_preset in {"custom", "long_180"}
+            and str(clean.get("profile") or "full").strip().lower() != "full"
+        ):
+            raise ValueError(f"Validation preset {validation_preset} requires full profile")
     if set(tasks) & TASKS_REQUIRING_FACTOR_SOURCE:
         factor_source = str(governance.get("factor_source") or "").strip()
         if factor_source not in FACTOR_SOURCE_CHOICES:
@@ -1259,7 +1619,22 @@ def _sanitize_selection_payload(payload: dict) -> dict:
             and not str(governance.get("factor_cabinet_run_id") or "").strip()
         ):
             raise ValueError("selected_factor_cabinet requires factor_cabinet_run_id")
-    allow_multi_task = bool(clean.get("allow_multi_task", False))
+    execution_tasks = {
+        "governance_active", "governance_mainline_review", "governance_layer_validation",
+        "governance_layer_ablation_suite", "registered_mainline_v2_suite",
+    }
+    start_month = str(governance.get("start_month") or "").strip()
+    end_month = str(governance.get("end_month") or "").strip()
+    if set(tasks) & execution_tasks and start_month and end_month:
+        preflight = _governance_preflight(
+            start_month,
+            end_month,
+            max_days=governance.get("max_days"),
+            universe_ids=governance.get("universes"),
+            pit_mode=governance.get("pit_mode", "research"),
+        )
+        if preflight["status"] != "pass":
+            raise ValueError("governance preflight blocked: " + "; ".join(preflight["reasons"]))
     # Mainline review and the enhanced diagnostic suite are both long governance
     # jobs. If a stale browser page or checkbox state submits both, prefer the
     # explicitly requested mainline review unless the user clicked "run all".
@@ -1350,8 +1725,11 @@ def _render_factor_cabinet_options() -> str:
 
 
 def _select_default_factor_cabinet_run(rows: list[dict]) -> tuple[str, str]:
-    """Prefer the newest PIT-augmented lineage, then the pinned safe base."""
+    """Pin the controlled SCAP baseline cabinet before newer research lineages."""
     payloads = _factor_cabinet_payloads(rows)
+    available = {str(row.get("run_id") or "") for row in rows}
+    if DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID in available:
+        return DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID, "controlled_scap_baseline"
 
     def belongs_to_augmented_lineage(run_id: str, seen: set[str] | None = None) -> bool:
         visited = set(seen or ())
@@ -1376,9 +1754,6 @@ def _select_default_factor_cabinet_run(rows: list[dict]) -> tuple[str, str]:
         run_id = str(row.get("run_id") or "")
         if belongs_to_augmented_lineage(run_id):
             return run_id, "latest_pit_augmented"
-    available = {str(row.get("run_id") or "") for row in rows}
-    if DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID in available:
-        return DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID, "safe_base_fallback"
     return DEFAULT_SELECTED_FACTOR_CABINET_RUN_ID, "configured_default_missing"
 
 
@@ -1402,6 +1777,89 @@ def _render_run_html() -> str:
     return RUN_HTML.replace("__FACTOR_CABINET_OPTIONS__", _render_factor_cabinet_options())
 
 
+def _parquet_date_bounds(path: Path, column: str = "date") -> tuple[str, str]:
+    if not path.exists():
+        return "", ""
+    import pyarrow.parquet as pq
+    import pandas as pd
+
+    parquet = pq.ParquetFile(path)
+    column_index = parquet.schema_arrow.names.index(column)
+    minima = []
+    maxima = []
+    for row_group in range(parquet.metadata.num_row_groups):
+        stats = parquet.metadata.row_group(row_group).column(column_index).statistics
+        if stats is not None and stats.has_min_max:
+            minima.append(stats.min)
+            maxima.append(stats.max)
+    if not minima:
+        values = pq.read_table(path, columns=[column]).column(column).to_pandas()
+        return str(values.min().date()), str(values.max().date())
+    return str(pd.Timestamp(min(minima)).date()), str(pd.Timestamp(max(maxima)).date())
+
+
+def _governance_preflight(
+    start_month: str,
+    end_month: str,
+    *,
+    max_days=None,
+    universe_ids=None,
+    pit_mode: str = "research",
+) -> dict:
+    import pandas as pd
+    from config import FEATURE_DAILY_PARQUET
+    from functions.data.trading_calendar import bounded_observed_feature_end, first_observed_feature_session
+    from functions.investable_universe import (
+        load_index_constituents,
+        validate_constituent_temporal_contract,
+        validate_pit_membership_manifest_coverage,
+    )
+
+    start = pd.Timestamp(f"{start_month}-01")
+    year, month = (int(value) for value in end_month.split("-"))
+    requested_end = pd.Timestamp(year=year, month=month, day=calendar.monthrange(year, month)[1])
+    parsed_max_days = pd.to_numeric(pd.Series([max_days]), errors="coerce").iloc[0]
+    parsed_max_days = int(parsed_max_days) if pd.notna(parsed_max_days) else None
+    effective_end = bounded_observed_feature_end(
+        FEATURE_DAILY_PARQUET,
+        start,
+        requested_end,
+        parsed_max_days,
+    )
+    feature_min, feature_max = _parquet_date_bounds(Path(FEATURE_DAILY_PARQUET))
+    reasons = []
+    if not feature_max:
+        reasons.append("特征数据不存在")
+    elif pd.Timestamp(feature_max) < effective_end:
+        reasons.append(f"有效结束日 {effective_end.date()} 晚于数据截止日 {feature_max}")
+    constituents = load_index_constituents()
+    temporal = validate_constituent_temporal_contract(
+        constituents, start_date=start, end_date=effective_end
+    )
+    blocked = temporal[temporal["status"].astype(str).eq("blocked")]
+    reasons.extend(blocked["reason"].astype(str).drop_duplicates().tolist())
+    membership_coverage = validate_pit_membership_manifest_coverage(
+        start_date=first_observed_feature_session(FEATURE_DAILY_PARQUET, start, effective_end),
+        end_date=effective_end,
+    )
+    if membership_coverage["status"] != "pass":
+        reasons.append(str(membership_coverage["reason"]))
+    return {
+        "status": "blocked" if reasons else "pass",
+        "requested_start": str(start.date()),
+        "requested_end": str(requested_end.date()),
+        "effective_end": str(effective_end.date()),
+        "max_days": parsed_max_days,
+        "universe_ids": list(universe_ids or []),
+        "pit_mode": str(pit_mode or "research"),
+        "feature_date_min": feature_min,
+        "feature_date_max": feature_max,
+        "constituent_status": "blocked" if not blocked.empty else "pass",
+        "constituent_coverage": membership_coverage,
+        "reasons": reasons,
+    }
+
+
 def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
     handler.send_response(302)
     handler.send_header("Location", location)
@@ -1410,16 +1868,29 @@ def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
 
 
 def _read_csv_rows(path: Path) -> list[dict]:
-    if not path.exists() or path.stat().st_size <= 0:
+    resolved = str(Path(path).resolve())
+    readable_path = (
+        resolved if os.name != "nt" or resolved.startswith("\\\\?\\")
+        else "\\\\?\\" + resolved
+    )
+    if not os.path.exists(readable_path) or os.path.getsize(readable_path) <= 0:
         return []
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        with open(readable_path, "r", encoding="utf-8-sig", newline="") as handle:
             return list(csv.DictReader(handle))
     except UnicodeDecodeError:
-        with path.open("r", encoding="utf-8", newline="") as handle:
+        with open(readable_path, "r", encoding="utf-8", newline="") as handle:
             return list(csv.DictReader(handle))
     except Exception:
         return []
+
+
+def _read_json_dict(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def _result_identity(result_stem: str) -> tuple[str, str]:
@@ -1476,6 +1947,14 @@ def _discover_result_runs() -> list[dict]:
         control_loss_path = run_dir / "governance_control_avoided_loss_summary.csv"
         trade_rel = trade_path.relative_to(results_dir).as_posix()
         strategy, profile = _governance_result_identity(run_dir, results_dir)
+        artifact_manifest = _read_json_dict(run_dir / "artifact_manifest.json")
+        completion = _read_json_dict(run_dir / "COMPLETE.json")
+        save_status = str(
+            artifact_manifest.get(
+                "status",
+                "complete" if completion.get("status") == "complete" else "legacy_unknown",
+            )
+        )
         modified = max(
             [
                 path.stat().st_mtime
@@ -1510,6 +1989,53 @@ def _discover_result_runs() -> list[dict]:
                 "metrics_file": summary_path.name if summary_path.exists() else "",
                 "modified": modified,
                 "modified_time": _format_timestamp(modified),
+                "save_status": save_status,
+                "save_stage": str(artifact_manifest.get("stage", "")),
+                "core_complete": bool(artifact_manifest.get("core_complete", False)),
+                "audit_complete": bool(artifact_manifest.get("audit_complete", False)),
+                "web_complete": bool(artifact_manifest.get("web_complete", False)),
+                "save_error": str(artifact_manifest.get("error", "")),
+            }
+        )
+    discovered_governance_dirs = {
+        (results_dir / run["trade_rel"]).parent.resolve()
+        for run in runs
+        if run.get("kind") == "governance" and run.get("trade_rel")
+    }
+    for artifact_path in results_dir.rglob("artifact_manifest.json"):
+        run_dir = artifact_path.parent
+        if "_archive" in artifact_path.relative_to(results_dir).parts:
+            continue
+        if run_dir.resolve() in discovered_governance_dirs:
+            continue
+        manifest = _read_json_dict(artifact_path)
+        if manifest.get("schema_version") != "governance_artifact_manifest_v1":
+            continue
+        artifact_rel = artifact_path.relative_to(results_dir).as_posix()
+        strategy, profile = _governance_result_identity(run_dir, results_dir)
+        modified = artifact_path.stat().st_mtime
+        runs.append(
+            {
+                "key": quote(artifact_rel, safe=""),
+                "result_ref": artifact_rel,
+                "result_stem": artifact_rel,
+                "strategy": strategy,
+                "profile": profile,
+                "kind": "governance_partial",
+                "trade_rel": "",
+                "open_rel": "",
+                "manifest_rel": artifact_rel,
+                "trade_file": "",
+                "open_file": "",
+                "metrics_file": "",
+                "modified": modified,
+                "modified_time": _format_timestamp(modified),
+                "save_status": str(manifest.get("status", "unknown")),
+                "save_stage": str(manifest.get("stage", "")),
+                "core_complete": bool(manifest.get("core_complete", False)),
+                "audit_complete": bool(manifest.get("audit_complete", False)),
+                "web_complete": bool(manifest.get("web_complete", False)),
+                "save_error": str(manifest.get("error", "")),
             }
         )
     for manifest_path in results_dir.rglob("fast_factor_judge_manifest.csv"):
@@ -1628,7 +2154,11 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
     results_dir = _results_dir()
     if run.get("kind") == "fast_factor_judge":
         return _fast_factor_judge_detail(run, results_dir), 200
-    trade_rows = _read_csv_rows(results_dir / run.get("trade_rel", ""))
+    trade_rows = (
+        _read_csv_rows(results_dir / run.get("trade_rel", ""))
+        if run.get("trade_rel")
+        else []
+    )
     open_rows = _read_csv_rows(results_dir / run.get("open_rel", "")) if run.get("open_rel") else []
     control_loss_rows = []
     governance_research_rows = {}
@@ -1643,6 +2173,10 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
             "trading_evidence": _read_csv_rows(run_dir / "governance_trading_evidence_report.csv"),
             "factor_validation": _read_csv_rows(run_dir / "governance_factor_validation_report.csv"),
             "portfolio_constraints": _read_csv_rows(run_dir / "governance_portfolio_constraint_report.csv"),
+            "ml_training": _read_csv_rows(run_dir / "governance_monthly_lgbm_training_audit.csv"),
+            "ml_treatment_daily": _read_csv_rows(run_dir / "governance_monthly_lgbm_treatment_daily.csv"),
+            "ml_treatment_effect": _read_csv_rows(run_dir / "governance_monthly_lgbm_treatment_effect.csv"),
+            "v31_reliability": _read_csv_rows(run_dir / "governance_v31_rolling_reliability_audit.csv"),
         }
     latest_holding_by_symbol: dict[str, dict] = {}
     if run.get("kind") == "governance" and run.get("trade_rel"):
@@ -1773,11 +2307,39 @@ def _result_detail(result_key: str) -> tuple[dict, int]:
     }
     return {
         "run": run,
+        "artifact_manifest": (
+            _read_json_dict(
+                (
+                    (results_dir / run["trade_rel"]).parent
+                    if run.get("trade_rel")
+                    else (results_dir / run.get("manifest_rel", "")).parent
+                )
+                / "artifact_manifest.json"
+            )
+            if run.get("kind") in {"governance", "governance_partial"}
+            else {}
+        ),
         "summary": summary,
         "stock_summary": stock_rows,
         "closed_trades": closed_trades,
         "open_positions": open_positions,
     }, 200
+
+
+def _factor_product_dir(result_key: str) -> Path:
+    result_ref = unquote(result_key or "")
+    available = {run["result_ref"]: run for run in _discover_result_runs()}
+    if result_ref not in available:
+        raise KeyError("未找到所选运行。")
+    run = available[result_ref]
+    trade_rel = str(run.get("trade_rel", "") or "")
+    if not trade_rel.endswith("governance_trade_pairs.csv"):
+        raise ValueError("所选结果不是支持逐因子持仓曲线的治理运行。")
+    from functions.decision_council.holding_factor_products import (
+        FACTOR_PRODUCT_DIRNAME,
+    )
+
+    return (_results_dir() / trade_rel).parent / FACTOR_PRODUCT_DIRNAME
 
 
 def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
@@ -1821,6 +2383,10 @@ def _fast_factor_judge_detail(run: dict, results_dir: Path) -> dict:
         "account_effective_n": _safe_optional_float(manifest.get("symbol_count")),
         "top1_account_weight": None,
         "top5_account_weight_sum": None,
+        "ml_best_iteration": None,
+        "ml_changed_topk_days": 0,
+        "ml_incremental_alpha": None,
+        "v31_reliability_blend": None,
         "promote_candidate_count": verdict_counts.get("promote_candidate", 0),
         "watchlist_count": verdict_counts.get("watchlist", 0),
         "reject_or_rework_count": verdict_counts.get("reject_or_rework", 0),
@@ -1936,6 +2502,26 @@ def _governance_research_summary_from_rows(rows_by_report: dict[str, list[dict]]
         summary["trading_evidence_block_reason"] = str(latest_evidence.get("block_reason") or "")
         summary["trading_evidence_avg_exposure"] = _safe_optional_float(latest_evidence.get("avg_actual_exposure"))
 
+    training_rows = rows_by_report.get("ml_training") or []
+    trained_rows = [row for row in training_rows if _safe_optional_int(row.get("best_iteration"))]
+    if trained_rows:
+        summary["ml_best_iteration"] = _safe_optional_int(trained_rows[-1].get("best_iteration"))
+    treatment_daily = rows_by_report.get("ml_treatment_daily") or []
+    summary["ml_changed_topk_days"] = sum(
+        1 for row in treatment_daily if _safe_optional_bool(row.get("ml_changed_top_k")) is True
+    )
+    treatment_effect = rows_by_report.get("ml_treatment_effect") or []
+    incremental = []
+    for row in treatment_effect:
+        value = _safe_optional_float(row.get("ml_incremental_top_k_net_alpha"))
+        if value is not None and _safe_float(row.get("treated_candidate_count")) > 0:
+            incremental.append(value)
+    if incremental:
+        summary["ml_incremental_alpha"] = sum(incremental) / len(incremental)
+    reliability_rows = rows_by_report.get("v31_reliability") or []
+    if reliability_rows:
+        summary["v31_reliability_blend"] = _safe_optional_float(reliability_rows[-1].get("reliability_blend"))
+
     validation_rows = rows_by_report.get("factor_validation") or []
     if validation_rows and summary["factor_validation_pass_count"] is None:
         summary["factor_validation_pass_count"] = sum(1 for row in validation_rows if _safe_optional_bool(row.get("pass_flag")) is True)
@@ -1988,12 +2574,15 @@ def _pick_port() -> int:
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        print("Usage: main_launcher_web.py <selection_json_path>")
+        print("Usage: main_launcher_web.py <selection_json_path> [--spawn-worker]")
         return 1
 
     state_path = Path(argv[1])
+    spawn_worker = "--spawn-worker" in argv[2:]
     stop_event = threading.Event()
     shutdown_scheduled = {"done": False}
+    worker_state: dict = {}
+    worker_lock = threading.Lock()
 
     def schedule_shutdown(delay_seconds: float = 3.0) -> None:
         if shutdown_scheduled["done"]:
@@ -2020,8 +2609,130 @@ def main(argv: list[str]) -> int:
             if parsed.path == "/run":
                 _html_response(self, _render_run_html())
                 return
+            if parsed.path == "/api/health":
+                with worker_lock:
+                    worker_pid = worker_state.get("pid")
+                    worker_process = worker_state.get("process")
+                    worker_console_mode = worker_state.get("console_mode", "")
+                    worker_exit_code = (
+                        worker_process.poll() if worker_process is not None else None
+                    )
+                _json_response(self, {
+                    "status": "ok",
+                    "host": "127.0.0.1",
+                    "port": int(port),
+                    "launcher_pid": os.getpid(),
+                    "run_path": "/run",
+                    "results_path": "/results",
+                    "submit_path": "/submit",
+                    "progress_path": "/api/progress",
+                    "worker_mode": bool(spawn_worker),
+                    "worker_pid": worker_pid,
+                    "worker_exit_code": worker_exit_code,
+                    "worker_console_mode": worker_console_mode,
+                })
+                return
+            if parsed.path == "/api/governance-preflight":
+                try:
+                    query = parse_qs(parsed.query)
+                    start_month = str(query.get("start_month", ["2025-01"])[0])
+                    end_month = str(query.get("end_month", ["2026-05"])[0])
+                    max_days = str(query.get("max_days", [""])[0]).strip() or None
+                    universes = [
+                        value for value in str(query.get("universes", [""])[0]).split(",") if value
+                    ]
+                    pit_mode = str(query.get("pit_mode", ["research"])[0])
+                    _json_response(self, _governance_preflight(
+                        start_month,
+                        end_month,
+                        max_days=max_days,
+                        universe_ids=universes,
+                        pit_mode=pit_mode,
+                    ))
+                except Exception as exc:
+                    _json_response(self, {"status": "blocked", "message": f"preflight failed: {exc}"}, status=400)
+                return
             if parsed.path == "/results":
                 _html_response(self, RESULTS_HTML)
+                return
+            if parsed.path == "/factors":
+                from functions.decision_council.factor_curve_web import (
+                    HTML as FACTOR_CURVE_HTML,
+                )
+
+                _html_response(self, FACTOR_CURVE_HTML)
+                return
+            if parsed.path == "/api/meta":
+                try:
+                    key = parse_qs(parsed.query).get("key", [""])[0]
+                    data_dir = _factor_product_dir(key)
+                    from functions.decision_council.factor_curve_web import FactorStore
+
+                    _json_response(self, FactorStore(data_dir).meta())
+                except Exception as exc:
+                    _json_response(
+                        self,
+                        {"message": f"逐因子产品尚不可用：{exc}"},
+                        status=404,
+                    )
+                return
+            if parsed.path == "/api/series":
+                try:
+                    query = parse_qs(parsed.query)
+                    key = query.get("key", [""])[0]
+                    store = __import__(
+                        "functions.decision_council.factor_curve_web",
+                        fromlist=["FactorStore"],
+                    ).FactorStore(_factor_product_dir(key))
+                    symbol = str(query.get("symbol", [store.symbols[0]])[0])
+                    metric = str(
+                        query.get("metric", ["predicted_return_5d"])[0]
+                    )
+                    factors = [
+                        value
+                        for value in str(query.get("factors", [""])[0]).split("|")
+                        if value
+                    ]
+                    if symbol not in store.symbols:
+                        raise KeyError(f"未知股票：{symbol}")
+                    _json_response(
+                        self,
+                        store.series(symbol, metric, factors),
+                    )
+                except Exception as exc:
+                    _json_response(
+                        self,
+                        {"message": f"逐因子序列读取失败：{exc}"},
+                        status=404,
+                    )
+                return
+            if parsed.path == "/factor-workbook":
+                try:
+                    key = parse_qs(parsed.query).get("key", [""])[0]
+                    from functions.decision_council.holding_factor_products import (
+                        FACTOR_WORKBOOK_NAME,
+                    )
+
+                    workbook_path = _factor_product_dir(key) / FACTOR_WORKBOOK_NAME
+                    body = workbook_path.read_bytes()
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                    self.send_header(
+                        "Content-Disposition",
+                        'attachment; filename="SCAP_holding_factor_curves.xlsx"',
+                    )
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as exc:
+                    _json_response(
+                        self,
+                        {"message": f"逐因子Excel尚不可用：{exc}"},
+                        status=404,
+                    )
                 return
             if parsed.path == "/api/results":
                 try:
@@ -2041,9 +2752,47 @@ def main(argv: list[str]) -> int:
                 try:
                     from functions.runtime_progress import read_progress
 
-                    progress = read_progress(owner_pid=os.getppid())
+                    with worker_lock:
+                        worker_pid = worker_state.get("pid")
+                        worker_process = worker_state.get("process")
+                        worker_stdout = worker_state.get("stdout_path", "")
+                        worker_stderr = worker_state.get("stderr_path", "")
+                        worker_console_mode = worker_state.get("console_mode", "")
+                    progress_owner_pid = worker_pid or os.getppid()
+                    progress = read_progress(owner_pid=progress_owner_pid)
+                    exit_code = (
+                        worker_process.poll() if worker_process is not None else None
+                    )
+                    if worker_pid:
+                        progress["worker_pid"] = worker_pid
+                        progress["worker_stdout_path"] = worker_stdout
+                        progress["worker_stderr_path"] = worker_stderr
+                        progress["worker_console_mode"] = worker_console_mode
+                    if (
+                        worker_pid
+                        and exit_code is not None
+                        and str(progress.get("status", "")).lower()
+                        not in {"complete", "failed", "interrupted"}
+                    ):
+                        progress.update(
+                            {
+                                "status": "failed",
+                                "display_status": "failed",
+                                "owner_pid_alive": False,
+                                "worker_exit_code": int(exit_code),
+                                "message": (
+                                    "独立worker已经退出，但没有写入完成标记；"
+                                    f"exit_code={exit_code}"
+                                ),
+                                "detail": (
+                                    f"stderr={worker_stderr}; stdout={worker_stdout}"
+                                ),
+                            }
+                        )
                     _json_response(self, progress)
                     if (
+                        not spawn_worker
+                        and
                         str(progress.get("task_name", "")) == "interactive_task_suite"
                         and str(progress.get("status", "")).lower() in {"complete", "failed"}
                     ):
@@ -2082,10 +2831,57 @@ def main(argv: list[str]) -> int:
             raw = self.rfile.read(length)
             try:
                 payload = json.loads(raw.decode("utf-8"))
-                _write_selection(state_path, payload)
+                selection = _sanitize_selection_payload(payload)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 _json_response(self, {"message": f"Invalid selection request: {exc}"}, status=400)
                 return
+            if spawn_worker:
+                with worker_lock:
+                    existing = worker_state.get("process")
+                    if existing is not None and existing.poll() is None:
+                        _json_response(
+                            self,
+                            {
+                                "message": (
+                                    "已有独立worker正在运行，禁止重复提交。"
+                                ),
+                                "worker_pid": worker_state.get("pid"),
+                            },
+                            status=409,
+                        )
+                        return
+                    try:
+                        started = _start_interactive_worker(state_path, selection)
+                    except Exception as exc:
+                        _json_response(
+                            self,
+                            {"message": f"独立worker启动失败：{exc}"},
+                            status=500,
+                        )
+                        return
+                    worker_state.clear()
+                    worker_state.update(started)
+                    notification = dict(selection)
+                    notification["_worker_delegated"] = True
+                    notification["_worker_pid"] = started["pid"]
+                    notification["_worker_stdout_path"] = started["stdout_path"]
+                    notification["_worker_stderr_path"] = started["stderr_path"]
+                    notification["_worker_console_mode"] = started["console_mode"]
+                    _atomic_write_json(state_path, notification)
+                _json_response(
+                    self,
+                    {
+                        "message": (
+                            "任务已提交给独立worker；Spyder现在可以恢复响应或关闭。"
+                        ),
+                        "worker_pid": started["pid"],
+                        "stdout_path": started["stdout_path"],
+                        "stderr_path": started["stderr_path"],
+                        "console_mode": started["console_mode"],
+                    },
+                )
+                return
+            _write_selection(state_path, selection)
             _json_response(self, {"message": "选择已记录，可以关闭本页面。"})
 
         def log_message(self, format, *args):
@@ -2096,10 +2892,13 @@ def main(argv: list[str]) -> int:
     results_url = f"http://127.0.0.1:{port}/results"
     print(f"运行配置页地址: {run_url}")
     print(f"回测结果页地址: {results_url}")
-    try:
-        opened = webbrowser.open(run_url, new=1)
-    except Exception:
-        opened = False
+    if str(os.environ.get("TDX_WEB_NO_BROWSER", "")).strip().lower() in {"1", "true", "yes"}:
+        opened = True
+    else:
+        try:
+            opened = webbrowser.open(run_url, new=1)
+        except Exception:
+            opened = False
     if not opened:
         print("浏览器没有自动打开，请手动打开上面的两个地址。")
 

@@ -471,7 +471,7 @@ def _plot_overview(plt, summary: pd.DataFrame, path: Path) -> None:
     metrics = [
         ("total_return", "Account Return"),
         ("holding_portfolio_return", "Holding Return"),
-        ("benchmark_excess_return", "Top30 Excess"),
+        ("benchmark_excess_return", "Top-Pool Excess"),
         ("buy_expectancy_10d", "Buy Exp 10D"),
         ("max_drawdown", "Max DD"),
         ("max_risk_contribution_observed", "Max Risk Contr."),
@@ -581,7 +581,7 @@ def _plot_incremental(plt, increments: pd.DataFrame, path: Path) -> None:
     metrics = [
         ("buy_expectancy_10d_delta_vs_core_base", "Buy Exp 10D Delta"),
         ("holding_portfolio_return_delta_vs_core_base", "Holding Return Delta"),
-        ("benchmark_excess_return_delta_vs_core_base", "Top30 Excess Delta"),
+        ("benchmark_excess_return_delta_vs_core_base", "Top-Pool Excess Delta"),
         ("max_risk_contribution_observed_delta_vs_core_base", "Risk Contribution Delta"),
     ]
     fig, axes = plt.subplots(2, 2, figsize=(18, 9))

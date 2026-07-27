@@ -86,10 +86,11 @@ def check_run_single_experiment_progress_hooks() -> None:
         *,
         alpha_models,
         allowed_instrument_types,
+        governance_control_mode="normal",
         factor_spec=None,
         progress_callback=None,
     ):
-        _ = factor_spec
+        _ = factor_spec, governance_control_mode
         progress_callback(
             {
                 "percent": 32.0,

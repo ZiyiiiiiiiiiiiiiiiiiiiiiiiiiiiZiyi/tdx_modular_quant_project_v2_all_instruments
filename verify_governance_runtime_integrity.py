@@ -17,11 +17,28 @@ def main() -> int:
         }
     ])
     account = pd.DataFrame([{"reconciliation_error": 0.0}])
-    audit = build_runtime_integrity_audit(execution_ledger=execution, account_audit=account)
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2024-01-03",
+                "actual_exposure": 0.20,
+                "effective_target_exposure_cap": 0.50,
+            }
+        ]
+    )
+    audit = build_runtime_integrity_audit(
+        execution_ledger=execution,
+        account_audit=account,
+        daily_result=daily,
+    )
     assert audit["passed"].all(), audit.to_dict("records")
     broken = execution.copy()
     broken.loc[0, "trade_date"] = "2024-01-02"
-    failed = build_runtime_integrity_audit(execution_ledger=broken, account_audit=account)
+    failed = build_runtime_integrity_audit(
+        execution_ledger=broken,
+        account_audit=account,
+        daily_result=daily,
+    )
     assert not bool(failed.loc[failed["check"].eq("signal_before_execution"), "passed"].iloc[0])
     print("[PASS] execution status, timing, shares, and account reconciliation are audited")
     return 0

@@ -6,10 +6,19 @@ import math
 import numpy as np
 import pandas as pd
 
+from config import (
+    COMMISSION_RATE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    SLIPPAGE_RATE,
+    STAMP_DUTY_RATE,
+    TRANSFER_FEE_RATE,
+)
+from functions.execution.fee_schedule import stamp_duty_rate_for
+
 
 VALID_INVESTED_EXPOSURE_FLOOR = 0.05
-TOP_STRENGTH_BENCHMARK_FRACTION = 0.30
-TOP_STRENGTH_BENCHMARK_ID = "top_strength_30pct_equal_weight"
+TOP_POOL_BENCHMARK_ID_PREFIX = "top_liquidity"
 
 
 def build_governance_attribution(
@@ -18,6 +27,8 @@ def build_governance_attribution(
     feature_data: pd.DataFrame,
     benchmark_symbol: str | None,
     factor_weight_ledger: pd.DataFrame | None = None,
+    benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ) -> pd.DataFrame:
     """Add benchmark, invested-capital, exposure-adjusted, and factor-state metrics."""
     if daily_result is None or daily_result.empty:
@@ -62,13 +73,33 @@ def build_governance_attribution(
     data["cash_drag_net_value"] = (1.0 + data["cash_drag_daily_return"]).cumprod()
     data["valid_cash_drag_net_value"] = (1.0 + data["valid_cash_drag_daily_return"]).cumprod()
 
-    benchmark = _benchmark_series(feature_data, benchmark_symbol)
+    benchmark = _benchmark_series(
+        feature_data,
+        benchmark_symbol,
+        top_n=benchmark_top_n,
+        rebalance=benchmark_rebalance,
+    )
     data = data.merge(benchmark, on="date", how="left")
+    if "benchmark_return_valid" not in data.columns:
+        data["benchmark_return_valid"] = data["benchmark_net_value"].notna()
+    else:
+        data["benchmark_return_valid"] = data["benchmark_return_valid"].astype("boolean").fillna(False).astype(bool)
     data["benchmark_net_value"] = data["benchmark_net_value"].ffill()
     benchmark_initial = _first_positive(data["benchmark_net_value"])
     if benchmark_initial > 0:
         data["benchmark_net_value"] = data["benchmark_net_value"] / benchmark_initial
-    data["benchmark_daily_return"] = data["benchmark_net_value"].pct_change(fill_method=None).fillna(0.0)
+    data["benchmark_daily_return_display"] = data["benchmark_net_value"].pct_change(fill_method=None).fillna(0.0)
+    # Keep a continuous benchmark NAV for display, but never let a return with
+    # incomplete constituent prices enter alpha, beta or capture statistics.
+    data["benchmark_daily_return"] = data["benchmark_daily_return_display"].where(
+        data["benchmark_return_valid"]
+    )
+    data["matched_exposure_benchmark_daily_return"] = (
+        data["benchmark_daily_return"] * data["actual_exposure"].clip(0.0, 1.0)
+    )
+    data["matched_exposure_benchmark_net_value"] = (
+        1.0 + data["matched_exposure_benchmark_daily_return"]
+    ).cumprod()
     data["excess_daily_return"] = data["account_daily_return"] - data["benchmark_daily_return"]
     data["excess_net_value"] = (1.0 + data["excess_daily_return"]).cumprod()
     data["invested_excess_daily_return"] = data["exposure_adjusted_daily_return"] - data["benchmark_daily_return"]
@@ -226,51 +257,73 @@ def factor_module(model_name: str) -> str:
     return "other"
 
 
-def build_top_strength_benchmark_series(
+def build_top_pool_benchmark_series(
     feature_data: pd.DataFrame,
     *,
-    top_fraction: float = TOP_STRENGTH_BENCHMARK_FRACTION,
+    top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ) -> pd.DataFrame:
-    """Build a PIT synthetic benchmark from prior-day top-strength stocks.
+    """Build a prior-period fixed-N, top-liquidity opportunity-set benchmark.
 
-    The benchmark return on T+1 is the equal-weight return of stocks ranked in
-    the top fraction by strength at T. It is intentionally harder than a broad
-    mean/median universe benchmark and avoids same-day return lookahead.
+    Membership is chosen using information available at T and becomes effective
+    on T+1.  Equal weights are set only at the requested rebalance; weights then
+    drift with member returns. Missing T+1 prices are marked at zero return, not
+    removed before ranking, preventing future-availability selection leakage.
     """
-    columns = ["date", "benchmark_net_value", "benchmark_daily_return", "benchmark_member_count", "benchmark_id"]
+    columns = [
+        "date", "benchmark_net_value", "benchmark_daily_return",
+        "benchmark_gross_daily_return", "benchmark_gross_net_value",
+        "benchmark_transaction_cost_rate", "benchmark_return_valid",
+        "benchmark_member_count", "benchmark_return_coverage",
+        "benchmark_rebalanced", "benchmark_turnover", "benchmark_id",
+        "benchmark_constituent_rule", "benchmark_weighting", "benchmark_return_basis",
+    ]
     if feature_data is None or feature_data.empty:
         return pd.DataFrame(columns=columns)
+    requested_top_n = int(top_n)
+    if requested_top_n <= 0:
+        raise ValueError("benchmark top_n must be positive")
+    rebalance_mode = str(rebalance or "monthly").strip().lower()
+    if rebalance_mode not in {"daily", "weekly", "monthly"}:
+        raise ValueError("benchmark rebalance must be daily, weekly, or monthly")
     close_col = "close_nominal" if "close_nominal" in feature_data.columns else "close"
     if close_col not in feature_data.columns:
         return pd.DataFrame(columns=columns)
-    strength_columns = [
-        column
-        for column in [
-            "ret_20",
-            "close_to_ma20",
-            "score_eod_close_strength",
-            "score_price_volume_breakout",
-            "amount_ratio_20",
-        ]
-        if column in feature_data.columns
-    ]
-    if not strength_columns:
+    liquidity_columns = [column for column in ("amount_ma20", "amount") if column in feature_data.columns]
+    if not liquidity_columns:
         return pd.DataFrame(columns=columns)
 
-    required = ["date", "symbol", close_col] + strength_columns
+    required = ["date", "symbol", close_col, *liquidity_columns]
+    required.extend(column for column in ("instrument_type", "is_trading") if column in feature_data.columns)
     data = feature_data[required].copy()
     data["date"] = pd.to_datetime(data["date"], errors="coerce")
     data["symbol"] = data["symbol"].astype(str)
     data[close_col] = pd.to_numeric(data[close_col], errors="coerce")
-    for column in strength_columns:
+    for column in liquidity_columns:
         data[column] = pd.to_numeric(data[column], errors="coerce")
-    data = data.dropna(subset=["date", "symbol", close_col]).sort_values(["date", "symbol"])
+    if "amount" in data.columns:
+        rolling_amount = data.sort_values(["symbol", "date"]).groupby("symbol", sort=False)["amount"].transform(
+            lambda values: values.rolling(20, min_periods=1).mean()
+        )
+    else:
+        rolling_amount = pd.Series(float("nan"), index=data.index)
+    data["_benchmark_liquidity"] = (
+        data["amount_ma20"].combine_first(rolling_amount)
+        if "amount_ma20" in data.columns else rolling_amount
+    )
+    if "instrument_type" in data.columns:
+        data = data[data["instrument_type"].astype(str).eq("stock")]
+    data = data.dropna(subset=["date", "symbol", close_col]).drop_duplicates(
+        ["date", "symbol"], keep="last"
+    ).sort_values(["date", "symbol"])
     if data.empty:
         return pd.DataFrame(columns=columns)
 
-    data["_strength_score"] = _cross_sectional_strength_score(data, strength_columns)
     close_pivot = data.pivot_table(index="date", columns="symbol", values=close_col, aggfunc="last").sort_index()
-    strength_pivot = data.pivot_table(index="date", columns="symbol", values="_strength_score", aggfunc="last").reindex(close_pivot.index)
+    liquidity_pivot = data.pivot_table(index="date", columns="symbol", values="_benchmark_liquidity", aggfunc="last").reindex(close_pivot.index)
+    trading_pivot = None
+    if "is_trading" in data.columns:
+        trading_pivot = data.pivot_table(index="date", columns="symbol", values="is_trading", aggfunc="last").reindex(close_pivot.index)
     if len(close_pivot.index) < 2:
         return pd.DataFrame(columns=columns)
 
@@ -279,35 +332,166 @@ def build_top_strength_benchmark_series(
             "date": pd.Timestamp(close_pivot.index[0]),
             "benchmark_daily_return": 0.0,
             "benchmark_member_count": 0,
+            "benchmark_return_coverage": 0.0,
+            "benchmark_rebalanced": False,
+            "benchmark_turnover": 0.0,
         }
     ]
-    top_fraction = float(np.clip(top_fraction, 0.01, 1.0))
+    weights = pd.Series(dtype=float)
     for idx in range(len(close_pivot.index) - 1):
         current_date = close_pivot.index[idx]
         next_date = close_pivot.index[idx + 1]
-        scores = pd.to_numeric(strength_pivot.loc[current_date], errors="coerce")
-        next_returns = close_pivot.iloc[idx + 1] / close_pivot.iloc[idx] - 1.0
-        candidates = pd.DataFrame({"score": scores, "return": next_returns}).replace([np.inf, -np.inf], np.nan).dropna()
-        if candidates.empty:
-            daily_return = 0.0
+        should_rebalance = weights.empty or _benchmark_rebalance_due(
+            current_date, next_date, rebalance_mode
+        )
+        turnover = 0.0
+        initial_rebalance = weights.empty
+        if should_rebalance:
+            liquidity = pd.to_numeric(liquidity_pivot.loc[current_date], errors="coerce")
+            current_close = pd.to_numeric(close_pivot.loc[current_date], errors="coerce")
+            eligible = liquidity.notna() & liquidity.gt(0.0) & current_close.notna() & current_close.gt(0.0)
+            if trading_pivot is not None:
+                trading_known = trading_pivot.loc[current_date].astype("boolean").fillna(False)
+                eligible &= trading_known.astype(bool)
+            selected = liquidity[eligible].sort_values(ascending=False).head(requested_top_n).index
+            new_weights = pd.Series(1.0 / len(selected), index=selected, dtype=float) if len(selected) else pd.Series(dtype=float)
+            union = weights.index.union(new_weights.index)
+            turnover = float(
+                0.5 * (
+                    weights.reindex(union, fill_value=0.0)
+                    - new_weights.reindex(union, fill_value=0.0)
+                ).abs().sum()
+            ) if not weights.empty else 1.0 if not new_weights.empty else 0.0
+            weights = new_weights
+
+        if weights.empty:
+            gross_daily_return = 0.0
             member_count = 0
+            coverage = 0.0
         else:
-            member_count = max(1, int(math.ceil(len(candidates) * top_fraction)))
-            top = candidates.sort_values("score", ascending=False).head(member_count)
-            daily_return = float(pd.to_numeric(top["return"], errors="coerce").dropna().mean()) if not top.empty else 0.0
+            current_prices = pd.to_numeric(close_pivot.loc[current_date].reindex(weights.index), errors="coerce")
+            next_prices = pd.to_numeric(close_pivot.loc[next_date].reindex(weights.index), errors="coerce")
+            observed = current_prices.gt(0.0) & next_prices.notna() & next_prices.gt(0.0)
+            member_returns = (next_prices / current_prices - 1.0).replace([np.inf, -np.inf], np.nan)
+            member_returns = member_returns.where(observed, 0.0).fillna(0.0)
+            gross_daily_return = float((weights * member_returns).sum())
+            member_count = int(len(weights))
+            coverage = float(observed.mean()) if member_count else 0.0
+            grown = weights * (1.0 + member_returns)
+            total = float(grown.sum())
+            weights = grown / total if total > 0.0 else weights
+        buy_rate = float(COMMISSION_RATE + SLIPPAGE_RATE + TRANSFER_FEE_RATE)
+        sell_rate = buy_rate + float(stamp_duty_rate_for(next_date, fallback_rate=STAMP_DUTY_RATE))
+        transaction_cost_rate = (
+            float(turnover) * (buy_rate if initial_rebalance else buy_rate + sell_rate)
+            if should_rebalance else 0.0
+        )
+        return_valid = bool(member_count == 0 or coverage >= 1.0 - 1e-12)
         rows.append(
             {
                 "date": pd.Timestamp(next_date),
-                "benchmark_daily_return": daily_return,
+                "benchmark_gross_daily_return": gross_daily_return,
+                "benchmark_daily_return": gross_daily_return - transaction_cost_rate,
+                "benchmark_transaction_cost_rate": transaction_cost_rate,
+                "benchmark_return_valid": return_valid,
                 "benchmark_member_count": int(member_count),
+                "benchmark_return_coverage": coverage,
+                "benchmark_rebalanced": bool(should_rebalance),
+                "benchmark_turnover": turnover,
             }
         )
 
     result = pd.DataFrame(rows).sort_values("date")
+    result["benchmark_gross_daily_return"] = pd.to_numeric(
+        result.get("benchmark_gross_daily_return"), errors="coerce"
+    ).fillna(0.0)
+    result["benchmark_gross_net_value"] = (1.0 + result["benchmark_gross_daily_return"]).cumprod()
+    result["benchmark_transaction_cost_rate"] = pd.to_numeric(
+        result.get("benchmark_transaction_cost_rate"), errors="coerce"
+    ).fillna(0.0)
+    result["benchmark_return_valid"] = result.get(
+        "benchmark_return_valid", pd.Series(False, index=result.index, dtype="boolean")
+    ).astype("boolean").fillna(False).astype(bool)
     result["benchmark_daily_return"] = pd.to_numeric(result["benchmark_daily_return"], errors="coerce").fillna(0.0)
     result["benchmark_net_value"] = (1.0 + result["benchmark_daily_return"]).cumprod()
-    result["benchmark_id"] = TOP_STRENGTH_BENCHMARK_ID
+    result["benchmark_id"] = f"{TOP_POOL_BENCHMARK_ID_PREFIX}_{requested_top_n}_equal_weight_{rebalance_mode}"
+    result["benchmark_constituent_rule"] = "prior_period_top_liquidity_fixed_n"
+    result["benchmark_weighting"] = "equal_weight_research_fallback"
+    result["benchmark_return_basis"] = (
+        "net_proportional_cost;missing_price_zero_for_nav_display;"
+        "invalid_dates_excluded_from_attribution"
+    )
     return result[columns]
+
+
+def build_top_strength_benchmark_series(
+    feature_data: pd.DataFrame,
+    *,
+    top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+) -> pd.DataFrame:
+    """Compatibility alias for the retired percentage-based benchmark API."""
+    return build_top_pool_benchmark_series(feature_data, top_n=top_n, rebalance=rebalance)
+
+
+def build_top_pool_benchmark_sensitivity(
+    feature_data: pd.DataFrame,
+    *,
+    top_n_values=(50, 100, 300),
+    rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    evaluation_start=None,
+    evaluation_end=None,
+) -> pd.DataFrame:
+    """Report alternative fixed-N definitions without selecting the ex-post winner."""
+    rows = []
+    for top_n in tuple(dict.fromkeys(int(value) for value in top_n_values)):
+        series = build_top_pool_benchmark_series(feature_data, top_n=top_n, rebalance=rebalance)
+        if series.empty:
+            continue
+        evaluation = series.copy()
+        evaluation["date"] = pd.to_datetime(evaluation["date"], errors="coerce")
+        if evaluation_start is not None:
+            evaluation = evaluation[evaluation["date"] >= pd.Timestamp(evaluation_start)]
+        if evaluation_end is not None:
+            evaluation = evaluation[evaluation["date"] <= pd.Timestamp(evaluation_end)]
+        if evaluation.empty:
+            continue
+        daily = pd.to_numeric(evaluation["benchmark_daily_return"], errors="coerce").dropna()
+        # The account NAV is initialized on evaluation_start; the benchmark
+        # must share that same zero-return origin instead of importing the
+        # preload-to-start return into a bounded comparison.
+        if not daily.empty:
+            daily.iloc[0] = 0.0
+        nav = (1.0 + daily).cumprod()
+        active = evaluation[pd.to_numeric(evaluation["benchmark_member_count"], errors="coerce").gt(0)]
+        rows.append(
+            {
+                "benchmark_id": str(series["benchmark_id"].iloc[-1]),
+                "top_n": int(top_n),
+                "rebalance": str(rebalance),
+                "observed_days": int(len(daily)),
+                "total_return": float(nav.iloc[-1] - 1.0) if len(nav) else np.nan,
+                "annualized_volatility": float(daily.std(ddof=1) * math.sqrt(252.0)) if len(daily) > 1 else np.nan,
+                "average_member_count": float(pd.to_numeric(active["benchmark_member_count"], errors="coerce").mean()) if not active.empty else 0.0,
+                "average_return_coverage": float(pd.to_numeric(active["benchmark_return_coverage"], errors="coerce").mean()) if not active.empty else 0.0,
+                "average_daily_turnover": float(pd.to_numeric(evaluation["benchmark_turnover"], errors="coerce").mean()),
+                "rebalance_count": int(evaluation["benchmark_rebalanced"].fillna(False).astype(bool).sum()),
+                "evaluation_start": pd.Timestamp(evaluation["date"].min()),
+                "evaluation_end": pd.Timestamp(evaluation["date"].max()),
+                "selection_policy": "pre_registered_only_do_not_choose_best_ex_post",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _benchmark_rebalance_due(current_date, next_date, mode: str) -> bool:
+    current = pd.Timestamp(current_date)
+    following = pd.Timestamp(next_date)
+    if mode == "daily":
+        return True
+    if mode == "weekly":
+        return current.to_period("W-FRI") != following.to_period("W-FRI")
+    return current.to_period("M") != following.to_period("M")
 
 
 def _cross_sectional_strength_score(data: pd.DataFrame, strength_columns: list[str]) -> pd.Series:
@@ -322,10 +506,10 @@ def _cross_sectional_strength_score(data: pd.DataFrame, strength_columns: list[s
     return pd.concat(ranked, axis=1).mean(axis=1, skipna=True)
 
 
-def _benchmark_series(feature_data: pd.DataFrame, benchmark_symbol: str | None) -> pd.DataFrame:
-    top_strength = build_top_strength_benchmark_series(feature_data)
-    if not top_strength.empty:
-        return top_strength
+def _benchmark_series(feature_data: pd.DataFrame, benchmark_symbol: str | None, *, top_n: int, rebalance: str) -> pd.DataFrame:
+    top_pool = build_top_pool_benchmark_series(feature_data, top_n=top_n, rebalance=rebalance)
+    if not top_pool.empty:
+        return top_pool
     if feature_data is None or feature_data.empty or not benchmark_symbol:
         return pd.DataFrame(columns=["date", "benchmark_net_value", "benchmark_daily_return"])
     data = feature_data.copy()

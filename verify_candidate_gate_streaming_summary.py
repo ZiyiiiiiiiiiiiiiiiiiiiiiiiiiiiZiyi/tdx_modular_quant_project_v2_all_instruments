@@ -23,6 +23,10 @@ def main() -> None:
             "strategy_logic_version": ["production_v1"] * len(values),
             "probability_gate_evaluated": [True] * len(values),
             "probability_gate_changed_decision": values,
+            "paper_loss_containment_exit": values,
+            "loss_containment_exit": [False] * len(values),
+            "paper_thesis_failure_exit": values,
+            "thesis_failure_exit": values,
         }).to_csv(path, index=False)
         paths.append(path)
     summary = build_entry_gate_summary_from_csv_parts(paths, chunksize=2).set_index("gate")
@@ -38,6 +42,10 @@ def main() -> None:
     assert int(triggers.loc["probability_gate", "evaluated_count"]) == 5
     assert int(triggers.loc["probability_gate", "active_trigger_count"]) == 2
     assert triggers.loc["probability_gate", "audit_scope"] == "full_streamed_history"
+    assert int(triggers.loc["loss_containment_exit", "paper_trigger_count"]) == 2
+    assert int(triggers.loc["loss_containment_exit", "active_trigger_count"]) == 0
+    assert int(triggers.loc["thesis_failure_exit", "paper_trigger_count"]) == 2
+    assert int(triggers.loc["thesis_failure_exit", "active_trigger_count"]) == 2
     print("[PASS] candidate gate summary streams monthly parts without full concat")
 
 

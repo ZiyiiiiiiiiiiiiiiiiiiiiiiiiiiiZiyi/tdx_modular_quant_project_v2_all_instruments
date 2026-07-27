@@ -54,6 +54,9 @@ from config import (
     GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_NORMAL,
     GOVERNANCE_FORCE_DEPLOY_TARGET_EXPOSURE_WEAK,
     GOVERNANCE_HARD_STOP_COOLDOWN_DAYS,
+    GOVERNANCE_HARD_STOP_LOSS,
+    GOVERNANCE_IMPACT_MAX_RATE,
+    GOVERNANCE_IMPACT_SQRT_COEFFICIENT,
     GOVERNANCE_LAYER_ADD_GAPS,
     GOVERNANCE_LAYER_WEIGHTS,
     GOVERNANCE_ADD_MIN_FACTOR_CONVICTION,
@@ -88,6 +91,8 @@ from config import (
     GOVERNANCE_INITIAL_CASH,
     GOVERNANCE_END_DATE,
     GOVERNANCE_OUTPUT_DIR,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
+    GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
     GOVERNANCE_PRELOAD_CALENDAR_DAYS,
     GOVERNANCE_REPUTATION_WARMUP_DAYS,
     GOVERNANCE_RETAIL_STARTER_2_LOTS,
@@ -103,6 +108,7 @@ from config import (
     TRANSFER_FEE_RATE,
 )
 from functions.decision_council.accounting import build_exposure_snapshot, calculate_five_day_reward
+from functions.execution.security_trading_rules import trading_rule_for
 from functions.decision_council.account_state import (
     ExploratoryCorporateActionProcessor,
     LastKnownPriceLedger,
@@ -110,7 +116,8 @@ from functions.decision_council.account_state import (
 from functions.decision_council.analytics import (
     build_bucket_attribution,
     build_governance_attribution,
-    build_top_strength_benchmark_series,
+    build_top_pool_benchmark_series,
+    build_top_pool_benchmark_sensitivity,
     factor_module,
 )
 from functions.decision_council.engine import PhaseOneDecisionCouncilEngine
@@ -121,6 +128,7 @@ from functions.decision_council.execution_runtime import (
     prune_empty_positions as prune_empty_positions_runtime,
     register_orders as register_orders_runtime,
 )
+from functions.decision_council.runtime_identity import build_runtime_identity
 from functions.decision_council.exposure_catchup import decide_exposure_catchup
 from functions.decision_council.exposure_runtime import (
     current_weights as current_weights_runtime,
@@ -135,11 +143,35 @@ from functions.decision_council.market_regime_policy import MarketRegimePolicy
 from functions.decision_council.mainline_v2 import (
     MAINLINE_V2,
     MAINLINE_V3,
+    MAINLINE_V3_MONTHLY_LGBM_HYBRID,
     apply_mainline_v2_entry_policy,
     calibration_runtime_state,
+    is_mainline_v3_version,
     normalize_strategy_logic_version,
 )
+from functions.decision_council.reliability_weighted_scoring import (
+    MAINLINE_V31_RELIABILITY,
+    RollingRoleReliabilityController,
+    attach_reliability_weighted_score,
+)
 from functions.decision_council.mainline_v3 import apply_mainline_v3_entry_policy
+from functions.decision_council.small_capital_aggressive import (
+    build_scap_exposure_targets,
+    scap_control_enabled,
+)
+from functions.decision_council.multi_horizon_value import attach_multi_horizon_value_contract
+from functions.decision_council.action_counterfactual_reward import (
+    build_action_decisions,
+    mature_action_rewards,
+)
+from functions.decision_council.flow_state_features import attach_flow_state_features
+from functions.decision_council.monthly_lgbm_hybrid import (
+    FusionCalibration,
+    OnlineMonthlyLGBMController,
+    apply_continuous_rank_fusion,
+    predict_daily_rank,
+)
+from functions.decision_council.dual_horizon_lgbm import DualHorizonMonthlyLGBMController
 from functions.decision_council.runtime_maturity import (
     combined_runtime_maturity,
     covariance_runtime_state,
@@ -240,15 +272,27 @@ EXECUTION_LEDGER_COLUMNS = [
     "order_id",
     "decision_id",
     "reason",
+    "origin_reason",
+    "latest_reason",
+    "highest_priority_reason",
+    "reason_history",
+    "reason_schema_version",
     "position_state",
     "orderflow_candidate_score",
     "reversal_entry_score",
     "breakout_gate_score",
     "trend_hold_score",
     "position_exit_reason",
+    "liquidation_intent",
     "add_layer",
     "add_allowed",
     "add_block_reason",
+    "add_decision_type",
+    "unified_action_selected",
+    "unified_action_proposals",
+    "unified_action_vetoed",
+    "unified_action_conflict_count",
+    "unified_action_contract",
     "entry_matrix_score",
     "entry_alpha_score",
     "entry_timing_score",
@@ -274,6 +318,21 @@ EXECUTION_LEDGER_COLUMNS = [
     "post_entry_failure_score",
     "strategy_logic_version",
     "cabinet_native_final_score",
+    "mainline_v3_score_authority",
+    "mainline_v3_score_authority_version",
+    "mainline_v3_selection_evaluated",
+    "v31_reliability_score",
+    "v31_reliability_score_coverage",
+    "v31_reliability_contract",
+    "v31_calibration_window",
+    "v31_score_formula",
+    "v31_score_authority",
+    "v31_strict_entry_paper_only",
+    "monthly_lgbm_raw_score",
+    "monthly_lgbm_rank_percentile",
+    "hybrid_final_score",
+    "hybrid_ml_weight",
+    "hybrid_fusion_status",
     "cabinet_base_entry_score",
     "cabinet_strict_entry_score",
     "cabinet_proxy_entry_score",
@@ -286,6 +345,26 @@ EXECUTION_LEDGER_COLUMNS = [
     "mainline_v3_one_lot_cash_required",
     "mainline_v3_one_lot_weight",
     "mainline_v3_lot_feasible",
+    "comparable_value_horizon_days",
+    "comparable_expected_alpha",
+    "comparable_alpha_lcb",
+    "comparable_value_contract",
+    "scap_expected_return_point",
+    "scap_expected_return_lcb",
+    "scap_decision_expected_return",
+    "scap_decision_return_basis",
+    "scap_estimated_total_cost_amount",
+    "scap_risk_penalty_amount",
+    "scap_candidate_utility",
+    "scap_candidate_utility_version",
+    "replacement_pair_id",
+    "replacement_paired_symbol",
+    "replacement_pair_leg",
+    "replacement_horizon_days",
+    "replacement_expected_net_edge",
+    "replacement_lcb_net_edge",
+    "replacement_cost_rate",
+    "replacement_contract",
 ]
 
 HOLDINGS_LEDGER_COLUMNS = [
@@ -339,10 +418,18 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "add_block_reason",
     "add_layer",
     "add_budget",
+    "add_decision_type",
+    "unified_action_selected",
+    "unified_action_proposals",
+    "unified_action_vetoed",
+    "unified_action_conflict_count",
+    "unified_action_contract",
     "hard_stop_exit",
     "profit_hard_stop_exit",
     "paper_hard_stop_exit",
     "paper_profit_hard_stop_exit",
+    "loss_containment_exit",
+    "paper_loss_containment_exit",
     "hard_stop_net_mfe",
     "hard_stop_net_unrealized",
     "hard_stop_giveback_from_net_peak",
@@ -354,6 +441,14 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "paper_alpha_collapse_exit",
     "signal_failure_exit",
     "paper_signal_failure_exit",
+    "signal_failure_confirmation_count",
+    "signal_failure_confirmation_required",
+    "signal_failure_confirmed",
+    "exit_arbitration_contract",
+    "exit_triggered_reasons",
+    "exit_authorized_reasons",
+    "exit_vetoed_reasons",
+    "exit_conflict_count",
     "entry_thesis",
     "entry_logic_version",
     "entry_module_support",
@@ -389,15 +484,26 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "liquidity_decay_score",
     "risk_contribution_penalty",
     "risk_adjusted_primary_score",
+    "cabinet_native_final_score",
+    "cabinet_strict_entry_score",
+    "cabinet_proxy_entry_score",
+    "cabinet_timing_score",
+    "cabinet_liquidity_health_score",
+    "cabinet_risk_safety_score",
+    "cabinet_hold_support_score",
+    "comparable_value_horizon_days",
+    "comparable_expected_alpha",
+    "comparable_alpha_lcb",
+    "comparable_value_contract",
 ]
 
 
 def _frame_with_columns(rows, columns: list[str]) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
-    for column in columns:
-        if column not in frame.columns:
-            frame[column] = pd.Series(dtype="object")
-    return frame
+    ordered_columns = list(dict.fromkeys([*columns, *frame.columns.tolist()]))
+    # Add all missing audit fields in one operation. Repeated scalar-column
+    # insertion fragments wide empty ledgers and emits thousands of warnings.
+    return frame.reindex(columns=ordered_columns)
 
 
 def archive_existing_governance_output(output_dir: Path) -> Path | None:
@@ -513,19 +619,32 @@ class GovernanceBacktestRunner:
         factor_source_spec: FactorSourceSpec | None = None,
         strategy_logic_version: str = "production_v1",
         pit_runtime_state: str = "degraded",
+        pit_level2_runtime_state: str = "degraded",
+        factor_temporal_isolation_pass: bool = False,
+        monthly_lgbm_artifact=None,
+        monthly_lgbm_fusion_calibration: FusionCalibration | None = None,
+        monthly_lgbm_maximum_weight: float | None = None,
+        monthly_lgbm_controller: OnlineMonthlyLGBMController | None = None,
+        performance_benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+        performance_benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
     ):
         self.features = feature_df if prepared_features else _prepare_features(feature_df)
         self.features["date"] = pd.to_datetime(self.features["date"], errors="coerce")
         audit_source = audit_price_df if audit_price_df is not None else self.features
         audit_close = "close_nominal" if "close_nominal" in audit_source.columns else "close"
         if {"date", "symbol", audit_close}.issubset(audit_source.columns):
-            self.audit_prices = audit_source[["date", "symbol", audit_close]].copy()
+            audit_columns = ["date", "symbol", audit_close]
+            audit_columns.extend(
+                column for column in ("open_nominal", "open", "amount", "volatility_20")
+                if column in audit_source.columns and column not in audit_columns
+            )
+            self.audit_prices = audit_source[audit_columns].copy()
             if audit_close != "close":
                 self.audit_prices = self.audit_prices.rename(columns={audit_close: "close"})
             self.audit_prices["date"] = pd.to_datetime(self.audit_prices["date"], errors="coerce")
             self.audit_prices["symbol"] = self.audit_prices["symbol"].astype(str)
             self.audit_prices["close"] = pd.to_numeric(self.audit_prices["close"], errors="coerce")
-            self.audit_prices = self.audit_prices.dropna().drop_duplicates(["date", "symbol"], keep="last")
+            self.audit_prices = self.audit_prices.dropna(subset=["date", "symbol", "close"]).drop_duplicates(["date", "symbol"], keep="last")
         else:
             self.audit_prices = pd.DataFrame(columns=["date", "symbol", "close"])
         self.output_dir = Path(output_dir)
@@ -562,11 +681,58 @@ class GovernanceBacktestRunner:
             alpha_bundle=LEGACY_GOVERNANCE_ALPHA_BUNDLE,
         )
         self.strategy_logic_version = normalize_strategy_logic_version(strategy_logic_version)
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            if not is_mainline_v3_version(self.strategy_logic_version):
+                raise ValueError("SCAP control modes require a mainline_v3 strategy logic version")
+            if not bool(self.capital_profile.get("retail_lot_adapter", False)):
+                raise ValueError("SCAP control modes require a retail lot-aware capital profile")
+        self.monthly_lgbm_artifact = monthly_lgbm_artifact
+        self.monthly_lgbm_fusion_calibration = monthly_lgbm_fusion_calibration
+        self.monthly_lgbm_fusion_rows: list[dict] = []
+        self.monthly_lgbm_controller = monthly_lgbm_controller
+        self.role_reliability_controller: RollingRoleReliabilityController | None = None
+        self.performance_benchmark_top_n = int(performance_benchmark_top_n)
+        self.performance_benchmark_rebalance = str(performance_benchmark_rebalance or "monthly").strip().lower()
+        if self.performance_benchmark_top_n <= 0:
+            raise ValueError("performance benchmark top_n must be positive")
+        if self.performance_benchmark_rebalance not in {"daily", "weekly", "monthly"}:
+            raise ValueError("performance benchmark rebalance must be daily, weekly, or monthly")
+        if (
+            self.strategy_logic_version == MAINLINE_V3_MONTHLY_LGBM_HYBRID
+            and self.monthly_lgbm_controller is None
+            and self.monthly_lgbm_artifact is None
+            and monthly_lgbm_maximum_weight is not None
+        ):
+            self.monthly_lgbm_controller = DualHorizonMonthlyLGBMController(
+                maximum_ml_weight=float(monthly_lgbm_maximum_weight),
+                benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
+                round_trip_cost_rate=(
+                    2.0 * (float(COMMISSION_RATE) + float(SLIPPAGE_RATE) + float(TRANSFER_FEE_RATE))
+                    + float(STAMP_DUTY_RATE)
+                ),
+                allow_pit_restricted_features=str(pit_level2_runtime_state).strip().lower() in {
+                    "formal", "formal_ready", "production", "production_ready", "ready"
+                },
+                treatment_top_k=int(self._max_positions_override or 5),
+            )
+        if self.strategy_logic_version == MAINLINE_V31_RELIABILITY:
+            self.role_reliability_controller = RollingRoleReliabilityController(
+                benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
+                horizon_days=10,
+                minimum_dates=60,
+                rolling_dates=252,
+                round_trip_cost_rate=(
+                    2.0 * (float(COMMISSION_RATE) + float(SLIPPAGE_RATE) + float(TRANSFER_FEE_RATE))
+                    + float(STAMP_DUTY_RATE)
+                ),
+            )
         self.pit_runtime_state = str(pit_runtime_state or "degraded")
+        self.pit_level2_runtime_state = str(pit_level2_runtime_state or "degraded")
+        self.factor_temporal_isolation_pass = bool(factor_temporal_isolation_pass)
         self.factor_runtime_context = self.factor_source_spec.runtime_context()
         self.factor_semantic_contracts = {}
         self.factor_semantic_contract_audit = {}
-        if self.strategy_logic_version == MAINLINE_V3:
+        if is_mainline_v3_version(self.strategy_logic_version):
             if not self.factor_source_spec.uses_factor_cabinet:
                 raise ValueError("mainline_v3_cabinet_native requires a resolved factor_cabinet source")
             self.factor_semantic_contracts = build_factor_semantic_contracts(self.factor_runtime_context)
@@ -618,6 +784,7 @@ class GovernanceBacktestRunner:
         self.holding_days: dict[str, int] = {}
         self.position_lifecycle: dict[str, dict] = {}
         self.position_cooldowns: dict[str, dict] = {}
+        self.position_exit_confirmations: dict[str, dict] = {}
         self.position_state_rows = []
         self.retail_execution_rows = []
         self.entry_formula_audit_rows = []
@@ -650,6 +817,7 @@ class GovernanceBacktestRunner:
         self.exposure_rows = []
         self.holdings_rows = []
         self.reward_rows = []
+        self.action_decision_rows = []
         self.alpha_rows = []
         self.entry_confirmation_rows = []
         self.factor_weight_rows = []
@@ -692,8 +860,56 @@ class GovernanceBacktestRunner:
             dates = dates[dates <= pd.Timestamp(end_date)]
         if max_days is not None:
             dates = dates[: int(max_days)]
+        if len(dates) and self.governance_control_mode == "aggressive_lean":
+            warmup_manifest = self.entry_calibrator.warmup_from_feature_history(
+                self.features,
+                trade_start=dates[0],
+                horizon_days=int(
+                    self.capital_profile.get("scap_forecast_horizon_days", 10) or 10
+                ),
+                lookback_sessions=int(
+                    self.capital_profile.get("scap_warmup_sessions", 252) or 252
+                ),
+                score_columns=tuple(
+                    dict.fromkeys(
+                        str(column)
+                        for column in (
+                            self.factor_source_spec.model_feature_map or {}
+                        ).values()
+                        if str(column)
+                    )
+                ),
+            )
+            self.engine.manifest["scap_v3_lean_warmup"] = warmup_manifest
+            if warmup_manifest.get("status") != "ready":
+                raise RuntimeError(
+                    "SCAP-V3 Lean warm-up is not ready: "
+                    f"{warmup_manifest}"
+                )
         
         total_days = len(dates)
+        self.runtime_identity = build_runtime_identity(
+            self,
+            dates=dates,
+            output_dir=self.output_dir,
+        )
+        self.engine.manifest["runtime_identity"] = self.runtime_identity
+        self.engine.manifest["effective_config_hash"] = self.runtime_identity[
+            "runtime_identity_hash"
+        ]
+        from functions.decision_council.runtime_checkpoint import (
+            write_run_checkpoint,
+        )
+        write_run_checkpoint(
+            self.output_dir,
+            status="running",
+            current_day=0,
+            total_days=total_days,
+            runtime_identity_hash=self.runtime_identity["runtime_identity_hash"],
+            stage="initialized",
+        )
+        self._run_decision_start = pd.Timestamp(dates[0]).normalize() if total_days else None
+        self._run_decision_end = pd.Timestamp(dates[-1]).normalize() if total_days else None
         self._run_benchmark_base_nav = self._raw_benchmark_nav_asof(dates[0]) if total_days else 1.0
         weekly = pd.Series(dates, index=dates).groupby(dates.to_period("W-FRI")).max()
         self._normal_rebalance_dates = frozenset(pd.Timestamp(date) for date in weekly)
@@ -710,8 +926,10 @@ class GovernanceBacktestRunner:
                 title=f"Governance Backtest | {self._universe_name or 'unknown_universe'}",
                 total_days=total_days,
                 initial_nav=self.initial_cash,
+                output_dir=self.output_dir,
             )
         
+        run_outcome = "running"
         try:
             for day_index, date in enumerate(dates):
                 date_str = pd.Timestamp(date).strftime("%Y-%m-%d")
@@ -763,6 +981,17 @@ class GovernanceBacktestRunner:
                             "nominal_nav": latest_shadow.get("nominal_nav", 0.0),
                         }
                 self.step(date, day_index, reputation_rewards=shadow_rewards, reputation_activity=shadow_activity)
+                write_run_checkpoint(
+                    self.output_dir,
+                    status="running",
+                    current_day=day_index + 1,
+                    total_days=total_days,
+                    last_successful_date=pd.Timestamp(date).date(),
+                    runtime_identity_hash=self.runtime_identity[
+                        "runtime_identity_hash"
+                    ],
+                    stage="date_complete",
+                )
 
                 exposure = self.exposure_rows[-1] if self.exposure_rows else {}
                 if live_monitor is not None:
@@ -791,16 +1020,140 @@ class GovernanceBacktestRunner:
                         )
                     except Exception:
                         pass
+        except KeyboardInterrupt:
+            run_outcome = "interrupted"
+            write_run_checkpoint(
+                self.output_dir,
+                status="interrupted",
+                current_day=len(self.exposure_rows),
+                total_days=total_days,
+                last_successful_date=(
+                    pd.Timestamp(self.exposure_rows[-1]["date"]).date()
+                    if self.exposure_rows
+                    else None
+                ),
+                runtime_identity_hash=self.runtime_identity[
+                    "runtime_identity_hash"
+                ],
+                stage="keyboard_interrupt",
+                error="KeyboardInterrupt: user requested Ctrl+C stop",
+            )
+            print(
+                "Governance backtest interrupted by Ctrl+C; "
+                "the last completed trading day is preserved in run_checkpoint.json.",
+                flush=True,
+            )
+            raise
+        except Exception as exc:
+            run_outcome = "failed"
+            write_run_checkpoint(
+                self.output_dir,
+                status="failed",
+                current_day=len(self.exposure_rows),
+                total_days=total_days,
+                last_successful_date=(
+                    pd.Timestamp(self.exposure_rows[-1]["date"]).date()
+                    if self.exposure_rows
+                    else None
+                ),
+                runtime_identity_hash=self.runtime_identity[
+                    "runtime_identity_hash"
+                ],
+                stage="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
         finally:
             if live_monitor is not None:
-                live_monitor.finish("回测完成。窗口会保持打开，关闭浏览器标签即可。")
+                finish_messages = {
+                    "running": "回测计算完成，正在保存结果。",
+                    "interrupted": "回测已由 Ctrl+C 中断；最后完成交易日已写入 checkpoint。",
+                    "failed": "回测失败；请查看 checkpoint 和命令窗口错误。",
+                }
+                live_monitor.finish(finish_messages.get(run_outcome, "回测已停止。"))
         
         for model_name, shadow in shadows.items():
             shadow_frame = pd.DataFrame(shadow.exposure_rows)
             if not shadow_frame.empty:
                 shadow_frame.insert(0, "model_name", model_name)
                 self.engine.record_shadow_portfolio(shadow_frame)
-        return self._save()
+        write_run_checkpoint(
+            self.output_dir,
+            status="saving",
+            current_day=total_days,
+            total_days=total_days,
+            last_successful_date=(
+                pd.Timestamp(dates[-1]).date() if total_days else None
+            ),
+            runtime_identity_hash=self.runtime_identity[
+                "runtime_identity_hash"
+            ],
+            stage="saving_outputs",
+        )
+        try:
+            saved = self._save()
+        except Exception as exc:
+            from functions.decision_council.artifact_manifest import (
+                update_artifact_manifest,
+            )
+
+            update_artifact_manifest(
+                self.output_dir,
+                stage="save_failed",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            write_run_checkpoint(
+                self.output_dir,
+                status="failed",
+                current_day=total_days,
+                total_days=total_days,
+                last_successful_date=(
+                    pd.Timestamp(dates[-1]).date() if total_days else None
+                ),
+                runtime_identity_hash=self.runtime_identity[
+                    "runtime_identity_hash"
+                ],
+                stage="save_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        completion_path = self.output_dir / "COMPLETE.json"
+        write_governance_text(
+            __import__("json").dumps(
+                {
+                    "status": "complete",
+                    "schema_version": "governance_completion_v1",
+                    "runtime_identity_hash": self.runtime_identity[
+                        "runtime_identity_hash"
+                    ],
+                    "trading_days": total_days,
+                    "last_successful_date": (
+                        str(pd.Timestamp(dates[-1]).date())
+                        if total_days
+                        else None
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            completion_path,
+        )
+        saved["completion_marker"] = completion_path
+        write_run_checkpoint(
+            self.output_dir,
+            status="complete",
+            current_day=total_days,
+            total_days=total_days,
+            last_successful_date=(
+                pd.Timestamp(dates[-1]).date() if total_days else None
+            ),
+            runtime_identity_hash=self.runtime_identity[
+                "runtime_identity_hash"
+            ],
+            stage="complete",
+        )
+        return saved
 
     def step(
         self,
@@ -862,11 +1215,13 @@ class GovernanceBacktestRunner:
             regime_params = None
         current_turnover_budget = regime_params.default_turnover_budget if regime_params else GOVERNANCE_DEFAULT_TURNOVER_BUDGET
         current_min_score_percentile = regime_params.min_score_percentile if regime_params else None
-        if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}:
+        if self.strategy_logic_version == MAINLINE_V2 or is_mainline_v3_version(self.strategy_logic_version):
             # V2 keeps regime as an account-level exposure/risk overlay. It must
             # not also alter candidate admission or portfolio operating cadence.
             current_turnover_budget = GOVERNANCE_DEFAULT_TURNOVER_BUDGET
             current_min_score_percentile = 0.80
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            current_min_score_percentile = 0.0
         
         candidates, proposals = build_daily_candidates(
             daily,
@@ -882,13 +1237,16 @@ class GovernanceBacktestRunner:
             universe_mode=self._universe_mode,
             require_constituents=self._require_constituents,
             allow_fallback=self._allow_fallback,
-            enable_quality_filters=self._enable_quality_filters,
+            enable_quality_filters=(
+                False if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"} else self._enable_quality_filters
+            ),
             selection_weight_mode=(
-                "cabinet_native" if self.strategy_logic_version == MAINLINE_V3
+                "cabinet_native" if is_mainline_v3_version(self.strategy_logic_version)
                 else self.selection_weight_mode
             ),
             runtime_context=self.factor_runtime_context,
         )
+        candidates = attach_flow_state_features(candidates)
         candidate_build_counts = dict(candidates.attrs.get("candidate_funnel_counts", {}))
         safety_row = self.engine.safety_signals.loc[pd.Timestamp(date)]
         if isinstance(safety_row, pd.DataFrame):
@@ -896,7 +1254,7 @@ class GovernanceBacktestRunner:
         risk_level = str(safety_row.get("risk_level", "normal"))
         structural_regime_level = str(safety_row.get("structural_regime_level", "bull"))
         confirmation_mode = self.entry_confirmation_mode
-        if self.governance_control_mode in {"factor_only", "safe_factor_only"}:
+        if self.governance_control_mode in {"factor_only", "safe_factor_only", "aggressive_profit", "aggressive_lean"}:
             if str(confirmation_mode or "").strip().lower() in {"", "full", "fixed_percentile_only"}:
                 confirmation_mode = "factor_only"
         candidates = apply_entry_confirmation(
@@ -907,9 +1265,64 @@ class GovernanceBacktestRunner:
             confirmation_mode=confirmation_mode,
             capital_usage_mode=self.capital_usage_mode,
         )
-        if self.strategy_logic_version == MAINLINE_V3:
-            # Establish cabinet-native compatibility fields before lifecycle
-            # evaluation so old entry-matrix scores cannot drive V3 exits.
+        v3_ranking_score_column = "cabinet_native_final_score"
+        v3_ranking_coverage_column = "cabinet_strict_entry_score_coverage"
+        if is_mainline_v3_version(self.strategy_logic_version):
+            if self.strategy_logic_version == MAINLINE_V31_RELIABILITY:
+                candidates = self.role_reliability_controller.process_day(
+                    candidates, as_of_date=date, price_history=self.audit_prices
+                ) if self.role_reliability_controller is not None else attach_reliability_weighted_score(
+                    candidates, as_of_date=date
+                )
+                v3_ranking_score_column = "v31_reliability_score"
+                v3_ranking_coverage_column = "v31_reliability_score_coverage"
+            if self.strategy_logic_version == MAINLINE_V3_MONTHLY_LGBM_HYBRID:
+                if self.monthly_lgbm_controller is not None:
+                    candidates, audit_row = self.monthly_lgbm_controller.process_day(
+                        candidates,
+                        as_of_date=date,
+                        price_history=self.audit_prices,
+                    )
+                    self.monthly_lgbm_fusion_rows.append(audit_row)
+                else:
+                    calibration = self.monthly_lgbm_fusion_calibration
+                    if self.monthly_lgbm_artifact is not None and calibration is not None:
+                        candidates = predict_daily_rank(self.monthly_lgbm_artifact, candidates)
+                    else:
+                        calibration = FusionCalibration(
+                            ml_weight=0.0,
+                            unconstrained_weight=float("nan"),
+                            reliability=0.0,
+                            maximum_ml_weight=(
+                                float(calibration.maximum_ml_weight)
+                                if calibration is not None
+                                else 0.0
+                            ),
+                            validation_rank_ic_mean=float("nan"),
+                            validation_rank_ic_standard_error=float("nan"),
+                            status="fallback_monthly_model_unavailable",
+                        )
+                    candidates = apply_continuous_rank_fusion(candidates, calibration)
+                    audit_row = {"date": pd.Timestamp(date), **calibration.audit_dict()}
+                    audit_row["model_available"] = self.monthly_lgbm_artifact is not None
+                    if self.monthly_lgbm_artifact is not None:
+                        audit_row.update(self.monthly_lgbm_artifact.audit_dict())
+                    self.monthly_lgbm_fusion_rows.append(audit_row)
+                v3_ranking_score_column = "hybrid_final_score"
+            candidates = self._apply_candidate_risk_penalty(
+                candidates,
+                exposure=exposure,
+                score_column=v3_ranking_score_column,
+            )
+            v3_ranking_score_column = "risk_adjusted_primary_score"
+            # SCAP utility consumes same-horizon expected return and its
+            # conservative bound. Attach that contract before either V3 policy
+            # pass; attaching it after selection makes every row
+            # ``insufficient`` and deterministically blocks all new entries.
+            candidates = attach_multi_horizon_value_contract(candidates)
+            # Attach the one authoritative final score before lifecycle. This
+            # pass deliberately cannot select; the optimizer runs once only
+            # after lifecycle/state constraints have been evaluated.
             candidates = apply_mainline_v3_entry_policy(
                 candidates,
                 max_new_candidates=self._max_positions_override or 5,
@@ -922,8 +1335,22 @@ class GovernanceBacktestRunner:
                 ),
                 held_symbols=self.positions,
                 lot_size=MIN_LOT_SIZE,
+                strategy_logic_version=self.strategy_logic_version,
+                ranking_score_column=v3_ranking_score_column,
+                use_scap_candidate_utility=self.governance_control_mode in {"aggressive_profit", "aggressive_lean"},
+                scap_single_position_soft_cap=float(
+                    self.capital_profile.get("scap_single_position_soft_cap", 0.25) or 0.25
+                ),
+                scap_candidate_minimum_commission=float(
+                    self.capital_profile.get("scap_candidate_minimum_commission", 5.0) or 5.0
+                ),
+                scap_candidate_reward_basis=str(
+                    self.capital_profile.get("scap_candidate_reward_basis", "lcb") or "lcb"
+                ),
+                ranking_coverage_column=v3_ranking_coverage_column,
+                decision_date=date,
+                selection_enabled=False,
             )
-        candidates = self._apply_candidate_risk_penalty(candidates, exposure=exposure)
         candidates = self._attach_position_lifecycle_signals(candidates, date=date)
         candidates = self._apply_position_state_constraints(candidates, date=date, exposure=exposure)
         candidates = self._apply_optional_exit_controls(candidates)
@@ -937,7 +1364,7 @@ class GovernanceBacktestRunner:
                 risk_level=risk_level,
                 max_new_candidates=self._max_positions_override or 5,
             )
-        elif self.strategy_logic_version == MAINLINE_V3:
+        elif is_mainline_v3_version(self.strategy_logic_version):
             candidates = apply_mainline_v3_entry_policy(
                 candidates,
                 max_new_candidates=self._max_positions_override or 5,
@@ -950,7 +1377,48 @@ class GovernanceBacktestRunner:
                 ),
                 held_symbols=self.positions,
                 lot_size=MIN_LOT_SIZE,
+                strategy_logic_version=self.strategy_logic_version,
+                ranking_score_column=v3_ranking_score_column,
+                ranking_coverage_column=v3_ranking_coverage_column,
+                decision_date=date,
+                use_scap_candidate_utility=self.governance_control_mode in {"aggressive_profit", "aggressive_lean"},
+                scap_single_position_soft_cap=float(
+                    self.capital_profile.get("scap_single_position_soft_cap", 0.25) or 0.25
+                ),
+                scap_candidate_minimum_commission=float(
+                    self.capital_profile.get("scap_candidate_minimum_commission", 5.0) or 5.0
+                ),
+                scap_candidate_reward_basis=str(
+                    self.capital_profile.get("scap_candidate_reward_basis", "lcb") or "lcb"
+                ),
             )
+        # Non-V3 strategies still need the same comparable return-unit fields
+        # for lifecycle, replacement and reporting consumers.
+        if not is_mainline_v3_version(self.strategy_logic_version):
+            candidates = attach_multi_horizon_value_contract(candidates)
+        # Lifecycle rows are created before the final v3/ML ranking pass.  Bind
+        # the final comparable value and role scores back to the same daily
+        # held-position snapshot so monitoring and integrity audits evaluate
+        # the score that actually governed replacement decisions.
+        if self.position_state_rows and not candidates.empty:
+            final_by_symbol = candidates.drop_duplicates("symbol", keep="first").set_index("symbol", drop=False)
+            score_fields = (
+                "cabinet_native_final_score", "cabinet_strict_entry_score",
+                "cabinet_proxy_entry_score", "cabinet_timing_score",
+                "cabinet_liquidity_health_score", "cabinet_risk_safety_score",
+                "cabinet_hold_support_score", "comparable_value_horizon_days",
+                "comparable_expected_alpha", "comparable_alpha_lcb",
+                "comparable_value_contract",
+            )
+            for state_row in self.position_state_rows:
+                if pd.Timestamp(state_row.get("date")) != pd.Timestamp(date):
+                    continue
+                symbol = str(state_row.get("symbol", ""))
+                if symbol not in final_by_symbol.index:
+                    continue
+                final = final_by_symbol.loc[symbol]
+                for field in score_fields:
+                    state_row[field] = final.get(field, pd.NA)
         self._record_candidate_gate_audit(date=date, candidates=candidates)
         entry_confirmed = candidates.get("entry_confirmed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
         role_pass = candidates.get("state_machine_role_pass", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
@@ -971,6 +1439,14 @@ class GovernanceBacktestRunner:
             "regime_stage_mode": "confirmation_or_exposure_overlay",
             "candidate_detail_scope": f"top_{int(GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT)}",
             "candidate_detail_count": 0,
+            "scap_raw_signal_count": 0,
+            "scap_structural_feasible_count": 0,
+            "scap_cash_feasible_count": 0,
+            "scap_slot_feasible_count": 0,
+            "scap_optimizer_selected_count": 0,
+            "scap_registered_buy_count": 0,
+            "scap_registered_add_buy_count": 0,
+            "scap_registered_replacement_buy_count": 0,
         }
         defensive_candidates = self._record_defensive_sleeve_diagnostics(
             date=date,
@@ -1003,36 +1479,122 @@ class GovernanceBacktestRunner:
         safety_exposure_cap = float(pd.to_numeric(pd.Series([safety_row.get("exposure_cap", 1.0)]), errors="coerce").fillna(1.0).iloc[0])
         regime_name = getattr(regime_params, "regime_name", structural_regime_level) if regime_params is not None else structural_regime_level
         liquidity_stress = float(pd.to_numeric(pd.Series([safety_row.get("market_liquidity_stress_ratio", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-        qualified_entry_count = int(_state_machine_entry_mask(candidates).sum())
+        entry_stage_counts = _scap_entry_stage_counts(candidates)
+        qualified_entry_count = int(entry_stage_counts["optimizer_selected_entry_count"])
+        exposure_signal_count = (
+            int(entry_stage_counts["raw_signal_count"])
+            if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}
+            else qualified_entry_count
+        )
         trailing_buy_accuracy_5d = self._trailing_trade_accuracy(date, side="buy", horizon_days=5, lookback_trades=60)
         exposure_authorization = _authorize_exposure_by_regime(
             regime_name=regime_name,
             risk_level=risk_level,
             safety_exposure_cap=safety_exposure_cap,
             candidates=candidates,
-            qualified_entry_count=qualified_entry_count,
+            qualified_entry_count=exposure_signal_count,
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
             liquidity_stress=liquidity_stress,
             regime_overlay_mode=self.regime_overlay_mode if self._control_enabled("regime_overlay") else "off",
         )
         target_exposure_proxy = exposure_authorization["authorized_exposure_max"]
+        desired_exposure_target = float(target_exposure_proxy)
+        risk_exposure_ceiling = float(target_exposure_proxy)
+        lot_feasible_target_exposure = float(target_exposure_proxy)
+        if (
+            is_mainline_v3_version(self.strategy_logic_version)
+            and self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_DEFAULT
+        ):
+            selected_or_add = (
+                candidates.get("entry_confirmed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+                | candidates.get("add_allowed", pd.Series(False, index=candidates.index)).fillna(False).astype(bool)
+            )
+            feasible_increment = float(
+                pd.to_numeric(
+                    candidates.get("mainline_v3_one_lot_weight", pd.Series(0.0, index=candidates.index)),
+                    errors="coerce",
+                ).fillna(0.0).where(selected_or_add, 0.0).clip(lower=0.0).sum()
+            )
+            if self.governance_control_mode == "aggressive_profit":
+                scap_targets = build_scap_exposure_targets(
+                    actual_exposure=actual_exposure,
+                    authorized_risk_ceiling=target_exposure_proxy,
+                    feasible_increment=feasible_increment,
+                    qualified_entry_count=exposure_signal_count,
+                )
+                risk_exposure_ceiling = scap_targets.risk_exposure_ceiling
+                desired_exposure_target = scap_targets.desired_exposure_target
+                lot_feasible_target_exposure = scap_targets.executable_exposure_target
+                target_exposure_proxy = scap_targets.executable_exposure_target
+            elif self.governance_control_mode == "aggressive_lean":
+                if str(risk_level).strip().lower() in {"high", "critical"}:
+                    strategic_budget = float(
+                        self.capital_profile.get("strategic_exposure_high", 0.35)
+                    )
+                elif (
+                    str(risk_level).strip().lower() in {"weak", "elevated"}
+                    or str(structural_regime_level).strip().lower()
+                    in {"bear", "weak", "risk_off"}
+                ):
+                    strategic_budget = float(
+                        self.capital_profile.get("strategic_exposure_weak", 0.65)
+                    )
+                else:
+                    strategic_budget = float(
+                        self.capital_profile.get("strategic_exposure_normal", 0.90)
+                    )
+                target_exposure_proxy = min(
+                    max(strategic_budget, 0.0),
+                    float(safety_exposure_cap),
+                )
+                risk_exposure_ceiling = float(target_exposure_proxy)
+                desired_exposure_target = float(target_exposure_proxy)
+                lot_feasible_target_exposure = float(target_exposure_proxy)
+            else:
+                lot_feasible_target_exposure = min(
+                    float(target_exposure_proxy),
+                    float(actual_exposure) + feasible_increment,
+                )
+                target_exposure_proxy = max(float(actual_exposure), lot_feasible_target_exposure)
         force_deploy_target = self._force_deploy_target_exposure(
             risk_level=risk_level,
             structural_regime_level=structural_regime_level,
             safety_exposure_cap=safety_exposure_cap,
             liquidity_stress=liquidity_stress,
         )
-        if force_deploy_target is not None:
+        if (
+            force_deploy_target is not None
+            and self.governance_control_mode != "aggressive_lean"
+        ):
             target_exposure_proxy = max(float(target_exposure_proxy), float(force_deploy_target))
             target_exposure_proxy = min(float(target_exposure_proxy), float(safety_exposure_cap))
         high_exposure_gate = self._high_exposure_research_gate(date)
+        high_exposure_cap_applied = False
+        if (
+            self.governance_control_mode == "aggressive_profit"
+            and not bool(high_exposure_gate["gate_pass"])
+            and float(target_exposure_proxy) > 0.60
+        ):
+            # The same authorization is consumed by new entries, both add
+            # paths, and replacements through DecisionContext/ActionPlan.
+            target_exposure_proxy = 0.60
+            desired_exposure_target = min(float(desired_exposure_target), 0.60)
+            risk_exposure_ceiling = min(float(risk_exposure_ceiling), 0.60)
+            lot_feasible_target_exposure = min(
+                float(lot_feasible_target_exposure), 0.60
+            )
+            high_exposure_cap_applied = True
         catchup_decision = decide_exposure_catchup(
             actual_exposure=actual_exposure,
-            target_exposure=target_exposure_proxy,
+            target_exposure=(
+                desired_exposure_target
+                if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}
+                else target_exposure_proxy
+            ),
             risk_level=risk_level,
             structural_regime_level=structural_regime_level,
             market_liquidity_stress_ratio=liquidity_stress,
-            qualified_entry_count=qualified_entry_count,
+            qualified_entry_count=exposure_signal_count,
             transition_only=day_index < GOVERNANCE_INITIAL_TRANSITION_DAYS,
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
             risk_contribution_gate_pass=high_exposure_gate["gate_pass"],
@@ -1043,6 +1605,7 @@ class GovernanceBacktestRunner:
         high_exposure_gate_diagnostics = {
             "high_exposure_research_gate_pass": high_exposure_gate["gate_pass"],
             "high_exposure_research_gate_reason": high_exposure_gate["gate_reason"],
+            "high_exposure_unified_cap_applied": high_exposure_cap_applied,
             "closed_trade_count_for_gate": high_exposure_gate["closed_trade_count"],
             "closed_trade_win_rate_for_gate": high_exposure_gate["closed_trade_win_rate"],
             "profit_factor_for_gate": high_exposure_gate["profit_factor"],
@@ -1073,7 +1636,7 @@ class GovernanceBacktestRunner:
                 self._max_positions_override
                 or (
                     GOVERNANCE_DEFAULT_TOP_N
-                    if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}
+                    if self.strategy_logic_version == MAINLINE_V2 or is_mainline_v3_version(self.strategy_logic_version)
                     else (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N)
                 )
             ),
@@ -1082,8 +1645,49 @@ class GovernanceBacktestRunner:
             hard_qualification_symbols=self._hard_qualification_symbols(),
             catchup_buy_budget=catchup_decision.catchup_buy_budget,
             catchup_allowed=catchup_decision.catchup_allowed,
+            active_replacement_enabled=bool(
+                self.capital_profile.get("active_replacement_enabled", True)
+            ),
+            active_replacement_max_pairs_per_day=int(
+                self.capital_profile.get(
+                    "scap_active_replacement_max_pairs_per_day", 1
+                )
+                or 0
+            ),
             target_exposure_cap=target_exposure_proxy,
             covariance_matrix=covariance_matrix,
+            nav_amount=float(exposure["nominal_nav"]),
+            cash_amount=float(self.cash),
+            cash_buffer_amount=float(
+                self.capital_profile.get("min_cash_buffer", 0.0) or 0.0
+            ),
+            per_name_structural_cap=float(
+                self.capital_profile.get(
+                    "retail_single_position_cap",
+                    self.capital_profile.get("retail_one_lot_position_cap", 1.0),
+                )
+                or 1.0
+            ),
+            portfolio_stress_budget_amount=float(exposure["nominal_nav"]) * 0.40,
+            control_mode=self.governance_control_mode,
+            winner_add_enabled=bool(
+                self.capital_profile.get("scap_winner_pyramiding_enabled", False)
+            ),
+            loser_add_enabled=bool(
+                self.capital_profile.get("scap_loser_averaging_enabled", False)
+            ),
+            soft_exit_enabled=bool(
+                self.capital_profile.get("scap_soft_exit_enabled", True)
+            ),
+            forecast_horizon_sessions=int(
+                self.capital_profile.get("scap_forecast_horizon_days", 10) or 10
+            ),
+            forecast_kappa=float(
+                self.capital_profile.get("scap_forecast_kappa", 0.50) or 0.50
+            ),
+            soft_target_positions=int(
+                self.capital_profile.get("soft_target_positions", 4) or 4
+            ),
         )
         orders = self._augment_force_deploy_diversify_orders(
             orders=orders,
@@ -1096,7 +1700,57 @@ class GovernanceBacktestRunner:
             daily=daily,
             target_exposure=target_exposure_proxy,
         )
+        self.action_decision_rows.extend(build_action_decisions(
+            date=date,
+            candidates=candidates,
+            held_symbols=self.positions,
+            orders=orders,
+            daily=daily,
+        ))
         diagnostics.update(catchup_decision.__dict__)
+        diagnostics["policy_target_exposure_before_lot_cap"] = float(exposure_authorization["authorized_exposure_max"])
+        diagnostics["qualified_entry_count"] = int(qualified_entry_count)
+        diagnostics["pre_slot_qualified_entry_count"] = int(
+            entry_stage_counts["pre_slot_qualified_entry_count"]
+        )
+        diagnostics["raw_signal_count"] = int(entry_stage_counts["raw_signal_count"])
+        diagnostics["structural_feasible_count"] = int(
+            entry_stage_counts["structural_feasible_count"]
+        )
+        diagnostics["cash_feasible_count"] = int(
+            entry_stage_counts["cash_feasible_count"]
+        )
+        diagnostics["slot_feasible_count"] = int(
+            entry_stage_counts["slot_feasible_count"]
+        )
+        diagnostics["optimizer_selected_entry_count"] = int(
+            entry_stage_counts["optimizer_selected_entry_count"]
+        )
+        diagnostics["exposure_signal_count"] = int(exposure_signal_count)
+        diagnostics["lot_feasible_target_exposure"] = float(lot_feasible_target_exposure)
+        diagnostics["risk_exposure_ceiling"] = float(risk_exposure_ceiling)
+        diagnostics["desired_exposure_target"] = float(desired_exposure_target)
+        diagnostics["executable_exposure_target"] = float(lot_feasible_target_exposure)
+        if self.governance_control_mode == "aggressive_profit":
+            diagnostics.update(scap_targets.as_dict())
+            diagnostics["target_exposure"] = float(desired_exposure_target)
+            diagnostics["effective_target_exposure_cap"] = float(lot_feasible_target_exposure)
+        elif self.governance_control_mode == "aggressive_lean":
+            diagnostics["strategic_exposure_budget"] = float(
+                risk_exposure_ceiling
+            )
+            diagnostics["actual_exposure"] = float(actual_exposure)
+            diagnostics["execution_drag"] = max(
+                float(diagnostics.get("planned_exposure", actual_exposure))
+                - float(actual_exposure),
+                0.0,
+            )
+            diagnostics["target_exposure"] = float(
+                diagnostics.get("planned_exposure", desired_exposure_target)
+            )
+            diagnostics["effective_target_exposure_cap"] = float(
+                risk_exposure_ceiling
+            )
         diagnostics.update(high_exposure_gate_diagnostics)
         if (
             not bool(high_exposure_gate["gate_pass"])
@@ -1119,6 +1773,66 @@ class GovernanceBacktestRunner:
         candidate_funnel_row["candidate_detail_count"] = int(len(today_entry_audit))
         candidate_funnel_row["ideal_portfolio_count"] = int(len(ideal_plan))
         candidate_funnel_row["order_count"] = int(len(orders))
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            from functions.decision_council.candidate_funnel_audit import (
+                classify_scap_registered_buys,
+            )
+
+            registered_buy_counts = classify_scap_registered_buys(orders)
+            if self.governance_control_mode == "aggressive_lean":
+                funnel_stage_counts = {
+                    "raw_signal_count": int(
+                        diagnostics.get("lean_raw_entry_signal_count", 0)
+                    ),
+                    "structural_feasible_count": int(
+                        diagnostics.get("lean_structural_feasible_entry_count", 0)
+                    ),
+                    "cash_feasible_count": int(
+                        diagnostics.get("lean_cash_feasible_entry_count", 0)
+                    ),
+                    "slot_feasible_count": int(
+                        diagnostics.get("lean_slot_feasible_entry_count", 0)
+                    ),
+                    "optimizer_selected_entry_count": int(
+                        diagnostics.get("lean_optimizer_selected_entry_count", 0)
+                    ),
+                }
+            else:
+                funnel_stage_counts = entry_stage_counts
+            candidate_funnel_row.update(
+                {
+                    "scap_raw_signal_count": int(funnel_stage_counts["raw_signal_count"]),
+                    "scap_structural_feasible_count": int(
+                        funnel_stage_counts["structural_feasible_count"]
+                    ),
+                    "scap_cash_feasible_count": int(
+                        funnel_stage_counts["cash_feasible_count"]
+                    ),
+                    "scap_slot_feasible_count": int(
+                        funnel_stage_counts["slot_feasible_count"]
+                    ),
+                    "scap_optimizer_selected_count": int(
+                        funnel_stage_counts["optimizer_selected_entry_count"]
+                    ),
+                    # Only first-entry buys belong to the candidate subset
+                    # chain. Adds and paired replacement buys have different
+                    # denominators and are audited separately.
+                    "scap_registered_buy_count": registered_buy_counts[
+                        "entry_buy_count"
+                    ],
+                    "scap_registered_add_buy_count": registered_buy_counts[
+                        "add_buy_count"
+                    ],
+                    "scap_registered_replacement_buy_count": registered_buy_counts[
+                        "replacement_buy_count"
+                    ],
+                }
+            )
+            from functions.decision_council.candidate_funnel_audit import (
+                assert_scap_funnel_monotonic,
+            )
+
+            assert_scap_funnel_monotonic(candidate_funnel_row)
         self.candidate_funnel_rows.append(candidate_funnel_row)
         self.exposure_rows[-1].update(
             {
@@ -1130,8 +1844,20 @@ class GovernanceBacktestRunner:
                 "trade_accuracy_runtime_state": trade_accuracy_state,
                 "runtime_maturity_state": runtime_maturity_state,
                 "pit_runtime_state": self.pit_runtime_state,
+                "pit_level2_runtime_state": self.pit_level2_runtime_state,
+                "factor_temporal_isolation_status": (
+                    "PASS" if self.factor_temporal_isolation_pass else "FAIL_OR_NOT_EVALUATED"
+                ),
                 "capital_usage_mode": self.capital_usage_mode,
                 "force_deploy_enabled": self.capital_usage_mode == GOVERNANCE_CAPITAL_USAGE_MODE_FORCE_DEPLOY,
+                # Keep the account configuration distinct from the minimum/target
+                # holding count.  Reports must not infer a hard position limit
+                # from the profile's diversification target.
+                "configured_max_positions": int(
+                    self._max_positions_override
+                    or self.capital_profile.get("max_positions", GOVERNANCE_DEFAULT_TOP_N)
+                    or GOVERNANCE_DEFAULT_TOP_N
+                ),
                 "target_holding_count": int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K),
                 "holding_shortfall_count": max(
                     int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K)
@@ -1166,10 +1892,25 @@ class GovernanceBacktestRunner:
                 "actual_target_ratio_for_gate": diagnostics.get("actual_target_ratio_for_gate", pd.NA),
                 "latest_top1_risk_contribution_for_gate": diagnostics.get("latest_top1_risk_contribution_for_gate", pd.NA),
                 "qualified_entry_count": diagnostics.get("qualified_entry_count", 0),
+                "pre_slot_qualified_entry_count": diagnostics.get("pre_slot_qualified_entry_count", 0),
+                "raw_signal_count": diagnostics.get("raw_signal_count", 0),
+                "structural_feasible_count": diagnostics.get("structural_feasible_count", 0),
+                "cash_feasible_count": diagnostics.get("cash_feasible_count", 0),
+                "slot_feasible_count": diagnostics.get("slot_feasible_count", 0),
+                "optimizer_selected_entry_count": diagnostics.get("optimizer_selected_entry_count", 0),
+                "exposure_signal_count": diagnostics.get("exposure_signal_count", 0),
                 "regime_name": diagnostics.get("regime_name", ""),
                 "base_exposure_by_regime": diagnostics.get("base_exposure_by_regime", 0.0),
                 "raw_safety_exposure_cap": diagnostics.get("raw_safety_exposure_cap", safety_exposure_cap),
                 "effective_target_exposure_cap": diagnostics.get("effective_target_exposure_cap", target_exposure_proxy),
+                "policy_target_exposure_before_lot_cap": diagnostics.get("policy_target_exposure_before_lot_cap", target_exposure_proxy),
+                "lot_feasible_target_exposure": diagnostics.get("lot_feasible_target_exposure", target_exposure_proxy),
+                "risk_exposure_ceiling": diagnostics.get("risk_exposure_ceiling", target_exposure_proxy),
+                "desired_exposure_target": diagnostics.get("desired_exposure_target", target_exposure_proxy),
+                "executable_exposure_target": diagnostics.get("executable_exposure_target", target_exposure_proxy),
+                "signal_cash_drag": diagnostics.get("signal_cash_drag", 0.0),
+                "lot_feasibility_drag": diagnostics.get("lot_feasibility_drag", 0.0),
+                "risk_ceiling_drag": diagnostics.get("risk_ceiling_drag", 0.0),
                 "authorized_exposure_max": diagnostics.get("authorized_exposure_max", target_exposure_proxy),
                 "exposure_authorization_tier": diagnostics.get("exposure_authorization_tier", ""),
                 "exposure_authorization_block_reasons": diagnostics.get("exposure_authorization_block_reasons", ""),
@@ -1212,6 +1953,9 @@ class GovernanceBacktestRunner:
                 "retail_blocked_count": retail_diagnostics.get("retail_blocked_count", 0),
                 "retail_lot_cash_insufficient_count": retail_diagnostics.get("retail_lot_cash_insufficient_count", 0),
                 "retail_state_block_count": retail_diagnostics.get("retail_state_block_count", 0),
+                "zero_lot_order_count": retail_diagnostics.get("zero_lot_order_count", 0),
+                "zero_lot_buy_order_count": retail_diagnostics.get("zero_lot_buy_order_count", 0),
+                "zero_lot_sell_order_count": retail_diagnostics.get("zero_lot_sell_order_count", 0),
             }
         )
         market_total_amount = float(pd.to_numeric(daily["amount"], errors="coerce").fillna(0.0).sum())
@@ -1342,7 +2086,15 @@ class GovernanceBacktestRunner:
         pending = self.engine.pending_orders.orders
         if pending is not None and not pending.empty:
             active = pending[pending["status"].isin(["pending", "pending_locked"])].copy()
-            pending_cols = [column for column in ["symbol", "side", "remaining_shares", "status", "reason", "lock_days"] if column in active.columns]
+            pending_cols = [
+                column
+                for column in [
+                    "symbol", "side", "remaining_shares", "status", "reason",
+                    "origin_reason", "latest_reason", "highest_priority_reason",
+                    "reason_history", "lock_days",
+                ]
+                if column in active.columns
+            ]
             for _, row in active.loc[:, pending_cols].head(10).iterrows():
                 pending_preview.append({key: row.get(key) for key in pending_cols})
 
@@ -1351,6 +2103,13 @@ class GovernanceBacktestRunner:
         holding_price_paths = self._holding_price_paths(date=date)
         lifecycle_preview = self._holding_lifecycle_preview()
         benchmark_nav = self._benchmark_nav_asof(date)
+        benchmark_audit = {}
+        benchmark_frame = getattr(self, "_performance_benchmark_frame", pd.DataFrame())
+        if benchmark_frame is not None and not benchmark_frame.empty:
+            benchmark_dates = pd.to_datetime(benchmark_frame.get("date"), errors="coerce").dt.normalize()
+            matching = benchmark_frame.loc[benchmark_dates.eq(pd.Timestamp(date).normalize())]
+            if not matching.empty:
+                benchmark_audit = matching.iloc[-1].to_dict()
         nav_amount = float(exposure.get("liquidatable_nav", exposure.get("nominal_nav", self.initial_cash)) or self.initial_cash)
         account_net_value = nav_amount / max(float(self.initial_cash), 1e-12)
         excess_net_value = account_net_value / max(float(benchmark_nav), 1e-12)
@@ -1364,6 +2123,15 @@ class GovernanceBacktestRunner:
         )
 
         return {
+            "runtime_identity_hash": str(
+                getattr(self, "runtime_identity", {}).get("runtime_identity_hash", "")
+            ),
+            "scap_exit_stage": str(
+                self.capital_profile.get("scap_exit_stage", "E0") or "E0"
+            ).upper(),
+            "scap_loss_stop": float(
+                self.capital_profile.get("scap_loss_stop", -0.12)
+            ),
             "risk_level": str(safety_row.get("risk_level", "normal")),
             "raw_risk_level": str(safety_row.get("raw_risk_level", "normal")),
             "trigger_streak_days": int(pd.to_numeric(pd.Series([safety_row.get("trigger_streak_days", 0)]), errors="coerce").fillna(0).iloc[0]),
@@ -1376,6 +2144,23 @@ class GovernanceBacktestRunner:
             "market_liquidity_stress_ratio": float(pd.to_numeric(pd.Series([safety_row.get("market_liquidity_stress_ratio", 0.0)]), errors="coerce").fillna(0.0).iloc[0]),
             "trigger_source": str(safety_row.get("trigger_source", "normal")),
             "benchmark_nav": float(benchmark_nav),
+            "performance_benchmark_id": str(
+                benchmark_audit.get(
+                    "benchmark_id",
+                    f"top_liquidity_{self.performance_benchmark_top_n}_equal_weight_{self.performance_benchmark_rebalance}",
+                )
+            ),
+            "performance_benchmark_member_count": int(
+                pd.to_numeric(pd.Series([benchmark_audit.get("benchmark_member_count", 0)]), errors="coerce").fillna(0).iloc[0]
+            ),
+            "performance_benchmark_return_coverage": float(
+                pd.to_numeric(pd.Series([benchmark_audit.get("benchmark_return_coverage", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+            ),
+            "performance_benchmark_rebalanced": bool(benchmark_audit.get("benchmark_rebalanced", False)),
+            "performance_benchmark_turnover": float(
+                pd.to_numeric(pd.Series([benchmark_audit.get("benchmark_turnover", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
+            ),
+            "safety_benchmark_id": str(MARKET_REGIME_BENCHMARK_SYMBOL or ""),
             "account_net_value": float(account_net_value),
             "excess_net_value": float(excess_net_value),
             "structural_regime_level": str(safety_row.get("structural_regime_level", "bull")),
@@ -1388,6 +2173,12 @@ class GovernanceBacktestRunner:
             "base_exposure_by_regime": float(diagnostics.get("base_exposure_by_regime", 0.0)),
             "raw_safety_exposure_cap": float(diagnostics.get("raw_safety_exposure_cap", 0.0)),
             "effective_target_exposure_cap": float(diagnostics.get("effective_target_exposure_cap", 0.0)),
+            "risk_exposure_ceiling": float(diagnostics.get("risk_exposure_ceiling", 0.0)),
+            "desired_exposure_target": float(diagnostics.get("desired_exposure_target", 0.0)),
+            "executable_exposure_target": float(diagnostics.get("executable_exposure_target", 0.0)),
+            "signal_cash_drag": float(diagnostics.get("signal_cash_drag", 0.0)),
+            "lot_feasibility_drag": float(diagnostics.get("lot_feasibility_drag", 0.0)),
+            "risk_ceiling_drag": float(diagnostics.get("risk_ceiling_drag", 0.0)),
             "exposure_authorization_tier": str(diagnostics.get("exposure_authorization_tier", "")),
             "exposure_authorization_block_reasons": str(diagnostics.get("exposure_authorization_block_reasons", "")),
             "governance_control_mode": self.governance_control_mode,
@@ -1501,6 +2292,9 @@ class GovernanceBacktestRunner:
             "retail_blocked_count": int(diagnostics.get("retail_blocked_count", 0)),
             "retail_lot_cash_insufficient_count": int(diagnostics.get("retail_lot_cash_insufficient_count", 0)),
             "retail_state_block_count": int(diagnostics.get("retail_state_block_count", 0)),
+            "zero_lot_order_count": int(diagnostics.get("zero_lot_order_count", 0)),
+            "zero_lot_buy_order_count": int(diagnostics.get("zero_lot_buy_order_count", 0)),
+            "zero_lot_sell_order_count": int(diagnostics.get("zero_lot_sell_order_count", 0)),
             "candidate_preview": candidate_preview,
             "confirmed_preview": confirmed_preview,
             "order_preview": order_preview,
@@ -1645,6 +2439,9 @@ class GovernanceBacktestRunner:
                 "post_entry_failure_exit",
                 "hard_stop_exit",
             }
+        if mode == "aggressive_profit":
+            exit_stage = str(self.capital_profile.get("scap_exit_stage", "E0") or "E0").strip().upper()
+            return scap_control_enabled(exit_stage=exit_stage, control_name=control)
         return True
 
     def _holding_price_paths(self, *, date) -> list[dict]:
@@ -1718,6 +2515,7 @@ class GovernanceBacktestRunner:
     def _holding_lifecycle_preview(self) -> list[dict]:
         rows = []
         latest_state_by_symbol = {}
+        latest_date = ""
         if self.position_state_rows:
             latest_date = max(pd.Timestamp(row.get("date")) for row in self.position_state_rows if row.get("date") is not None)
             latest_state_by_symbol = {
@@ -1730,6 +2528,7 @@ class GovernanceBacktestRunner:
             rows.append(
                 {
                     "symbol": str(row.get("symbol", "")),
+                    "snapshot_date": str(row.get("date", latest_date))[:10],
                     "market_value": _safe_float(row.get("market_value"), default=0.0),
                     "entry_date": str(row.get("entry_date", ""))[:10],
                     "entry_price": _safe_float(row.get("entry_price"), default=0.0),
@@ -1737,6 +2536,10 @@ class GovernanceBacktestRunner:
                     "mfe": _safe_float(row.get("mfe"), default=0.0),
                     "mae": _safe_float(row.get("mae"), default=0.0),
                     "giveback_from_peak": _safe_float(row.get("giveback_from_peak"), default=0.0),
+                    "giveback_armed": bool(
+                        _safe_float(row.get("mfe"), default=0.0)
+                        >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1)
+                    ),
                     "trend_direction_score": _safe_float(row.get("trend_direction_score"), default=0.0),
                     "peak_decay_score": _safe_float(row.get("peak_decay_score"), default=0.0),
                     "profit_protection_pressure": _safe_float(row.get("profit_protection_pressure"), default=0.0),
@@ -1744,10 +2547,19 @@ class GovernanceBacktestRunner:
                     "future_loss_risk_score": _safe_float(row.get("future_loss_risk_score"), default=0.0),
                     "profit_giveback_flag": bool(row.get("profit_giveback_flag", False)),
                     "post_entry_failure_flag": bool(row.get("post_entry_failure_flag", False)),
+                    "post_entry_failure_score": _safe_float(
+                        state.get("post_entry_failure_score"), default=0.0
+                    ),
+                    "post_entry_failure_threshold": _safe_float(
+                        state.get("post_entry_failure_threshold"),
+                        default=GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE,
+                    ),
                     "position_state": state.get("position_state", ""),
                     "add_allowed": bool(state.get("add_allowed", False)),
                     "add_block_reason": state.get("add_block_reason", ""),
                     "position_exit_reason": state.get("position_exit_reason", ""),
+                    "paper_exit_reason": state.get("paper_exit_reason", ""),
+                    "paper_exit_state": bool(state.get("paper_exit_state", False)),
                     "cooldown_until": state.get("cooldown_until", ""),
                 }
             )
@@ -1764,9 +2576,13 @@ class GovernanceBacktestRunner:
         return float(lookup.get(key, 1.0))
 
     def _build_benchmark_nav_lookup(self) -> dict:
-        top_strength = build_top_strength_benchmark_series(self.features)
-        if not top_strength.empty:
-            data = top_strength.copy()
+        self._performance_benchmark_frame = build_top_pool_benchmark_series(
+            self._performance_benchmark_source(),
+            top_n=self.performance_benchmark_top_n,
+            rebalance=self.performance_benchmark_rebalance,
+        )
+        if not self._performance_benchmark_frame.empty:
+            data = self._performance_benchmark_frame.copy()
             data["date_norm"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
             data["benchmark_nav"] = pd.to_numeric(data["benchmark_net_value"], errors="coerce")
             data = data.dropna(subset=["date_norm", "benchmark_nav"])
@@ -1795,6 +2611,34 @@ class GovernanceBacktestRunner:
         data["date_norm"] = data["date"].dt.normalize()
         return data.drop_duplicates("date_norm", keep="last").set_index("date_norm")["benchmark_nav"].astype(float).to_dict()
 
+    def _performance_benchmark_source(self) -> pd.DataFrame:
+        source_frames = []
+        for source in (self.features, self.audit_prices):
+            if source is None or source.empty:
+                continue
+            close_col = "close_nominal" if "close_nominal" in source.columns else "close"
+            columns = [column for column in (
+                "date", "symbol", close_col, "amount", "amount_ma20", "instrument_type", "is_trading"
+            ) if column in source.columns]
+            if not {"date", "symbol", close_col}.issubset(columns):
+                continue
+            frame = source.loc[:, columns].copy()
+            if close_col != "close_nominal":
+                frame = frame.rename(columns={close_col: "close_nominal"})
+            if "instrument_type" not in frame.columns:
+                frame["instrument_type"] = "stock"
+            if "is_trading" not in frame.columns:
+                frame["is_trading"] = True
+            source_frames.append(frame)
+        if not source_frames:
+            return pd.DataFrame()
+        result = pd.concat(source_frames, ignore_index=True).drop_duplicates(["date", "symbol"], keep="first")
+        # The ETF proxy remains a safety/regime input.  It must not become a
+        # constituent of the independent stock-pool performance benchmark.
+        return result.loc[
+            ~result["symbol"].astype(str).eq(str(MARKET_REGIME_BENCHMARK_SYMBOL or ""))
+        ].copy()
+
     def _update_lifecycle_on_buy(self, symbol: str, *, date, price: float, shares: float, current, signal=None) -> None:
         return update_lifecycle_on_buy_runtime(self, symbol, date=date, price=price, shares=shares, current=current, signal=signal)
 
@@ -1810,8 +2654,19 @@ class GovernanceBacktestRunner:
     def _apply_position_state_constraints(self, candidates: pd.DataFrame, *, date, exposure: dict) -> pd.DataFrame:
         return apply_position_state_constraints_runtime(self, candidates, date=date, exposure=exposure)
 
-    def _apply_candidate_risk_penalty(self, candidates: pd.DataFrame, *, exposure: dict) -> pd.DataFrame:
-        return apply_candidate_risk_penalty_runtime(self, candidates, exposure=exposure)
+    def _apply_candidate_risk_penalty(
+        self,
+        candidates: pd.DataFrame,
+        *,
+        exposure: dict,
+        score_column: str = "primary_score",
+    ) -> pd.DataFrame:
+        return apply_candidate_risk_penalty_runtime(
+            self,
+            candidates,
+            exposure=exposure,
+            score_column=score_column,
+        )
 
     def _expire_position_cooldowns(self, date) -> None:
         return expire_position_cooldowns_runtime(self, date)
@@ -2065,7 +2920,7 @@ class GovernanceBacktestRunner:
             lambda symbol: self._retail_cash_required(
                 side="buy",
                 price=float(price_map.at[symbol]) if symbol in price_map.index and pd.notna(price_map.at[symbol]) else 0.0,
-                shares=float(MIN_LOT_SIZE),
+                shares=float(trading_rule_for(symbol).minimum_buy_quantity),
             )
         )
         out["_one_lot_account_weight"] = out["_one_lot_cash_required"] / max(float(nominal_nav), 1e-12)
@@ -2231,12 +3086,21 @@ class GovernanceBacktestRunner:
             "entry_confirmed_matrix_counterfactual", "entry_confirmed_without_probability",
             "entry_confirmed_roles_only_counterfactual", "probability_gate_evaluated",
             "probability_gate_changed_decision", "paper_exit_state", "paper_profit_giveback_exit",
-            "paper_post_entry_failure_exit", "paper_signal_failure_exit", "paper_hard_stop_exit",
+            "paper_post_entry_failure_exit", "paper_signal_failure_exit",
+            "paper_thesis_failure_exit", "paper_stale_time_exit",
+            "paper_loss_containment_exit", "paper_hard_stop_exit",
+            "paper_profit_hard_stop_exit",
             "profit_giveback_exit", "post_entry_failure_exit", "signal_failure_exit",
+            "thesis_failure_exit", "stale_time_exit", "loss_containment_exit",
+            "hard_stop_exit", "profit_hard_stop_exit",
+            "signal_failure_confirmed",
             "production_v1_entry_confirmed", "mainline_v2_eligible",
             "mainline_v2_entry_confirmed", "mainline_v2_changed_decision",
             "mainline_v3_eligible", "mainline_v3_entry_confirmed", "mainline_v3_changed_decision",
-            "lifecycle_held_row",
+            "mainline_v3_lot_feasible", "lifecycle_held_row",
+            "mainline_v3_selection_evaluated",
+            "mainline_v3_raw_signal", "mainline_v3_structural_feasible",
+            "mainline_v3_cash_feasible", "mainline_v3_slot_feasible",
         )
         score_fields = (
             "primary_score", "alpha_percentile", "entry_alpha_score", "entry_timing_score",
@@ -2246,6 +3110,23 @@ class GovernanceBacktestRunner:
             "cabinet_base_entry_score", "cabinet_strict_entry_score", "cabinet_proxy_entry_score",
             "cabinet_timing_score", "cabinet_liquidity_health_score",
             "cabinet_risk_safety_score", "cabinet_hold_support_score",
+            "v31_reliability_score", "v31_reliability_score_coverage",
+            "monthly_lgbm_raw_score", "monthly_lgbm_rank_percentile",
+            "hybrid_rule_rank_percentile", "hybrid_ml_rank_percentile",
+            "hybrid_ml_weight", "hybrid_rule_weight", "hybrid_final_score",
+            "mainline_v3_one_lot_cash_required", "mainline_v3_one_lot_weight",
+            "scap_alpha_percentile", "scap_estimated_round_trip_cost_rate",
+            "scap_cost_penalty", "scap_concentration_penalty",
+            "scap_cash_fragment_penalty", "scap_soft_quality_penalty",
+            "scap_overlap_penalty", "scap_candidate_utility",
+            "comparable_value_horizon_days", "comparable_expected_alpha",
+            "comparable_alpha_lcb", "scap_expected_return_point",
+            "scap_expected_return_lcb", "scap_decision_expected_return",
+            "scap_estimated_total_cost_amount", "scap_risk_penalty_amount",
+            "scap_optimizer_objective", "scap_optimizer_candidate_pool_size",
+            "signal_failure_confirmation_count",
+            "signal_failure_confirmation_required",
+            "exit_conflict_count",
         )
         family_score_fields = tuple(
             column for column in candidates.columns
@@ -2265,6 +3146,37 @@ class GovernanceBacktestRunner:
                 "state_machine_role_block_reason": str(candidate.get("state_machine_role_block_reason", "")),
                 "position_state": str(candidate.get("position_state", "")),
                 "cabinet_entry_thesis": str(candidate.get("cabinet_entry_thesis", "")),
+                "hybrid_fusion_status": str(candidate.get("hybrid_fusion_status", "")),
+                "hybrid_fusion_formula_version": str(candidate.get("hybrid_fusion_formula_version", "")),
+                "hybrid_score_authority": str(candidate.get("hybrid_score_authority", "")),
+                "v31_reliability_contract": str(candidate.get("v31_reliability_contract", "")),
+                "v31_calibration_window": str(candidate.get("v31_calibration_window", "")),
+                "v31_score_formula": str(candidate.get("v31_score_formula", "")),
+                "v31_score_authority": str(candidate.get("v31_score_authority", "")),
+                "v31_strict_entry_paper_only": candidate.get("v31_strict_entry_paper_only", pd.NA),
+                "scap_candidate_utility_version": str(candidate.get("scap_candidate_utility_version", "")),
+                "scap_decision_return_basis": str(candidate.get("scap_decision_return_basis", "")),
+                "scap_overlap_penalty_state": str(candidate.get("scap_overlap_penalty_state", "")),
+                "scap_optimizer_selected": candidate.get("scap_optimizer_selected", pd.NA),
+                "scap_optimizer_status": str(candidate.get("scap_optimizer_status", "")),
+                "exit_arbitration_contract": str(
+                    candidate.get("exit_arbitration_contract", "")
+                ),
+                "exit_triggered_reasons": str(
+                    candidate.get("exit_triggered_reasons", "")
+                ),
+                "exit_authorized_reasons": str(
+                    candidate.get("exit_authorized_reasons", "")
+                ),
+                "exit_vetoed_reasons": str(
+                    candidate.get("exit_vetoed_reasons", "")
+                ),
+                "mainline_v3_score_authority": str(
+                    candidate.get("mainline_v3_score_authority", "")
+                ),
+                "mainline_v3_score_authority_version": str(
+                    candidate.get("mainline_v3_score_authority_version", "")
+                ),
             }
             for field in bool_fields:
                 value = candidate.get(field, pd.NA)
@@ -2414,14 +3326,25 @@ class GovernanceBacktestRunner:
             for row in getattr(self, "_last_position_mark_rows", []) or []
         }
         rank_rows = []
-        ordered = data.sort_values(["entry_matrix_score", "primary_score", "symbol"], ascending=[False, False, True]).head(
-            GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT
-        )
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"} and "scap_candidate_utility" in data.columns:
+            ordered = data.sort_values(
+                ["scap_optimizer_selected", "scap_candidate_utility", "primary_score", "symbol"],
+                ascending=[False, False, False, True],
+            ).head(GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT)
+        else:
+            ordered = data.sort_values(
+                ["entry_matrix_score", "primary_score", "symbol"],
+                ascending=[False, False, True],
+            ).head(GOVERNANCE_AUDIT_ENTRY_FORMULA_LIMIT)
         for _, row in ordered.iterrows():
             symbol = str(row.get("symbol", ""))
             price = _safe_float(price_map.get(symbol), default=float("nan"))
             one_lot_cash_required = (
-                self._retail_cash_required(side="buy", price=price, shares=float(MIN_LOT_SIZE))
+                self._retail_cash_required(
+                    side="buy",
+                    price=price,
+                    shares=float(trading_rule_for(symbol).minimum_buy_quantity),
+                )
                 if pd.notna(price) and price > 0.0
                 else float("nan")
             )
@@ -2431,7 +3354,11 @@ class GovernanceBacktestRunner:
             cash_ok = pd.notna(one_lot_cash_required) and one_lot_cash_required <= max(available_cash - min_buffer, 0.0)
             cap_ok = pd.notna(one_lot_weight) and current_weight + one_lot_weight <= one_lot_cap + 1e-12
             state_ok = state not in {"blocked", "cooldown", "exiting", "protecting_profit"} and not bool(row.get("exit_state", False))
-            score_ok = _safe_float(row.get("entry_matrix_score"), default=0.0) >= min_entry_score
+            score_ok = _retail_entry_score_gate_pass(
+                row,
+                strategy_logic_version=self.strategy_logic_version,
+                minimum_score=min_entry_score,
+            )
             block_reasons = []
             if not pd.notna(price) or price <= 0.0:
                 block_reasons.append("missing_price")
@@ -2462,6 +3389,8 @@ class GovernanceBacktestRunner:
                 + 0.10 * alpha_score
                 + 0.05 * (1.0 - one_lot_penalty)
             )
+            if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+                retail_score = _safe_float(row.get("scap_candidate_utility"), default=retail_score)
             payload = {
                 "decision_id": f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
                 "date": pd.Timestamp(date),
@@ -2499,6 +3428,34 @@ class GovernanceBacktestRunner:
                 "retail_one_lot_position_cap": one_lot_cap,
                 "available_cash": available_cash,
                 "cash_buffer_required": min_buffer,
+                "scap_alpha_percentile": row.get("scap_alpha_percentile", pd.NA),
+                "scap_estimated_round_trip_cost_rate": row.get(
+                    "scap_estimated_round_trip_cost_rate", pd.NA
+                ),
+                "scap_cost_penalty": row.get("scap_cost_penalty", pd.NA),
+                "scap_concentration_penalty": row.get("scap_concentration_penalty", pd.NA),
+                "scap_cash_fragment_penalty": row.get("scap_cash_fragment_penalty", pd.NA),
+                "scap_soft_quality_penalty": row.get("scap_soft_quality_penalty", pd.NA),
+                "scap_overlap_penalty": row.get("scap_overlap_penalty", pd.NA),
+                "scap_overlap_penalty_state": row.get("scap_overlap_penalty_state", ""),
+                "scap_candidate_utility": row.get("scap_candidate_utility", pd.NA),
+                "scap_candidate_utility_version": row.get("scap_candidate_utility_version", ""),
+                "scap_optimizer_selected": row.get("scap_optimizer_selected", pd.NA),
+                "scap_optimizer_objective": row.get("scap_optimizer_objective", pd.NA),
+                "scap_optimizer_candidate_pool_size": row.get(
+                    "scap_optimizer_candidate_pool_size", pd.NA
+                ),
+                "scap_optimizer_status": row.get("scap_optimizer_status", ""),
+                "mainline_v3_raw_signal": row.get("mainline_v3_raw_signal", pd.NA),
+                "mainline_v3_structural_feasible": row.get(
+                    "mainline_v3_structural_feasible", pd.NA
+                ),
+                "mainline_v3_cash_feasible": row.get(
+                    "mainline_v3_cash_feasible", pd.NA
+                ),
+                "mainline_v3_slot_feasible": row.get(
+                    "mainline_v3_slot_feasible", pd.NA
+                ),
                 "forward_return_1d": self._forward_return(symbol, date, 1),
                 "forward_return_3d": self._forward_return(symbol, date, 3),
                 "forward_return_5d": self._forward_return(symbol, date, 5),
@@ -2524,19 +3481,19 @@ class GovernanceBacktestRunner:
 
     def _forward_return(self, symbol: str, date, horizon_days: int):
         try:
-            pivot = self._return_pivot
-            if pivot is None or pivot.empty or symbol not in pivot.columns:
-                return pd.NA
             horizon = int(horizon_days)
             if horizon <= 0:
                 return pd.NA
-            returns = pd.to_numeric(
-                pivot.loc[pivot.index > pd.Timestamp(date), symbol],
-                errors="coerce",
-            ).dropna().head(horizon)
-            if len(returns) < horizon:
+            history = self._audit_close_history(symbol)
+            if history.empty:
                 return pd.NA
-            return float((1.0 + returns).prod() - 1.0)
+            dates = pd.to_datetime(history["date"], errors="coerce")
+            closes = pd.to_numeric(history["close"], errors="coerce")
+            current = closes[dates.le(pd.Timestamp(date))].dropna()
+            future = closes[dates.gt(pd.Timestamp(date))].dropna().head(horizon)
+            if current.empty or len(future) < horizon or float(current.iloc[-1]) <= 0.0:
+                return pd.NA
+            return float(future.iloc[-1] / float(current.iloc[-1]) - 1.0)
         except Exception:
             return pd.NA
 
@@ -2762,7 +3719,7 @@ class GovernanceBacktestRunner:
     def _allow_normal_rebalance(self, date, day_index):
         if self._normal_rebalance_dates:
             return pd.Timestamp(date) in self._normal_rebalance_dates
-        if self.strategy_logic_version in {MAINLINE_V2, MAINLINE_V3}:
+        if self.strategy_logic_version == MAINLINE_V2 or is_mainline_v3_version(self.strategy_logic_version):
             return int(day_index) % 5 == 0
         # Use regime-adjusted rebalancing interval
         regime_params = self._get_regime_params(date)
@@ -2931,7 +3888,20 @@ class GovernanceBacktestRunner:
         returns = returns.dropna(axis=1, thresh=max(int(lookback_days * 0.50), 10)).dropna(how="all")
         if returns.shape[1] < 2:
             return pd.DataFrame()
-        return returns.cov()
+        covariance = returns.cov()
+        if covariance.empty:
+            return covariance
+        # A fixed diagonal shrinkage keeps the short 60-session estimate
+        # positive and stable enough for a five-name integer decision. Missing
+        # pairs remain conservative zero-covariance fallback in the optimizer.
+        diagonal = pd.DataFrame(
+            0.0,
+            index=covariance.index,
+            columns=covariance.columns,
+        )
+        for symbol in covariance.index.intersection(covariance.columns):
+            diagonal.at[symbol, symbol] = covariance.at[symbol, symbol]
+        return 0.70 * covariance.fillna(0.0) + 0.30 * diagonal.fillna(0.0)
 
     def _latest_price_frame_for_trade_pairing(self, execution_ledger: pd.DataFrame) -> pd.DataFrame:
         return latest_price_frame_for_trade_pairing_runtime(self, execution_ledger)
@@ -2957,12 +3927,9 @@ class GovernanceBacktestRunner:
             reasons.append("profit_factor_below_threshold")
         if realized_pnl <= float(GOVERNANCE_HIGH_EXPOSURE_MIN_REALIZED_PNL):
             reasons.append("realized_pnl_not_positive")
-        payoff_or_win_ok = (
-            (pd.notna(payoff_ratio) and payoff_ratio >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_PAYOFF_RATIO))
-            or (pd.notna(closed_trade_win_rate) and closed_trade_win_rate >= float(GOVERNANCE_HIGH_EXPOSURE_MIN_CLOSED_WIN_RATE))
-        )
-        if not payoff_or_win_ok:
-            reasons.append("payoff_and_win_rate_below_threshold")
+        # Win rate and payoff ratio are diagnostics only for the small-capital
+        # branch. They must not jointly or alternatively veto profitable
+        # deployment after the profit-factor and realized-PnL health gates.
         if latest_top1_risk > float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION):
             reasons.append("top1_risk_contribution_above_threshold")
 
@@ -3008,13 +3975,53 @@ class GovernanceBacktestRunner:
         detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
         suffix = f" | {detail_text}" if detail_text else ""
         print(f"[governance] save_stage: {stage}{suffix}", flush=True)
+        from functions.decision_council.artifact_manifest import (
+            update_artifact_manifest,
+        )
+
+        update_artifact_manifest(
+            self.output_dir,
+            stage=str(stage),
+            status=("complete" if str(stage) == "complete" else "saving"),
+            core_complete=(True if str(stage) == "complete" else None),
+            audit_complete=(True if str(stage) == "complete" else None),
+            web_complete=(True if str(stage) == "complete" else None),
+        )
 
     def _save(self):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._log_save_stage("engine_ledgers")
         saved = self.engine.save(self.output_dir)
+        from functions.decision_council.artifact_manifest import (
+            update_artifact_manifest,
+        )
+        update_artifact_manifest(
+            self.output_dir,
+            stage="core_ledgers_saved",
+            status="saving",
+            core_complete=True,
+        )
         self._log_save_stage("build_extra_frames")
         daily_result = pd.DataFrame(self.exposure_rows)
+        reward_prices = self.audit_prices.copy()
+        performance_benchmark_symbol = "__TOP_POOL_PERFORMANCE_BENCHMARK__"
+        if not getattr(self, "_performance_benchmark_frame", pd.DataFrame()).empty:
+            benchmark_prices = self._performance_benchmark_frame[["date", "benchmark_net_value"]].rename(
+                columns={"benchmark_net_value": "close"}
+            )
+            benchmark_prices["symbol"] = performance_benchmark_symbol
+            reward_prices = pd.concat(
+                [reward_prices, benchmark_prices[["date", "symbol", "close"]]],
+                ignore_index=True,
+            )
+        performance_benchmark_output = getattr(self, "_performance_benchmark_frame", pd.DataFrame()).copy()
+        if not performance_benchmark_output.empty:
+            benchmark_dates = pd.to_datetime(performance_benchmark_output["date"], errors="coerce").dt.normalize()
+            performance_benchmark_output["benchmark_scope"] = "decision"
+            if self._run_decision_start is not None:
+                performance_benchmark_output.loc[benchmark_dates < self._run_decision_start, "benchmark_scope"] = "preload"
+            if self._run_decision_end is not None:
+                performance_benchmark_output.loc[benchmark_dates > self._run_decision_end, "benchmark_scope"] = "forward_audit"
         extra = {
             "governance_daily_result": daily_result,
             "governance_holdings_ledger": _frame_with_columns(self.holdings_rows, HOLDINGS_LEDGER_COLUMNS),
@@ -3022,6 +4029,21 @@ class GovernanceBacktestRunner:
             "governance_reward_ledger": _frame_with_columns(
                 self.reward_rows,
                 ["date", "symbol", "side", "trade_date", "reward_5d", "reward_source"],
+            ),
+            "governance_action_decision_ledger": pd.DataFrame(self.action_decision_rows),
+            "governance_action_counterfactual_reward": mature_action_rewards(
+                pd.DataFrame(self.action_decision_rows),
+                reward_prices,
+                benchmark_symbol=performance_benchmark_symbol,
+                executions=pd.DataFrame(self.execution_rows),
+            ),
+            "governance_performance_benchmark": performance_benchmark_output,
+            "governance_performance_benchmark_sensitivity": build_top_pool_benchmark_sensitivity(
+                self._performance_benchmark_source(),
+                top_n_values=(50, 100, 300),
+                rebalance=self.performance_benchmark_rebalance,
+                evaluation_start=self._run_decision_start,
+                evaluation_end=self._run_decision_end,
             ),
             "governance_entry_confirmation_ledger": pd.DataFrame(self.entry_confirmation_rows),
             "governance_position_state_ledger": _frame_with_columns(
@@ -3072,6 +4094,18 @@ class GovernanceBacktestRunner:
                     "post_entry_failure_score",
                     "strategy_logic_version",
                     "cabinet_native_final_score",
+                    "v31_reliability_score",
+                    "v31_reliability_score_coverage",
+                    "v31_reliability_contract",
+                    "v31_calibration_window",
+                    "v31_score_formula",
+                    "v31_score_authority",
+                    "v31_strict_entry_paper_only",
+                    "monthly_lgbm_raw_score",
+                    "monthly_lgbm_rank_percentile",
+                    "hybrid_final_score",
+                    "hybrid_ml_weight",
+                    "hybrid_fusion_status",
                     "cabinet_base_entry_score",
                     "cabinet_strict_entry_score",
                     "cabinet_proxy_entry_score",
@@ -3096,6 +4130,39 @@ class GovernanceBacktestRunner:
             "governance_defensive_sleeve_diagnostics": pd.DataFrame(self.defensive_sleeve_rows),
             "governance_factor_weight_ledger": pd.DataFrame(self.factor_weight_rows),
             "governance_factor_source_report": pd.DataFrame([self.factor_source_spec.summary_dict()]),
+            "governance_monthly_lgbm_fusion_audit": pd.DataFrame(self.monthly_lgbm_fusion_rows),
+            "governance_monthly_lgbm_training_audit": (
+                self.monthly_lgbm_controller.training_attempt_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_feature_diagnostics": (
+                self.monthly_lgbm_controller.feature_diagnostic_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_iteration_metrics": (
+                self.monthly_lgbm_controller.iteration_metric_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_nested_candidates": (
+                self.monthly_lgbm_controller.nested_candidate_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_treatment_candidates": (
+                self.monthly_lgbm_controller.treatment_candidate_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_treatment_daily": (
+                self.monthly_lgbm_controller.treatment_daily_frame()
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_monthly_lgbm_treatment_effect": (
+                self.monthly_lgbm_controller.treatment_effect_frame(self.features)
+                if self.monthly_lgbm_controller is not None else pd.DataFrame()
+            ),
+            "governance_v31_rolling_reliability_audit": (
+                self.role_reliability_controller.audit_frame()
+                if self.role_reliability_controller is not None else pd.DataFrame()
+            ),
             "governance_factor_semantic_contract": pd.DataFrame(
                 semantic_contract_rows(self.factor_semantic_contracts)
             ),
@@ -3104,6 +4171,27 @@ class GovernanceBacktestRunner:
             "governance_account_audit_ledger": pd.DataFrame(self.account_audit_rows),
             "governance_corporate_action_ledger": self.corporate_actions.audit_frame(),
         }
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            from functions.decision_council.small_capital_aggressive import (
+                build_scap_exit_stage_contract,
+            )
+
+            extra["scap_exit_stage_contract"] = build_scap_exit_stage_contract(
+                self.capital_profile.get("scap_exit_stage", "E0"),
+                active_replacement_enabled=bool(
+                    self.capital_profile.get("active_replacement_enabled", False)
+                ),
+                loser_averaging_enabled=bool(
+                    self.capital_profile.get(
+                        "scap_loser_averaging_enabled", False
+                    )
+                ),
+                winner_pyramiding_enabled=bool(
+                    self.capital_profile.get(
+                        "scap_winner_pyramiding_enabled", False
+                    )
+                ),
+            )
         maturity_columns = [
             column
             for column in (
@@ -3127,6 +4215,7 @@ class GovernanceBacktestRunner:
             extra["governance_execution_ledger"],
             latest_prices=self._latest_price_frame_for_trade_pairing(extra["governance_execution_ledger"]),
             capital_profile=self._trade_pairing_capital_profile(),
+            corporate_action_ledger=extra["governance_corporate_action_ledger"],
         )
         extra["governance_trade_pairs"] = trade_pairs
         extra["governance_open_positions"] = open_positions
@@ -3138,6 +4227,19 @@ class GovernanceBacktestRunner:
         extra["governance_entry_timing_diagnostics"] = _entry_timing_diagnostics(
             extra["governance_entry_formula_audit"],
             extra["governance_execution_ledger"],
+        )
+        from functions.decision_council.scap_profit_objective import (
+            build_scap_profit_objective_audit,
+            summarize_scap_profit_objective,
+        )
+
+        profit_objective_audit = build_scap_profit_objective_audit(
+            extra["governance_entry_formula_audit"]
+        )
+        # Keep filenames short enough for legacy Windows MAX_PATH consumers.
+        extra["scap_profit_audit"] = profit_objective_audit
+        extra["scap_profit_summary"] = (
+            summarize_scap_profit_objective(profit_objective_audit)
         )
         extra["governance_pnl_by_sell_reason"] = _pnl_by_sell_reason(trade_pairs)
         rejection_detail = build_candidate_rejection_detail(extra["governance_entry_formula_audit"])
@@ -3183,6 +4285,95 @@ class GovernanceBacktestRunner:
                     trade_pairs=trade_pairs,
                 )
             )
+            from functions.decision_council.failure_lab import (
+                ROLE_SCORE_COLUMNS,
+                build_failure_lab_overview,
+                build_negative_control_permutation_report,
+                build_paired_layer_increment_reports,
+                build_role_marginal_regression_reports,
+            )
+
+            layer_failure_reports = build_paired_layer_increment_reports(
+                extra["governance_layer_validation_daily"]
+            )
+            role_failure_reports = build_role_marginal_regression_reports(
+                extra["governance_layer_validation_candidate_detail"]
+            )
+            negative_control_reports = build_negative_control_permutation_report(
+                extra["governance_layer_validation_candidate_detail"]
+            )
+            extra.update(layer_failure_reports)
+            extra.update(role_failure_reports)
+            extra.update(negative_control_reports)
+            from functions.decision_council.survival_audit import build_candidate_competing_risk_reports
+            survival_reports = build_candidate_competing_risk_reports(
+                extra["governance_layer_validation_candidate_detail"],
+                close_history_getter=self._audit_close_history,
+                feature_columns=ROLE_SCORE_COLUMNS,
+                entry_mask_column="l1_current_role_confirmation",
+                horizon_days=20,
+                profit_barrier=GOVERNANCE_PROFIT_PROTECT_TRIGGER_1,
+                loss_barrier=GOVERNANCE_HARD_STOP_LOSS,
+                bootstrap_samples=500,
+            )
+            extra.update(survival_reports)
+            from functions.decision_council.drift_audit import build_adversarial_drift_reports
+            candidate_detail = extra["governance_layer_validation_candidate_detail"]
+            candidate_dates = pd.Index(sorted(pd.to_datetime(candidate_detail["signal_date"], errors="coerce").dropna().unique()))
+            split = max(1, int(len(candidate_dates) * .70))
+            early_dates, late_dates = set(candidate_dates[:split]), set(candidate_dates[split:])
+            early = candidate_detail[pd.to_datetime(candidate_detail["signal_date"], errors="coerce").isin(early_dates)]
+            late = candidate_detail[pd.to_datetime(candidate_detail["signal_date"], errors="coerce").isin(late_dates)]
+            drift_reports = build_adversarial_drift_reports(
+                early, late, feature_columns=ROLE_SCORE_COLUMNS,
+                group_column="symbol", permutation_samples=300, minimum_domain_rows=100,
+            )
+            extra.update(drift_reports)
+            extra["governance_failure_lab_overview"] = build_failure_lab_overview(
+                layer_increment=layer_failure_reports["governance_failure_lab_layer_increment"],
+                role_marginal_summary=role_failure_reports["governance_failure_lab_role_marginal_summary"],
+                negative_control_audit=negative_control_reports["governance_failure_lab_negative_control_audit"],
+            )
+        from functions.decision_council.cost_capacity_audit import build_cost_capacity_stress_reports
+        extra.update(build_cost_capacity_stress_reports(
+            trade_pairs,
+            extra["governance_execution_ledger"],
+            impact_sqrt_coefficient=GOVERNANCE_IMPACT_SQRT_COEFFICIENT,
+            impact_max_rate=GOVERNANCE_IMPACT_MAX_RATE,
+        ))
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            from functions.decision_council.scap_cost_stress import build_scap_cost_stress_report
+            extra["governance_scap_cost_stress_report"] = build_scap_cost_stress_report(
+                trade_pairs,
+                extra["governance_execution_ledger"],
+                initial_cash=self.initial_cash,
+            )
+        requires_monthly_ml = self.strategy_logic_version == MAINLINE_V3_MONTHLY_LGBM_HYBRID
+        if self.monthly_lgbm_controller is not None:
+            from functions.decision_council.ml_stability_audit import build_monthly_lgbm_stability_reports
+            extra.update(build_monthly_lgbm_stability_reports(
+                extra["governance_monthly_lgbm_training_audit"],
+                extra["governance_monthly_lgbm_feature_diagnostics"],
+            ))
+        elif requires_monthly_ml:
+            from functions.decision_council.ml_stability_audit import build_insufficient_ml_stability_reports
+            extra.update(build_insufficient_ml_stability_reports(
+                "externally supplied artifact has no cross-month online training history"
+            ))
+        from functions.decision_council.overfit_audit import build_insufficient_overfit_reports
+        extra.update(build_insufficient_overfit_reports(
+            "matched v1/v2/v3 daily return matrix must be supplied by the fixed comparison runner"
+        ))
+        from functions.decision_council.research_gate import build_unified_research_gate
+        gate_detail, gate_summary = build_unified_research_gate(
+            extra,
+            pit_runtime_state=self.pit_runtime_state,
+            requires_monthly_ml=requires_monthly_ml,
+            pit_level2_runtime_state=self.pit_level2_runtime_state,
+            temporal_isolation_pass=self.factor_temporal_isolation_pass,
+        )
+        extra["governance_unified_research_gate"] = gate_detail
+        extra["governance_unified_research_gate_summary"] = gate_summary
         self._log_save_stage("future_loss_duration_audit", trades=len(trade_pairs))
         extra["governance_future_loss_duration_audit"] = _future_loss_duration_audit(
             trade_pairs,
@@ -3197,7 +4388,7 @@ class GovernanceBacktestRunner:
         extra["governance_control_avoided_loss_summary"] = _control_avoided_loss_summary_frame(
             extra["governance_control_avoided_loss_ledger"]
         )
-        if self.strategy_logic_version == MAINLINE_V3:
+        if is_mainline_v3_version(self.strategy_logic_version):
             from functions.decision_council.cabinet_thesis_audit import build_cabinet_thesis_counterfactual
             from functions.decision_council.factor_ic_transfer_audit import build_factor_ic_transfer_audit
 
@@ -3217,6 +4408,8 @@ class GovernanceBacktestRunner:
             feature_data=self.features,
             benchmark_symbol=self.engine.safety_agent.proxy_symbol,
             factor_weight_ledger=extra["governance_factor_weight_ledger"],
+            benchmark_top_n=self.performance_benchmark_top_n,
+            benchmark_rebalance=self.performance_benchmark_rebalance,
         )
         extra["governance_bucket_attribution"] = build_bucket_attribution(extra["governance_attribution_ledger"])
         self._log_save_stage("quality_reports")
@@ -3231,6 +4424,8 @@ class GovernanceBacktestRunner:
             attribution_ledger=extra["governance_attribution_ledger"],
             return_pivot=self._return_pivot,
             runtime_context=self.factor_runtime_context,
+            benchmark_top_n=self.performance_benchmark_top_n,
+            benchmark_rebalance=self.performance_benchmark_rebalance,
         )
         extra.update(quality_reports)
         monitoring_input = extra["governance_daily_result"].merge(
@@ -3246,6 +4441,12 @@ class GovernanceBacktestRunner:
         for name, frame in extra.items():
             path = self.output_dir / f"{name}.csv"
             saved[name] = write_governance_csv(frame, path)
+        update_artifact_manifest(
+            self.output_dir,
+            stage="audit_csv_saved",
+            status="saving",
+            audit_complete=True,
+        )
         self._log_save_stage("summary_report")
         governance_summary = self._build_governance_summary(
             daily_result=extra["governance_daily_result"],
@@ -3265,6 +4466,25 @@ class GovernanceBacktestRunner:
             else self.output_dir / "governance_strategy_summary.csv"
         )
         saved["governance_strategy_summary"] = write_governance_csv(governance_summary, summary_path)
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            from functions.decision_council.scap_admission import build_scap_admission_report
+            scap_admission = build_scap_admission_report(
+                governance_summary=governance_summary,
+                cost_stress=extra["governance_scap_cost_stress_report"],
+                daily_result=extra["governance_daily_result"],
+                holdings_ledger=extra["governance_holdings_ledger"],
+                initial_cash=self.initial_cash,
+                profit_factor_threshold=float(
+                    self.capital_profile.get("scap_profit_factor_admission", 1.15) or 1.15
+                ),
+                structural_single_position_cap=float(
+                    self.capital_profile.get("retail_single_position_cap", 0.40) or 0.40
+                ),
+            )
+            saved["governance_scap_admission_report"] = write_governance_csv(
+                scap_admission,
+                self.output_dir / "governance_scap_admission_report.csv",
+            )
         report_path = (
             GOVERNANCE_REPORT_MD
             if self.output_dir.resolve() == Path(GOVERNANCE_OUTPUT_DIR).resolve()
@@ -3323,10 +4543,45 @@ class GovernanceBacktestRunner:
                 attribution_ledger=extra["governance_attribution_ledger"],
                 bucket_attribution=extra["governance_bucket_attribution"],
                 factor_weight_ledger=extra["governance_factor_weight_ledger"],
+                ml_iteration_metrics=extra["governance_monthly_lgbm_iteration_metrics"],
+                ml_treatment_effect=extra["governance_monthly_lgbm_treatment_effect"],
+                role_reliability_audit=extra["governance_v31_rolling_reliability_audit"],
                 feature_data=self.features,
                 output_dir=self.output_dir,
             )
         )
+        if self.governance_control_mode in {"aggressive_profit", "aggressive_lean"}:
+            self._log_save_stage("holding_factor_products")
+            from functions.decision_council.holding_factor_products import (
+                FACTOR_PRODUCT_DIRNAME,
+                FACTOR_WORKBOOK_NAME,
+                build_integrated_products,
+            )
+
+            factor_product = build_integrated_products(
+                self.output_dir,
+                build_workbook=True,
+                strict=True,
+            )
+            factor_product_dir = self.output_dir / FACTOR_PRODUCT_DIRNAME
+            saved["holding_factor_product_status"] = (
+                factor_product_dir / "product_status.json"
+            )
+            saved["holding_factor_scores_long"] = (
+                factor_product_dir / "holding_factor_scores_long.csv"
+            )
+            if factor_product.get("workbook_status") == "ok":
+                saved["holding_factor_workbook"] = (
+                    factor_product_dir / FACTOR_WORKBOOK_NAME
+                )
+            update_artifact_manifest(
+                self.output_dir,
+                stage="holding_factor_products",
+                status="saving",
+                web_complete=bool(factor_product.get("workbook_status") == "ok"),
+                artifact_name="holding_factor_products",
+                artifact_status=str(factor_product.get("workbook_status", "unknown")),
+            )
         self._log_save_stage("complete")
         return saved
 
@@ -3425,7 +4680,10 @@ def run_governance_backtest(
     factor_cabinet_run_id: str = "",
     factor_cabinet_path: str = "",
     strategy_logic_version: str = "production_v1",
+    monthly_lgbm_maximum_weight: float | None = None,
     pit_mode: str = "research",
+    performance_benchmark_top_n: int = GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N,
+    performance_benchmark_rebalance: str = GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE,
 ) -> dict[str, Path]:
     from functions.decision_council.policy import RulesBasedPresidentPolicy
     from functions.alpha_bundles import ALPHA_BUNDLE_REGISTRY
@@ -3434,6 +4692,10 @@ def run_governance_backtest(
     # the strategy path, but older interactive launchers/notebook state may still
     # pass this keyword after module reloads.
     _ = probability_bucket_mode
+    if strategy_logic_version == MAINLINE_V3_MONTHLY_LGBM_HYBRID and monthly_lgbm_maximum_weight is None:
+        raise ValueError(
+            "mainline_v3_monthly_lgbm_hybrid requires a pre-registered monthly_lgbm_maximum_weight"
+        )
 
     output_dir = Path(output_dir)
     if not output_dir.name.startswith("run"):
@@ -3445,11 +4707,16 @@ def run_governance_backtest(
         mode=pit_mode,
         output_path=output_dir / "pit_runtime_audit.json",
     )
+    from functions.data.pit_level2_store import run_pit_level2_preflight
+    pit_level2_preflight = run_pit_level2_preflight(
+        mode=pit_mode,
+        output_path=output_dir / "pit_level2_runtime_audit.json",
+    )
 
     effective_start = pd.Timestamp(start_date or GOVERNANCE_START_DATE) if (start_date or GOVERNANCE_START_DATE) else None
     effective_end = pd.Timestamp(end_date or GOVERNANCE_END_DATE) if (end_date or GOVERNANCE_END_DATE) else None
     if effective_start is not None and effective_end is not None:
-        from functions.data.trading_calendar import bounded_observed_feature_end
+        from functions.data.trading_calendar import bounded_observed_feature_end, first_observed_feature_session
 
         effective_end = bounded_observed_feature_end(
             feature_path,
@@ -3457,9 +4724,24 @@ def run_governance_backtest(
             effective_end,
             max_days,
         )
+        if require_constituents and not allow_fallback:
+            from functions.investable_universe import validate_pit_membership_manifest_coverage
+
+            membership_coverage = validate_pit_membership_manifest_coverage(
+                start_date=first_observed_feature_session(feature_path, effective_start, effective_end),
+                end_date=effective_end,
+            )
+            if membership_coverage["status"] != "pass":
+                raise ValueError(
+                    "PIT index membership does not cover the effective governance window: "
+                    f"{membership_coverage}"
+                )
     filters = []
+    preload_calendar_days = governance_preload_calendar_days(governance_control_mode)
     if effective_start is not None:
-        filters.append(("date", ">=", effective_start - pd.Timedelta(days=GOVERNANCE_PRELOAD_CALENDAR_DAYS)))
+        filters.append(
+            ("date", ">=", effective_start - pd.Timedelta(days=preload_calendar_days))
+        )
     if effective_end is not None:
         filters.append(("date", "<=", effective_end))
     if allowed_instrument_types:
@@ -3479,6 +4761,14 @@ def run_governance_backtest(
     else:
         alpha_bundle = LEGACY_GOVERNANCE_ALPHA_BUNDLE
         alpha_models = tuple(ALPHA_BUNDLE_REGISTRY.get_alpha_model_names(alpha_bundle))
+    temporal_pass = False
+    if factor_spec.uses_factor_cabinet and effective_start is not None:
+        from functions.research.temporal_contract import audit_artifact_lineage, write_temporal_audit
+        temporal_evidence, temporal_summary = audit_artifact_lineage(
+            factor_spec.factor_cabinet_path, oos_start=effective_start
+        )
+        write_temporal_audit(output_dir, temporal_evidence, temporal_summary)
+        temporal_pass = bool(temporal_summary["temporal_isolation_pass"])
     try:
         import pyarrow.parquet as pq
 
@@ -3503,10 +4793,23 @@ def run_governance_backtest(
         filters=filters or None,
     )
     if generated_candidate_columns:
-        cache_start = effective_start - pd.Timedelta(days=GOVERNANCE_PRELOAD_CALENDAR_DAYS) if effective_start is not None else features["date"].min()
+        cache_start = (
+            effective_start - pd.Timedelta(days=preload_calendar_days)
+            if effective_start is not None
+            else features["date"].min()
+        )
         cache_end = effective_end if effective_end is not None else features["date"].max()
         if factor_spec.uses_factor_cabinet:
-            cabinet_cache_start = effective_start if effective_start is not None else cache_start
+            cabinet_cache_start = (
+                cache_start
+                if _normalize_governance_control_mode(governance_control_mode)
+                == "aggressive_lean"
+                else (
+                    effective_start
+                    if effective_start is not None
+                    else cache_start
+                )
+            )
             features = attach_factor_cabinet_feature_cache(
                 features,
                 spec=factor_spec,
@@ -3577,7 +4880,12 @@ def run_governance_backtest(
         capital_profile=capital_profile,
         factor_source_spec=factor_spec,
         strategy_logic_version=strategy_logic_version,
+        monthly_lgbm_maximum_weight=monthly_lgbm_maximum_weight,
         pit_runtime_state=pit_preflight["pit_runtime_state"],
+        pit_level2_runtime_state=pit_level2_preflight["pit_runtime_state"],
+        factor_temporal_isolation_pass=temporal_pass,
+        performance_benchmark_top_n=performance_benchmark_top_n,
+        performance_benchmark_rebalance=performance_benchmark_rebalance,
     )
     return runner.run(
         start_date=effective_start,
@@ -4203,6 +5511,20 @@ def _safe_float(value, default=0.0) -> float:
     return float(numeric.iloc[0])
 
 
+def _retail_entry_score_gate_pass(row, *, strategy_logic_version: str, minimum_score: float) -> bool:
+    """Keep the legacy retail score gate out of every v3 execution audit.
+
+    V3 admission has already been decided by its cabinet/state-machine score.
+    Reapplying the legacy matrix threshold here would only create a false audit
+    rejection (and the raw Native score is not on the same scale as the ML
+    percentile score).
+    """
+    if is_mainline_v3_version(strategy_logic_version):
+        return True
+    value = row.get("entry_matrix_score", 0.0) if hasattr(row, "get") else 0.0
+    return _safe_float(value, default=0.0) >= float(minimum_score)
+
+
 def _clip01(value) -> float:
     return min(max(_safe_float(value, default=0.0), 0.0), 1.0)
 
@@ -4249,12 +5571,30 @@ def _normalize_governance_control_mode(value) -> str:
         "paper_control": "paper_controls",
         "safe_factor": "safe_factor_only",
         "safe_stop": "safe_factor_only",
+        "scap": "aggressive_profit",
+        "profit": "aggressive_profit",
+        "lean": "aggressive_lean",
+        "scap_v3": "aggressive_lean",
     }
     mode = aliases.get(mode, mode)
-    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only"}
+    allowed = {"normal", "factor_only", "paper_controls", "safe_factor_only", "aggressive_profit", "aggressive_lean"}
     if mode not in allowed:
         raise ValueError(f"Unknown governance_control_mode '{value}'. Available: {sorted(allowed)}")
     return mode
+
+
+def governance_preload_calendar_days(control_mode, configured_days=None) -> int:
+    """Return the single feature-history preload contract for every entry point."""
+    base_days = (
+        int(GOVERNANCE_PRELOAD_CALENDAR_DAYS)
+        if configured_days is None
+        else int(configured_days)
+    )
+    if base_days < 0:
+        raise ValueError("governance preload calendar days must be non-negative")
+    if _normalize_governance_control_mode(control_mode) == "aggressive_lean":
+        return max(base_days, 420)
+    return base_days
 
 
 def _normalize_capital_usage_mode(value) -> str:
@@ -4283,6 +5623,48 @@ def _state_machine_entry_mask(candidates: pd.DataFrame) -> pd.Series:
         return confirmed
     role_pass = candidates["state_machine_role_pass"].fillna(False).astype(bool)
     return confirmed & role_pass
+
+
+def _scap_entry_stage_counts(candidates: pd.DataFrame) -> dict[str, int]:
+    """Keep signal qualification distinct from optimizer slot allocation."""
+    if candidates is None or candidates.empty:
+        return {
+            "raw_signal_count": 0,
+            "structural_feasible_count": 0,
+            "cash_feasible_count": 0,
+            "slot_feasible_count": 0,
+            "pre_slot_qualified_entry_count": 0,
+            "optimizer_selected_entry_count": 0,
+        }
+    selected = _state_machine_entry_mask(candidates)
+    role_pass = candidates.get(
+        "state_machine_role_pass",
+        pd.Series(True, index=candidates.index),
+    ).fillna(False).astype(bool)
+    pre_slot = candidates.get(
+        "mainline_v3_pre_slot_qualified",
+        selected,
+    ).fillna(False).astype(bool) & role_pass
+    raw_signal = candidates.get(
+        "mainline_v3_raw_signal", pre_slot
+    ).fillna(False).astype(bool) & role_pass
+    structural = candidates.get(
+        "mainline_v3_structural_feasible", pre_slot
+    ).fillna(False).astype(bool) & role_pass
+    cash = candidates.get(
+        "mainline_v3_cash_feasible", structural
+    ).fillna(False).astype(bool) & role_pass
+    slot = candidates.get(
+        "mainline_v3_slot_feasible", cash
+    ).fillna(False).astype(bool) & role_pass
+    return {
+        "raw_signal_count": int(raw_signal.sum()),
+        "structural_feasible_count": int(structural.sum()),
+        "cash_feasible_count": int(cash.sum()),
+        "slot_feasible_count": int(slot.sum()),
+        "pre_slot_qualified_entry_count": int(pre_slot.sum()),
+        "optimizer_selected_entry_count": int(selected.sum()),
+    }
 
 
 def _best_bucket(bucket_frame: pd.DataFrame, dimension: str, metric: str) -> str:
@@ -4491,7 +5873,8 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
     mfe = pd.to_numeric(candidates.get("position_mfe", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     mae = pd.to_numeric(candidates.get("position_mae", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
     downtrend_decay = pd.to_numeric(candidates.get("downtrend_decay_score", pd.Series(0.0, index=candidates.index)), errors="coerce").fillna(0.0)
-    flow_count = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
+    flow_raw = pd.to_numeric(candidates.get("entry_orderflow_confirm_count", pd.Series(float("nan"), index=candidates.index)), errors="coerce")
+    flow_count = flow_raw.fillna(0.0)
     holding_days = pd.to_numeric(candidates.get("position_holding_days", pd.Series(0, index=candidates.index)), errors="coerce").fillna(0)
     alpha_collapse = (
         alpha.lt(0.45).astype(float) * 0.35
@@ -4503,7 +5886,7 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
         + ret20.lt(-0.04).astype(float) * 0.35
         + close_to_ma20.lt(-0.03).astype(float) * 0.30
     ).clip(0.0, 1.0)
-    orderflow_bad = flow_count.le(1).astype(float)
+    orderflow_bad = flow_count.le(1).astype(float).where(flow_raw.notna(), 0.5)
     loss_bad = ((-unrealized - 0.015) / 0.055).clip(0.0, 1.0)
     poor_excursion = (
         mfe.lt(0.02).astype(float) * 0.45
@@ -4518,7 +5901,8 @@ def _post_entry_failure_score(candidates: pd.DataFrame) -> pd.Series:
         + 0.15 * orderflow_bad
         + 0.15 * trend_weak
         + 0.05 * stale_bad
-    ).clip(0.0, 1.0)
+    ) / 1.05
+    score = score.clip(0.0, 1.0)
     return score.where(watch | holding_days.ge(3), 0.0)
 
 
