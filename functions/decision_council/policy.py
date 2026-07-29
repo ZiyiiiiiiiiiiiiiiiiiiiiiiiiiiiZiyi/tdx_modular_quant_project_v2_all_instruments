@@ -80,6 +80,8 @@ ORDER_COLUMNS = [
     "action_proposal_id",
     "action_plan_selected",
     "action_plan_contract",
+    "scap_v31_authority_tier",
+    "scap_v31_authority_contract",
     "scap_candidate_utility",
     "add_expected_net_profit_lcb",
     "entry_matrix_score",
@@ -446,6 +448,12 @@ class RulesBasedPresidentPolicy:
             order["unified_action_selected"] = proposal.action_type
             order["unified_action_contract"] = "scap_v3_lean_single_plan_v1"
             order["planned_entry_lots"] = int(proposal.requested_lots)
+            order["scap_v31_authority_tier"] = proposal.authority_tier
+            order["scap_v31_authority_contract"] = str(
+                row.get("scap_v31_authority_contract", "")
+                if row is not None
+                else ""
+            )
             if proposal.action_type in {"winner_add", "loser_add"}:
                 order["add_allowed"] = True
                 order["add_decision_type"] = proposal.action_type
@@ -483,6 +491,10 @@ class RulesBasedPresidentPolicy:
                     decision.plan.downside_cvar_amount
                 ),
                 "action_plan_solver_status": decision.plan.solver_status,
+                "action_plan_rejection_lineage": "|".join(
+                    f"{item.get('proposal_id')}:{item.get('reason')}"
+                    for item in decision.plan.rejected_proposals
+                ),
                 "scap_discrete_entry_count": int(
                     sum(
                         proposal.action_type == "new_entry"

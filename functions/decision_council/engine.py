@@ -95,6 +95,7 @@ class PhaseOneDecisionCouncilEngine:
         forecast_horizon_sessions: int = 10,
         forecast_kappa: float = 0.50,
         soft_target_positions: int = 4,
+        execution_cost_profile: dict | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         decision_date = pd.Timestamp(decision_date)
         if decision_date not in self.safety_signals.index:
@@ -147,6 +148,7 @@ class PhaseOneDecisionCouncilEngine:
             forecast_horizon_sessions=max(int(forecast_horizon_sessions), 1),
             forecast_kappa=max(float(forecast_kappa), 0.0),
             soft_target_positions=max(int(soft_target_positions), 0),
+            execution_cost_profile=dict(execution_cost_profile or {}),
         )
         ideal, orders, diagnostics = self.policy.decide(context)
         diagnostics["raw_safety_exposure_cap"] = raw_safety_exposure_cap

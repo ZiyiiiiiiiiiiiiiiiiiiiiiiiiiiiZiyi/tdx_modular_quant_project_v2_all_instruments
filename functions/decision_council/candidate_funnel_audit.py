@@ -33,6 +33,14 @@ SCAP_ACTION_COUNT_COLUMNS = (
     "scap_registered_add_buy_count",
     "scap_registered_replacement_buy_count",
 )
+SCAP_LIVENESS_COUNT_COLUMNS = (
+    "scap_v31_positive_c_fallback_count",
+    "scap_v31_all_d_streak",
+    "scap_v31_normal_cash_zero_proposal_streak",
+)
+SCAP_LIVENESS_METADATA_COLUMNS = (
+    "scap_v31_position_recovery_alert",
+)
 
 
 def assert_scap_funnel_monotonic(row: dict) -> None:
@@ -158,11 +166,12 @@ def reconcile_funnel_daily(
         *FUNNEL_COUNT_COLUMNS,
         *SCAP_FUNNEL_COUNT_COLUMNS,
         *SCAP_ACTION_COUNT_COLUMNS,
+        *SCAP_LIVENESS_COUNT_COLUMNS,
     ):
         if column not in data.columns:
             data[column] = 0
         data[column] = pd.to_numeric(data[column], errors="coerce").fillna(0).astype(int)
-    for column in FUNNEL_METADATA_COLUMNS:
+    for column in (*FUNNEL_METADATA_COLUMNS, *SCAP_LIVENESS_METADATA_COLUMNS):
         if column not in data.columns:
             data[column] = pd.NA
     ordered = [
@@ -171,7 +180,9 @@ def reconcile_funnel_daily(
         *FUNNEL_COUNT_COLUMNS,
         *SCAP_FUNNEL_COUNT_COLUMNS,
         *SCAP_ACTION_COUNT_COLUMNS,
+        *SCAP_LIVENESS_COUNT_COLUMNS,
         *FUNNEL_METADATA_COLUMNS,
+        *SCAP_LIVENESS_METADATA_COLUMNS,
     ]
     return data[ordered].sort_values("date").reset_index(drop=True)
 
@@ -256,7 +267,7 @@ def build_entry_gate_summary_from_csv_parts(paths, *, chunksize: int = 5000) -> 
     totals: dict[str, dict[str, int]] = {}
     for path in [Path(item) for item in paths]:
         try:
-            iterator = pd.read_csv(path, chunksize=chunksize)
+            iterator = pd.read_csv(path, chunksize=chunksize, low_memory=False)
         except (OSError, pd.errors.EmptyDataError):
             continue
         for chunk in iterator:
@@ -339,7 +350,11 @@ def build_control_trigger_summary_from_csv_parts(
     """Compute exact trigger counts from monthly parts without concatenating history."""
     totals: dict[str, dict[str, int]] = {}
     for path in paths:
-        for chunk in pd.read_csv(path, chunksize=max(int(chunksize), 1)):
+        for chunk in pd.read_csv(
+            path,
+            chunksize=max(int(chunksize), 1),
+            low_memory=False,
+        ):
             partial = build_control_trigger_summary(
                 chunk,
                 order_plan=pd.DataFrame(),

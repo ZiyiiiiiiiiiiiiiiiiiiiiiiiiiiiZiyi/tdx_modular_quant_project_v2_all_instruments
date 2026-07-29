@@ -34,6 +34,8 @@ class RollingEntryCalibrator:
     _history_version: int = 0
     _stats_cache: dict[int, dict] = field(default_factory=dict)
     _negative_drift_streak: int = 0
+    _nonnegative_recovery_streak: int = 0
+    _drifted_latched: bool = False
     _last_drift_history_version: int = -1
     warmup_manifest: dict = field(default_factory=dict)
 
@@ -141,6 +143,10 @@ class RollingEntryCalibrator:
                     "flow_bucket": _flow_bucket(row.get("entry_orderflow_confirm_count", 0)),
                     "regime_bucket": "unknown",
                     "expected_return_5d": _safe_float(row.get("expected_return_5d"), 0.0),
+                    "calibration_forecast_score": _safe_float(
+                        row.get("_warmup_score"), 0.0
+                    ),
+                    "calibration_score_contract": score_identity,
                 }
             )
         self.history_rows = rows[-int(self.max_history_rows):]
@@ -236,6 +242,7 @@ class RollingEntryCalibrator:
         day_index: int,
         horizon_days: int,
         regime_name: str,
+        score_column: str = "cabinet_native_final_score",
     ) -> None:
         """Store today's candidate features for future calibration outcomes."""
         if candidates is None or candidates.empty:
@@ -244,6 +251,19 @@ class RollingEntryCalibrator:
         data = data.dropna(subset=["symbol"])
         if data.empty:
             return
+        available_score_column = next(
+            (
+                column
+                for column in (
+                    score_column,
+                    "cabinet_native_final_score",
+                    "primary_score",
+                    "expected_return_5d",
+                )
+                if column in data.columns
+            ),
+            None,
+        )
         for _, row in data.iterrows():
             payload = {
                 "symbol": str(row["symbol"]),
@@ -256,6 +276,12 @@ class RollingEntryCalibrator:
                 "regime_bucket": _regime_bucket(regime_name),
                 "alpha_bucket": _alpha_bucket(row.get("alpha_percentile", 0.5)),
                 "flow_bucket": _flow_bucket(row.get("entry_orderflow_confirm_count", 0)),
+                "calibration_forecast_score": _safe_float(
+                    row.get(available_score_column), 0.0
+                ),
+                "calibration_score_contract": str(
+                    available_score_column or "missing_score"
+                ),
             }
             for column in CALIBRATION_FEATURE_COLUMNS:
                 payload[column] = _safe_float(row.get(column), 0.0)
@@ -358,15 +384,45 @@ class RollingEntryCalibrator:
                     int(horizon_days)
                 )
             ]
+        # In-memory histories created before the score-identity migration do
+        # not carry the new field. Keep them testable/auditable without
+        # changing the live contract, whose scheduled rows always persist the
+        # factor-cabinet score explicitly.
+        if (
+            not history.empty
+            and "calibration_forecast_score" not in history.columns
+            and "expected_return_5d" in history.columns
+        ):
+            history = history.copy()
+            history["calibration_forecast_score"] = history[
+                "expected_return_5d"
+            ]
+            history["calibration_score_contract"] = (
+                "legacy_expected_return_5d_compatibility"
+            )
+        unique_sessions = 0
+        if not history.empty:
+            session_column = (
+                "entry_day_index"
+                if "entry_day_index" in history.columns
+                else ("date" if "date" in history.columns else None)
+            )
+            if session_column is not None:
+                unique_sessions = int(history[session_column].nunique())
+        scored[f"entry_calibration_unique_session_count_{horizon_days}d"] = (
+            unique_sessions
+        )
         rank_ic = float("nan")
         calibration_slope = float("nan")
         if (
             not history.empty
             and len(history) >= int(self.min_global_samples)
-            and {"expected_return_5d", "forward_return"}.issubset(history.columns)
+            and {"calibration_forecast_score", "forward_return"}.issubset(
+                history.columns
+            )
         ):
             forecast = pd.to_numeric(
-                history["expected_return_5d"], errors="coerce"
+                history["calibration_forecast_score"], errors="coerce"
             )
             realized = pd.to_numeric(history["forward_return"], errors="coerce")
             valid = forecast.notna() & realized.notna()
@@ -381,12 +437,29 @@ class RollingEntryCalibrator:
             float(rank_ic) <= 0.0
             or (pd.notna(calibration_slope) and float(calibration_slope) <= 0.0)
         )
+        nonnegative_direction = (
+            pd.notna(rank_ic)
+            and pd.notna(calibration_slope)
+            and float(rank_ic) >= 0.0
+            and float(calibration_slope) >= 0.0
+        )
         if self._last_drift_history_version != self._history_version:
-            self._negative_drift_streak = (
-                self._negative_drift_streak + 1 if negative_drift else 0
-            )
+            if negative_drift:
+                self._negative_drift_streak += 1
+                self._nonnegative_recovery_streak = 0
+                if self._negative_drift_streak >= 3:
+                    self._drifted_latched = True
+            elif nonnegative_direction:
+                self._negative_drift_streak = 0
+                if self._drifted_latched:
+                    self._nonnegative_recovery_streak += 1
+                    if self._nonnegative_recovery_streak >= 2:
+                        self._drifted_latched = False
+                        self._nonnegative_recovery_streak = 0
+                else:
+                    self._nonnegative_recovery_streak = 0
             self._last_drift_history_version = self._history_version
-        drifted = self._negative_drift_streak >= 3
+        drifted = bool(self._drifted_latched)
         calibrated = pd.Series(
             global_n_eff >= float(self.min_global_samples) and not drifted,
             index=scored.index,
@@ -394,9 +467,13 @@ class RollingEntryCalibrator:
         state = pd.Series("prior_only", index=scored.index)
         state.loc[calibrated] = "calibrated"
         if drifted:
+            recovering = bool(
+                self._nonnegative_recovery_streak > 0
+                and nonnegative_direction
+            )
             state.loc[
                 scored["effective_sample_size"].ge(float(self.min_bucket_samples))
-            ] = "drifted"
+            ] = "recovering" if recovering else "drifted"
         scored[f"entry_calibration_state_{horizon_days}d"] = state
         scored[f"forecast_authority_weight_{horizon_days}d"] = (
             trust.clip(0.0, 1.0) * calibrated.astype(float)
@@ -419,6 +496,12 @@ class RollingEntryCalibrator:
         )
         scored[f"forecast_drift_streak_{horizon_days}d"] = int(
             self._negative_drift_streak
+        )
+        scored[f"forecast_recovery_streak_{horizon_days}d"] = int(
+            self._nonnegative_recovery_streak
+        )
+        scored[f"forecast_score_identity_{horizon_days}d"] = (
+            "factor_cabinet_score_contract"
         )
         scored = scored.drop(
             columns=["_alpha_bucket", "_flow_bucket", "_regime_bucket", *stat_columns]
