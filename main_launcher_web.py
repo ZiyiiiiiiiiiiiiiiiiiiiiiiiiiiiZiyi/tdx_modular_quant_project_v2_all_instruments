@@ -337,7 +337,7 @@ RUN_HTML = """<!doctype html>
         </div>
         <div class="field">
           <label for="min_cash_buffer">现金缓冲，可选</label>
-          <input type="number" id="min_cash_buffer" min="0" step="100" value="2000" placeholder="留空=档位默认">
+          <input type="number" id="min_cash_buffer" min="0" step="100" value="" placeholder="留空=档位默认（Lean=1000）">
         </div>
         <div class="field">
           <label for="capital_usage_mode">资金使用模式</label>

@@ -123,6 +123,9 @@ from functions.decision_council.analytics import (
 from functions.decision_council.engine import PhaseOneDecisionCouncilEngine
 from functions.decision_council.entry_calibration import RollingEntryCalibrator
 from functions.decision_council.entry_confirmation import apply_entry_confirmation
+from functions.decision_council.scap_v31_authority import (
+    attach_scap_v31_authority,
+)
 from functions.decision_council.execution_runtime import (
     execute_pending as execute_pending_runtime,
     prune_empty_positions as prune_empty_positions_runtime,
@@ -495,6 +498,10 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "comparable_expected_alpha",
     "comparable_alpha_lcb",
     "comparable_value_contract",
+    "state_observation_status",
+    "state_source_date",
+    "valuation_source",
+    "stale_days",
 ]
 
 
@@ -795,6 +802,8 @@ class GovernanceBacktestRunner:
         self.candidate_funnel_rows = []
         self.retail_executable_rank_rows = []
         self.defensive_sleeve_rows = []
+        self._scap_v31_all_d_streak = 0
+        self._scap_v31_normal_cash_zero_proposal_streak = 0
         # Entry-price diagnostics are post-trade audit data.  Do not materialize
         # a copied DataFrame for every symbol in the full feature universe.
         self._feature_indices_by_symbol: dict[str, object] | None = None
@@ -1320,6 +1329,16 @@ class GovernanceBacktestRunner:
             # pass; attaching it after selection makes every row
             # ``insufficient`` and deterministically blocks all new entries.
             candidates = attach_multi_horizon_value_contract(candidates)
+            if self.governance_control_mode == "aggressive_lean":
+                candidates = attach_scap_v31_authority(
+                    candidates,
+                    horizon_days=int(
+                        self.capital_profile.get(
+                            "scap_forecast_horizon_days", 10
+                        )
+                        or 10
+                    ),
+                )
             # Attach the one authoritative final score before lifecycle. This
             # pass deliberately cannot select; the optimizer runs once only
             # after lifecycle/state constraints have been evaluated.
@@ -1365,6 +1384,16 @@ class GovernanceBacktestRunner:
                 max_new_candidates=self._max_positions_override or 5,
             )
         elif is_mainline_v3_version(self.strategy_logic_version):
+            if self.governance_control_mode == "aggressive_lean":
+                candidates = attach_scap_v31_authority(
+                    candidates,
+                    horizon_days=int(
+                        self.capital_profile.get(
+                            "scap_forecast_horizon_days", 10
+                        )
+                        or 10
+                    ),
+                )
             candidates = apply_mainline_v3_entry_policy(
                 candidates,
                 max_new_candidates=self._max_positions_override or 5,
@@ -1396,6 +1425,14 @@ class GovernanceBacktestRunner:
         # for lifecycle, replacement and reporting consumers.
         if not is_mainline_v3_version(self.strategy_logic_version):
             candidates = attach_multi_horizon_value_contract(candidates)
+        if self.governance_control_mode == "aggressive_lean":
+            candidates = attach_scap_v31_authority(
+                candidates,
+                horizon_days=int(
+                    self.capital_profile.get("scap_forecast_horizon_days", 10)
+                    or 10
+                ),
+            )
         # Lifecycle rows are created before the final v3/ML ranking pass.  Bind
         # the final comparable value and role scores back to the same daily
         # held-position snapshot so monitoring and integrity audits evaluate
@@ -1461,12 +1498,22 @@ class GovernanceBacktestRunner:
             day_index=day_index,
             horizon_days=5,
             regime_name=structural_regime_level,
+            score_column=(
+                "cabinet_native_final_score"
+                if "cabinet_native_final_score" in candidates.columns
+                else "primary_score"
+            ),
         )
         self.entry_calibrator.schedule_candidates(
             candidates,
             day_index=day_index,
             horizon_days=10,
             regime_name=structural_regime_level,
+            score_column=(
+                "cabinet_native_final_score"
+                if "cabinet_native_final_score" in candidates.columns
+                else "primary_score"
+            ),
         )
         if not self.shadow_fast_mode:
             self._record_entry_confirmation(date, candidates)
@@ -1688,6 +1735,7 @@ class GovernanceBacktestRunner:
             soft_target_positions=int(
                 self.capital_profile.get("soft_target_positions", 4) or 4
             ),
+            execution_cost_profile=self.capital_profile,
         )
         orders = self._augment_force_deploy_diversify_orders(
             orders=orders,
@@ -1745,9 +1793,13 @@ class GovernanceBacktestRunner:
                 - float(actual_exposure),
                 0.0,
             )
-            diagnostics["target_exposure"] = float(
-                diagnostics.get("planned_exposure", desired_exposure_target)
+            diagnostics["optimizer_planned_exposure"] = float(
+                diagnostics.get("planned_exposure", actual_exposure)
             )
+            # Compatibility target now means the strategic desired exposure.
+            # The optimizer plan has its own explicit field and must not be
+            # mixed with the gap to the strategic budget.
+            diagnostics["target_exposure"] = float(desired_exposure_target)
             diagnostics["effective_target_exposure_cap"] = float(
                 risk_exposure_ceiling
             )
@@ -1833,7 +1885,65 @@ class GovernanceBacktestRunner:
             )
 
             assert_scap_funnel_monotonic(candidate_funnel_row)
+        authority_tiers = candidates.get(
+            "scap_v31_authority_tier",
+            pd.Series(dtype=str),
+        ).fillna("D").astype(str).str.upper()
+        positive_c_fallback_count = int(authority_tiers.eq("C").sum())
+        all_d_today = bool(
+            self.governance_control_mode == "aggressive_lean"
+            and len(authority_tiers) > 0
+            and authority_tiers.eq("D").all()
+        )
+        self._scap_v31_all_d_streak = (
+            self._scap_v31_all_d_streak + 1 if all_d_today else 0
+        )
+        current_idle_cash_ratio = float(
+            exposure.get("cash", self.cash) or 0.0
+        ) / max(
+            float(
+                exposure.get("nominal_nav", self.initial_cash)
+                or self.initial_cash
+            ),
+            1e-12,
+        )
+        normal_cash_zero_proposal = bool(
+            self.governance_control_mode == "aggressive_lean"
+            and str(getattr(risk_level, "value", risk_level)).strip().upper()
+            == "NORMAL"
+            and current_idle_cash_ratio >= 0.30
+            and int(candidate_funnel_row.get("scap_raw_signal_count", 0)) == 0
+        )
+        self._scap_v31_normal_cash_zero_proposal_streak = (
+            self._scap_v31_normal_cash_zero_proposal_streak + 1
+            if normal_cash_zero_proposal
+            else 0
+        )
+        liveness_streak = max(
+            self._scap_v31_all_d_streak,
+            self._scap_v31_normal_cash_zero_proposal_streak,
+        )
+        liveness_alert = (
+            "red"
+            if liveness_streak >= 10
+            else ("yellow" if liveness_streak >= 5 else "none")
+        )
+        candidate_funnel_row.update(
+            {
+                "scap_v31_positive_c_fallback_count": positive_c_fallback_count,
+                "scap_v31_all_d_streak": self._scap_v31_all_d_streak,
+                "scap_v31_normal_cash_zero_proposal_streak": (
+                    self._scap_v31_normal_cash_zero_proposal_streak
+                ),
+                "scap_v31_position_recovery_alert": liveness_alert,
+            }
+        )
         self.candidate_funnel_rows.append(candidate_funnel_row)
+        holding_targets = _holding_target_contract(
+            self.capital_profile,
+            actual_holding_count=int(exposure.get("holding_count", 0) or 0),
+            max_positions_override=self._max_positions_override,
+        )
         self.exposure_rows[-1].update(
             {
                 "target_exposure": diagnostics["target_exposure"],
@@ -1858,14 +1968,29 @@ class GovernanceBacktestRunner:
                     or self.capital_profile.get("max_positions", GOVERNANCE_DEFAULT_TOP_N)
                     or GOVERNANCE_DEFAULT_TOP_N
                 ),
-                "target_holding_count": int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K),
-                "holding_shortfall_count": max(
-                    int(self.capital_profile.get("min_holdings", GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K) or GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K)
-                    - int(exposure.get("holding_count", 0) or 0),
-                    0,
-                ),
+                "minimum_required_holding_count": holding_targets[
+                    "minimum_required_holding_count"
+                ],
+                "soft_target_holding_count": holding_targets[
+                    "soft_target_holding_count"
+                ],
+                "maximum_allowed_holding_count": holding_targets[
+                    "maximum_allowed_holding_count"
+                ],
+                "target_holding_count": holding_targets[
+                    "soft_target_holding_count"
+                ],
+                "holding_shortfall_count": holding_targets[
+                    "soft_holding_shortfall_count"
+                ],
                 "idle_cash": float(exposure.get("cash", self.cash) or 0.0),
                 "idle_cash_ratio": float(exposure.get("cash", self.cash) or 0.0) / max(float(exposure.get("nominal_nav", self.initial_cash) or self.initial_cash), 1e-12),
+                "scap_v31_positive_c_fallback_count": positive_c_fallback_count,
+                "scap_v31_all_d_streak": self._scap_v31_all_d_streak,
+                "scap_v31_normal_cash_zero_proposal_streak": (
+                    self._scap_v31_normal_cash_zero_proposal_streak
+                ),
+                "scap_v31_position_recovery_alert": liveness_alert,
                 "defensive_candidate_count": int(len(defensive_candidates)) if defensive_candidates is not None else 0,
                 "defensive_eligible_count": (
                     int(defensive_candidates.get("defensive_state", pd.Series(dtype=str)).astype(str).eq("eligible_defensive").sum())
@@ -1908,6 +2033,10 @@ class GovernanceBacktestRunner:
                 "risk_exposure_ceiling": diagnostics.get("risk_exposure_ceiling", target_exposure_proxy),
                 "desired_exposure_target": diagnostics.get("desired_exposure_target", target_exposure_proxy),
                 "executable_exposure_target": diagnostics.get("executable_exposure_target", target_exposure_proxy),
+                "optimizer_planned_exposure": diagnostics.get(
+                    "optimizer_planned_exposure",
+                    diagnostics.get("planned_exposure", actual_exposure),
+                ),
                 "signal_cash_drag": diagnostics.get("signal_cash_drag", 0.0),
                 "lot_feasibility_drag": diagnostics.get("lot_feasibility_drag", 0.0),
                 "risk_ceiling_drag": diagnostics.get("risk_ceiling_drag", 0.0),
@@ -1986,6 +2115,9 @@ class GovernanceBacktestRunner:
         safety_row = self.engine.safety_signals.loc[pd.Timestamp(date)]
         if isinstance(safety_row, pd.DataFrame):
             safety_row = safety_row.iloc[-1]
+        factual_exposure_row = (
+            dict(self.exposure_rows[-1]) if self.exposure_rows else {}
+        )
 
         candidate_preview = []
         candidate_cols = [
@@ -2042,6 +2174,11 @@ class GovernanceBacktestRunner:
                 "cabinet_hold_support_score",
                 "cabinet_entry_thesis",
                 "cabinet_entry_thesis_support",
+                "scap_v31_authority_tier",
+                "scap_v31_authority_reason",
+                "scap_v31_decision_expected_return",
+                "scap_candidate_utility",
+                "scap_optimizer_selected",
             ]
             if column in candidates.columns
         ]
@@ -2168,14 +2305,33 @@ class GovernanceBacktestRunner:
             "safety_exposure_cap": float(pd.to_numeric(pd.Series([safety_row.get("safety_exposure_cap", 1.0)]), errors="coerce").fillna(1.0).iloc[0]),
             "hard_freeze_active": bool(safety_row.get("hard_freeze_active", False)),
             "unresolved_safety_exposure": float(diagnostics.get("unresolved_safety_exposure", 0.0)),
-            "target_exposure": float(diagnostics.get("target_exposure", 0.0)),
-            "actual_exposure": float(diagnostics.get("actual_exposure", 0.0)),
+            "target_exposure": float(
+                factual_exposure_row.get(
+                    "target_exposure",
+                    diagnostics.get("target_exposure", 0.0),
+                )
+            ),
+            "actual_exposure": float(
+                factual_exposure_row.get(
+                    "actual_exposure",
+                    diagnostics.get("actual_exposure", 0.0),
+                )
+            ),
             "base_exposure_by_regime": float(diagnostics.get("base_exposure_by_regime", 0.0)),
             "raw_safety_exposure_cap": float(diagnostics.get("raw_safety_exposure_cap", 0.0)),
             "effective_target_exposure_cap": float(diagnostics.get("effective_target_exposure_cap", 0.0)),
             "risk_exposure_ceiling": float(diagnostics.get("risk_exposure_ceiling", 0.0)),
             "desired_exposure_target": float(diagnostics.get("desired_exposure_target", 0.0)),
             "executable_exposure_target": float(diagnostics.get("executable_exposure_target", 0.0)),
+            "optimizer_planned_exposure": float(
+                factual_exposure_row.get(
+                    "optimizer_planned_exposure",
+                    diagnostics.get(
+                        "optimizer_planned_exposure",
+                        diagnostics.get("planned_exposure", 0.0),
+                    ),
+                )
+            ),
             "signal_cash_drag": float(diagnostics.get("signal_cash_drag", 0.0)),
             "lot_feasibility_drag": float(diagnostics.get("lot_feasibility_drag", 0.0)),
             "risk_ceiling_drag": float(diagnostics.get("risk_ceiling_drag", 0.0)),
@@ -2192,6 +2348,52 @@ class GovernanceBacktestRunner:
             "authorization_expected_edge_10d_mean": _safe_float(diagnostics.get("authorization_expected_edge_10d_mean"), default=0.0),
             "authorization_p_win_10d_mean": _safe_float(diagnostics.get("authorization_p_win_10d_mean"), default=0.0),
             "constraint_cash_reserve": float(diagnostics.get("constraint_cash_reserve", 0.0)),
+            "minimum_required_holding_count": int(
+                factual_exposure_row.get("minimum_required_holding_count", 0)
+            ),
+            "soft_target_holding_count": int(
+                factual_exposure_row.get("soft_target_holding_count", 0)
+            ),
+            "maximum_allowed_holding_count": int(
+                factual_exposure_row.get("maximum_allowed_holding_count", 0)
+            ),
+            "target_holding_count": int(
+                factual_exposure_row.get("target_holding_count", 0)
+            ),
+            "holding_shortfall_count": int(
+                factual_exposure_row.get("holding_shortfall_count", 0)
+            ),
+            "idle_cash": float(
+                factual_exposure_row.get("idle_cash", exposure.get("cash", 0.0))
+            ),
+            "idle_cash_ratio": float(
+                factual_exposure_row.get(
+                    "idle_cash_ratio",
+                    float(exposure.get("cash", 0.0))
+                    / max(float(exposure.get("nominal_nav", self.initial_cash)), 1e-12),
+                )
+            ),
+            "defensive_eligible_count": int(
+                factual_exposure_row.get("defensive_eligible_count", 0)
+            ),
+            "scap_v31_positive_c_fallback_count": int(
+                factual_exposure_row.get(
+                    "scap_v31_positive_c_fallback_count", 0
+                )
+            ),
+            "scap_v31_all_d_streak": int(
+                factual_exposure_row.get("scap_v31_all_d_streak", 0)
+            ),
+            "scap_v31_normal_cash_zero_proposal_streak": int(
+                factual_exposure_row.get(
+                    "scap_v31_normal_cash_zero_proposal_streak", 0
+                )
+            ),
+            "scap_v31_position_recovery_alert": str(
+                factual_exposure_row.get(
+                    "scap_v31_position_recovery_alert", "none"
+                )
+            ),
             "planned_safety_sell_weight": float(diagnostics.get("planned_safety_sell_weight", 0.0)),
             "normal_turnover_weight": float(diagnostics.get("normal_turnover_weight", 0.0)),
             "total_target_drift": float(diagnostics.get("total_target_drift", 0.0)),
@@ -3124,6 +3326,8 @@ class GovernanceBacktestRunner:
             "scap_expected_return_lcb", "scap_decision_expected_return",
             "scap_estimated_total_cost_amount", "scap_risk_penalty_amount",
             "scap_optimizer_objective", "scap_optimizer_candidate_pool_size",
+            "scap_v31_decision_expected_return", "scap_v31_max_lots",
+            "entry_calibration_unique_session_count_10d",
             "signal_failure_confirmation_count",
             "signal_failure_confirmation_required",
             "exit_conflict_count",
@@ -3159,6 +3363,15 @@ class GovernanceBacktestRunner:
                 "scap_overlap_penalty_state": str(candidate.get("scap_overlap_penalty_state", "")),
                 "scap_optimizer_selected": candidate.get("scap_optimizer_selected", pd.NA),
                 "scap_optimizer_status": str(candidate.get("scap_optimizer_status", "")),
+                "scap_v31_authority_tier": str(
+                    candidate.get("scap_v31_authority_tier", "")
+                ),
+                "scap_v31_authority_reason": str(
+                    candidate.get("scap_v31_authority_reason", "")
+                ),
+                "scap_v31_authority_contract": str(
+                    candidate.get("scap_v31_authority_contract", "")
+                ),
                 "exit_arbitration_contract": str(
                     candidate.get("exit_arbitration_contract", "")
                 ),
@@ -3226,7 +3439,7 @@ class GovernanceBacktestRunner:
             if remaining <= 0:
                 break
             try:
-                part = pd.read_csv(path, nrows=remaining)
+                part = pd.read_csv(path, nrows=remaining, low_memory=False)
             except (OSError, pd.errors.EmptyDataError):
                 continue
             if not part.empty:
@@ -5295,6 +5508,8 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
         "window_end_price",
         "avoided_loss_to_window_low",
         "avoided_loss_to_window_end",
+        "signed_exit_benefit_to_window_low",
+        "signed_exit_benefit_to_window_end",
         "counterfactual_window_observed_days",
         "counterfactual_note",
     ]
@@ -5375,6 +5590,8 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
                 "window_end_price": window_end_price,
                 "avoided_loss_to_window_low": max((exit_net_price - window_low_price) * shares, 0.0),
                 "avoided_loss_to_window_end": max((exit_net_price - window_end_price) * shares, 0.0),
+                "signed_exit_benefit_to_window_low": (exit_net_price - window_low_price) * shares,
+                "signed_exit_benefit_to_window_end": (exit_net_price - window_end_price) * shares,
                 "counterfactual_window_observed_days": int(len(path)),
                 "counterfactual_note": "If the control sell had not happened, this is the extra mark-to-low/end loss avoided in the post-exit window.",
             }
@@ -5389,6 +5606,8 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
         "avoided_loss_to_window_low",
         "avoided_loss_to_window_end",
         "avg_avoided_loss_to_window_low",
+        "signed_exit_benefit_to_window_low",
+        "signed_exit_benefit_to_window_end",
         "avg_observed_days",
     ]
     if ledger is None or ledger.empty:
@@ -5398,6 +5617,12 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
     data["avoided_loss_to_window_end"] = pd.to_numeric(data.get("avoided_loss_to_window_end"), errors="coerce").fillna(0.0)
     data["counterfactual_window_observed_days"] = pd.to_numeric(
         data.get("counterfactual_window_observed_days"), errors="coerce"
+    ).fillna(0.0)
+    data["signed_exit_benefit_to_window_low"] = pd.to_numeric(
+        data.get("signed_exit_benefit_to_window_low"), errors="coerce"
+    ).fillna(0.0)
+    data["signed_exit_benefit_to_window_end"] = pd.to_numeric(
+        data.get("signed_exit_benefit_to_window_end"), errors="coerce"
     ).fillna(0.0)
     rows = []
     for reason, group in data.groupby("sell_reason", dropna=False):
@@ -5410,6 +5635,12 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
                 "avoided_loss_to_window_low": low_sum,
                 "avoided_loss_to_window_end": float(group["avoided_loss_to_window_end"].sum()),
                 "avg_avoided_loss_to_window_low": low_sum / max(count, 1),
+                "signed_exit_benefit_to_window_low": float(
+                    group["signed_exit_benefit_to_window_low"].sum()
+                ),
+                "signed_exit_benefit_to_window_end": float(
+                    group["signed_exit_benefit_to_window_end"].sum()
+                ),
                 "avg_observed_days": float(group["counterfactual_window_observed_days"].mean()) if count else pd.NA,
             }
         )
@@ -5581,6 +5812,42 @@ def _normalize_governance_control_mode(value) -> str:
     if mode not in allowed:
         raise ValueError(f"Unknown governance_control_mode '{value}'. Available: {sorted(allowed)}")
     return mode
+
+
+def _holding_target_contract(
+    capital_profile,
+    *,
+    actual_holding_count: int,
+    max_positions_override=None,
+) -> dict:
+    """Resolve minimum, soft target and hard maximum without treating zero as missing."""
+    profile = dict(capital_profile or {})
+    minimum_raw = profile.get("min_holdings")
+    minimum = (
+        int(GOVERNANCE_FORCE_DEPLOY_MIN_HOLDINGS_20K)
+        if minimum_raw is None
+        else max(int(minimum_raw), 0)
+    )
+    maximum_raw = (
+        max_positions_override
+        if max_positions_override not in (None, "")
+        else profile.get("max_positions")
+    )
+    maximum = (
+        int(GOVERNANCE_DEFAULT_TOP_N)
+        if maximum_raw in (None, "")
+        else max(int(maximum_raw), 1)
+    )
+    soft_raw = profile.get("soft_target_positions")
+    soft = minimum if soft_raw is None else max(int(soft_raw), 0)
+    soft = min(max(soft, minimum), maximum)
+    actual = max(int(actual_holding_count), 0)
+    return {
+        "minimum_required_holding_count": minimum,
+        "soft_target_holding_count": soft,
+        "maximum_allowed_holding_count": maximum,
+        "soft_holding_shortfall_count": max(soft - actual, 0),
+    }
 
 
 def governance_preload_calendar_days(control_mode, configured_days=None) -> int:

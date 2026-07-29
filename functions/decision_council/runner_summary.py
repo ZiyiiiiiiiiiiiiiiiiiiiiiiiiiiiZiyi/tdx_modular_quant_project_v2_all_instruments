@@ -406,6 +406,8 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
         "window_end_price",
         "avoided_loss_to_window_low",
         "avoided_loss_to_window_end",
+        "signed_exit_benefit_to_window_low",
+        "signed_exit_benefit_to_window_end",
         "counterfactual_window_observed_days",
         "counterfactual_note",
     ]
@@ -486,6 +488,8 @@ def _control_avoided_loss_ledger(execution_ledger: pd.DataFrame, features: pd.Da
                 "window_end_price": window_end_price,
                 "avoided_loss_to_window_low": max((exit_net_price - window_low_price) * shares, 0.0),
                 "avoided_loss_to_window_end": max((exit_net_price - window_end_price) * shares, 0.0),
+                "signed_exit_benefit_to_window_low": (exit_net_price - window_low_price) * shares,
+                "signed_exit_benefit_to_window_end": (exit_net_price - window_end_price) * shares,
                 "counterfactual_window_observed_days": int(len(path)),
                 "counterfactual_note": "If the control sell had not happened, this is the extra mark-to-low/end loss avoided in the post-exit window.",
             }
@@ -500,6 +504,8 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
         "avoided_loss_to_window_low",
         "avoided_loss_to_window_end",
         "avg_avoided_loss_to_window_low",
+        "signed_exit_benefit_to_window_low",
+        "signed_exit_benefit_to_window_end",
         "avg_observed_days",
     ]
     if ledger is None or ledger.empty:
@@ -509,6 +515,12 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
     data["avoided_loss_to_window_end"] = pd.to_numeric(data.get("avoided_loss_to_window_end"), errors="coerce").fillna(0.0)
     data["counterfactual_window_observed_days"] = pd.to_numeric(
         data.get("counterfactual_window_observed_days"), errors="coerce"
+    ).fillna(0.0)
+    data["signed_exit_benefit_to_window_low"] = pd.to_numeric(
+        data.get("signed_exit_benefit_to_window_low"), errors="coerce"
+    ).fillna(0.0)
+    data["signed_exit_benefit_to_window_end"] = pd.to_numeric(
+        data.get("signed_exit_benefit_to_window_end"), errors="coerce"
     ).fillna(0.0)
     rows = []
     for reason, group in data.groupby("sell_reason", dropna=False):
@@ -521,6 +533,12 @@ def _control_avoided_loss_summary_frame(ledger: pd.DataFrame) -> pd.DataFrame:
                 "avoided_loss_to_window_low": low_sum,
                 "avoided_loss_to_window_end": float(group["avoided_loss_to_window_end"].sum()),
                 "avg_avoided_loss_to_window_low": low_sum / max(count, 1),
+                "signed_exit_benefit_to_window_low": float(
+                    group["signed_exit_benefit_to_window_low"].sum()
+                ),
+                "signed_exit_benefit_to_window_end": float(
+                    group["signed_exit_benefit_to_window_end"].sum()
+                ),
                 "avg_observed_days": float(group["counterfactual_window_observed_days"].mean()) if count else pd.NA,
             }
         )

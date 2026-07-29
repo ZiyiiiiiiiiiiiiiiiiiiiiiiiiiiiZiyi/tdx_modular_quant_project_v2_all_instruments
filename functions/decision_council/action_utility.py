@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pandas as pd
 
-from functions.execution.cost_model import estimate_trade_costs
+from functions.execution.cost_model import cost_kwargs_from_profile, estimate_trade_costs
 
 
 ACTION_UTILITY_CONTRACT_VERSION = "unified_action_utility_v3"
@@ -47,6 +47,7 @@ def round_trip_cost_amount(
     price: float,
     shares: float,
     trade_date=None,
+    cost_profile=None,
 ) -> float:
     """Estimate buy plus later sell costs once for the proposed quantity."""
     if float(price) <= 0.0 or float(shares) <= 0.0:
@@ -62,7 +63,10 @@ def round_trip_cost_amount(
                 "target_shares": float(shares),
             }
         )
-    costs = estimate_trade_costs(pd.DataFrame(rows))
+    costs = estimate_trade_costs(
+        pd.DataFrame(rows),
+        **cost_kwargs_from_profile(cost_profile),
+    )
     return float(pd.to_numeric(costs["total_cost"], errors="coerce").fillna(0.0).sum())
 
 
@@ -113,7 +117,11 @@ def build_incremental_action_utility(
         - max(float(risk_penalty_amount or 0.0), 0.0)
         - max(float(opportunity_cost_amount or 0.0), 0.0)
     )
-    if state != "calibrated":
+    if state not in {
+        "calibrated",
+        "pit_fallback_authorized",
+        "recovery_authorized",
+    }:
         incremental = min(incremental, 0.0)
     return ActionUtility(
         proposal_id=str(proposal_id or uuid4()),

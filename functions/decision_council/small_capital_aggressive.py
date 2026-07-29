@@ -249,6 +249,18 @@ def attach_scap_candidate_utility(
         data.get("comparable_alpha_lcb", pd.Series(pd.NA, index=data.index)),
         errors="coerce",
     )
+    authority_tier = data.get(
+        "scap_v31_authority_tier", pd.Series("", index=data.index)
+    ).fillna("").astype(str).str.upper()
+    authority_return = pd.to_numeric(
+        data.get(
+            "scap_v31_decision_expected_return",
+            pd.Series(pd.NA, index=data.index),
+        ),
+        errors="coerce",
+    )
+    tier_authorized = authority_tier.isin({"A", "B", "C"})
+    expected_lcb = expected_lcb.where(~tier_authorized, authority_return)
     horizon = pd.to_numeric(
         data.get("comparable_value_horizon_days", pd.Series(10, index=data.index)),
         errors="coerce",
@@ -282,6 +294,12 @@ def attach_scap_candidate_utility(
         forecast_authority.gt(0.0),
         "prior_only",
     )
+    data.loc[authority_tier.isin({"A", "B"}), "scap_utility_calibration_state"] = (
+        "calibrated"
+    )
+    data.loc[authority_tier.eq("C"), "scap_utility_calibration_state"] = (
+        "pit_fallback_authorized"
+    )
     missing_return = expected_point.isna() | expected_lcb.isna()
     data.loc[missing_return, "scap_utility_calibration_state"] = "insufficient"
     data["scap_utility_baseline_action"] = "hold_cash"
@@ -307,6 +325,12 @@ def attach_scap_candidate_utility(
             0.0025 * float(data.at[idx, "scap_concentration_penalty"])
             + 0.0025 * float(data.at[idx, "scap_soft_quality_penalty"])
         )
+        reward_basis = (
+            "lcb"
+            if str(row.get("scap_v31_authority_tier", "")).upper()
+            in {"A", "B", "C"}
+            else candidate_reward_basis
+        )
         utility_rows.append(
             build_incremental_action_utility(
                 action_type="new_entry",
@@ -317,7 +341,7 @@ def attach_scap_candidate_utility(
                 horizon_days=int(horizon.loc[idx]),
                 risk_penalty_amount=risk_penalty,
                 calibration_state=str(data.at[idx, "scap_utility_calibration_state"]),
-                decision_return_basis=candidate_reward_basis,
+                decision_return_basis=reward_basis,
                 proposal_id=f"entry|{row.get('symbol', '')}",
             ).as_dict()
         )

@@ -290,7 +290,7 @@ BACKTEST_CAPITAL_PROFILES = {
         "retail_lot_adapter": True,
         "retail_single_position_cap": 0.40,
         "retail_one_lot_position_cap": 0.40,
-        "scap_single_position_soft_cap": 0.30,
+        "scap_single_position_soft_cap": 0.25,
         "capital_usage_mode": "allow_cash",
         "min_holdings": 0,
         "force_deploy_target_exposure_normal": 0.90,
@@ -300,10 +300,21 @@ BACKTEST_CAPITAL_PROFILES = {
         "objective_metric": "terminal_net_profit_after_all_costs",
         "trade_quality_gate": "terminal_net_profit_primary_profit_factor_health",
         "risk_tolerance": "aggressive_drawdown_tolerant_no_leverage",
-        "special_strategy_version": "small_capital_aggressive_profit_v3_lean",
-        "scap_contract_version": "scap_v3_lean_contracts_v1",
+        "special_strategy_version": "small_capital_aggressive_profit_v3_2",
+        "scap_contract_version": "scap_v3_2_contracts_v1",
+        "scap_optimizer_objective_version": "scap_v32_robust_wealth_deployment_breadth_v1",
+        "scap_candidate_pool_contract": "scap_v32_thesis_pool_preserving_v1",
+        "scap_authority_contract": "scap_v32_abcd_sizing_only_v1",
+        "scap_risk_episode_contract": "scap_v32_hysteresis_reentry_v1",
+        "scap_exit_contract": "scap_v32_adaptive_loss_signed_counterfactual_v1",
         "scap_exit_stage": "E4",
-        "scap_loss_stop": -0.15,
+        "scap_loss_stop": -0.18,
+        "scap_loss_stop_mode": "adaptive_volatility_or_disaster_floor",
+        "scap_loss_stop_volatility_multiple": 2.50,
+        "scap_loss_stop_confirmation_days": 2,
+        "scap_profit_protection_arm": 0.12,
+        "scap_profit_protection_min_net_profit": 0.03,
+        "scap_profit_protection_giveback": 0.55,
         "scap_drawdown_warning": 0.30,
         "scap_new_entry_freeze_drawdown": 0.40,
         "scap_loser_averaging_enabled": False,
@@ -315,11 +326,33 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_forecast_kappa": 0.50,
         "scap_warmup_sessions": 252,
         "scap_candidate_minimum_commission": 5.0,
+        "execution_cost_profile_id": "cn_a_share_retail_min5_v1",
+        "commission_rate": COMMISSION_RATE,
+        "minimum_commission": 5.0,
+        "stamp_duty_rate": STAMP_DUTY_RATE,
+        "slippage_rate": SLIPPAGE_RATE,
+        "transfer_fee_rate": 0.00001,
         "scap_candidate_reward_basis": "shrunk_point_minus_0.50_cluster_se",
+        # V3.2: A/B/C control evidence discount and starter size only. They
+        # must not become hidden portfolio-name or gross-exposure ceilings.
+        "scap_tier_c_max_names": 5,
+        "scap_exploration_exposure_cap": 1.00,
+        "scap_tier_a_uncertainty_rate": 0.0000,
+        "scap_tier_b_uncertainty_rate": 0.0005,
+        "scap_tier_c_uncertainty_rate": 0.0010,
+        "scap_cash_gap_penalty_rate": 0.0020,
+        "scap_breadth_near_optimal_tolerance_rate": 0.0015,
+        "scap_name_concentration_penalty_rate": 0.25,
+        "scap_safety_no_trade_band": 0.015,
+        "scap_safety_confirmation_days": 2,
+        "scap_risk_reentry_cooldown_days": 3,
+        "scap_block_new_entry_during_high_risk": True,
+        "scap_candidate_pool_top_m": 8,
+        "scap_optimizer_candidate_limit": 24,
         "strategic_exposure_normal": 0.90,
         "strategic_exposure_weak": 0.65,
         "strategic_exposure_high": 0.35,
-        "notes": "Isolated SCAP-V3 Lean research identity: PIT warm-up, one proposal factory, one integer ActionPlan, winner adds on, loser adds and replacement off.",
+        "notes": "SCAP-V3.2 aggressive small-capital research identity: pool-preserving PIT candidates, A/B/C sizing-only authority, one integer ActionPlan, soft deployment/breadth, risk hysteresis, winner adds on, loser adds and replacement off.",
     },
 }
 
@@ -380,6 +413,20 @@ def get_backtest_capital_profile(
     profile["affordability_first"] = bool(profile.get("affordability_first", False))
     profile["skip_unaffordable_symbols"] = bool(profile.get("skip_unaffordable_symbols", False))
     profile["retail_lot_adapter"] = bool(profile.get("retail_lot_adapter", False))
+    profile["execution_cost_profile_id"] = str(
+        profile.get("execution_cost_profile_id", "cn_a_share_default_cost_v1")
+    )
+    profile["commission_rate"] = float(profile.get("commission_rate", COMMISSION_RATE))
+    profile["minimum_commission"] = float(
+        profile.get("minimum_commission", MINIMUM_COMMISSION)
+    )
+    profile["stamp_duty_rate"] = float(
+        profile.get("stamp_duty_rate", STAMP_DUTY_RATE)
+    )
+    profile["slippage_rate"] = float(profile.get("slippage_rate", SLIPPAGE_RATE))
+    profile["transfer_fee_rate"] = float(
+        profile.get("transfer_fee_rate", TRANSFER_FEE_RATE)
+    )
     override_parts = []
     if initial_cash not in (None, ""):
         profile["initial_cash"] = float(initial_cash)

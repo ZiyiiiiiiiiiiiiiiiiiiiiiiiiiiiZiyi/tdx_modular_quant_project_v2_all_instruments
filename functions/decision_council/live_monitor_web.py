@@ -325,9 +325,14 @@ HTML = """<!doctype html>
       ["trend_direction_score_mean", "趋势方向均值"],
       ["peak_decay_score_mean", "峰值衰退均值"],
       ["future_loss_risk_score_mean", "未来亏损风险"],
-      ["target_holding_count", "目标持仓数"],
-      ["holding_shortfall_count", "持仓不足数"],
+      ["minimum_required_holding_count", "最低持仓数"],
+      ["soft_target_holding_count", "软目标持仓数"],
+      ["maximum_allowed_holding_count", "持仓硬上限"],
+      ["holding_shortfall_count", "软目标不足数"],
       ["idle_cash_ratio", "闲置现金比例"],
+      ["scap_v31_positive_c_fallback_count", "C级试探候选"],
+      ["scap_v31_all_d_streak", "全D连续日"],
+      ["scap_v31_normal_cash_zero_proposal_streak", "正常高现金零提案连续日"],
       ["defensive_eligible_count", "防守候选数"],
       ["downtrend_decay_count", "阴跌风险"],
       ["protecting_profit_count", "利润保护持仓"],
@@ -348,8 +353,8 @@ HTML = """<!doctype html>
       ["strategic_exposure_budget", "战略暴露预算"],
       ["signal_supported_exposure", "信号支持仓位"],
       ["integer_feasible_exposure", "整手可行仓位"],
-      ["planned_exposure", "计划后仓位"],
-      ["target_exposure", "目标仓位"],
+      ["planned_exposure", "优化器计划仓位"],
+      ["target_exposure", "战略期望仓位"],
       ["actual_exposure", "实际仓位"],
       ["exposure_gap", "仓位缺口"],
       ["valid_invested_nav", "持仓/投入净值"],
@@ -944,9 +949,14 @@ HTML = """<!doctype html>
       setMetric("trend_direction_score_mean", fmtNum(Number(ms.trend_direction_score_mean), 3), Number(ms.trend_direction_score_mean || 0) - 0.5);
       setMetric("peak_decay_score_mean", fmtNum(Number(ms.peak_decay_score_mean), 3), 0.5 - Number(ms.peak_decay_score_mean || 0));
       setMetric("future_loss_risk_score_mean", fmtNum(Number(ms.future_loss_risk_score_mean), 3), 0.5 - Number(ms.future_loss_risk_score_mean || 0));
-      setMetric("target_holding_count", String(Number(ms.target_holding_count || 0)), 0);
+      setMetric("minimum_required_holding_count", String(Number(ms.minimum_required_holding_count || 0)), 0);
+      setMetric("soft_target_holding_count", String(Number(ms.soft_target_holding_count || 0)), 0);
+      setMetric("maximum_allowed_holding_count", String(Number(ms.maximum_allowed_holding_count || 0)), 0);
       setMetric("holding_shortfall_count", String(Number(ms.holding_shortfall_count || 0)), -Number(ms.holding_shortfall_count || 0));
       setMetric("idle_cash_ratio", fmtPct(Number(ms.idle_cash_ratio)), -Number(ms.idle_cash_ratio || 0));
+      setMetric("scap_v31_positive_c_fallback_count", String(Number(ms.scap_v31_positive_c_fallback_count || 0)), Number(ms.scap_v31_positive_c_fallback_count || 0));
+      setMetric("scap_v31_all_d_streak", String(Number(ms.scap_v31_all_d_streak || 0)), -Number(ms.scap_v31_all_d_streak || 0));
+      setMetric("scap_v31_normal_cash_zero_proposal_streak", String(Number(ms.scap_v31_normal_cash_zero_proposal_streak || 0)), -Number(ms.scap_v31_normal_cash_zero_proposal_streak || 0));
       setMetric("defensive_eligible_count", String(Number(ms.defensive_eligible_count || 0)), Number(ms.defensive_eligible_count || 0));
       setMetric("downtrend_decay_count", String(Number(ms.downtrend_decay_count || 0)), -Number(ms.downtrend_decay_count || 0));
       setMetric("protecting_profit_count", String(Number(ms.protecting_profit_count || 0)), Number(ms.protecting_profit_count || 0));
@@ -1154,10 +1164,10 @@ HTML = """<!doctype html>
       }
       if (!lifecycleRows.length) lifecycleBody.innerHTML = `<tr><td colspan="11">暂无持仓生命周期记录。</td></tr>`;
 
-      const candidateLines = [`候选股票前列（${Number(ms.candidate_count || 0)}）`, "", "代码         分数     矩阵   状态       5日预期 候选 买入 突破 趋势 拦截原因"];
+      const candidateLines = [`排序候选预览（不等于拥有交易权，共${Number(ms.candidate_count || 0)}只）`, "", "代码         分数   权限  权限收益   人民币效用  状态       拦截/权限原因"];
       for (const item of (ms.candidate_preview || [])) {
         candidateLines.push(
-          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${fmtNum(Number(item.entry_matrix_score || 0),2).padStart(6)} ${String(item.position_state || "--").slice(0,10).padEnd(10)} ${(Number(item.expected_return_5d || 0)*100).toFixed(2).padStart(6)}% ${fmtNum(Number(item.module_candidate_score || 0),2).padStart(6)} ${fmtNum(Number(item.module_entry_score || 0),2).padStart(5)} ${fmtNum(Number(item.breakout_gate_score || 0),2).padStart(5)} ${fmtNum(Number(item.trend_hold_score || 0),2).padStart(5)} ${String(item.entry_block_reason || item.add_block_reason || "").slice(0,18)}`
+          `${String(item.symbol || "").padEnd(10)} ${fmtNum(Number(item.primary_score || 0),3).padStart(7)} ${String(item.scap_v31_authority_tier || "D").padStart(4)} ${fmtPct(Number(item.scap_v31_decision_expected_return || 0)).padStart(9)} ${fmtMoney(Number(item.scap_candidate_utility || 0)).padStart(11)} ${String(item.position_state || "--").slice(0,10).padEnd(10)} ${String(item.entry_block_reason || item.scap_v31_authority_reason || item.add_block_reason || "").slice(0,30)}`
         );
       }
       if ((ms.candidate_preview || []).length === 0) candidateLines.push("暂无候选预览。");

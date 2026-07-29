@@ -16,6 +16,24 @@ from config import (
 from functions.execution.fee_schedule import commission_cost, stamp_duty_rate_for
 
 
+def cost_kwargs_from_profile(profile=None) -> dict:
+    """Resolve one immutable fee schedule for planning and execution."""
+    source = dict(profile or {})
+    return {
+        "commission_rate": float(source.get("commission_rate", COMMISSION_RATE)),
+        "minimum_commission": float(
+            source.get("minimum_commission", MINIMUM_COMMISSION)
+        ),
+        "stamp_duty_rate": float(
+            source.get("stamp_duty_rate", STAMP_DUTY_RATE)
+        ),
+        "slippage_rate": float(source.get("slippage_rate", SLIPPAGE_RATE)),
+        "transfer_fee_rate": float(
+            source.get("transfer_fee_rate", TRANSFER_FEE_RATE)
+        ),
+    }
+
+
 def estimate_trade_costs(
     order_df,
     *,

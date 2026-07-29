@@ -18,7 +18,7 @@ SIMULATED_ORDER_COLUMNS = [
 ]
 
 
-def simulate_order_book(order_df):
+def simulate_order_book(order_df, *, cost_profile=None):
     constrained = apply_a_share_constraints(order_df)
     constrained["execution_status"] = constrained["constraint_blocked"].map(
         {True: "pending", False: "filled"}
@@ -27,7 +27,13 @@ def simulate_order_book(order_df):
         ~constrained["constraint_blocked"],
         0.0,
     )
-    simulated = estimate_trade_costs(constrained, shares_col="executed_shares")
+    from functions.execution.cost_model import cost_kwargs_from_profile
+
+    simulated = estimate_trade_costs(
+        constrained,
+        shares_col="executed_shares",
+        **cost_kwargs_from_profile(cost_profile),
+    )
     simulated["remaining_shares"] = simulated["target_shares"] - simulated["executed_shares"]
     return simulated
 

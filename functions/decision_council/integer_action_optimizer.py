@@ -29,7 +29,9 @@ def optimize_action_proposals(
     thesis_by_symbol: Mapping[str, str] | None = None,
     max_names_per_thesis: int = 2,
     correlation_matrix: pd.DataFrame | None = None,
-    correlation_penalty_rate: float = 0.10,
+    covariance_matrix: pd.DataFrame | None = None,
+    covariance_risk_aversion: float = 0.05,
+    candidate_limit: int = 24,
 ) -> ActionPlan:
     """Return the sole strategy-authorized integer ActionPlan.
 
@@ -40,13 +42,6 @@ def optimize_action_proposals(
     cash. Spending more is never a tie-break objective.
     """
     items = tuple(proposals)
-    if not items:
-        return _empty_plan(authorization)
-    if any(item.decision_id != authorization.decision_id for item in items):
-        raise ValueError("all proposals and authorization must share decision_id")
-    if len({item.proposal_id for item in items}) != len(items):
-        raise ValueError("proposal_id must be unique")
-
     current_lots = {
         str(symbol): max(int(lots), 0)
         for symbol, lots in (current_lots_by_symbol or {}).items()
@@ -55,23 +50,42 @@ def optimize_action_proposals(
         str(symbol): max(float(weight), 0.0)
         for symbol, weight in (current_weights_by_symbol or {}).items()
     }
+    if not items:
+        return _empty_plan(
+            authorization,
+            current_lots=current_lots,
+            current_weights=current_weights,
+            current_exposure=current_exposure,
+        )
+    if any(item.decision_id != authorization.decision_id for item in items):
+        raise ValueError("all proposals and authorization must share decision_id")
+    if len({item.proposal_id for item in items}) != len(items):
+        raise ValueError("proposal_id must be unique")
     thesis_map = {str(k): str(v) for k, v in (thesis_by_symbol or {}).items()}
     forced = tuple(
         item
         for item in items
         if item.executable and item.action_type in {"safety_exit", "hard_exit"}
     )
-    candidates = tuple(
+    candidate_pool = tuple(
         item
         for item in items
         if item.executable
         and item not in forced
-        and item.robust_net_profit_amount > 0.0
+        and (
+            item.robust_net_profit_amount
+            - item.authority_penalty_amount
+        )
+        > 0.0
         and _action_authorized(item.action_type, authorization)
     )
     # A bounded reducer keeps exhaustive enumeration predictable while
     # preserving diverse actions/symbols.
-    candidates = _pareto_reduce(candidates, limit=20)
+    candidates = _pareto_reduce(
+        candidate_pool,
+        limit=max(int(candidate_limit), int(max_positions)),
+    )
+    reduced_ids = {item.proposal_id for item in candidates}
     pair_expected_counts: dict[str, int] = {}
     for item in items:
         if item.replacement_pair_id:
@@ -90,9 +104,15 @@ def optimize_action_proposals(
         thesis_map=thesis_map,
         max_names_per_thesis=max_names_per_thesis,
         pair_expected_counts=pair_expected_counts,
-        correlation_matrix=correlation_matrix,
-        correlation_penalty_rate=correlation_penalty_rate,
+        covariance_matrix=(
+            covariance_matrix
+            if covariance_matrix is not None
+            else correlation_matrix
+        ),
+        covariance_risk_aversion=covariance_risk_aversion,
     )
+    best_nonbuy_key = best_key
+    best_buy_key = None
     max_optional = min(max(int(max_positions), 0), len(candidates))
     for size in range(1, max_optional + 1):
         for optional in combinations(candidates, size):
@@ -107,11 +127,20 @@ def optimize_action_proposals(
                 thesis_map=thesis_map,
                 max_names_per_thesis=max_names_per_thesis,
                 pair_expected_counts=pair_expected_counts,
-                correlation_matrix=correlation_matrix,
-                correlation_penalty_rate=correlation_penalty_rate,
+                covariance_matrix=(
+                    covariance_matrix
+                    if covariance_matrix is not None
+                    else correlation_matrix
+                ),
+                covariance_risk_aversion=covariance_risk_aversion,
             )
             if key is None:
                 continue
+            if any(_is_buy_action(item.action_type) for item in selected):
+                if best_buy_key is None or key > best_buy_key:
+                    best_buy_key = key
+            elif best_nonbuy_key is None or key > best_nonbuy_key:
+                best_nonbuy_key = key
             if best_key is None or key > best_key:
                 best, best_key = selected, key
 
@@ -121,7 +150,18 @@ def optimize_action_proposals(
             "proposal_id": item.proposal_id,
             "symbol": item.symbol,
             "action_type": item.action_type,
-            "reason": _rejection_reason(item, authorization, selected_ids),
+            "reason": _rejection_reason(
+                item,
+                authorization,
+                selected_ids,
+                reduced_ids=reduced_ids,
+                current_weights=current_weights,
+                current_exposure=current_exposure,
+                current_lots=current_lots,
+                max_positions=max_positions,
+                thesis_map=thesis_map,
+                thesis_hard_max=max_names_per_thesis,
+            ),
         }
         for item in items
         if item.proposal_id not in selected_ids
@@ -152,6 +192,47 @@ def optimize_action_proposals(
         if current_weights
         else min(current_exposure + funding / authorization.nav_amount, 1.0)
     )
+    deployment_gap = max(
+        float(authorization.effective_deployment_target)
+        - float(projected_exposure),
+        0.0,
+    )
+    selected_buy_symbols = {
+        item.symbol
+        for item in best
+        if _is_buy_action(item.action_type)
+    }
+    held_symbols = {
+        symbol
+        for symbol, weight in projected_weights.items()
+        if float(weight) > 1e-12
+    }
+    selected_pools = {
+        item.pool_id or item.thesis
+        for item in best
+        if _is_buy_action(item.action_type) and (item.pool_id or item.thesis)
+    }
+    selected_pools.update(
+        thesis_map.get(symbol, "")
+        for symbol in held_symbols
+        if thesis_map.get(symbol, "")
+    )
+    breadth_score = float(
+        min(len(held_symbols), 4)
+        + min(len(selected_pools), 3)
+    )
+    authority_penalty = sum(
+        max(float(item.authority_penalty_amount), 0.0)
+        for item in best
+    )
+    concentration_penalty = _concentration_penalty(
+        projected_weights,
+        authorization,
+    )
+    buy_plan_dominates_nonbuy = bool(
+        best_buy_key is not None
+        and (best_nonbuy_key is None or best_buy_key > best_nonbuy_key)
+    )
     return ActionPlan(
         decision_id=authorization.decision_id,
         selected_proposal_ids=tuple(item.proposal_id for item in best),
@@ -164,7 +245,13 @@ def optimize_action_proposals(
         projected_cash=projected_cash,
         projected_exposure=projected_exposure,
         projected_stress_loss=downside,
-        objective_lexicographic_rank=(robust, -downside, -cost, projected_cash),
+        objective_lexicographic_rank=(
+            robust,
+            -deployment_gap,
+            breadth_score,
+            -downside,
+            -cost,
+        ),
         constraint_slacks={
             "exposure": max(
                 authorization.risk_exposure_ceiling - projected_exposure, 0.0
@@ -172,10 +259,39 @@ def optimize_action_proposals(
             "stress": max(
                 authorization.portfolio_stress_budget_amount - downside, 0.0
             ),
+            "cash": max(
+                available_cash
+                - authorization.cash_buffer_amount
+                - funding,
+                0.0,
+            ),
+            "slots": max(
+                int(max_positions)
+                - sum(1 for lots in target_lots.values() if int(lots) > 0),
+                0,
+            ),
+            "best_feasible_buy_robust_objective": (
+                float(best_buy_key[0]) if best_buy_key is not None else 0.0
+            ),
+            "best_feasible_nonbuy_robust_objective": (
+                float(best_nonbuy_key[0])
+                if best_nonbuy_key is not None
+                else 0.0
+            ),
+            "buy_plan_dominates_nonbuy": int(buy_plan_dominates_nonbuy),
+            "deployment_gap": deployment_gap,
+            "breadth_score": breadth_score,
+            "authority_penalty_amount": authority_penalty,
+            "concentration_penalty_amount": concentration_penalty,
         },
         solver_status="optimal_bounded_exhaustive",
         plan_id=f"{authorization.decision_id}|action_plan",
         optimizer_invocation_count=1,
+        deployment_gap=deployment_gap,
+        breadth_score=breadth_score,
+        authority_penalty_amount=authority_penalty,
+        concentration_penalty_amount=concentration_penalty,
+        risk_episode_id=str(authorization.risk_episode_id),
     )
 
 
@@ -190,9 +306,9 @@ def _plan_key(
     thesis_map: Mapping[str, str],
     max_names_per_thesis: int,
     pair_expected_counts: Mapping[str, int],
-    correlation_matrix: pd.DataFrame | None,
-    correlation_penalty_rate: float,
-) -> tuple[float, float, float, float, tuple[str, ...]] | None:
+    covariance_matrix: pd.DataFrame | None,
+    covariance_risk_aversion: float,
+) -> tuple[float, float, float, float, float, float, tuple[str, ...]] | None:
     by_symbol: dict[str, list[ActionProposal]] = {}
     for item in selected:
         by_symbol.setdefault(item.symbol, []).append(item)
@@ -257,47 +373,103 @@ def _plan_key(
         return None
     if downside > authorization.portfolio_stress_budget_amount + 1e-12:
         return None
+    tier_b_exposure = sum(
+        max(item.exposure_delta, 0.0)
+        for item in selected
+        if item.authority_tier == "B"
+    )
+    exploration_exposure = sum(
+        max(item.exposure_delta, 0.0)
+        for item in selected
+        if item.authority_tier in {"B", "C"}
+    )
+    tier_c_names = len(
+        {
+            item.symbol
+            for item in selected
+            if item.authority_tier == "C" and item.exposure_delta > 0.0
+        }
+    )
+    # V3.2: A/B/C are evidence discounts and starter-size controls. They are
+    # audited here but are no longer hidden portfolio-name/exposure vetoes.
     if thesis_map:
+        baseline_counts: dict[str, int] = {}
+        for symbol, weight in current_weights.items():
+            thesis = thesis_map.get(symbol, "")
+            if weight > 1e-12 and thesis:
+                baseline_counts[thesis] = baseline_counts.get(thesis, 0) + 1
         counts: dict[str, int] = {}
         for symbol in symbols:
             thesis = thesis_map.get(symbol, "")
             if not thesis:
                 continue
             counts[thesis] = counts.get(thesis, 0) + 1
-        if any(count > int(max_names_per_thesis) for count in counts.values()):
-            return None
+        for thesis, count in counts.items():
+            baseline = baseline_counts.get(thesis, 0)
+            if count > int(max_names_per_thesis) and count > baseline:
+                return None
 
-    robust = sum(item.robust_net_profit_amount for item in selected)
-    if correlation_matrix is not None and not correlation_matrix.empty:
-        buy_items = [
-            item
-            for item in selected
-            if item.action_type
-            not in {"exit", "hard_exit", "safety_exit", "replacement_sell"}
-        ]
-        interaction_penalty = 0.0
-        for left_index, left in enumerate(buy_items):
-            for right in buy_items[left_index + 1 :]:
-                if (
-                    left.symbol in correlation_matrix.index
-                    and right.symbol in correlation_matrix.columns
-                ):
-                    corr = pd.to_numeric(
-                        pd.Series(
-                            [correlation_matrix.at[left.symbol, right.symbol]]
-                        ),
-                        errors="coerce",
-                    ).iloc[0]
-                    if pd.notna(corr):
-                        interaction_penalty += (
-                            max(float(corr), 0.0)
-                            * max(float(correlation_penalty_rate), 0.0)
-                            * min(
-                                max(left.robust_net_profit_amount, 0.0),
-                                max(right.robust_net_profit_amount, 0.0),
-                            )
-                        )
-        robust -= interaction_penalty
+    robust = sum(
+        item.robust_net_profit_amount - item.authority_penalty_amount
+        for item in selected
+    )
+    soft_thesis_penalty = 0.0
+    if thesis_map:
+        for thesis, count in counts.items():
+            excess = max(count - int(authorization.thesis_soft_max_names), 0)
+            if excess:
+                thesis_profits = sorted(
+                    (
+                        max(item.robust_net_profit_amount, 0.0)
+                        for item in selected
+                        if thesis_map.get(item.symbol, "") == thesis
+                        and item.exposure_delta > 0.0
+                    )
+                )
+                soft_thesis_penalty += 0.10 * sum(thesis_profits[:excess])
+    robust -= soft_thesis_penalty
+    if covariance_matrix is not None and not covariance_matrix.empty:
+        pre_sigma = _portfolio_sigma(current_weights, covariance_matrix)
+        post_sigma = _portfolio_sigma(projected_weights, covariance_matrix)
+        robust -= (
+            max(post_sigma - pre_sigma, 0.0)
+            * authorization.nav_amount
+            * max(float(covariance_risk_aversion), 0.0)
+        )
+    concentration_penalty = _concentration_penalty(
+        projected_weights,
+        authorization,
+    )
+    robust -= concentration_penalty
+    deployment_gap = max(
+        float(authorization.effective_deployment_target)
+        - float(projected_exposure),
+        0.0,
+    )
+    robust -= (
+        authorization.nav_amount
+        * authorization.cash_gap_penalty_rate
+        * deployment_gap
+    )
+    active_symbols = {
+        symbol
+        for symbol, weight in projected_weights.items()
+        if float(weight) > 1e-12
+    }
+    active_pools = {
+        item.pool_id or item.thesis
+        for item in selected
+        if _is_buy_action(item.action_type) and (item.pool_id or item.thesis)
+    }
+    active_pools.update(
+        thesis_map.get(symbol, "")
+        for symbol in active_symbols
+        if thesis_map.get(symbol, "")
+    )
+    breadth = float(
+        min(len(active_symbols), 4)
+        + min(len(active_pools), 3)
+    )
     expected = sum(item.expected_net_profit_amount for item in selected)
     cost = sum(item.exact_cost_amount for item in selected)
     residual = max(
@@ -307,7 +479,26 @@ def _plan_key(
         0.0,
     )
     ids = tuple(sorted(item.proposal_id for item in selected))
-    return robust, expected, -downside, -cost, ids
+    return robust, -deployment_gap, breadth, expected, -downside, -cost, ids
+
+
+def _concentration_penalty(
+    weights: Mapping[str, float],
+    authorization: ExposureAuthorization,
+) -> float:
+    soft_cap = min(
+        max(float(authorization.per_name_soft_cap), 0.0),
+        float(authorization.per_name_structural_cap),
+    )
+    excess_square = sum(
+        max(float(weight) - soft_cap, 0.0) ** 2
+        for weight in weights.values()
+    )
+    return (
+        float(authorization.nav_amount)
+        * float(authorization.name_concentration_penalty_rate)
+        * excess_square
+    )
 
 
 def _projected_weights(
@@ -331,6 +522,34 @@ def _projected_weights(
     return weights
 
 
+def _portfolio_sigma(
+    weights: Mapping[str, float],
+    covariance_matrix: pd.DataFrame,
+) -> float:
+    """Daily portfolio volatility from a covariance matrix (not correlation)."""
+    symbols = [
+        symbol
+        for symbol, weight in weights.items()
+        if weight > 1e-12
+        and symbol in covariance_matrix.index
+        and symbol in covariance_matrix.columns
+    ]
+    if not symbols:
+        return 0.0
+    vector = pd.Series(
+        [float(weights[symbol]) for symbol in symbols],
+        index=symbols,
+        dtype=float,
+    )
+    covariance = (
+        covariance_matrix.loc[symbols, symbols]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+    variance = float(vector.T.dot(covariance).dot(vector))
+    return max(variance, 0.0) ** 0.5
+
+
 def _action_authorized(action_type: str, authorization: ExposureAuthorization) -> bool:
     action = str(action_type)
     if action == "new_entry":
@@ -340,6 +559,18 @@ def _action_authorized(action_type: str, authorization: ExposureAuthorization) -
     if action in {"replacement_buy", "replacement_sell"}:
         return authorization.replacement_allowed
     return True
+
+
+def _is_buy_action(action_type: str) -> bool:
+    return str(action_type) in {
+        "new_entry",
+        "winner_pyramiding",
+        "loser_averaging",
+        "winner_add",
+        "loser_add",
+        "add",
+        "replacement_buy",
+    }
 
 
 def _pareto_reduce(
@@ -352,18 +583,32 @@ def _pareto_reduce(
     ordered = sorted(
         proposals,
         key=lambda item: (
+            -item.unit_capital_robust_return,
+            item.primary_rank if item.primary_rank > 0.0 else float("inf"),
+            -item.primary_score,
             -item.robust_net_profit_amount,
-            -(item.robust_net_profit_amount / max(item.funding_cash_amount, 1.0)),
             item.downside_cvar_amount,
             item.proposal_id,
         ),
     )
     by_action: dict[str, ActionProposal] = {}
     by_symbol: dict[str, ActionProposal] = {}
+    by_pool: dict[str, ActionProposal] = {}
     for item in ordered:
         by_action.setdefault(item.action_type, item)
         by_symbol.setdefault(item.symbol, item)
-    union = list(dict.fromkeys([*by_action.values(), *by_symbol.values(), *ordered]))
+        if item.pool_id:
+            by_pool.setdefault(item.pool_id, item)
+    union = list(
+        dict.fromkeys(
+            [
+                *by_action.values(),
+                *by_pool.values(),
+                *by_symbol.values(),
+                *ordered,
+            ]
+        )
+    )
     return tuple(union[: int(limit)])
 
 
@@ -371,6 +616,14 @@ def _rejection_reason(
     item: ActionProposal,
     authorization: ExposureAuthorization,
     selected_ids: set[str],
+    *,
+    reduced_ids: set[str],
+    current_weights: Mapping[str, float],
+    current_exposure: float,
+    current_lots: Mapping[str, int],
+    max_positions: int,
+    thesis_map: Mapping[str, str],
+    thesis_hard_max: int,
 ) -> str:
     if item.proposal_id in selected_ids:
         return ""
@@ -378,31 +631,122 @@ def _rejection_reason(
         return "hard_veto:" + "|".join(item.hard_veto_reasons)
     if not _action_authorized(item.action_type, authorization):
         return "exposure_authorization"
-    if item.robust_net_profit_amount <= 0.0:
+    if (
+        item.robust_net_profit_amount
+        - item.authority_penalty_amount
+        <= 0.0
+    ):
         return "non_positive_robust_profit"
+    if item.proposal_id not in reduced_ids:
+        return "pareto_reduced"
+    if item.funding_cash_amount > max(
+        float(authorization.current_cash_amount)
+        - float(authorization.cash_buffer_amount),
+        0.0,
+    ) + 1e-8:
+        return "cash_constraint"
+    projected_weight = (
+        float(current_weights.get(item.symbol, 0.0))
+        + max(float(item.exposure_delta), 0.0)
+    )
+    if projected_weight > authorization.per_name_structural_cap + 1e-12:
+        return "per_name_structural_cap"
+    if (
+        float(current_exposure) + float(item.exposure_delta)
+        > authorization.risk_exposure_ceiling + 1e-12
+    ):
+        return "exposure_ceiling"
+    if item.downside_cvar_amount > authorization.portfolio_stress_budget_amount:
+        return "portfolio_stress_budget"
+    if (
+        item.action_type == "new_entry"
+        and item.symbol not in current_lots
+        and sum(1 for lots in current_lots.values() if lots > 0)
+        >= int(max_positions)
+    ):
+        return "position_slot_limit"
+    thesis = thesis_map.get(item.symbol, "")
+    if thesis and item.exposure_delta > 0.0:
+        baseline = sum(
+            1
+            for symbol, weight in current_weights.items()
+            if weight > 1e-12 and thesis_map.get(symbol, "") == thesis
+        )
+        projected = baseline + (0 if item.symbol in current_weights else 1)
+        if projected > int(thesis_hard_max) and projected > baseline:
+            return "thesis_hard_cap_non_worsening"
+    if any(
+        proposal_id in selected_ids
+        for proposal_id in selected_ids
+        if f"|{item.symbol}|" in proposal_id
+    ):
+        return "alternative_lot_not_selected"
     return "dominated_or_portfolio_constraint"
 
 
-def _empty_plan(authorization: ExposureAuthorization) -> ActionPlan:
+def _empty_plan(
+    authorization: ExposureAuthorization,
+    *,
+    current_lots: Mapping[str, int],
+    current_weights: Mapping[str, float],
+    current_exposure: float,
+) -> ActionPlan:
+    """Return the factual no-action portfolio, not a synthetic zero account."""
+    projected_exposure = (
+        min(sum(max(float(weight), 0.0) for weight in current_weights.values()), 1.0)
+        if current_weights
+        else min(max(float(current_exposure), 0.0), 1.0)
+    )
+    projected_cash = max(float(authorization.current_cash_amount), 0.0)
     return ActionPlan(
         decision_id=authorization.decision_id,
         selected_proposal_ids=(),
         rejected_proposals=(),
-        target_lots_by_symbol={},
+        target_lots_by_symbol=dict(current_lots),
         expected_net_profit_amount=0.0,
         robust_net_profit_amount=0.0,
         downside_cvar_amount=0.0,
         exact_cost_amount=0.0,
-        projected_cash=authorization.nav_amount
-        * authorization.risk_exposure_ceiling,
-        projected_exposure=0.0,
+        projected_cash=projected_cash,
+        projected_exposure=projected_exposure,
         projected_stress_loss=0.0,
         objective_lexicographic_rank=(0.0, 0.0, 0.0, 0.0),
         constraint_slacks={
-            "exposure": authorization.risk_exposure_ceiling,
+            "exposure": max(
+                authorization.risk_exposure_ceiling - projected_exposure,
+                0.0,
+            ),
             "stress": authorization.portfolio_stress_budget_amount,
+            "cash": max(
+                projected_cash - authorization.cash_buffer_amount,
+                0.0,
+            ),
+            "best_feasible_buy_robust_objective": 0.0,
+            "best_feasible_nonbuy_robust_objective": 0.0,
+            "buy_plan_dominates_nonbuy": 0,
         },
         solver_status="empty",
         plan_id=f"{authorization.decision_id}|action_plan",
         optimizer_invocation_count=1,
+        deployment_gap=max(
+            float(authorization.effective_deployment_target)
+            - projected_exposure,
+            0.0,
+        ),
+        breadth_score=float(
+            min(
+                sum(
+                    1
+                    for weight in current_weights.values()
+                    if float(weight) > 1e-12
+                ),
+                4,
+            )
+        ),
+        authority_penalty_amount=0.0,
+        concentration_penalty_amount=_concentration_penalty(
+            current_weights,
+            authorization,
+        ),
+        risk_episode_id=str(authorization.risk_episode_id),
     )

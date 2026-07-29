@@ -15,7 +15,7 @@ import math
 import pandas as pd
 
 
-SCAP_V2_CONTRACT_VERSION = "scap_v3_lean_contracts_v1"
+SCAP_V2_CONTRACT_VERSION = "scap_v3_2_contracts_v1"
 
 
 def _finite(value, *, name: str) -> float:
@@ -124,6 +124,14 @@ class ActionProposal:
     replacement_pair_id: str = ""
     score_contract_id: str = ""
     forecast_contract_id: str = ""
+    authority_tier: str = "A"
+    thesis: str = ""
+    pool_id: str = ""
+    pool_memberships: tuple[str, ...] = ()
+    primary_score: float = 0.0
+    primary_rank: float = 0.0
+    unit_capital_robust_return: float = 0.0
+    authority_penalty_amount: float = 0.0
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -140,9 +148,17 @@ class ActionProposal:
             "exact_cost_amount",
             "funding_cash_amount",
             "exposure_delta",
+            "primary_score",
+            "primary_rank",
+            "unit_capital_robust_return",
+            "authority_penalty_amount",
         ):
             _finite(getattr(self, name), name=name)
-        if self.exact_cost_amount < 0.0 or self.funding_cash_amount < 0.0:
+        if (
+            self.exact_cost_amount < 0.0
+            or self.funding_cash_amount < 0.0
+            or self.authority_penalty_amount < 0.0
+        ):
             raise ValueError("cost and funding amounts must be non-negative")
         for value in self.scenario_delta_wealth:
             _finite(value, name="scenario_delta_wealth")
@@ -174,6 +190,19 @@ class ExposureAuthorization:
     blocking_reasons: tuple[str, ...] = ()
     covariance_state: str = "unavailable"
     fallback_risk_model: str = "per_name_stress_cap"
+    tier_b_exposure_cap: float = 0.40
+    tier_c_max_names: int = 2
+    exploration_exposure_cap: float = 0.55
+    thesis_soft_max_names: int = 2
+    thesis_hard_max_names: int = 3
+    desired_exposure_target: float = 0.0
+    effective_deployment_target: float = 0.0
+    per_name_soft_cap: float = 0.25
+    cash_gap_penalty_rate: float = 0.0
+    name_concentration_penalty_rate: float = 0.0
+    breadth_near_optimal_tolerance_amount: float = 0.0
+    risk_episode_id: str = ""
+    risk_reentry_blocked: bool = False
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -193,8 +222,22 @@ class ExposureAuthorization:
             "strategic_exposure_budget",
             "signal_supported_exposure",
             "integer_feasible_exposure",
+            "desired_exposure_target",
+            "effective_deployment_target",
+            "per_name_soft_cap",
         ):
             _unit_interval(getattr(self, name), name=name)
+        _unit_interval(self.tier_b_exposure_cap, name="tier_b_exposure_cap")
+        _unit_interval(
+            self.exploration_exposure_cap, name="exploration_exposure_cap"
+        )
+        for name in (
+            "cash_gap_penalty_rate",
+            "name_concentration_penalty_rate",
+            "breadth_near_optimal_tolerance_amount",
+        ):
+            if _finite(getattr(self, name), name=name) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -218,6 +261,11 @@ class ActionPlan:
     solver_status: str
     plan_id: str = ""
     optimizer_invocation_count: int = 1
+    deployment_gap: float = 0.0
+    breadth_score: float = 0.0
+    authority_penalty_amount: float = 0.0
+    concentration_penalty_amount: float = 0.0
+    risk_episode_id: str = ""
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -238,6 +286,10 @@ class ActionPlan:
             "downside_cvar_amount",
             "exact_cost_amount",
             "projected_stress_loss",
+            "deployment_gap",
+            "breadth_score",
+            "authority_penalty_amount",
+            "concentration_penalty_amount",
         ):
             _finite(getattr(self, name), name=name)
 

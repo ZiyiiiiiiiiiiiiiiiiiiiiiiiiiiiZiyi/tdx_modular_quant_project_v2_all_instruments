@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from functions.execution.cost_model import estimate_trade_costs
+from functions.execution.cost_model import cost_kwargs_from_profile, estimate_trade_costs
 from functions.execution.order_simulator import simulate_order_book
 from functions.execution.execution_rules import open_price_limit_blocked
 from functions.execution.security_trading_rules import legal_buy_quantity, trading_rule_for
@@ -118,6 +118,12 @@ def execute_pending(runner, date, daily):
             "action_proposal_id": order.get("action_proposal_id", ""),
             "action_plan_selected": order.get("action_plan_selected", False),
             "action_plan_contract": order.get("action_plan_contract", ""),
+            "scap_v31_authority_tier": order.get(
+                "scap_v31_authority_tier", ""
+            ),
+            "scap_v31_authority_contract": order.get(
+                "scap_v31_authority_contract", ""
+            ),
             "cash_reservation_id": order.get("cash_reservation_id", ""),
             "entry_matrix_score": order.get("entry_matrix_score", pd.NA),
             "entry_alpha_score": order.get("entry_alpha_score", pd.NA),
@@ -205,7 +211,10 @@ def execute_pending(runner, date, daily):
     if not rows:
         runner.engine.settle_pending_orders(date, blocked_symbols=blocked_symbols)
         return
-    simulated = simulate_order_book(pd.DataFrame(rows))
+    simulated = simulate_order_book(
+        pd.DataFrame(rows),
+        cost_profile=runner.capital_profile,
+    )
     processed_fill_ids = {
         str(row.get("fill_id", "") or "")
         for row in getattr(runner, "execution_rows", [])
@@ -251,7 +260,10 @@ def execute_pending(runner, date, daily):
             shares = min(shares, affordable_quantity)
             if shares <= 0:
                 continue
-            recalculated = estimate_trade_costs(pd.DataFrame([{**fill.to_dict(), "target_shares": shares}]))
+            recalculated = estimate_trade_costs(
+                pd.DataFrame([{**fill.to_dict(), "target_shares": shares}]),
+                **cost_kwargs_from_profile(runner.capital_profile),
+            )
             notional = float(recalculated.iloc[0]["trade_notional"])
             cost = float(recalculated.iloc[0]["total_cost"])
             runner.cash -= notional + cost
@@ -558,7 +570,8 @@ def register_orders(runner, orders, daily, nominal_nav):
                             "target_shares": shares,
                         }
                     ]
-                )
+                ),
+                **cost_kwargs_from_profile(runner.capital_profile),
             ).iloc[0]
             conditional_pair_cash[pair_id] = max(
                 float(sell_costs.get("trade_notional", 0.0))
@@ -622,6 +635,12 @@ def register_orders(runner, orders, daily, nominal_nav):
             "action_proposal_id": order.get("action_proposal_id", ""),
             "action_plan_selected": order.get("action_plan_selected", False),
             "action_plan_contract": order.get("action_plan_contract", ""),
+            "scap_v31_authority_tier": order.get(
+                "scap_v31_authority_tier", ""
+            ),
+            "scap_v31_authority_contract": order.get(
+                "scap_v31_authority_contract", ""
+            ),
             "cash_reservation_id": order.get(
                 "_cash_reservation_id", order.get("cash_reservation_id", "")
             ),

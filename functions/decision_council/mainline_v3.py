@@ -227,6 +227,19 @@ def apply_mainline_v3_entry_policy(
                     .head(2)
                     .index.tolist()
                 )
+        if "scap_v31_authority_tier" in pool.columns:
+            for _, group in pool.groupby(
+                pool["scap_v31_authority_tier"].fillna("D").astype(str),
+                dropna=False,
+            ):
+                union.extend(
+                    group.sort_values(
+                        ["_utility_amount", "symbol"],
+                        ascending=[False, True],
+                    )
+                    .head(2)
+                    .index.tolist()
+                )
         selected_index = list(dict.fromkeys(union))[:15]
         data["scap_action_candidate"] = data.index.isin(selected_index)
         data["scap_optimizer_selected"] = False

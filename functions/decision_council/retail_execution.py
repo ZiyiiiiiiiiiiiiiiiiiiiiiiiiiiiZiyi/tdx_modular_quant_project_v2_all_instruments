@@ -4,7 +4,7 @@ from __future__ import annotations
 import pandas as pd
 
 from config import *  # noqa: F403 - retail rules are config-driven.
-from functions.execution.cost_model import estimate_trade_costs
+from functions.execution.cost_model import cost_kwargs_from_profile, estimate_trade_costs
 from functions.execution.security_trading_rules import legal_buy_quantity, trading_rule_for
 from functions.decision_council.mainline_v2 import is_mainline_v3_version
 
@@ -177,7 +177,8 @@ def retail_cash_required(runner, *, side: str, price: float, shares: float) -> f
                     "target_shares": float(shares),
                 }
             ]
-        )
+        ),
+        **cost_kwargs_from_profile(runner.capital_profile),
     )
     row = costs.iloc[0]
     return float(row.get("trade_notional", 0.0)) + float(row.get("total_cost", 0.0))

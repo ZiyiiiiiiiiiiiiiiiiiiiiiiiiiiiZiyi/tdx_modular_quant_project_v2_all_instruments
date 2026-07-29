@@ -178,6 +178,14 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         "trough_price": min(float(existing.get("trough_price", price)) if existing else price, price),
         "buy_count": int(existing.get("buy_count", 1) + 1) if existing and previous_shares > 0.0 else 1,
         "last_buy_date": pd.Timestamp(date),
+        "last_add_date": (
+            pd.Timestamp(date)
+            if existing and previous_shares > 0.0
+            else pd.NaT
+        ),
+        "last_add_shares": (
+            float(shares) if existing and previous_shares > 0.0 else 0.0
+        ),
         "entry_alpha_quality_score": (
             float(existing.get("entry_alpha_quality_score", entry_alpha_quality))
             if existing and previous_shares > 0.0
@@ -190,6 +198,15 @@ def update_lifecycle_on_buy(runner, symbol: str, *, date, price: float, shares: 
         "entry_thesis": str(existing.get("entry_thesis", entry_thesis)) if existing and previous_shares > 0.0 else entry_thesis,
         "entry_module_support": float(existing.get("entry_module_support", entry_support)) if existing and previous_shares > 0.0 else entry_support,
         "entry_logic_version": str(getattr(runner, "strategy_logic_version", "production_v1")),
+        "entry_authority_tier": (
+            str(existing.get("entry_authority_tier", ""))
+            if existing and previous_shares > 0.0
+            else str(
+                signal.get("scap_v31_authority_tier", "")
+                if hasattr(signal, "get")
+                else ""
+            )
+        ),
     }
 
 def mark_lifecycle(runner, symbol: str, *, date, price: float) -> dict:
@@ -357,8 +374,83 @@ def attach_position_lifecycle_signals(runner, candidates: pd.DataFrame, *, date)
     data["post_entry_failure_exit"] = data["post_entry_failure_score"].ge(float(GOVERNANCE_POST_ENTRY_FAILURE_EXIT_SCORE))
     return data
 
+def _carried_unobserved_position_states(
+    runner,
+    *,
+    date,
+    exposure: dict,
+    observed_symbols: set[str],
+) -> list[dict]:
+    """Represent held names that have no current feature row without inventing a signal.
+
+    Suspensions and other missing-bar cases remain economically held and are
+    valued from the conservative mark ledger.  Their latest *known* lifecycle
+    state is carried forward for audit continuity, while every current-day
+    action/exit flag is reset and the missing observation is explicit.
+    """
+    date_ts = pd.Timestamp(date)
+    nominal_nav = max(float(exposure.get("nominal_nav", 0.0) or 0.0), 1e-12)
+    mark_by_symbol = {
+        str(row.get("symbol", "")): row
+        for row in getattr(runner, "_last_position_mark_rows", []) or []
+    }
+    latest_by_symbol: dict[str, dict] = {}
+    for prior in getattr(runner, "position_state_rows", []) or []:
+        symbol = str(prior.get("symbol", ""))
+        prior_date = pd.to_datetime(prior.get("date"), errors="coerce")
+        if symbol and pd.notna(prior_date) and prior_date < date_ts:
+            latest_by_symbol[symbol] = prior
+
+    carried_rows: list[dict] = []
+    for symbol in sorted(set(getattr(runner, "positions", {})) - observed_symbols):
+        prior = dict(latest_by_symbol.get(symbol, {}))
+        source_date = prior.get("date", pd.NaT)
+        mark = mark_by_symbol.get(symbol, {})
+        row = {
+            **prior,
+            "date": date_ts,
+            "symbol": symbol,
+            "held": True,
+            "holding_days": int(getattr(runner, "holding_days", {}).get(symbol, 0)),
+            "account_weight": float(mark.get("market_value", 0.0) or 0.0) / nominal_nav,
+            "position_state": "held_unobserved",
+            "exit_state": False,
+            "position_exit_reason": "",
+            "paper_exit_reason": "",
+            "paper_exit_state": False,
+            "add_allowed": False,
+            "add_block_reason": "current_feature_observation_missing",
+            "add_decision_type": "hold_unobserved",
+            "unified_action_selected": "hold",
+            "unified_action_proposals": "",
+            "unified_action_vetoed": "",
+            "unified_action_conflict_count": 0,
+            "exit_triggered_reasons": "",
+            "exit_authorized_reasons": "",
+            "exit_vetoed_reasons": "",
+            "exit_conflict_count": 0,
+            "state_observation_status": "carried_forward_missing_current_feature",
+            "state_source_date": source_date,
+            "valuation_source": mark.get("valuation_source", "last_known_close"),
+            "stale_days": mark.get("stale_days", pd.NA),
+        }
+        for key in tuple(row):
+            if key.endswith("_exit") or key.startswith("paper_") and key.endswith("_exit"):
+                row[key] = False
+        carried_rows.append(row)
+    return carried_rows
+
+
 def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, exposure: dict) -> pd.DataFrame:
     if candidates is None or candidates.empty:
+        runner.position_state_rows.extend(
+            _carried_unobserved_position_states(
+                runner,
+                date=date,
+                exposure=exposure,
+                observed_symbols=set(),
+            )
+        )
         return candidates
     data = candidates.copy()
     date_ts = pd.Timestamp(date)
@@ -447,6 +539,10 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         "signal_failure_confirmation_count": 0,
         "signal_failure_confirmation_required": 1,
         "signal_failure_confirmed": False,
+        "loss_containment_confirmation_count": 0,
+        "loss_containment_confirmation_required": 1,
+        "loss_containment_confirmed": False,
+        "adaptive_loss_stop": pd.NA,
         "exit_arbitration_contract": "single_exit_authority_v2",
         "exit_triggered_reasons": "",
         "exit_authorized_reasons": "",
@@ -459,6 +555,9 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         "profit_protection_pressure": pd.NA,
         "dynamic_giveback_limit": pd.NA,
         "future_loss_risk_score": pd.NA,
+        "entry_authority_tier": "",
+        "winner_add_review_due": False,
+        "winner_add_review_passed": True,
     }
     for column, default in defaults.items():
         if column not in data.columns:
@@ -507,6 +606,24 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             current_support_by_thesis[entry_thesis] = _safe_float(row.get(cabinet_family_column), default=0.5)
         current_module_support = _clip01(current_support_by_thesis.get(entry_thesis, entry_score))
         support_decay = max(entry_module_support - current_module_support, 0.0)
+        last_add_date = pd.to_datetime(
+            lifecycle.get("last_add_date", pd.NaT), errors="coerce"
+        )
+        add_review_age = (
+            int((date_ts - last_add_date).days)
+            if pd.notna(last_add_date)
+            else 0
+        )
+        winner_add_review_due = bool(
+            is_held and pd.notna(last_add_date) and add_review_age >= 10
+        )
+        winner_add_review_passed = bool(
+            not winner_add_review_due
+            or (
+                _safe_float(row.get("add_expected_net_profit_lcb"), 0.0) > 0.0
+                and support_decay < 0.20
+            )
+        )
         orderflow_decay_score = max(0.55 - orderflow_score, 0.0) / 0.55
         liquidity_decay_score = max(0.55 - volume_score, 0.0) / 0.55
         factor_conviction_score = _clip01(
@@ -566,11 +683,31 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
 
         net_unrealized = float(unrealized) - _governance_round_trip_cost_rate()
         net_mfe = float(mfe) - _governance_round_trip_cost_rate()
+        profit_arm_trigger = float(GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER)
+        profit_min_net = float(GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT)
+        profit_giveback_limit = float(GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK)
+        if str(getattr(runner, "governance_control_mode", "")).strip().lower() == "aggressive_lean":
+            profit_arm_trigger = float(
+                runner.capital_profile.get(
+                    "scap_profit_protection_arm", profit_arm_trigger
+                )
+            )
+            profit_min_net = float(
+                runner.capital_profile.get(
+                    "scap_profit_protection_min_net_profit", profit_min_net
+                )
+            )
+            profit_giveback_limit = float(
+                runner.capital_profile.get(
+                    "scap_profit_protection_giveback", profit_giveback_limit
+                )
+            )
         hard_stop = bool(
             is_held
-            and net_mfe >= float(GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER)
-            and net_unrealized >= float(GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT)
-            and (net_mfe - net_unrealized) / max(net_mfe, 1e-12) >= float(GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK)
+            and net_mfe >= profit_arm_trigger
+            and net_unrealized >= profit_min_net
+            and (net_mfe - net_unrealized) / max(net_mfe, 1e-12)
+            >= profit_giveback_limit
         )
         loss_containment = bool(
             is_held
@@ -578,18 +715,66 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             and net_unrealized <= float(GOVERNANCE_HARD_STOP_LOSS)
         )
         paper_loss_containment = loss_containment
-        if str(getattr(runner, "governance_control_mode", "")).strip().lower() == "aggressive_profit":
+        scap_loss_stop = float(GOVERNANCE_HARD_STOP_LOSS)
+        if str(getattr(runner, "governance_control_mode", "")).strip().lower() in {
+            "aggressive_profit",
+            "aggressive_lean",
+        }:
             scap_loss_stop = float(runner.capital_profile.get("scap_loss_stop", -0.12))
+            loss_stop_mode = str(
+                runner.capital_profile.get(
+                    "scap_loss_stop_mode", "fixed"
+                )
+                or "fixed"
+            ).strip().lower()
+            if loss_stop_mode == "adaptive_volatility_or_disaster_floor":
+                tail_proxy = min(max(float(tail_risk_proxy), 0.0), 1.0)
+                scap_loss_stop = min(
+                    scap_loss_stop,
+                    -(0.12 + 0.08 * tail_proxy),
+                )
             paper_loss_containment = bool(
                 is_held and holding_days >= 3 and net_unrealized <= scap_loss_stop
             )
-            loss_containment = scap_loss_containment_exit(
-                exit_stage=str(runner.capital_profile.get("scap_exit_stage", "E0") or "E0"),
-                is_held=is_held,
-                holding_days=holding_days,
-                net_unrealized_return=net_unrealized,
-                loss_stop=scap_loss_stop,
+            loss_confirmation_required = max(
+                int(
+                    runner.capital_profile.get(
+                        "scap_loss_stop_confirmation_days", 1
+                    )
+                    or 1
+                ),
+                1,
             )
+            (
+                loss_confirmation_count,
+                loss_containment_confirmed,
+            ) = update_consecutive_confirmation(
+                runner.position_exit_confirmations,
+                symbol=symbol,
+                signal_name="loss_containment",
+                date=date_ts,
+                triggered=paper_loss_containment,
+                required_days=loss_confirmation_required,
+            )
+            loss_containment = bool(
+                loss_containment_confirmed
+                and scap_loss_containment_exit(
+                    exit_stage=str(
+                        runner.capital_profile.get(
+                            "scap_exit_stage", "E0"
+                        )
+                        or "E0"
+                    ),
+                    is_held=is_held,
+                    holding_days=holding_days,
+                    net_unrealized_return=net_unrealized,
+                    loss_stop=scap_loss_stop,
+                )
+            )
+        else:
+            loss_confirmation_required = 1
+            loss_confirmation_count = int(loss_containment)
+            loss_containment_confirmed = bool(loss_containment)
         profit_giveback = bool(
             is_held
             and mfe >= float(GOVERNANCE_PROFIT_PROTECT_TRIGGER_1)
@@ -716,7 +901,7 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             {
                 "profit_hard_stop_exit": hard_stop,
                 "profit_giveback_exit": profit_giveback or peak_decay_exit,
-                "loss_containment_exit": paper_loss_containment,
+                "loss_containment_exit": loss_containment,
                 "post_entry_failure_exit": post_entry_failure_signal,
                 "thesis_failure_exit": thesis_failure,
                 "signal_failure_exit": raw_signal_failure or downtrend_exit,
@@ -1008,6 +1193,10 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "paper_profit_hard_stop_exit": hard_stop,
             "loss_containment_exit": loss_containment and runner._control_enabled("loss_containment_exit"),
             "paper_loss_containment_exit": paper_loss_containment,
+            "loss_containment_confirmation_count": loss_confirmation_count,
+            "loss_containment_confirmation_required": loss_confirmation_required,
+            "loss_containment_confirmed": loss_containment_confirmed,
+            "adaptive_loss_stop": scap_loss_stop if is_held else pd.NA,
             "hard_stop_net_mfe": net_mfe if is_held else pd.NA,
             "hard_stop_net_unrealized": net_unrealized if is_held else pd.NA,
             "hard_stop_giveback_from_net_peak": (
@@ -1040,6 +1229,9 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             ),
             "exit_conflict_count": paper_arbitration.conflict_count,
             "entry_thesis": entry_thesis,
+            "entry_authority_tier": str(
+                lifecycle.get("entry_authority_tier", "")
+            ),
             "entry_logic_version": str(lifecycle.get("entry_logic_version", "")),
             "entry_module_support": entry_module_support,
             "current_module_support": current_module_support,
@@ -1068,6 +1260,8 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "profit_protection_pressure": profit_protection_pressure,
             "dynamic_giveback_limit": dynamic_giveback_limit,
             "future_loss_risk_score": future_loss_risk_score,
+            "winner_add_review_due": winner_add_review_due,
+            "winner_add_review_passed": winner_add_review_passed,
             "factor_conviction_score": factor_conviction_score,
             "signal_retention_score": signal_retention_score,
             "liquidity_decay_score": liquidity_decay_score,
@@ -1120,6 +1314,14 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
                     **updates,
                 }
             )
+    state_rows.extend(
+        _carried_unobserved_position_states(
+            runner,
+            date=date_ts,
+            exposure=exposure,
+            observed_symbols={str(row.get("symbol", "")) for row in state_rows},
+        )
+    )
     runner.position_state_rows.extend(state_rows)
     return data
 

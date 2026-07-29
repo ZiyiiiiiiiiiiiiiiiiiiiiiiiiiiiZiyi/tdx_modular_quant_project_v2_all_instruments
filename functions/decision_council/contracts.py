@@ -66,3 +66,4 @@ class DecisionContext:
     forecast_horizon_sessions: int = 10
     forecast_kappa: float = 0.50
     soft_target_positions: int = 4
+    execution_cost_profile: Mapping[str, object] | None = None

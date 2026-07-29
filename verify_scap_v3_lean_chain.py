@@ -66,13 +66,16 @@ def frame() -> pd.DataFrame:
                 "mainline_v3_one_lot_cash_required": 2_000.0,
                 "mainline_v3_one_lot_weight": 0.10,
                 "mainline_v3_lot_feasible": True,
-                "net_unrealized_return": 0.06,
-                "add_layer": 1,
+                "position_unrealized_return": 0.06,
+                "add_layer": 2,
                 "add_expected_net_profit_lcb": 80.0,
+                "scap_candidate_utility": 80.0,
                 "scap_estimated_total_cost_amount": 10.0,
                 "cabinet_entry_thesis": "momentum",
                 "entry_confirmed": False,
-                "add_allowed": False,
+                "add_allowed": True,
+                "add_decision_type": "winner_pyramiding",
+                "winner_add_review_passed": True,
                 "exit_state": False,
             },
             {
@@ -140,7 +143,7 @@ passed("lot alternatives cannot be cumulatively selected and all actions share 1
 
 assert any(proposal.action_type == "winner_add" for proposal in base.proposals)
 assert not any(proposal.action_type == "loser_add" for proposal in base.proposals)
-passed("winner add is proposal-reachable without add_allowed; loser add remains disabled")
+passed("lifecycle-authorized winner add is proposal-reachable; loser add remains disabled")
 
 low_cash = build_lean_decision(context(cash=4_000.0), frame())
 base_buy_lots = sum(
@@ -267,8 +270,8 @@ multi_lot_candidate = pd.DataFrame(
             "mainline_v3_minimum_buy_quantity": 100,
             "mainline_v3_lot_feasible": True,
             "scap_candidate_utility": -4.0,
-            "scap_decision_expected_return": 0.0030,
-            "scap_expected_return_point": 0.0035,
+            "scap_decision_expected_return": 0.0040,
+            "scap_expected_return_point": 0.0045,
             "scap_risk_penalty_amount": 0.0,
             "scap_estimated_total_cost_amount": 10.0,
             "cabinet_entry_thesis": "momentum",

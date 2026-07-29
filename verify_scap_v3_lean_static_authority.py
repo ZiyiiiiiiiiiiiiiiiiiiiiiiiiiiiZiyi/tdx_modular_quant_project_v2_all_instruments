@@ -61,6 +61,8 @@ for required in (
     '"action_plan_id"',
     '"action_proposal_id"',
     '"action_plan_selected"',
+    '"scap_v31_authority_tier"',
+    '"scap_v31_authority_contract"',
     '"cash_reservation_id"',
 ):
     assert required in pending_source
@@ -74,6 +76,8 @@ for required in (
     '"action_proposal_id": order.get("action_proposal_id", "")',
     '"action_plan_selected": order.get("action_plan_selected", False)',
     '"action_plan_contract": order.get("action_plan_contract", "")',
+    '"scap_v31_authority_tier": order.get(',
+    '"scap_v31_authority_contract": order.get(',
     '"_cash_reservation_id", order.get("cash_reservation_id", "")',
 ):
     assert required in register_source
