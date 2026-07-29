@@ -1641,3 +1641,4 @@
 - 明确排除：未跟踪的`codex_smoke_*`目录、临时验证目录、stdout/stderr运行日志、长路径测试目录及其他历史临时产物；这些文件不属于可维护源码快照，不得使用`git add -A`误上传。
 - 合并门槛：沿用CHANGE-20260729-03的180日全链验证和跨模块回归证据；提交前再次执行`git diff --check`并核对暂存文件清单，推送分支后以非快进合并或等价可审计方式合并`main`并推送。
 - 版本语义：“次黄金版本”只表示当前工程恢复节点的源码标签，不改变`research_gate_status=blocked`、禁止上线和不得宣称样本外盈利的结论。
+- 实际发布证据：版本提交`faaad58e8498698484b6202616f5d5c24464f865`已推送至`origin/codex/scap-v32-secondary-golden-20260729`；GitHub PR #7（`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/7`）状态为MERGED；远端`main`合并提交为`db2ed82b33fb8fa7ae0ae06cc76d4d1895994f10`，且已验证`faaad58`为该主干提交祖先；版本分支保留，未删除。
