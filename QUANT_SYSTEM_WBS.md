@@ -1809,5 +1809,5 @@
 - 发布流程：先在新分支显式暂存上述文件，执行相关验证和`git diff --check`，再提交、推送、创建面向`main`的PR；仅在远端检查通过且合并无冲突时合并。分支、提交、PR、合并SHA和验证结果在本条后续补录。
 - 提交前验证：固定解释器`C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe`为Python 3.10.19；32个本次受影响/新增Python文件全部`py_compile`通过。随后按身份、整数优化、动作效用、退出/加仓/替换、时间隔离、pending、执行、运行完整性、资本缩放、经验因子簇、利润审计、报表和Web合同顺序运行28个专项验证脚本，结果28/28退出0。该验证证明当前黄金快照满足既有工程合同，但不撤销`CHANGE-20260730-05`记录的静默计算缺陷。
 - GitHub发布结果：黄金提交为`313d89a195e537918d80af8c7d6f683a0efad8ab`，已推送并永久保留在远端分支`origin/codex/golden-pre-calculation-fix-20260730`。PR为`#8`（`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/8`），head/base核对为黄金分支→`main`，状态`MERGEABLE/CLEAN`，远端未配置额外CI checks。
-- 主干合并结果：PR #8于2026-07-30合并，merge commit为`5d8d1e385812c75c46f6f69b1e6ad7dacaa668f8`；本地`main`随后以fast-forward同步，`HEAD`与`origin/main`均指向该merge commit。GitHub连接器创建/合并PR均因integration权限返回403，按发布技能规定使用已认证的GitHub CLI完成，未产生重复PR或重复提交。
+- 主干合并结果：PR #8于2026-07-30合并，merge commit为`5d8d1e385812c75c46f6f69b1e6ad7dacaa668f8`；本地`main`随后以fast-forward同步并核对该merge commit，之后仅追加本条WBS发布结果记录并推送主干。GitHub连接器创建/合并PR均因integration权限返回403，按发布技能规定使用已认证的GitHub CLI完成，未产生重复PR或重复黄金提交。
 - 保留与清理：黄金远端分支不删除，作为后续修复前的可复现基线；本地大量未跟踪运行产物仍原样保留，没有暂存、提交或删除。主干合并只证明版本发布完成，不改变研究/上线`blocked`结论。
