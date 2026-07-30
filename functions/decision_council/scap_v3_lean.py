@@ -12,6 +12,8 @@ import math
 import pandas as pd
 
 from functions.decision_council.action_utility import round_trip_cost_amount
+from functions.decision_council.capital_scaling import scaled_candidate_budgets
+from functions.execution.security_trading_rules import trading_rule_for
 from functions.decision_council.integer_action_optimizer import (
     optimize_action_proposals,
 )
@@ -40,10 +42,34 @@ class LeanDecision:
 
 def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
     """Build all actions first, then invoke the integer optimizer once."""
-    data = attach_scap_v31_authority(
-        candidates,
-        horizon_days=max(int(context.forecast_horizon_sessions), 1),
-    )
+    authority_columns = {
+        "scap_v31_authority_tier",
+        "scap_v31_decision_expected_return",
+        "scap_v31_max_lots",
+    }
+    if authority_columns.issubset(candidates.columns):
+        data = candidates.copy()
+    else:
+        # Direct callers and contract tests may not have executed the runner's
+        # daily authority stage. Compute it once here as a fail-closed fallback.
+        data = attach_scap_v31_authority(
+            candidates,
+            horizon_days=max(int(context.forecast_horizon_sessions), 1),
+            position_cap_mode=str(
+                (context.execution_cost_profile or {}).get(
+                    "position_cap_mode",
+                    "fixed",
+                )
+            ),
+            target_position_cash=(
+                float(context.safety.exposure_cap)
+                * float(context.nav_amount)
+                / max(int(context.top_n), 1)
+            ),
+            authority_snapshot_id=f"{context.decision_id}|authority",
+        )
+    if "scap_authority_snapshot_id" not in data.columns:
+        data["scap_authority_snapshot_id"] = f"{context.decision_id}|authority"
     data["symbol"] = data["symbol"].astype(str)
     data = _attach_pool_contract(data)
     rows = _deduplicate_pool_rows(data)
@@ -68,8 +94,20 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             lot_weight = lot_cash / max(float(context.nav_amount), 1e-12)
         if lot_cash <= 0.0 and lot_weight > 0.0:
             lot_cash = lot_weight * float(context.nav_amount)
-        if old_weight > 0.0 and lot_weight > 0.0:
-            current_lots[symbol] = max(int(round(old_weight / lot_weight)), 1)
+        exact_current_lots = dict(
+            getattr(context, "current_lots_by_symbol", None) or {}
+        )
+        if old_weight > 0.0:
+            if symbol in exact_current_lots:
+                current_lots[symbol] = max(
+                    int(exact_current_lots[symbol]),
+                    1,
+                )
+            elif lot_weight > 0.0:
+                current_lots[symbol] = max(
+                    int(round(old_weight / lot_weight)),
+                    1,
+                )
 
         if old_weight > 0.0:
             _append_held_proposals(
@@ -90,7 +128,12 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         point_return = _number(
             row.get("scap_expected_return_point", decision_return)
         )
-        hard_vetoes = _entry_hard_vetoes(row, lot_cash, lot_weight)
+        hard_vetoes = _entry_hard_vetoes(
+            row,
+            lot_cash,
+            lot_weight,
+            structural_cap=float(context.per_name_structural_cap),
+        )
         if decision_return <= 0.0 and utility <= 0.0:
             continue
         raw_entry_signal_symbols.add(symbol)
@@ -208,7 +251,33 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             positive_signal_weights.append(lot_weight)
 
     current_exposure = min(sum(current_weights.values()), 1.0)
-    strategic_budget = min(max(float(context.safety.exposure_cap), 0.0), 1.0)
+    strategic_budget = min(
+        max(
+            float(
+                context.desired_exposure_target
+                if context.desired_exposure_target is not None
+                else context.safety.exposure_cap
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    hard_exposure_ceiling = min(
+        max(
+            float(
+                context.hard_exposure_ceiling
+                if context.hard_exposure_ceiling is not None
+                else context.safety.exposure_cap
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    confirmed_derisk_target = (
+        min(max(float(context.confirmed_derisk_target), 0.0), 1.0)
+        if context.confirmed_derisk_target is not None
+        else None
+    )
     planned_safety_sell_weight = _append_exposure_cap_safety_exits(
         proposals,
         proposal_rows,
@@ -217,7 +286,12 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         current_weights=current_weights,
         current_lots=current_lots,
         current_exposure=current_exposure,
-        strategic_budget=strategic_budget,
+        strategic_budget=(
+            confirmed_derisk_target
+            if confirmed_derisk_target is not None
+            else hard_exposure_ceiling
+        ),
+        derisk_confirmed=confirmed_derisk_target is not None,
     )
     signal_supported = min(
         current_exposure + sum(sorted(positive_signal_weights)[: max(int(context.top_n), 0)]),
@@ -285,7 +359,7 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
     authorization = ExposureAuthorization(
         decision_id=str(context.decision_id),
         nav_amount=max(float(context.nav_amount), 1e-12),
-        risk_exposure_ceiling=strategic_budget,
+        risk_exposure_ceiling=hard_exposure_ceiling,
         cash_buffer_amount=max(float(context.cash_buffer_amount), 0.0),
         per_name_structural_cap=min(
             max(float(context.per_name_structural_cap), 0.0), 1.0
@@ -300,12 +374,16 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             not bool(context.safety.hard_freeze_active)
             and planned_safety_sell_weight <= 1e-12
             and not risk_episode_active
+            and current_exposure < strategic_budget - 1e-12
             and not (
                 bool(profile.get("scap_block_new_entry_during_high_risk", True))
                 and risk_level == "high"
             )
         ),
-        add_allowed=not bool(context.safety.hard_freeze_active),
+        add_allowed=(
+            not bool(context.safety.hard_freeze_active)
+            and current_exposure < strategic_budget - 1e-12
+        ),
         replacement_allowed=bool(context.active_replacement_enabled),
         current_cash_amount=max(float(context.cash_amount), 0.0),
         strategic_exposure_budget=strategic_budget,
@@ -361,6 +439,44 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         risk_reentry_blocked=bool(
             risk_episode_active or planned_safety_sell_weight > 1e-12
         ),
+        hard_exposure_ceiling=hard_exposure_ceiling,
+        confirmed_derisk_target=confirmed_derisk_target,
+        authority_snapshot_id=f"{context.decision_id}|authority",
+        risk_horizon_sessions=max(
+            int(context.forecast_horizon_sessions),
+            1,
+        ),
+    )
+    pool_count = max(
+        len(
+            {
+                str(row.get("cabinet_entry_thesis", "") or "")
+                for row in rows.values()
+                if str(row.get("cabinet_entry_thesis", "") or "")
+            }
+        ),
+        1,
+    )
+    scalable_budgets = scaled_candidate_budgets(
+        effective_position_cap=max(int(context.top_n), 1),
+        pool_count=pool_count,
+        optimizer_multiple=float(
+            profile.get("scap_optimizer_candidate_multiple", 4.0) or 4.0
+        ),
+        search_cap=int(
+            profile.get("scap_optimizer_candidate_search_cap", 96) or 96
+        ),
+    )
+    fixed_mode = str(profile.get("position_cap_mode", "fixed")).lower() == "fixed"
+    thesis_hard_max = (
+        3
+        if fixed_mode
+        else scalable_budgets["thesis_hard_max_names"]
+    )
+    optimizer_candidate_limit = (
+        max(int(profile.get("scap_optimizer_candidate_limit", 24) or 24), 5)
+        if fixed_mode
+        else scalable_budgets["optimizer_candidate_limit"]
     )
     plan = optimize_action_proposals(
         proposals,
@@ -377,12 +493,9 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             )
             for symbol, row in rows.items()
         },
-        max_names_per_thesis=3,
+        max_names_per_thesis=thesis_hard_max,
         covariance_matrix=covariance,
-        candidate_limit=max(
-            int(profile.get("scap_optimizer_candidate_limit", 24) or 24),
-            5,
-        ),
+        candidate_limit=optimizer_candidate_limit,
     )
     selected_types = [
         proposal.action_type
@@ -464,6 +577,13 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         "lean_optimizer_selected_entry_count": len(selected_entry_symbols),
         "strategic_exposure_budget": strategic_budget,
+        "desired_exposure_target": strategic_budget,
+        "hard_exposure_ceiling": hard_exposure_ceiling,
+        "confirmed_derisk_target": (
+            confirmed_derisk_target
+            if confirmed_derisk_target is not None
+            else pd.NA
+        ),
         "signal_supported_exposure": signal_supported,
         "integer_feasible_exposure": integer_feasible,
         "planned_exposure": float(plan.projected_exposure),
@@ -509,8 +629,24 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             )
         ),
         "legacy_allocation_authority": "shadow_only",
+        "position_cap_mode": str(profile.get("position_cap_mode", "fixed")),
+        "scaled_pool_count": pool_count,
+        "scaled_optimizer_candidate_limit": optimizer_candidate_limit,
+        "scaled_thesis_hard_max_names": thesis_hard_max,
+        "action_plan_target_holding_count": int(
+            sum(
+                int(lots) > 0
+                for lots in plan.target_lots_by_symbol.values()
+            )
+        ),
         "unresolved_safety_exposure": max(
-            current_exposure - planned_safety_sell_weight - strategic_budget,
+            current_exposure
+            - planned_safety_sell_weight
+            - (
+                confirmed_derisk_target
+                if confirmed_derisk_target is not None
+                else hard_exposure_ceiling
+            ),
             0.0,
         ),
         "planned_safety_sell_weight": planned_safety_sell_weight,
@@ -547,6 +683,7 @@ def _append_exposure_cap_safety_exits(
     current_lots,
     current_exposure,
     strategic_budget,
+    derisk_confirmed: bool = False,
 ) -> float:
     """Create factual full-position exits until the next-session cap is reachable."""
     required_reduction = max(float(current_exposure) - float(strategic_budget), 0.0)
@@ -563,7 +700,8 @@ def _append_exposure_cap_safety_exits(
         1,
     )
     confirmed = bool(
-        risk_level == "high"
+        derisk_confirmed
+        or risk_level == "high"
         or bool(context.safety.hard_freeze_active)
         or int(context.safety.trigger_streak_days) >= confirmation_days
     )
@@ -631,14 +769,14 @@ def _append_held_proposals(
     exit_reason = str(row.get("position_exit_reason", "") or "")
     exit_state = bool(row.get("exit_state", False))
     if exit_state:
-        hard = any(
-            token in exit_reason
-            for token in ("qualification", "hard_stop", "loss_containment", "safety")
-        )
+        # `exit_state` is emitted only after lifecycle confirmation. Once it
+        # is active it is a mandatory position-state transition, not an alpha
+        # buy competing for positive profit.
+        hard = True
         expected_hold = _number(row.get("comparable_expected_alpha"))
         position_amount = float(context.nav_amount) * old_weight
         robust = 0.0 if hard else max(-expected_hold * position_amount, 0.0)
-        action_type = "hard_exit" if hard else "exit"
+        action_type = "hard_exit"
         proposal = _proposal(
             context,
             symbol=symbol,
@@ -671,17 +809,17 @@ def _append_held_proposals(
         unrealized = 0.0
     # Lifecycle `add_layer` is the *next buy count*: an initial one-lot
     # holding therefore exposes add_layer=2 for its first possible add.
-    # Convert it to completed add count before choosing the 4%/8% trigger.
+    # Convert it to completed add count for the profile-owned layer limit.
     layer = max(int(_number(row.get("add_layer"))) - 2, 0)
     base_utility = _number(row.get("add_expected_net_profit_lcb"))
-    add_review_passed = bool(row.get("winner_add_review_passed", True))
-    entry_authority_tier = str(row.get("entry_authority_tier", "A") or "A")
+    add_review_passed = bool(row.get("winner_add_review_passed", False))
+    entry_authority_tier = str(row.get("entry_authority_tier", "D") or "D")
     current_authority_tier = str(
         row.get(
             "scap_v32_current_authority_tier",
-            row.get("scap_v31_authority_tier", entry_authority_tier),
+            row.get("scap_v31_authority_tier", "D"),
         )
-        or entry_authority_tier
+        or "D"
     )
     lifecycle_winner_allowed = bool(row.get("add_allowed", False)) and str(
         row.get("add_decision_type", "")
@@ -704,30 +842,94 @@ def _append_held_proposals(
             lot_cash * current_return
             - _number(row.get("scap_estimated_total_cost_amount"))
         )
+    max_winner_add_layers = max(
+        int(
+            (context.execution_cost_profile or {}).get(
+                "scap_max_winner_add_layers",
+                0,
+            )
+            or 0
+        ),
+        0,
+    )
+    authority_snapshot_id = str(
+        row.get("scap_authority_snapshot_id", "") or ""
+    )
     if (
         context.winner_add_enabled
         and lifecycle_winner_allowed
-        and unrealized >= (0.04, 0.08)[min(layer, 1)]
-        and layer < 2
+        and layer < max_winner_add_layers
         and add_review_passed
         and current_authority_tier in {"A", "B"}
+        and bool(authority_snapshot_id)
     ):
-        trigger = (0.04, 0.08)[min(layer, 1)]
-        confirmation = 1.0 / (1.0 + math.exp(-(unrealized - trigger) / 0.02))
-        robust = base_utility * confirmation
+        # Lifecycle owns the trigger schedule. Its positive robust incremental
+        # utility is the optimizer input; do not apply a second hard-coded
+        # trigger or a second confidence transform here.
+        remaining_name_weight = max(
+            float(getattr(context, "per_name_structural_cap", 1.0))
+            - float(old_weight),
+            0.0,
+        )
+        max_by_name = (
+            int(math.floor(remaining_name_weight / lot_weight))
+            if lot_weight > 0.0
+            else 0
+        )
+        spendable_cash = max(
+            float(getattr(context, "cash_amount", lot_cash))
+            - float(getattr(context, "cash_buffer_amount", 0.0)),
+            0.0,
+        )
+        max_by_cash = (
+            int(math.floor(spendable_cash / lot_cash))
+            if lot_cash > 0.0
+            else 0
+        )
+        authority_lots = max(
+            int(_number(row.get("scap_v31_max_lots"), default=1.0)),
+            0,
+        )
+        add_lots = min(max_by_name, max_by_cash, authority_lots)
+        if add_lots <= 0:
+            return
+        decision_date = getattr(
+            context, "decision_date", pd.Timestamp("2000-01-01")
+        )
+        rule = trading_rule_for(symbol, trade_date=decision_date)
+        lot_shares = max(float(rule.minimum_buy_quantity), 1.0)
+        inferred_price = lot_cash / lot_shares
+        exact_total_cost = round_trip_cost_amount(
+            symbol=symbol,
+            price=inferred_price,
+            shares=lot_shares * add_lots,
+            trade_date=decision_date,
+        )
+        one_lot_cost = max(
+            _number(row.get("scap_estimated_total_cost_amount")),
+            0.0,
+        )
+        gross_robust_profit = (
+            max(base_utility, 0.0) + one_lot_cost
+        ) * add_lots
+        scaled_base_utility = gross_robust_profit - exact_total_cost
+        if scaled_base_utility <= 0.0:
+            return
+        scaled_robust = scaled_base_utility
         proposal = _proposal(
             context,
             symbol=symbol,
             action_type="winner_add",
-            lots=1,
-            expected=max(base_utility, 0.0),
-            robust=robust,
-            downside=lot_cash * 0.15,
-            cost=_number(row.get("scap_estimated_total_cost_amount")),
-            funding=lot_cash,
+            lots=add_lots,
+            expected=scaled_base_utility,
+            robust=scaled_robust,
+            downside=lot_cash * 0.15 * add_lots,
+            cost=exact_total_cost,
+            funding=lot_cash * add_lots,
             suffix=f"winner_add_{layer + 1}",
             source="position_lifecycle_evidence",
             authority_tier=current_authority_tier,
+            authority_snapshot_id=authority_snapshot_id,
             thesis=str(row.get("entry_thesis", "") or ""),
         )
         proposals.append(proposal)
@@ -771,6 +973,9 @@ def _proposal(
     primary_rank=0.0,
     unit_capital_robust_return=0.0,
     authority_penalty_amount=0.0,
+    execution_class=None,
+    must_execute=None,
+    authority_snapshot_id=None,
 ) -> ActionProposal:
     return ActionProposal(
         proposal_id=f"{context.decision_id}|{symbol}|{suffix}",
@@ -786,6 +991,17 @@ def _proposal(
         downside_cvar_amount=max(float(downside), 0.0),
         exact_cost_amount=max(float(cost), 0.0),
         funding_cash_amount=max(float(funding), 0.0),
+        cash_release_amount=(
+            max(
+                float(context.current_weights.get(symbol, 0.0))
+                * float(context.nav_amount)
+                - max(float(cost), 0.0),
+                0.0,
+            )
+            if action_type
+            in {"exit", "hard_exit", "safety_exit", "replacement_sell"}
+            else 0.0
+        ),
         exposure_delta=(
             -float(context.current_weights.get(symbol, 0.0))
             if action_type in {"exit", "hard_exit", "safety_exit", "replacement_sell"}
@@ -799,6 +1015,22 @@ def _proposal(
         primary_rank=float(primary_rank),
         unit_capital_robust_return=float(unit_capital_robust_return),
         authority_penalty_amount=max(float(authority_penalty_amount), 0.0),
+        execution_class=str(
+            execution_class
+            or (
+                "mandatory_exit"
+                if action_type in {"hard_exit", "safety_exit"}
+                else "alpha"
+            )
+        ),
+        must_execute=bool(
+            action_type in {"hard_exit", "safety_exit"}
+            if must_execute is None
+            else must_execute
+        ),
+        authority_snapshot_id=str(
+            authority_snapshot_id or f"{context.decision_id}|authority"
+        ),
     )
 
 
@@ -854,11 +1086,17 @@ def _deduplicate_pool_rows(data: pd.DataFrame) -> dict[str, pd.Series]:
     return rows
 
 
-def _entry_hard_vetoes(row, lot_cash: float, lot_weight: float) -> tuple[str, ...]:
+def _entry_hard_vetoes(
+    row,
+    lot_cash: float,
+    lot_weight: float,
+    *,
+    structural_cap: float = 0.40,
+) -> tuple[str, ...]:
     reasons = []
     if lot_cash <= 0.0 or lot_weight <= 0.0:
         reasons.append("invalid_or_missing_lot_price")
-    if lot_weight > 0.40 + 1e-12:
+    if lot_weight > max(float(structural_cap), 0.0) + 1e-12:
         reasons.append("one_lot_exceeds_structural_cap")
     if "mainline_v3_lot_feasible" in row.index and not bool(
         row.get("mainline_v3_lot_feasible", False)

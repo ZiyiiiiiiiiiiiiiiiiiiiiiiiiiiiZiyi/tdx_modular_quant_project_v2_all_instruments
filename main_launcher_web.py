@@ -329,11 +329,11 @@ RUN_HTML = """<!doctype html>
         </div>
         <div class="field">
           <label for="initial_cash">初始资金，可选覆盖</label>
-          <input type="number" id="initial_cash" min="1" step="1000" value="20000" placeholder="留空=使用所选档位">
+          <input type="number" id="initial_cash" min="1" step="1000" value="" placeholder="留空=使用所选资金档位">
         </div>
         <div class="field">
           <label for="max_positions_account">最多买入/持有股票数量</label>
-          <input type="number" id="max_positions_account" min="0" step="1" value="5" placeholder="小资金建议 3-5；留空=档位默认；0=不限制">
+          <input type="number" id="max_positions_account" min="0" step="1" value="" placeholder="留空=档位默认；0=资金/整手/成本自动上限">
         </div>
         <div class="field">
           <label for="min_cash_buffer">现金缓冲，可选</label>
@@ -346,6 +346,9 @@ RUN_HTML = """<!doctype html>
             <option value="force_deploy">强制提高资金使用率</option>
           </select>
         </div>
+      </div>
+      <div class="mini">
+        “最多持仓”是可选治理护栏，不是永久产品定义。自动模式会把用户上限、资金整手经济上限、流动性容量和求解资源上限分开记录；实际持仓数仍由正净价值和风险优化决定。
       </div>
       <div class="mini">
         这些账户设置影响主策略回测。2万小资金档位会限制持股数量并保留现金缓冲，让 A 股一手 100 股的买入约束真实暴露出来。
@@ -485,8 +488,8 @@ RUN_HTML = """<!doctype html>
       </div>
       <div class="mini">绩效归因与卖出反事实使用前一期流动性固定 Top-N 股票池；默认月度等权，缺价成分保留并按零收益审计。沪深300 ETF 只用于安全/市场状态，不与绩效基准混用。当前等权口径为 research，待 PIT 自由流通市值完备后再升级为正式自由流通市值加权。</div>
       <label class="item"><input type="checkbox" id="alpha_collapse_exit_enabled" checked>启用 Alpha 信号塌陷卖出：当买入理由消失时卖出；取消勾选后只记录纸面信号，不实际卖出。</label>
-      <label class="item"><input type="checkbox" id="active_replacement_enabled" checked disabled>主动整手换仓由资金档案唯一控制；20,000元小资金特殊版已开启，每日最多一组完整卖买配对，并进入统一动作仲裁与归因账本。</label>
-      <div class="mini">主动换仓不是追求高换手率。没有同期限校准收益、保守下界或可执行整手时，系统继续持有并在反事实奖励账本中记录错过机会。</div>
+      <label class="item"><input type="checkbox" id="active_replacement_enabled" disabled>主动整手换仓由资金档案唯一控制；当前 SCAP-V3.2 小资金档案关闭主动换仓与亏损摊平，仅允许通过统一动作仲裁的赢家加仓。</label>
+      <div class="mini">该开关是当前资金档案的只读状态，不是启动页覆盖参数。换仓关闭时，系统不会为了填满仓位或维持换手而强制卖买；卖出、赢家加仓及其反事实仍分别进入审计账本。</div>
       <label class="item"><input type="checkbox" id="shadow_portfolios">启用单因子影子组合：非常慢的诊断模式。普通全历史复核建议关闭。</label>
       <label class="item"><input type="checkbox" id="timestamped_diagnostics" checked disabled>增强诊断后生成带时间戳的表格、图、增量贡献文件和 Markdown 报告。</label>
       <div class="mini">
@@ -1814,6 +1817,7 @@ def _governance_preflight(
         validate_constituent_temporal_contract,
         validate_pit_membership_manifest_coverage,
     )
+    from functions.universe_registry import get_universe_spec
 
     start = pd.Timestamp(f"{start_month}-01")
     year, month = (int(value) for value in end_month.split("-"))
@@ -1832,29 +1836,57 @@ def _governance_preflight(
         reasons.append("特征数据不存在")
     elif pd.Timestamp(feature_max) < effective_end:
         reasons.append(f"有效结束日 {effective_end.date()} 晚于数据截止日 {feature_max}")
-    constituents = load_index_constituents()
-    temporal = validate_constituent_temporal_contract(
-        constituents, start_date=start, end_date=effective_end
+    selected_universes = [str(value) for value in (universe_ids or []) if str(value)]
+    # Match the runner contract: PIT index membership is an input only for a
+    # strict constituent universe.  all_a_share_research, ETF research, and
+    # quality fallback do not consume index membership and must not be blocked
+    # merely because an unrelated index manifest starts later.
+    membership_required = not selected_universes or any(
+        get_universe_spec(name).require_constituents
+        and not get_universe_spec(name).allow_fallback
+        for name in selected_universes
     )
-    blocked = temporal[temporal["status"].astype(str).eq("blocked")]
-    reasons.extend(blocked["reason"].astype(str).drop_duplicates().tolist())
-    membership_coverage = validate_pit_membership_manifest_coverage(
-        start_date=first_observed_feature_session(FEATURE_DAILY_PARQUET, start, effective_end),
-        end_date=effective_end,
+    observed_start = first_observed_feature_session(
+        FEATURE_DAILY_PARQUET,
+        start,
+        effective_end,
     )
-    if membership_coverage["status"] != "pass":
-        reasons.append(str(membership_coverage["reason"]))
+    if membership_required:
+        constituents = load_index_constituents()
+        temporal = validate_constituent_temporal_contract(
+            constituents, start_date=start, end_date=effective_end
+        )
+        blocked = temporal[temporal["status"].astype(str).eq("blocked")]
+        reasons.extend(blocked["reason"].astype(str).drop_duplicates().tolist())
+        membership_coverage = validate_pit_membership_manifest_coverage(
+            start_date=observed_start,
+            end_date=effective_end,
+        )
+        if membership_coverage["status"] != "pass":
+            reasons.append(str(membership_coverage["reason"]))
+        constituent_status = "blocked" if not blocked.empty else "pass"
+    else:
+        membership_coverage = {
+            "status": "not_required",
+            "reason": "pit_membership_not_required_for_selected_universes",
+            "requested_start": str(pd.Timestamp(observed_start).date()),
+            "requested_end": str(pd.Timestamp(effective_end).date()),
+            "coverage_start": "",
+            "coverage_end": "",
+            "manifest_path": "",
+        }
+        constituent_status = "not_required"
     return {
         "status": "blocked" if reasons else "pass",
         "requested_start": str(start.date()),
         "requested_end": str(requested_end.date()),
         "effective_end": str(effective_end.date()),
         "max_days": parsed_max_days,
-        "universe_ids": list(universe_ids or []),
+        "universe_ids": selected_universes,
         "pit_mode": str(pit_mode or "research"),
         "feature_date_min": feature_min,
         "feature_date_max": feature_max,
-        "constituent_status": "blocked" if not blocked.empty else "pass",
+        "constituent_status": constituent_status,
         "constituent_coverage": membership_coverage,
         "reasons": reasons,
     }

@@ -67,3 +67,7 @@ class DecisionContext:
     forecast_kappa: float = 0.50
     soft_target_positions: int = 4
     execution_cost_profile: Mapping[str, object] | None = None
+    desired_exposure_target: float | None = None
+    hard_exposure_ceiling: float | None = None
+    confirmed_derisk_target: float | None = None
+    current_lots_by_symbol: Mapping[str, int] | None = None

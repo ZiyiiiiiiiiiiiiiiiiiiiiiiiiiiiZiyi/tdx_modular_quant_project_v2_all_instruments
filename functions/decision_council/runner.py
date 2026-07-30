@@ -133,6 +133,10 @@ from functions.decision_council.execution_runtime import (
 )
 from functions.decision_council.runtime_identity import build_runtime_identity
 from functions.decision_council.exposure_catchup import decide_exposure_catchup
+from functions.decision_council.capital_scaling import (
+    resolve_position_capacity,
+    scaled_position_weight_caps,
+)
 from functions.decision_council.exposure_runtime import (
     current_weights as current_weights_runtime,
     latest_price_frame_for_trade_pairing as latest_price_frame_for_trade_pairing_runtime,
@@ -827,6 +831,8 @@ class GovernanceBacktestRunner:
         self.holdings_rows = []
         self.reward_rows = []
         self.action_decision_rows = []
+        self.action_proposal_rows = []
+        self.action_plan_rows = []
         self.alpha_rows = []
         self.entry_confirmation_rows = []
         self.factor_weight_rows = []
@@ -1262,6 +1268,52 @@ class GovernanceBacktestRunner:
             safety_row = safety_row.iloc[-1]
         risk_level = str(safety_row.get("risk_level", "normal"))
         structural_regime_level = str(safety_row.get("structural_regime_level", "bull"))
+        preliminary_risk_cap = float(
+            pd.to_numeric(
+                pd.Series([safety_row.get("exposure_cap", 1.0)]),
+                errors="coerce",
+            ).fillna(1.0).iloc[0]
+        )
+        position_capacity = resolve_position_capacity(
+            capital_profile=self.capital_profile,
+            nav_amount=float(exposure.get("nominal_nav", self.initial_cash)),
+            cash_amount=float(self.cash),
+            risk_exposure_ceiling=preliminary_risk_cap,
+            candidates=candidates,
+            current_symbols=self.positions,
+        )
+        if position_capacity.mode == "auto":
+            dynamic_soft_cap, dynamic_hard_cap = scaled_position_weight_caps(
+                target_exposure=preliminary_risk_cap,
+                effective_position_cap=position_capacity.effective_position_cap,
+                absolute_soft_cap=float(
+                    self.capital_profile.get(
+                        "scap_single_position_soft_cap",
+                        0.25,
+                    )
+                    or 0.25
+                ),
+                absolute_hard_cap=float(
+                    self.capital_profile.get(
+                        "retail_single_position_cap",
+                        GOVERNANCE_MAX_POSITION_WEIGHT,
+                    )
+                    or GOVERNANCE_MAX_POSITION_WEIGHT
+                ),
+            )
+        else:
+            dynamic_soft_cap = float(
+                self.capital_profile.get("scap_single_position_soft_cap", 0.25)
+                or 0.25
+            )
+            dynamic_hard_cap = float(
+                self.capital_profile.get(
+                    "retail_single_position_cap",
+                    GOVERNANCE_MAX_POSITION_WEIGHT,
+                )
+                or GOVERNANCE_MAX_POSITION_WEIGHT
+            )
+        self._current_dynamic_single_position_hard_cap = float(dynamic_hard_cap)
         confirmation_mode = self.entry_confirmation_mode
         if self.governance_control_mode in {"factor_only", "safe_factor_only", "aggressive_profit", "aggressive_lean"}:
             if str(confirmation_mode or "").strip().lower() in {"", "full", "fixed_percentile_only"}:
@@ -1338,28 +1390,33 @@ class GovernanceBacktestRunner:
                         )
                         or 10
                     ),
+                    position_cap_mode=position_capacity.mode,
+                    target_position_cash=(
+                        preliminary_risk_cap
+                        * float(exposure.get("nominal_nav", self.initial_cash))
+                        / max(position_capacity.effective_position_cap, 1)
+                    ),
+                    authority_snapshot_id=(
+                        f"{pd.Timestamp(date).date().isoformat()}|"
+                        f"{self.strategy_logic_version}|authority"
+                    ),
                 )
             # Attach the one authoritative final score before lifecycle. This
             # pass deliberately cannot select; the optimizer runs once only
             # after lifecycle/state constraints have been evaluated.
             candidates = apply_mainline_v3_entry_policy(
                 candidates,
-                max_new_candidates=self._max_positions_override or 5,
+                max_new_candidates=position_capacity.effective_position_cap,
                 available_cash=self.cash,
                 nominal_nav=exposure.get("nominal_nav"),
                 min_cash_buffer=float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0),
-                max_single_position_weight=float(
-                    self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT)
-                    or GOVERNANCE_MAX_POSITION_WEIGHT
-                ),
+                max_single_position_weight=dynamic_hard_cap,
                 held_symbols=self.positions,
                 lot_size=MIN_LOT_SIZE,
                 strategy_logic_version=self.strategy_logic_version,
                 ranking_score_column=v3_ranking_score_column,
                 use_scap_candidate_utility=self.governance_control_mode in {"aggressive_profit", "aggressive_lean"},
-                scap_single_position_soft_cap=float(
-                    self.capital_profile.get("scap_single_position_soft_cap", 0.25) or 0.25
-                ),
+                scap_single_position_soft_cap=dynamic_soft_cap,
                 scap_candidate_minimum_commission=float(
                     self.capital_profile.get("scap_candidate_minimum_commission", 5.0) or 5.0
                 ),
@@ -1384,26 +1441,13 @@ class GovernanceBacktestRunner:
                 max_new_candidates=self._max_positions_override or 5,
             )
         elif is_mainline_v3_version(self.strategy_logic_version):
-            if self.governance_control_mode == "aggressive_lean":
-                candidates = attach_scap_v31_authority(
-                    candidates,
-                    horizon_days=int(
-                        self.capital_profile.get(
-                            "scap_forecast_horizon_days", 10
-                        )
-                        or 10
-                    ),
-                )
             candidates = apply_mainline_v3_entry_policy(
                 candidates,
-                max_new_candidates=self._max_positions_override or 5,
+                max_new_candidates=position_capacity.effective_position_cap,
                 available_cash=self.cash,
                 nominal_nav=exposure.get("nominal_nav"),
                 min_cash_buffer=float(self.capital_profile.get("min_cash_buffer", 0.0) or 0.0),
-                max_single_position_weight=float(
-                    self.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT)
-                    or GOVERNANCE_MAX_POSITION_WEIGHT
-                ),
+                max_single_position_weight=dynamic_hard_cap,
                 held_symbols=self.positions,
                 lot_size=MIN_LOT_SIZE,
                 strategy_logic_version=self.strategy_logic_version,
@@ -1411,9 +1455,7 @@ class GovernanceBacktestRunner:
                 ranking_coverage_column=v3_ranking_coverage_column,
                 decision_date=date,
                 use_scap_candidate_utility=self.governance_control_mode in {"aggressive_profit", "aggressive_lean"},
-                scap_single_position_soft_cap=float(
-                    self.capital_profile.get("scap_single_position_soft_cap", 0.25) or 0.25
-                ),
+                scap_single_position_soft_cap=dynamic_soft_cap,
                 scap_candidate_minimum_commission=float(
                     self.capital_profile.get("scap_candidate_minimum_commission", 5.0) or 5.0
                 ),
@@ -1425,14 +1467,6 @@ class GovernanceBacktestRunner:
         # for lifecycle, replacement and reporting consumers.
         if not is_mainline_v3_version(self.strategy_logic_version):
             candidates = attach_multi_horizon_value_contract(candidates)
-        if self.governance_control_mode == "aggressive_lean":
-            candidates = attach_scap_v31_authority(
-                candidates,
-                horizon_days=int(
-                    self.capital_profile.get("scap_forecast_horizon_days", 10)
-                    or 10
-                ),
-            )
         # Lifecycle rows are created before the final v3/ML ranking pass.  Bind
         # the final comparable value and role scores back to the same daily
         # held-position snapshot so monitoring and integrity audits evaluate
@@ -1646,8 +1680,18 @@ class GovernanceBacktestRunner:
             trailing_buy_accuracy_5d=trailing_buy_accuracy_5d,
             risk_contribution_gate_pass=high_exposure_gate["gate_pass"],
             top5_risk_contribution_sum=high_exposure_gate["latest_top5_risk_contribution_sum"],
+            top20pct_risk_contribution_sum=high_exposure_gate[
+                "latest_top20pct_risk_contribution_sum"
+            ],
+            risk_effective_n_ratio=high_exposure_gate[
+                "latest_risk_effective_n_ratio"
+            ],
             risk_symbol_count=high_exposure_gate["latest_risk_symbol_count"],
             hard_risk_gate_enabled=True,
+            representative_one_lot_weight=(
+                float(position_capacity.median_one_lot_amount)
+                / max(float(exposure.get("nominal_nav", self.initial_cash)), 1e-12)
+            ),
         )
         high_exposure_gate_diagnostics = {
             "high_exposure_research_gate_pass": high_exposure_gate["gate_pass"],
@@ -1680,11 +1724,19 @@ class GovernanceBacktestRunner:
             holding_days=self.holding_days,
             turnover_budget=current_turnover_budget,
             top_n=(
-                self._max_positions_override
-                or (
-                    GOVERNANCE_DEFAULT_TOP_N
-                    if self.strategy_logic_version == MAINLINE_V2 or is_mainline_v3_version(self.strategy_logic_version)
-                    else (regime_params.max_positions if regime_params else GOVERNANCE_DEFAULT_TOP_N)
+                position_capacity.effective_position_cap
+                if is_mainline_v3_version(self.strategy_logic_version)
+                else (
+                    self._max_positions_override
+                    or (
+                        GOVERNANCE_DEFAULT_TOP_N
+                        if self.strategy_logic_version == MAINLINE_V2
+                        else (
+                            regime_params.max_positions
+                            if regime_params
+                            else GOVERNANCE_DEFAULT_TOP_N
+                        )
+                    )
                 )
             ),
             allow_normal_rebalance=allow_normal_rebalance,
@@ -1708,13 +1760,7 @@ class GovernanceBacktestRunner:
             cash_buffer_amount=float(
                 self.capital_profile.get("min_cash_buffer", 0.0) or 0.0
             ),
-            per_name_structural_cap=float(
-                self.capital_profile.get(
-                    "retail_single_position_cap",
-                    self.capital_profile.get("retail_one_lot_position_cap", 1.0),
-                )
-                or 1.0
-            ),
+            per_name_structural_cap=dynamic_hard_cap,
             portfolio_stress_budget_amount=float(exposure["nominal_nav"]) * 0.40,
             control_mode=self.governance_control_mode,
             winner_add_enabled=bool(
@@ -1732,11 +1778,103 @@ class GovernanceBacktestRunner:
             forecast_kappa=float(
                 self.capital_profile.get("scap_forecast_kappa", 0.50) or 0.50
             ),
-            soft_target_positions=int(
-                self.capital_profile.get("soft_target_positions", 4) or 4
-            ),
+            soft_target_positions=position_capacity.soft_target_positions,
             execution_cost_profile=self.capital_profile,
+            desired_exposure_target=float(desired_exposure_target),
+            hard_exposure_ceiling=float(
+                min(
+                    float(safety_exposure_cap),
+                    float(risk_exposure_ceiling),
+                )
+                if (
+                    str(getattr(risk_level, "value", risk_level))
+                    .strip()
+                    .lower()
+                    in {"high", "critical"}
+                    or bool(safety_row.get("hard_freeze_active", False))
+                    or int(safety_row.get("trigger_streak_days", 0) or 0)
+                    >= max(
+                        int(
+                            self.capital_profile.get(
+                                "scap_safety_confirmation_days",
+                                1,
+                            )
+                            or 1
+                        ),
+                        1,
+                    )
+                )
+                else float(safety_exposure_cap)
+            ),
+            confirmed_derisk_target=(
+                float(risk_exposure_ceiling)
+                if (
+                    str(getattr(risk_level, "value", risk_level))
+                    .strip()
+                    .lower()
+                    in {"high", "critical"}
+                    or bool(safety_row.get("hard_freeze_active", False))
+                    or int(safety_row.get("trigger_streak_days", 0) or 0)
+                    >= max(
+                        int(
+                            self.capital_profile.get(
+                                "scap_safety_confirmation_days",
+                                1,
+                            )
+                            or 1
+                        ),
+                        1,
+                    )
+                )
+                else None
+            ),
+            current_lots_by_symbol={
+                str(symbol): max(
+                    int(
+                        (
+                            float(position.shares)
+                            + float(
+                                trading_rule_for(
+                                    symbol,
+                                    trade_date=date,
+                                ).minimum_buy_quantity
+                            )
+                            - 1.0
+                        )
+                        // float(
+                            trading_rule_for(
+                                symbol,
+                                trade_date=date,
+                            ).minimum_buy_quantity
+                        )
+                    ),
+                    1,
+                )
+                for symbol, position in self.positions.items()
+                if float(position.shares) > 0.0
+            },
         )
+        action_proposal_rows = diagnostics.pop("_action_proposal_rows", [])
+        action_plan_rows = diagnostics.pop("_action_plan_rows", [])
+        self.action_proposal_rows.extend(action_proposal_rows)
+        self.action_plan_rows.extend(action_plan_rows)
+        if self.governance_control_mode == "aggressive_lean":
+            selected_entry_symbols = {
+                str(row.get("symbol", ""))
+                for row in action_proposal_rows
+                if bool(row.get("selected_by_plan", False))
+                and str(row.get("action_type", "")) == "new_entry"
+            }
+            candidates["scap_optimizer_selected"] = (
+                candidates["symbol"].astype(str).isin(selected_entry_symbols)
+            )
+            today = pd.Timestamp(date).normalize()
+            for row in self.entry_formula_audit_rows:
+                if pd.Timestamp(row.get("date")).normalize() == today:
+                    row["scap_optimizer_selected"] = (
+                        str(row.get("symbol", ""))
+                        in selected_entry_symbols
+                    )
         orders = self._augment_force_deploy_diversify_orders(
             orders=orders,
             candidates=candidates,
@@ -1756,6 +1894,21 @@ class GovernanceBacktestRunner:
             daily=daily,
         ))
         diagnostics.update(catchup_decision.__dict__)
+        diagnostics.update(
+            {
+                f"position_capacity_{key}": value
+                for key, value in position_capacity.as_dict().items()
+            }
+        )
+        for column in (
+            "cabinet_raw_factor_count",
+            "cabinet_empirical_cluster_count",
+            "cabinet_empirical_compression_ratio",
+        ):
+            if column in candidates.columns and not candidates.empty:
+                diagnostics[column] = candidates.iloc[0].get(column, pd.NA)
+        diagnostics["dynamic_single_position_soft_cap"] = float(dynamic_soft_cap)
+        diagnostics["dynamic_single_position_hard_cap"] = float(dynamic_hard_cap)
         diagnostics["policy_target_exposure_before_lot_cap"] = float(exposure_authorization["authorized_exposure_max"])
         diagnostics["qualified_entry_count"] = int(qualified_entry_count)
         diagnostics["pre_slot_qualified_entry_count"] = int(
@@ -1772,7 +1925,9 @@ class GovernanceBacktestRunner:
             entry_stage_counts["slot_feasible_count"]
         )
         diagnostics["optimizer_selected_entry_count"] = int(
-            entry_stage_counts["optimizer_selected_entry_count"]
+            diagnostics.get("lean_optimizer_selected_entry_count", 0)
+            if self.governance_control_mode == "aggressive_lean"
+            else entry_stage_counts["optimizer_selected_entry_count"]
         )
         diagnostics["exposure_signal_count"] = int(exposure_signal_count)
         diagnostics["lot_feasible_target_exposure"] = float(lot_feasible_target_exposure)
@@ -1785,7 +1940,7 @@ class GovernanceBacktestRunner:
             diagnostics["effective_target_exposure_cap"] = float(lot_feasible_target_exposure)
         elif self.governance_control_mode == "aggressive_lean":
             diagnostics["strategic_exposure_budget"] = float(
-                risk_exposure_ceiling
+                desired_exposure_target
             )
             diagnostics["actual_exposure"] = float(actual_exposure)
             diagnostics["execution_drag"] = max(
@@ -1944,6 +2099,13 @@ class GovernanceBacktestRunner:
             actual_holding_count=int(exposure.get("holding_count", 0) or 0),
             max_positions_override=self._max_positions_override,
         )
+        action_plan_target_holding_count = int(
+            diagnostics.get(
+                "action_plan_target_holding_count",
+                holding_targets["soft_target_holding_count"],
+            )
+            or 0
+        )
         self.exposure_rows[-1].update(
             {
                 "target_exposure": diagnostics["target_exposure"],
@@ -1964,9 +2126,18 @@ class GovernanceBacktestRunner:
                 # holding count.  Reports must not infer a hard position limit
                 # from the profile's diversification target.
                 "configured_max_positions": int(
-                    self._max_positions_override
-                    or self.capital_profile.get("max_positions", GOVERNANCE_DEFAULT_TOP_N)
-                    or GOVERNANCE_DEFAULT_TOP_N
+                    position_capacity.effective_position_cap
+                ),
+                "position_capacity_mode": position_capacity.mode,
+                "position_capacity_reason": position_capacity.reason,
+                "cabinet_raw_factor_count": diagnostics.get(
+                    "cabinet_raw_factor_count", pd.NA
+                ),
+                "cabinet_empirical_cluster_count": diagnostics.get(
+                    "cabinet_empirical_cluster_count", pd.NA
+                ),
+                "cabinet_empirical_compression_ratio": diagnostics.get(
+                    "cabinet_empirical_compression_ratio", pd.NA
                 ),
                 "minimum_required_holding_count": holding_targets[
                     "minimum_required_holding_count"
@@ -1977,12 +2148,21 @@ class GovernanceBacktestRunner:
                 "maximum_allowed_holding_count": holding_targets[
                     "maximum_allowed_holding_count"
                 ],
-                "target_holding_count": holding_targets[
-                    "soft_target_holding_count"
-                ],
-                "holding_shortfall_count": holding_targets[
-                    "soft_holding_shortfall_count"
-                ],
+                "target_holding_count": (
+                    action_plan_target_holding_count
+                    if is_mainline_v3_version(self.strategy_logic_version)
+                    else holding_targets["soft_target_holding_count"]
+                ),
+                "action_plan_target_holding_count": action_plan_target_holding_count,
+                "holding_shortfall_count": (
+                    max(
+                        action_plan_target_holding_count
+                        - int(exposure.get("holding_count", 0) or 0),
+                        0,
+                    )
+                    if is_mainline_v3_version(self.strategy_logic_version)
+                    else holding_targets["soft_holding_shortfall_count"]
+                ),
                 "idle_cash": float(exposure.get("cash", self.cash) or 0.0),
                 "idle_cash_ratio": float(exposure.get("cash", self.cash) or 0.0) / max(float(exposure.get("nominal_nav", self.initial_cash) or self.initial_cash), 1e-12),
                 "scap_v31_positive_c_fallback_count": positive_c_fallback_count,
@@ -2031,6 +2211,13 @@ class GovernanceBacktestRunner:
                 "policy_target_exposure_before_lot_cap": diagnostics.get("policy_target_exposure_before_lot_cap", target_exposure_proxy),
                 "lot_feasible_target_exposure": diagnostics.get("lot_feasible_target_exposure", target_exposure_proxy),
                 "risk_exposure_ceiling": diagnostics.get("risk_exposure_ceiling", target_exposure_proxy),
+                "hard_exposure_ceiling": diagnostics.get(
+                    "hard_exposure_ceiling",
+                    diagnostics.get(
+                        "risk_exposure_ceiling",
+                        target_exposure_proxy,
+                    ),
+                ),
                 "desired_exposure_target": diagnostics.get("desired_exposure_target", target_exposure_proxy),
                 "executable_exposure_target": diagnostics.get("executable_exposure_target", target_exposure_proxy),
                 "optimizer_planned_exposure": diagnostics.get(
@@ -2068,6 +2255,10 @@ class GovernanceBacktestRunner:
                 "risk_symbol_count": diagnostics.get("risk_symbol_count", 0),
                 "risk_contribution_block_reason": diagnostics.get("risk_contribution_block_reason", ""),
                 "top5_risk_contribution_sum": diagnostics.get("top5_risk_contribution_sum", 0.0),
+                "top20pct_risk_contribution_sum": diagnostics.get("top20pct_risk_contribution_sum", 0.0),
+                "risk_effective_n": diagnostics.get("risk_effective_n", 0.0),
+                "risk_effective_n_ratio": diagnostics.get("risk_effective_n_ratio", 0.0),
+                "risk_contribution_hhi": diagnostics.get("risk_contribution_hhi", 0.0),
                 "risk_new_buy_block": diagnostics.get("risk_new_buy_block", False),
                 "risk_catchup_block": diagnostics.get("risk_catchup_block", False),
                 "risk_new_buy_block_applied": diagnostics.get("risk_new_buy_block_applied", False),
@@ -2479,6 +2670,10 @@ class GovernanceBacktestRunner:
             "risk_symbol_count": int(diagnostics.get("risk_symbol_count", 0)),
             "risk_contribution_block_reason": str(diagnostics.get("risk_contribution_block_reason", "")),
             "top5_risk_contribution_sum": _safe_float(diagnostics.get("top5_risk_contribution_sum"), default=0.0),
+            "top20pct_risk_contribution_sum": _safe_float(diagnostics.get("top20pct_risk_contribution_sum"), default=0.0),
+            "risk_effective_n": _safe_float(diagnostics.get("risk_effective_n"), default=0.0),
+            "risk_effective_n_ratio": _safe_float(diagnostics.get("risk_effective_n_ratio"), default=0.0),
+            "risk_contribution_hhi": _safe_float(diagnostics.get("risk_contribution_hhi"), default=0.0),
             "risk_new_buy_block": bool(diagnostics.get("risk_new_buy_block", False)),
             "risk_catchup_block": bool(diagnostics.get("risk_catchup_block", False)),
             "risk_new_buy_block_applied": bool(diagnostics.get("risk_new_buy_block_applied", False)),
@@ -4130,6 +4325,12 @@ class GovernanceBacktestRunner:
         latest = self.exposure_rows[-1] if self.exposure_rows else {}
         latest_top1_risk = _safe_float(latest.get("max_risk_contribution"), default=0.0)
         latest_top5_risk = _safe_float(latest.get("top5_risk_contribution_sum"), default=0.0)
+        latest_top20pct_risk = _safe_float(
+            latest.get("top20pct_risk_contribution_sum"), default=0.0
+        )
+        latest_risk_effective_n_ratio = _safe_float(
+            latest.get("risk_effective_n_ratio"), default=1.0
+        )
         latest_risk_symbol_count = int(_safe_float(latest.get("risk_symbol_count"), default=0.0))
         actual_target_ratio = _recent_actual_target_ratio(self.exposure_rows)
 
@@ -4163,6 +4364,8 @@ class GovernanceBacktestRunner:
             "actual_target_ratio": actual_target_ratio,
             "latest_top1_risk_contribution": latest_top1_risk,
             "latest_top5_risk_contribution_sum": latest_top5_risk,
+            "latest_top20pct_risk_contribution_sum": latest_top20pct_risk,
+            "latest_risk_effective_n_ratio": latest_risk_effective_n_ratio,
             "latest_risk_symbol_count": latest_risk_symbol_count,
         }
 
@@ -4244,6 +4447,12 @@ class GovernanceBacktestRunner:
                 ["date", "symbol", "side", "trade_date", "reward_5d", "reward_source"],
             ),
             "governance_action_decision_ledger": pd.DataFrame(self.action_decision_rows),
+            "governance_action_proposal_ledger": pd.DataFrame(
+                self.action_proposal_rows
+            ),
+            "governance_action_plan_ledger": pd.DataFrame(
+                self.action_plan_rows
+            ),
             "governance_action_counterfactual_reward": mature_action_rewards(
                 pd.DataFrame(self.action_decision_rows),
                 reward_prices,
@@ -4485,6 +4694,13 @@ class GovernanceBacktestRunner:
             holdings_ledger=extra["governance_holdings_ledger"],
             position_state_ledger=extra["governance_position_state_ledger"],
             max_positions=self._max_positions_override,
+            action_proposal_ledger=extra[
+                "governance_action_proposal_ledger"
+            ],
+            action_plan_ledger=extra["governance_action_plan_ledger"],
+            order_plan_ledger=self.engine.ledgers.frame(
+                "executable_order_plan"
+            ),
         )
         if self.governance_variant == "governance_layer_validation":
             self._log_save_stage("layer_validation_audit")

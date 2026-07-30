@@ -1,6 +1,8 @@
 """Exposure, weighting, and account audit helpers for governance backtests."""
 from __future__ import annotations
 
+import math
+
 import pandas as pd
 
 from functions.decision_council.accounting import build_exposure_snapshot
@@ -56,8 +58,26 @@ def record_exposure(runner, date, daily):
     snapshot["top5_sleeve_weight_sum"] = float(sorted_sleeve_weights.head(5).sum()) if len(sorted_sleeve_weights) else 0.0
     sleeve_weight_square_sum = float(sorted_sleeve_weights.pow(2).sum()) if len(sorted_sleeve_weights) else 0.0
     snapshot["sleeve_effective_n"] = float(1.0 / sleeve_weight_square_sum) if sleeve_weight_square_sum > 0 else 0.0
+    holding_count = int(len(sorted_sleeve_weights))
+    top_fraction_count = max(int(math.ceil(0.20 * holding_count)), 1) if holding_count else 0
+    snapshot["top20pct_sleeve_weight_sum"] = (
+        float(sorted_sleeve_weights.head(top_fraction_count).sum())
+        if top_fraction_count
+        else 0.0
+    )
+    snapshot["sleeve_weight_hhi"] = sleeve_weight_square_sum
+    snapshot["sleeve_effective_n_ratio"] = (
+        float(snapshot["sleeve_effective_n"]) / holding_count
+        if holding_count
+        else 0.0
+    )
     snapshot["top1_account_weight"] = float(sorted_account_weights.iloc[0]) if len(sorted_account_weights) else 0.0
     snapshot["top5_account_weight_sum"] = float(sorted_account_weights.head(5).sum()) if len(sorted_account_weights) else 0.0
+    snapshot["top20pct_account_weight_sum"] = (
+        float(sorted_account_weights.head(top_fraction_count).sum())
+        if top_fraction_count
+        else 0.0
+    )
     cash_weight = max(float(runner.cash) / nominal_nav, 0.0) if nominal_nav > 0 else 0.0
     # Account effective N includes cash as an account component. Omitting cash
     # made a 4% single-stock position report an impossible effective N above 600.
@@ -66,7 +86,7 @@ def record_exposure(runner, date, daily):
     snapshot["top5_weight_sum"] = snapshot["top5_sleeve_weight_sum"]
     snapshot["effective_n"] = snapshot["sleeve_effective_n"]
     snapshot["weight_basis"] = "sleeve_weight_legacy"
-    snapshot["holding_count"] = int(len(sorted_sleeve_weights))
+    snapshot["holding_count"] = holding_count
     snapshot.update({"date": pd.Timestamp(date), "decision_id": f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}", "safety_sell_flow_impact_estimate": 0.0})
     snapshot["stale_price_position_count"] = sum(int(row["valuation_source"] == "last_known_close") for row in rows)
     snapshot["missing_price_position_count"] = sum(int(row["valuation_source"] == "missing_mark") for row in rows)
@@ -182,4 +202,3 @@ def trade_pairing_capital_profile(runner) -> str:
     if profile_name:
         return f"{runner.governance_variant}__{profile_name}"
     return str(runner.governance_variant)
-

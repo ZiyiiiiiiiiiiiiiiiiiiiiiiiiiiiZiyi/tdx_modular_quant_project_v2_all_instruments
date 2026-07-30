@@ -8,7 +8,7 @@ from pathlib import Path
 from config import COMMISSION_RATE, SLIPPAGE_RATE, STAMP_DUTY_RATE, TRANSFER_FEE_RATE
 
 
-RUNTIME_IDENTITY_SCHEMA_VERSION = "governance_runtime_identity_v1"
+RUNTIME_IDENTITY_SCHEMA_VERSION = "governance_runtime_identity_v2"
 CONTROL_SCHEMA_VERSION = "scap_control_schema_v1"
 REASON_SCHEMA_VERSION = "scap_reason_schema_v1"
 SCORING_SCHEMA_VERSION = "mainline_v3_scoring_schema_v1"
@@ -25,6 +25,11 @@ _CODE_IDENTITY_FILES = (
     "functions/decision_council/small_capital_aggressive.py",
 )
 
+_CODE_IDENTITY_TREES = (
+    "functions/decision_council",
+    "functions/execution",
+)
+
 
 def build_runtime_identity(
     runner,
@@ -38,7 +43,7 @@ def build_runtime_identity(
     factor_spec = getattr(runner, "factor_source_spec", None)
     factor_summary = factor_spec.summary_dict() if factor_spec is not None else {}
     code_fingerprint, code_files = governance_code_fingerprint()
-    identity = {
+    experiment_spec = {
         "schema_version": RUNTIME_IDENTITY_SCHEMA_VERSION,
         "control_schema_version": CONTROL_SCHEMA_VERSION,
         "reason_schema_version": REASON_SCHEMA_VERSION,
@@ -76,11 +81,30 @@ def build_runtime_identity(
         "slippage_rate": float(SLIPPAGE_RATE),
         "stamp_duty_rate": float(STAMP_DUTY_RATE),
         "transfer_fee_rate": float(TRANSFER_FEE_RATE),
-        "output_dir": str(Path(output_dir).resolve()),
+        "resolved_capital_profile": profile,
         "code_fingerprint": code_fingerprint,
         "code_identity_files": code_files,
     }
-    identity["runtime_identity_hash"] = _stable_hash(identity)
+    cabinet_path = str(factor_summary.get("factor_cabinet_path", "") or "")
+    if cabinet_path:
+        experiment_spec["factor_cabinet_content_sha256"] = _small_file_sha256(
+            Path(cabinet_path)
+        )
+    experiment_spec_hash = _stable_hash(experiment_spec)
+    run_instance = {
+        "experiment_spec_hash": experiment_spec_hash,
+        "output_dir": str(Path(output_dir).resolve()),
+    }
+    identity = {
+        **experiment_spec,
+        "experiment_spec_hash": experiment_spec_hash,
+        "run_instance_hash": _stable_hash(run_instance),
+        "output_dir": run_instance["output_dir"],
+        # Compatibility alias. Checkpoints and older reports expect this
+        # field; it now means the result-relevant experiment specification,
+        # never the output location or process instance.
+        "runtime_identity_hash": experiment_spec_hash,
+    }
     return identity
 
 
@@ -105,7 +129,28 @@ def governance_code_fingerprint(project_root: Path | None = None) -> tuple[str, 
         files[relative] = (
             hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
         )
+    for relative_tree in _CODE_IDENTITY_TREES:
+        tree = root / relative_tree
+        if not tree.is_dir():
+            files[f"{relative_tree}/"] = "missing"
+            continue
+        for path in sorted(tree.rglob("*.py")):
+            relative = path.relative_to(root).as_posix()
+            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     return _stable_hash(files), files
+
+
+def _small_file_sha256(path: Path, *, maximum_bytes: int = 64 * 1024 * 1024) -> str:
+    """Hash result-defining model/config artifacts without reading huge parquet."""
+    try:
+        resolved = path.resolve()
+        if not resolved.is_file():
+            return "missing"
+        if resolved.stat().st_size > int(maximum_bytes):
+            return "oversize_requires_external_data_manifest"
+        return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
 
 
 def _stable_hash(value) -> str:

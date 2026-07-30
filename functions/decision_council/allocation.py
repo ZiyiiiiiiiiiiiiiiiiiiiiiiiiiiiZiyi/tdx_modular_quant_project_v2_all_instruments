@@ -167,6 +167,12 @@ def _apply_covariance_risk_budget(
     shrinkage: float,
     max_risk_contribution: float,
 ) -> dict:
+    empty_risk_shape = {
+        "top20pct_risk_contribution_sum": 0.0,
+        "risk_effective_n": 0.0,
+        "risk_effective_n_ratio": 0.0,
+        "risk_contribution_hhi": 0.0,
+    }
     if covariance_matrix is None or covariance_matrix.empty or data.empty:
         return {
             "covariance_risk_model_used": False,
@@ -181,6 +187,7 @@ def _apply_covariance_risk_budget(
             "risk_catchup_block": False,
             "avg_pairwise_correlation": 0.0,
             "covariance_condition_number": 0.0,
+            **empty_risk_shape,
         }
     symbols = data["symbol"].astype(str).tolist()
     cov = covariance_matrix.copy()
@@ -201,6 +208,7 @@ def _apply_covariance_risk_budget(
             "risk_catchup_block": False,
             "avg_pairwise_correlation": 0.0,
             "covariance_condition_number": 0.0,
+            **empty_risk_shape,
         }
     cov = cov.loc[available, available].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     raw_sigma = cov.to_numpy(dtype=float)
@@ -231,6 +239,7 @@ def _apply_covariance_risk_budget(
             "risk_catchup_block": False,
             "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
             "covariance_condition_number": _condition_number(sigma),
+            **empty_risk_shape,
         }
     for _ in range(80):
         rc = _risk_contribution(weights, sigma)
@@ -259,19 +268,46 @@ def _apply_covariance_risk_budget(
         max_rc_after = float(np.nanmax(rc_after)) if rc_after.size and weights.sum() > 0 else 0.0
     top_values = sorted([float(max(value, 0.0)) for value in rc_after], reverse=True)
     top5_sum = float(np.nansum(top_values[:5])) if top_values else 0.0
+    top_fraction_count = max(int(np.ceil(0.20 * len(top_values))), 1) if top_values else 0
+    top20pct_sum = (
+        float(np.nansum(top_values[:top_fraction_count])) if top_fraction_count else 0.0
+    )
+    positive_total = float(np.nansum(top_values))
+    normalized_rc = (
+        np.asarray(top_values, dtype=float) / positive_total
+        if positive_total > 0.0
+        else np.zeros(len(top_values), dtype=float)
+    )
+    risk_hhi = float(np.square(normalized_rc).sum()) if normalized_rc.size else 0.0
+    risk_effective_n = float(1.0 / risk_hhi) if risk_hhi > 0.0 else 0.0
+    risk_effective_n_ratio = (
+        float(risk_effective_n / len(available)) if available else 0.0
+    )
     risk_new_buy_block = bool(max_rc_after > 0.35)
-    risk_catchup_block = bool(top5_sum > 0.80 and len(available) < 8)
+    risk_catchup_block = bool(
+        max_rc_after > 0.35
+        or risk_effective_n_ratio < 0.55
+        or top20pct_sum > 0.55
+    )
     data.loc[indexer, "target_weight"] = weights
     variance = float(weights @ sigma @ weights)
     return {
         "covariance_risk_model_used": True,
         "portfolio_covariance_volatility": float(np.sqrt(max(variance, 0.0))),
         "max_risk_contribution": max_rc_after,
-        "risk_contribution_gate_pass": bool(max_rc_after <= max(float(max_risk_contribution), 0.35) and len(available) >= 5),
+        "risk_contribution_gate_pass": bool(
+            max_rc_after <= max(float(max_risk_contribution), 0.35)
+            and risk_effective_n_ratio >= 0.55
+            and top20pct_sum <= 0.55
+        ),
         "risk_contribution_exposure_scale": float(exposure_scale),
         "risk_symbol_count": int(len(available)),
         "risk_contribution_block_reason": block_reason or "passed",
         "top5_risk_contribution_sum": top5_sum,
+        "top20pct_risk_contribution_sum": top20pct_sum,
+        "risk_effective_n": risk_effective_n,
+        "risk_effective_n_ratio": risk_effective_n_ratio,
+        "risk_contribution_hhi": risk_hhi,
         "risk_new_buy_block": risk_new_buy_block,
         "risk_catchup_block": risk_catchup_block,
         "avg_pairwise_correlation": _avg_pairwise_correlation(sigma),
@@ -344,4 +380,8 @@ def _empty_diagnostics(exposure_cap: float) -> dict:
         "risk_catchup_block": False,
         "avg_pairwise_correlation": 0.0,
         "covariance_condition_number": 0.0,
+        "top20pct_risk_contribution_sum": 0.0,
+        "risk_effective_n": 0.0,
+        "risk_effective_n_ratio": 0.0,
+        "risk_contribution_hhi": 0.0,
     }

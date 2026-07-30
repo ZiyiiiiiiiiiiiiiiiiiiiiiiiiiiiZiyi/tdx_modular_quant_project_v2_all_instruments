@@ -44,13 +44,22 @@ def _runner(stage: str):
 dates = pd.date_range("2025-01-02", periods=3, freq="B")
 first = build_runtime_identity(_runner("E0"), dates=dates, output_dir=Path("results/test"))
 repeat = build_runtime_identity(_runner("E0"), dates=dates, output_dir=Path("results/test"))
+other_output = build_runtime_identity(
+    _runner("E0"), dates=dates, output_dir=Path("results/test_other")
+)
 stage_changed = build_runtime_identity(
     _runner("E1"), dates=dates, output_dir=Path("results/test")
 )
 
 assert first == repeat
 assert first["runtime_identity_hash"] != stage_changed["runtime_identity_hash"]
+assert first["experiment_spec_hash"] == other_output["experiment_spec_hash"]
+assert first["runtime_identity_hash"] == other_output["runtime_identity_hash"]
+assert first["run_instance_hash"] != other_output["run_instance_hash"]
 assert first["code_fingerprint"]
+assert "functions/decision_council/scap_v3_lean.py" in first["code_identity_files"]
+assert "functions/decision_council/integer_action_optimizer.py" in first["code_identity_files"]
+assert first["resolved_capital_profile"]["scap_exit_stage"] == "E0"
 assert first["effective_trading_days"] == 3
 assert first["scap_exit_stage"] == "E0"
 assert first["objective_metric"] == "terminal_net_profit_after_cost"

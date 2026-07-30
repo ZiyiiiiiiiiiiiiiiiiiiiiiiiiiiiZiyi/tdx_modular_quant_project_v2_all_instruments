@@ -118,6 +118,7 @@ class ActionProposal:
     downside_cvar_amount: float
     exact_cost_amount: float
     funding_cash_amount: float
+    cash_release_amount: float = 0.0
     exposure_delta: float = 0.0
     scenario_delta_wealth: tuple[float, ...] = ()
     hard_veto_reasons: tuple[str, ...] = ()
@@ -132,6 +133,9 @@ class ActionProposal:
     primary_rank: float = 0.0
     unit_capital_robust_return: float = 0.0
     authority_penalty_amount: float = 0.0
+    execution_class: str = "alpha"
+    must_execute: bool = False
+    authority_snapshot_id: str = ""
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -147,6 +151,7 @@ class ActionProposal:
             "downside_cvar_amount",
             "exact_cost_amount",
             "funding_cash_amount",
+            "cash_release_amount",
             "exposure_delta",
             "primary_score",
             "primary_rank",
@@ -157,6 +162,7 @@ class ActionProposal:
         if (
             self.exact_cost_amount < 0.0
             or self.funding_cash_amount < 0.0
+            or self.cash_release_amount < 0.0
             or self.authority_penalty_amount < 0.0
         ):
             raise ValueError("cost and funding amounts must be non-negative")
@@ -203,12 +209,24 @@ class ExposureAuthorization:
     breadth_near_optimal_tolerance_amount: float = 0.0
     risk_episode_id: str = ""
     risk_reentry_blocked: bool = False
+    hard_exposure_ceiling: float = 1.0
+    confirmed_derisk_target: float | None = None
+    authority_snapshot_id: str = ""
+    risk_horizon_sessions: int = 1
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
         if _finite(self.nav_amount, name="nav_amount") <= 0.0:
             raise ValueError("nav_amount must be positive")
         _unit_interval(self.risk_exposure_ceiling, name="risk_exposure_ceiling")
+        _unit_interval(self.hard_exposure_ceiling, name="hard_exposure_ceiling")
+        if self.confirmed_derisk_target is not None:
+            _unit_interval(
+                self.confirmed_derisk_target,
+                name="confirmed_derisk_target",
+            )
+        if int(self.risk_horizon_sessions) <= 0:
+            raise ValueError("risk_horizon_sessions must be positive")
         _unit_interval(self.per_name_structural_cap, name="per_name_structural_cap")
         for name in (
             "current_cash_amount",
@@ -265,6 +283,9 @@ class ActionPlan:
     breadth_score: float = 0.0
     authority_penalty_amount: float = 0.0
     concentration_penalty_amount: float = 0.0
+    marginal_risk_penalty_amount: float = 0.0
+    risk_model_used: str = "fallback_per_name_stress_cap"
+    risk_horizon_sessions: int = 1
     risk_episode_id: str = ""
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
@@ -290,8 +311,11 @@ class ActionPlan:
             "breadth_score",
             "authority_penalty_amount",
             "concentration_penalty_amount",
+            "marginal_risk_penalty_amount",
         ):
             _finite(getattr(self, name), name=name)
+        if int(self.risk_horizon_sessions) <= 0:
+            raise ValueError("risk_horizon_sessions must be positive")
 
     def as_dict(self) -> dict:
         return asdict(self)

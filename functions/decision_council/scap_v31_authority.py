@@ -13,6 +13,9 @@ def attach_scap_v31_authority(
     candidates: pd.DataFrame,
     *,
     horizon_days: int = 10,
+    position_cap_mode: str = "fixed",
+    target_position_cash: float | None = None,
+    authority_snapshot_id: str = "",
 ) -> pd.DataFrame:
     """Attach A/B/C/D authority and a cost-before decision return.
 
@@ -41,7 +44,12 @@ def attach_scap_v31_authority(
         allowed = legacy_return.gt(0.0) | legacy_utility.gt(0.0)
         data["scap_v31_authority_tier"] = allowed.map({True: "A", False: "D"})
         data["scap_v31_decision_expected_return"] = legacy_return
-        data["scap_v31_max_lots"] = allowed.map({True: 2, False: 0}).astype(int)
+        data["scap_v31_max_lots"] = _scaled_max_lots(
+            data,
+            tier=allowed.map({True: "A", False: "D"}),
+            position_cap_mode=position_cap_mode,
+            target_position_cash=target_position_cash,
+        )
         data["scap_v31_authority_contract"] = (
             AUTHORITY_CONTRACT + "|synthetic_compatibility"
         )
@@ -51,6 +59,7 @@ def attach_scap_v31_authority(
                 False: "missing_authority_evidence",
             }
         )
+        data["scap_authority_snapshot_id"] = str(authority_snapshot_id)
         return data
     n_eff = _numeric(data, f"entry_calibration_effective_sample_size_{suffix}")
     sessions = _numeric(data, f"entry_calibration_unique_session_count_{suffix}")
@@ -101,10 +110,10 @@ def attach_scap_v31_authority(
     tier.loc[tier_a] = "A"
     decision_return = pd.Series(0.0, index=data.index)
     decision_return.loc[tier_a] = (
-        point.loc[tier_a] - 0.50 * cluster_se.loc[tier_a]
+        point.loc[tier_a] - 0.25 * cluster_se.loc[tier_a]
     )
     decision_return.loc[tier_b] = (
-        point.loc[tier_b] - 0.25 * cluster_se.loc[tier_b]
+        point.loc[tier_b] - 0.50 * cluster_se.loc[tier_b]
     )
     decision_return.loc[tier_c] = fallback_lcb.loc[tier_c]
     negative_edge = decision_return.le(0.0)
@@ -113,7 +122,17 @@ def attach_scap_v31_authority(
 
     data["scap_v31_authority_tier"] = tier
     data["scap_v31_decision_expected_return"] = decision_return
-    data["scap_v31_max_lots"] = tier.map({"A": 2, "B": 1, "C": 1, "D": 0}).astype(int)
+    data["scap_v31_max_lots"] = _scaled_max_lots(
+        data,
+        tier=tier,
+        position_cap_mode=position_cap_mode,
+        target_position_cash=target_position_cash,
+    )
+    data["scap_v32_authority_size_mode"] = (
+        "capital_risk_scaled"
+        if str(position_cap_mode).strip().lower() == "auto"
+        else "fixed_micro_lots"
+    )
     data["scap_v32_current_authority_tier"] = tier
     data["scap_v32_authority_uncertainty_rank"] = tier.map(
         {"A": 0, "B": 1, "C": 2, "D": 3}
@@ -126,7 +145,51 @@ def attach_scap_v31_authority(
             tier, n_eff, sessions, rank_ic, slope, drift
         )
     ]
+    data["scap_authority_snapshot_id"] = str(authority_snapshot_id)
     return data
+
+
+def _scaled_max_lots(
+    data: pd.DataFrame,
+    *,
+    tier: pd.Series,
+    position_cap_mode: str,
+    target_position_cash: float | None,
+) -> pd.Series:
+    """Use capital-risk fractions in auto mode; preserve the 2/1/1 baseline."""
+    if (
+        str(position_cap_mode or "fixed").strip().lower() != "auto"
+        or target_position_cash is None
+        or float(target_position_cash) <= 0.0
+    ):
+        return tier.map({"A": 2, "B": 1, "C": 1, "D": 0}).fillna(0).astype(int)
+    lot_cash = _lot_cash(data)
+    base_lots = (
+        float(target_position_cash) / lot_cash.replace(0.0, float("nan"))
+    ).apply(math.floor)
+    base_lots = pd.to_numeric(base_lots, errors="coerce").fillna(0).clip(lower=0)
+    multiplier = tier.map({"A": 1.00, "B": 0.60, "C": 0.35, "D": 0.0}).fillna(0.0)
+    scaled = (base_lots * multiplier).apply(math.floor).astype(int)
+    positive_tier = tier.isin({"A", "B", "C"}) & base_lots.ge(1)
+    scaled.loc[positive_tier] = scaled.loc[positive_tier].clip(lower=1)
+    scaled.loc[tier.eq("D")] = 0
+    return scaled
+
+
+def _lot_cash(data: pd.DataFrame) -> pd.Series:
+    for column in (
+        "mainline_v3_one_lot_cash_required",
+        "one_lot_cash_required",
+        "lot_cash_required",
+    ):
+        if column in data.columns:
+            values = pd.to_numeric(data[column], errors="coerce")
+            if values.gt(0.0).any():
+                return values
+    for column in ("close_nominal", "close", "open_nominal", "open"):
+        if column in data.columns:
+            return pd.to_numeric(data[column], errors="coerce") * 100.0
+    return pd.Series(float("nan"), index=data.index)
 
 
 def _numeric(data: pd.DataFrame, column: str) -> pd.Series:

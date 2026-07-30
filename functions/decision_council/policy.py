@@ -475,6 +475,42 @@ class RulesBasedPresidentPolicy:
             ]
         ].copy()
         diagnostics = dict(decision.diagnostics)
+        selected_ids = set(decision.plan.selected_proposal_ids)
+        rejection_by_id = {
+            str(item.get("proposal_id", "")): str(item.get("reason", ""))
+            for item in decision.plan.rejected_proposals
+        }
+        diagnostics["_action_proposal_rows"] = [
+            {
+                **proposal.as_dict(),
+                "decision_date": pd.Timestamp(context.decision_date),
+                "selected_by_plan": proposal.proposal_id in selected_ids,
+                "optimizer_rejection_reason": rejection_by_id.get(
+                    proposal.proposal_id,
+                    "",
+                ),
+                "action_plan_id": decision.plan.plan_id,
+            }
+            for proposal in decision.proposals
+        ]
+        diagnostics["_action_plan_rows"] = [
+            {
+                **decision.plan.as_dict(),
+                "decision_date": pd.Timestamp(context.decision_date),
+                "authority_snapshot_id": (
+                    decision.authorization.authority_snapshot_id
+                ),
+                "hard_exposure_ceiling": (
+                    decision.authorization.hard_exposure_ceiling
+                ),
+                "desired_exposure_target": (
+                    decision.authorization.desired_exposure_target
+                ),
+                "confirmed_derisk_target": (
+                    decision.authorization.confirmed_derisk_target
+                ),
+            }
+        ]
         diagnostics.update(
             {
                 "target_exposure": float(decision.plan.projected_exposure),

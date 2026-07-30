@@ -50,6 +50,7 @@ def context(*, cash: float = 19_000.0) -> DecisionContext:
         forecast_horizon_sessions=10,
         forecast_kappa=0.50,
         soft_target_positions=4,
+        execution_cost_profile={"scap_max_winner_add_layers": 2},
     )
 
 
@@ -141,6 +142,17 @@ assert len({proposal.symbol for proposal in selected}) == len(selected)
 assert all(proposal.horizon_sessions == 10 for proposal in base.proposals)
 passed("lot alternatives cannot be cumulatively selected and all actions share 10 sessions")
 
+exact_lot_decision = build_lean_decision(
+    replace(
+        context(),
+        current_lots_by_symbol={"H": 7},
+        winner_add_enabled=False,
+    ),
+    frame(),
+)
+assert exact_lot_decision.plan.target_lots_by_symbol["H"] == 7
+passed("ActionPlan preserves exact account lots instead of weight inference")
+
 assert any(proposal.action_type == "winner_add" for proposal in base.proposals)
 assert not any(proposal.action_type == "loser_add" for proposal in base.proposals)
 passed("lifecycle-authorized winner add is proposal-reachable; loser add remains disabled")
@@ -179,6 +191,15 @@ assert diagnostics["legacy_allocation_authority"] == "shadow_only"
 assert diagnostics["optimizer_invocation_count"] == 1
 assert set(orders["action_plan_id"].dropna()) == {"lean_20250110|action_plan"}
 assert orders["action_proposal_id"].notna().all()
+proposal_rows = diagnostics["_action_proposal_rows"]
+plan_rows = diagnostics["_action_plan_rows"]
+assert len(plan_rows) == 1
+assert plan_rows[0]["plan_id"] == "lean_20250110|action_plan"
+assert {
+    row["proposal_id"]
+    for row in proposal_rows
+    if row["selected_by_plan"]
+} == set(orders["action_proposal_id"])
 passed("Lean policy bypasses legacy selector/continuous allocation and preserves plan lineage")
 
 assert float(diagnostics["strategic_exposure_budget"]) == 0.90

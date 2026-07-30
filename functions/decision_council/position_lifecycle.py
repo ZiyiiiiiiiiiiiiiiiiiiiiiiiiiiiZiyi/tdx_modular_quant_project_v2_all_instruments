@@ -33,6 +33,42 @@ def _clip01(value) -> float:
     return min(max(_safe_float(value, default=0.0), 0.0), 1.0)
 
 
+def _active_single_position_cap(runner) -> float:
+    dynamic = getattr(runner, "_current_dynamic_single_position_hard_cap", None)
+    if dynamic is not None and _safe_float(dynamic, default=0.0) > 0.0:
+        return float(dynamic)
+    return float(
+        runner.capital_profile.get(
+            "retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT
+        )
+        or GOVERNANCE_MAX_POSITION_WEIGHT
+    )
+
+
+def resolve_scap_loss_limits(
+    profile: dict,
+    *,
+    tail_risk_proxy: float,
+    disaster_floor: float = GOVERNANCE_HARD_STOP_LOSS,
+) -> tuple[float, float]:
+    """Return (adaptive soft stop, immediate disaster floor).
+
+    Higher tail risk tightens the confirmed soft stop.  The disaster floor is
+    an independent one-day circuit breaker and therefore never gets widened by
+    the adaptive formula.
+    """
+    disaster = float(disaster_floor)
+    configured = float(profile.get("scap_loss_stop", disaster))
+    mode = str(profile.get("scap_loss_stop_mode", "fixed") or "fixed").strip().lower()
+    if mode != "adaptive_volatility_or_disaster_floor":
+        return configured, disaster
+    tail_proxy = _clip01(tail_risk_proxy)
+    soft_base = float(profile.get("scap_loss_soft_base", -0.16))
+    tail_tightening = max(float(profile.get("scap_loss_tail_tightening", 0.04)), 0.0)
+    adaptive_soft = soft_base + tail_tightening * tail_proxy
+    return max(disaster, adaptive_soft), disaster
+
+
 def _dynamic_giveback_limit(
     *,
     mfe: float,
@@ -716,6 +752,8 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         )
         paper_loss_containment = loss_containment
         scap_loss_stop = float(GOVERNANCE_HARD_STOP_LOSS)
+        scap_disaster_stop = float(GOVERNANCE_HARD_STOP_LOSS)
+        loss_stop_kind = "legacy_hard_stop"
         if str(getattr(runner, "governance_control_mode", "")).strip().lower() in {
             "aggressive_profit",
             "aggressive_lean",
@@ -728,11 +766,15 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
                 or "fixed"
             ).strip().lower()
             if loss_stop_mode == "adaptive_volatility_or_disaster_floor":
-                tail_proxy = min(max(float(tail_risk_proxy), 0.0), 1.0)
-                scap_loss_stop = min(
-                    scap_loss_stop,
-                    -(0.12 + 0.08 * tail_proxy),
+                scap_loss_stop, scap_disaster_stop = resolve_scap_loss_limits(
+                    runner.capital_profile,
+                    tail_risk_proxy=tail_risk_proxy,
+                    disaster_floor=scap_disaster_stop,
                 )
+                loss_stop_kind = "adaptive_soft_with_disaster_floor"
+            disaster_breach = bool(
+                is_held and holding_days >= 1 and net_unrealized <= scap_disaster_stop
+            )
             paper_loss_containment = bool(
                 is_held and holding_days >= 3 and net_unrealized <= scap_loss_stop
             )
@@ -757,20 +799,27 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
                 required_days=loss_confirmation_required,
             )
             loss_containment = bool(
-                loss_containment_confirmed
-                and scap_loss_containment_exit(
-                    exit_stage=str(
-                        runner.capital_profile.get(
-                            "scap_exit_stage", "E0"
-                        )
-                        or "E0"
-                    ),
-                    is_held=is_held,
-                    holding_days=holding_days,
-                    net_unrealized_return=net_unrealized,
-                    loss_stop=scap_loss_stop,
+                disaster_breach
+                or (
+                    loss_containment_confirmed
+                    and scap_loss_containment_exit(
+                        exit_stage=str(
+                            runner.capital_profile.get(
+                                "scap_exit_stage", "E0"
+                            )
+                            or "E0"
+                        ),
+                        is_held=is_held,
+                        holding_days=holding_days,
+                        net_unrealized_return=net_unrealized,
+                        loss_stop=scap_loss_stop,
+                    )
                 )
             )
+            if disaster_breach:
+                loss_confirmation_count = loss_confirmation_required
+                loss_containment_confirmed = True
+                loss_stop_kind = "immediate_disaster_floor"
         else:
             loss_confirmation_required = 1
             loss_confirmation_count = int(loss_containment)
@@ -1036,7 +1085,7 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
                 add_block_reason = "protecting_profit_no_add"
             elif buy_count >= max_layers:
                 add_block_reason = "max_layers_reached"
-            elif account_weight >= float(runner.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT) or GOVERNANCE_MAX_POSITION_WEIGHT):
+            elif account_weight >= _active_single_position_cap(runner):
                 add_block_reason = "single_name_account_cap"
             else:
                 gap_index = min(max(buy_count - 1, 0), len(add_gaps) - 1)
@@ -1123,18 +1172,7 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             data.at[idx, "entry_block_reason"] = "cooldown_active"
 
         layer_index = min(max(next_layer - 1, 0), len(layer_weights) - 1)
-        position_cap = (
-            float(
-                runner.capital_profile.get(
-                    "retail_single_position_cap",
-                    GOVERNANCE_MAX_POSITION_WEIGHT,
-                )
-                or GOVERNANCE_MAX_POSITION_WEIGHT
-            )
-            if str(getattr(runner, "governance_control_mode", "")).strip().lower()
-            == "aggressive_profit"
-            else float(GOVERNANCE_MAX_POSITION_WEIGHT)
-        )
+        position_cap = _active_single_position_cap(runner)
         add_budget = (
             float(layer_weights[layer_index]) * position_cap
             if add_allowed
@@ -1197,6 +1235,8 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             "loss_containment_confirmation_required": loss_confirmation_required,
             "loss_containment_confirmed": loss_containment_confirmed,
             "adaptive_loss_stop": scap_loss_stop if is_held else pd.NA,
+            "disaster_loss_stop": scap_disaster_stop if is_held else pd.NA,
+            "loss_stop_kind": loss_stop_kind if is_held else "",
             "hard_stop_net_mfe": net_mfe if is_held else pd.NA,
             "hard_stop_net_unrealized": net_unrealized if is_held else pd.NA,
             "hard_stop_giveback_from_net_peak": (
@@ -1362,7 +1402,7 @@ def apply_candidate_risk_penalty(
     )
     prospective_entry_weight = (price * minimum_buy_quantity * planned_lots) / nominal_nav
     projected_weight = account_weight + prospective_entry_weight
-    single_cap = float(runner.capital_profile.get("retail_single_position_cap", GOVERNANCE_MAX_POSITION_WEIGHT) or GOVERNANCE_MAX_POSITION_WEIGHT)
+    single_cap = _active_single_position_cap(runner)
     research_cap = float(GOVERNANCE_HIGH_EXPOSURE_MAX_TOP1_RISK_CONTRIBUTION)
     soft_cap = max(min(single_cap, research_cap), 1e-12)
     penalty = ((projected_weight / soft_cap) - 1.0).clip(lower=0.0, upper=2.0) * float(GOVERNANCE_RISK_CONTRIBUTION_SCORE_PENALTY)

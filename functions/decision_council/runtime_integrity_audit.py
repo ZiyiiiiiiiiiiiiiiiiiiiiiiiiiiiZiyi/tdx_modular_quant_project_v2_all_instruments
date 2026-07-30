@@ -17,6 +17,9 @@ def build_runtime_integrity_audit(
     holdings_ledger: pd.DataFrame | None = None,
     position_state_ledger: pd.DataFrame | None = None,
     max_positions: int | None = None,
+    action_proposal_ledger: pd.DataFrame | None = None,
+    action_plan_ledger: pd.DataFrame | None = None,
+    order_plan_ledger: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     rows = []
     trades = execution_ledger.copy() if execution_ledger is not None else pd.DataFrame()
@@ -116,7 +119,13 @@ def build_runtime_integrity_audit(
                 f"violation_days={int(violations.sum())}"
             ),
         ))
-    exposure_columns = {"date", "actual_exposure", "effective_target_exposure_cap"}
+    hard_cap_column = (
+        "hard_exposure_ceiling"
+        if daily_result is not None
+        and "hard_exposure_ceiling" in daily_result.columns
+        else "effective_target_exposure_cap"
+    )
+    exposure_columns = {"date", "actual_exposure", hard_cap_column}
     if daily.empty or not exposure_columns.issubset(daily.columns):
         rows.append(_row(
             "execution_exposure_authorization",
@@ -132,7 +141,7 @@ def build_runtime_integrity_audit(
         # decision. Compare them with that decision's executable cap. A small
         # absolute allowance covers overnight price gaps, not sizing mistakes.
         authorized = pd.to_numeric(
-            exposure_daily["effective_target_exposure_cap"],
+            exposure_daily[hard_cap_column],
             errors="coerce",
         ).shift(1)
         comparable = actual.notna() & authorized.notna()
@@ -179,6 +188,75 @@ def build_runtime_integrity_audit(
                 f"max_excess={float(excess[comparable].max()) if comparable.any() else 'missing'}, "
                 f"max_granularity_allowance={float(tolerance[comparable].max()) if comparable.any() else 'missing'}, "
                 f"base_overnight_gap_tolerance={base_tolerance}"
+            ),
+        ))
+    proposals = (
+        action_proposal_ledger.copy()
+        if action_proposal_ledger is not None
+        else pd.DataFrame()
+    )
+    plans = (
+        action_plan_ledger.copy()
+        if action_plan_ledger is not None
+        else pd.DataFrame()
+    )
+    if proposals.empty and plans.empty:
+        rows.append(_row("action_lineage_contract", True, "no Lean action rows"))
+    elif proposals.empty or plans.empty:
+        rows.append(_row(
+            "action_lineage_contract",
+            False,
+            "proposal or plan ledger missing",
+        ))
+    else:
+        selected = proposals[
+            proposals.get(
+                "selected_by_plan",
+                pd.Series(False, index=proposals.index),
+            ).fillna(False).astype(bool)
+        ].copy()
+        selected_ids = set(selected["proposal_id"].astype(str))
+        order_plans = (
+            order_plan_ledger.copy()
+            if order_plan_ledger is not None
+            else trades
+        )
+        order_ids = set(
+            order_plans.get(
+                "action_proposal_id",
+                pd.Series(dtype=str),
+            ).dropna().astype(str)
+        )
+        order_ids.discard("")
+        selected_without_order = selected_ids - order_ids
+        filled_ids = set()
+        if not trades.empty:
+            filled_mask = trades.get(
+                "execution_status",
+                pd.Series("", index=trades.index),
+            ).fillna("").astype(str).str.lower().eq("filled")
+            filled_ids = set(
+                trades.loc[filled_mask].get(
+                    "action_proposal_id",
+                    pd.Series(dtype=str),
+                ).dropna().astype(str)
+            )
+            filled_ids.discard("")
+        filled_without_selection = filled_ids - selected_ids
+        plan_counts = plans.groupby("decision_id").size()
+        duplicate_plan_decisions = int(plan_counts.gt(1).sum())
+        rows.append(_row(
+            "action_lineage_contract",
+            bool(
+                not selected_without_order
+                and not filled_without_selection
+                and duplicate_plan_decisions == 0
+            ),
+            (
+                f"proposals={len(proposals)}, selected={len(selected)}, "
+                f"selected_without_order={len(selected_without_order)}, "
+                f"filled_without_selection={len(filled_without_selection)}, "
+                f"duplicate_plan_decisions={duplicate_plan_decisions}"
             ),
         ))
     holdings = holdings_ledger.copy() if holdings_ledger is not None else pd.DataFrame()

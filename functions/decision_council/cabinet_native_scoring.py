@@ -25,6 +25,8 @@ def attach_cabinet_native_scores(
     strict_weight: float = 1.0,
     timing_weight: float = 0.0,
     max_family_share: float = 0.25,
+    empirical_cluster_threshold: float = 0.90,
+    empirical_cluster_min_observations: int = 30,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Attach role scores without allowing factor-count or missingness inflation."""
     if candidates is None or candidates.empty:
@@ -52,20 +54,36 @@ def attach_cabinet_native_scores(
     evidence["primary_role"] = evidence["model_name"].map(lambda name: contracts[name].primary_role)
     evidence["economic_family"] = evidence["model_name"].map(lambda name: contracts[name].economic_family)
     evidence["near_relative_key"] = evidence["model_name"].map(lambda name: contracts[name].near_relative_key)
+    evidence["empirical_cluster_key"] = evidence["model_name"].map(
+        _empirical_cluster_map(
+            evidence,
+            threshold=float(empirical_cluster_threshold),
+            min_observations=int(empirical_cluster_min_observations),
+        )
+    )
 
     relative = (
         evidence.groupby(
-            ["symbol", "primary_role", "economic_family", "near_relative_key"],
+            ["symbol", "primary_role", "empirical_cluster_key"],
             sort=False,
             dropna=False,
-        )["factor_score"]
-        .median()
-        .rename("relative_score")
+        )
+        .agg(
+            relative_score=("factor_score", "median"),
+            economic_family=("economic_family", lambda values: sorted(map(str, values))[0]),
+            semantic_relative_count=("near_relative_key", "nunique"),
+            factor_count=("model_name", "nunique"),
+        )
         .reset_index()
     )
     family = (
         relative.groupby(["symbol", "primary_role", "economic_family"], sort=False, dropna=False)
-        .agg(family_score=("relative_score", "median"), relative_count=("near_relative_key", "nunique"))
+        .agg(
+            family_score=("relative_score", "median"),
+            relative_count=("empirical_cluster_key", "nunique"),
+            empirical_cluster_count=("empirical_cluster_key", "nunique"),
+            raw_factor_count=("factor_count", "sum"),
+        )
         .reset_index()
     )
     configured_families: dict[str, set[str]] = {}
@@ -158,11 +176,85 @@ def attach_cabinet_native_scores(
     output["cabinet_native_final_score"] = (
         output["cabinet_base_entry_score"] + timing_adjustment - liquidity_penalty
     ).clip(0.0, 1.0)
+    output["cabinet_raw_factor_count"] = int(evidence["model_name"].nunique())
+    output["cabinet_empirical_cluster_count"] = int(
+        evidence["empirical_cluster_key"].nunique()
+    )
+    output["cabinet_empirical_compression_ratio"] = (
+        float(output["cabinet_empirical_cluster_count"].iloc[0])
+        / max(float(output["cabinet_raw_factor_count"].iloc[0]), 1.0)
+    )
     output["primary_score"] = output["cabinet_native_final_score"]
-    output["score_authority"] = "cabinet_native_family_balanced_v1"
+    output["score_authority"] = "cabinet_native_empirical_cluster_family_balanced_v2"
     output = output.sort_values(["primary_score", "symbol"], ascending=[False, True])
     output["candidate_rank"] = range(1, len(output) + 1)
     return output, family
+
+
+def _empirical_cluster_map(
+    evidence: pd.DataFrame,
+    *,
+    threshold: float,
+    min_observations: int,
+) -> dict[str, str]:
+    """Create same-snapshot, no-forward empirical clusters within each role.
+
+    Semantic near relatives are always joined.  Additional joins require a
+    sufficiently observed absolute Spearman correlation.  This prevents a
+    large set of numerically duplicated factors from receiving repeated votes
+    while keeping the operation point-in-time.
+    """
+    models = sorted(evidence["model_name"].astype(str).unique().tolist())
+    parent = {model: model for model in models}
+
+    def find(model: str) -> str:
+        while parent[model] != model:
+            parent[model] = parent[parent[model]]
+            model = parent[model]
+        return model
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        first, second = sorted((left_root, right_root))
+        parent[second] = first
+
+    semantic = (
+        evidence[["model_name", "primary_role", "near_relative_key"]]
+        .drop_duplicates()
+        .sort_values(["primary_role", "near_relative_key", "model_name"])
+    )
+    for _, group in semantic.groupby(
+        ["primary_role", "near_relative_key"], sort=False, dropna=False
+    ):
+        members = group["model_name"].astype(str).tolist()
+        for member in members[1:]:
+            union(members[0], member)
+
+    minimum = max(int(min_observations), 3)
+    cutoff = min(max(float(threshold), 0.0), 1.0)
+    for _, role_evidence in evidence.groupby("primary_role", sort=False):
+        pivot = role_evidence.pivot_table(
+            index="symbol",
+            columns="model_name",
+            values="factor_score",
+            aggfunc="median",
+        )
+        if pivot.shape[0] < minimum or pivot.shape[1] < 2:
+            continue
+        corr = pivot.corr(method="spearman", min_periods=minimum).abs()
+        role_models = sorted(map(str, corr.columns))
+        for left_index, left in enumerate(role_models):
+            for right in role_models[left_index + 1 :]:
+                value = corr.at[left, right]
+                if pd.notna(value) and float(value) >= cutoff:
+                    union(left, right)
+
+    return {
+        model: f"empirical:{find(model)}"
+        for model in models
+    }
 
 
 def _safe_family_column(value: object) -> str:

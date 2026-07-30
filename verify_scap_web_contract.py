@@ -27,3 +27,10 @@ for required in (
 ):
     assert required in sources, required
 print("[PASS] SCAP Web identity/funnel/reason contract")
+
+launcher = (root / "main_launcher_web.py").read_text(encoding="utf-8")
+assert 'id="active_replacement_enabled" disabled' in launcher
+assert 'id="active_replacement_enabled" checked disabled' not in launcher
+assert "关闭主动换仓与亏损摊平" in launcher
+assert "仅允许通过统一动作仲裁的赢家加仓" in launcher
+print("[PASS] SCAP-V3.2 launcher reflects replacement/add-on product contract")
