@@ -1375,6 +1375,9 @@ def build_governance_summary(
                 "valid_invested_capital_return": valid_invested_capital_return,
                 "holding_portfolio_return": holding_portfolio_return,
                 "benchmark_total_return": benchmark_total_return,
+                "benchmark_return_method": (
+                    "geometric_chain_linked_net_value"
+                ),
                 "benchmark_excess_return": benchmark_excess_return,
                 "invested_excess_return": invested_excess_return,
                 "valid_invested_excess_return": valid_invested_excess_return,
@@ -1474,6 +1477,12 @@ def build_governance_summary(
                 "top1_sleeve_weight": float(pd.to_numeric(data.get("top1_sleeve_weight", data.get("top1_weight", pd.Series(dtype=float))), errors="coerce").mean()),
                 "top5_sleeve_weight_sum": float(pd.to_numeric(data.get("top5_sleeve_weight_sum", data.get("top5_weight_sum", pd.Series(dtype=float))), errors="coerce").mean()),
                 "sleeve_effective_n": float(pd.to_numeric(data.get("sleeve_effective_n", data.get("effective_n", pd.Series(dtype=float))), errors="coerce").mean()),
+                "top20pct_sleeve_weight_sum": float(pd.to_numeric(data.get("top20pct_sleeve_weight_sum", pd.Series(dtype=float)), errors="coerce").mean()),
+                "sleeve_effective_n_ratio": float(pd.to_numeric(data.get("sleeve_effective_n_ratio", pd.Series(dtype=float)), errors="coerce").mean()),
+                "sleeve_weight_hhi": float(pd.to_numeric(data.get("sleeve_weight_hhi", pd.Series(dtype=float)), errors="coerce").mean()),
+                "top20pct_risk_contribution_sum": float(pd.to_numeric(data.get("top20pct_risk_contribution_sum", pd.Series(dtype=float)), errors="coerce").mean()),
+                "risk_effective_n_ratio": float(pd.to_numeric(data.get("risk_effective_n_ratio", pd.Series(dtype=float)), errors="coerce").mean()),
+                "risk_contribution_hhi": float(pd.to_numeric(data.get("risk_contribution_hhi", pd.Series(dtype=float)), errors="coerce").mean()),
                 "top1_weight": float(pd.to_numeric(data.get("top1_weight", pd.Series(dtype=float)), errors="coerce").mean()),
                 "top5_weight_sum": float(pd.to_numeric(data.get("top5_weight_sum", pd.Series(dtype=float)), errors="coerce").mean()),
                 "effective_n": float(pd.to_numeric(data.get("effective_n", pd.Series(dtype=float)), errors="coerce").mean()),

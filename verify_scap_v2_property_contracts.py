@@ -1,6 +1,8 @@
 """Property tests for SCAP-V2 unit and authority contracts."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pandas as pd
 
 from functions.decision_council.mainline_v3 import apply_mainline_v3_entry_policy
@@ -270,6 +272,76 @@ reordered = optimize_action_proposals(
 )
 assert set(reordered.selected_proposal_ids) == set(plan.selected_proposal_ids)
 _pass("candidate row order does not change the ActionPlan")
+
+exit_authorization = replace(
+    authorization,
+    decision_id="d_exit",
+    current_cash_amount=1_000.0,
+    cash_buffer_amount=0.0,
+)
+exit_proposal = ActionProposal(
+    proposal_id="exit_A",
+    decision_id="d_exit",
+    symbol="A",
+    action_type="hard_exit",
+    source_module="lifecycle",
+    requested_lots=1,
+    baseline_action="hold_position",
+    horizon_sessions=10,
+    expected_net_profit_amount=0.0,
+    robust_net_profit_amount=0.0,
+    downside_cvar_amount=0.0,
+    exact_cost_amount=100.0,
+    funding_cash_amount=0.0,
+    cash_release_amount=5_900.0,
+    exposure_delta=-0.30,
+    must_execute=True,
+)
+exit_plan = optimize_action_proposals(
+    (exit_proposal,),
+    authorization=exit_authorization,
+    current_lots_by_symbol={"A": 1},
+    current_weights_by_symbol={"A": 0.30},
+    current_exposure=0.30,
+)
+assert exit_plan.projected_cash == 6_900.0
+assert exit_plan.target_lots_by_symbol["A"] == 0
+_pass("selected exits release net sale cash into the ActionPlan")
+
+risk_proposal = replace(
+    proposals[0],
+    proposal_id="risk_A",
+    decision_id="d_risk",
+    exposure_delta=0.20,
+    expected_net_profit_amount=1_000.0,
+    robust_net_profit_amount=1_000.0,
+)
+risk_base = replace(
+    authorization,
+    decision_id="d_risk",
+    current_cash_amount=10_000.0,
+    cash_buffer_amount=0.0,
+    risk_horizon_sessions=1,
+)
+covariance = pd.DataFrame([[0.0004]], index=["A"], columns=["A"])
+risk_1d = optimize_action_proposals(
+    (risk_proposal,),
+    authorization=risk_base,
+    covariance_matrix=covariance,
+    covariance_risk_aversion=1.0,
+)
+risk_4d = optimize_action_proposals(
+    (risk_proposal,),
+    authorization=replace(risk_base, risk_horizon_sessions=4),
+    covariance_matrix=covariance,
+    covariance_risk_aversion=1.0,
+)
+assert abs(
+    risk_4d.marginal_risk_penalty_amount
+    - 2.0 * risk_1d.marginal_risk_penalty_amount
+) < 1e-9
+assert risk_4d.risk_model_used == "covariance"
+_pass("daily covariance risk scales by square-root of forecast horizon")
 
 cash_ledger = CashReservationLedger(cash_amount=10_000.0, minimum_buffer=2_000.0)
 cash_ledger.reserve("ordinary", 3_000.0)

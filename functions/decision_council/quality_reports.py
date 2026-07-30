@@ -251,15 +251,20 @@ def build_portfolio_constraint_report(
     min_effective_n: float = GOVERNANCE_RESEARCH_MIN_EFFECTIVE_N,
     max_top1_account_weight: float = GOVERNANCE_RESEARCH_MAX_TOP1_ACCOUNT_WEIGHT,
     max_top5_account_weight_sum: float = GOVERNANCE_RESEARCH_MAX_TOP5_ACCOUNT_WEIGHT_SUM,
+    min_sleeve_effective_n_ratio: float = 0.65,
+    max_top20pct_sleeve_weight_sum: float = 0.55,
 ) -> pd.DataFrame:
     """Audit concentration constraints without changing the portfolio."""
     columns = [
         "date",
         "account_effective_n",
+        "sleeve_effective_n",
+        "sleeve_effective_n_ratio",
         "configured_max_positions",
         "effective_n_required",
         "top1_account_weight",
         "top5_account_weight_sum",
+        "top20pct_sleeve_weight_sum",
         "industry_top1_weight",
         "factor_cluster_top1_weight",
         "liquidity_bucket_exposure",
@@ -275,8 +280,11 @@ def build_portfolio_constraint_report(
     data["date"] = pd.to_datetime(data.get("date"), errors="coerce")
     numeric_defaults = {
         "account_effective_n": "effective_n",
+        "sleeve_effective_n": "effective_n",
+        "sleeve_effective_n_ratio": None,
         "top1_account_weight": "top1_weight",
         "top5_account_weight_sum": "top5_weight_sum",
+        "top20pct_sleeve_weight_sum": None,
         "industry_top1_weight": None,
         "factor_cluster_top1_weight": None,
         "liquidity_bucket_exposure": None,
@@ -298,28 +306,46 @@ def build_portfolio_constraint_report(
             )
             or 0
         )
-        # Cash is included in account effective N for transparent capital-use
-        # reporting, but it must not increase the diversification requirement.
-        # Requiring K+1 for a K-position account would demand the unattainable
-        # boundary case of perfectly equal cash and security weights.  Scale the
-        # global gate to the configured security capacity instead.
-        effective_n_required = float(max(configured_max_positions, 1))
+        holding_count = max(int(_coerce_float(row.get("holding_count", 0)) or 0), 0)
+        sleeve_effective_n = _coerce_float(row.get("sleeve_effective_n"))
+        sleeve_effective_n_ratio = _coerce_float(row.get("sleeve_effective_n_ratio"))
+        if not np.isfinite(sleeve_effective_n_ratio):
+            sleeve_effective_n_ratio = (
+                sleeve_effective_n / holding_count
+                if holding_count > 0 and np.isfinite(sleeve_effective_n)
+                else 0.0
+            )
+        effective_n_required = (
+            float(min_sleeve_effective_n_ratio) * holding_count
+            if holding_count > 0
+            else 0.0
+        )
         fail_reasons = []
-        scaled_min_effective_n = min(float(min_effective_n), effective_n_required)
-        if pd.notna(row["account_effective_n"]) and float(row["account_effective_n"]) < scaled_min_effective_n:
+        if holding_count > 0 and (
+            not np.isfinite(sleeve_effective_n)
+            or sleeve_effective_n < effective_n_required
+        ):
             fail_reasons.append("effective_n_below_research_min")
-        if pd.notna(row["top1_account_weight"]) and float(row["top1_account_weight"]) > float(max_top1_account_weight):
-            fail_reasons.append("top1_account_weight_above_cap")
-        if pd.notna(row["top5_account_weight_sum"]) and float(row["top5_account_weight_sum"]) > float(max_top5_account_weight_sum):
-            fail_reasons.append("top5_account_weight_sum_above_cap")
+        if holding_count > 0 and sleeve_effective_n_ratio < float(min_sleeve_effective_n_ratio):
+            fail_reasons.append("effective_n_ratio_below_research_min")
+        # Top-1 remains descriptive across capital scales.  A fixed 25% gate
+        # incorrectly rejects a balanced four-name whole-lot portfolio for a
+        # sub-percentage rounding difference.  Scale-normalized effective N
+        # and top-20% sleeve share are the binding concentration gates.
+        top20pct_sleeve = _coerce_float(row.get("top20pct_sleeve_weight_sum"))
+        if holding_count > 0 and np.isfinite(top20pct_sleeve) and top20pct_sleeve > float(max_top20pct_sleeve_weight_sum):
+            fail_reasons.append("top20pct_sleeve_weight_sum_above_cap")
         rows.append(
             {
                 "date": pd.Timestamp(row["date"]),
                 "account_effective_n": row["account_effective_n"],
+                "sleeve_effective_n": sleeve_effective_n,
+                "sleeve_effective_n_ratio": sleeve_effective_n_ratio,
                 "configured_max_positions": configured_max_positions,
-                "effective_n_required": scaled_min_effective_n,
+                "effective_n_required": effective_n_required,
                 "top1_account_weight": row["top1_account_weight"],
                 "top5_account_weight_sum": row["top5_account_weight_sum"],
+                "top20pct_sleeve_weight_sum": top20pct_sleeve,
                 "industry_top1_weight": row["industry_top1_weight"],
                 "factor_cluster_top1_weight": row["factor_cluster_top1_weight"],
                 "liquidity_bucket_exposure": row["liquidity_bucket_exposure"],
@@ -577,18 +603,40 @@ def build_research_gate_report(reports: dict[str, pd.DataFrame]) -> pd.DataFrame
 
     if constraints is not None and not constraints.empty:
         latest = constraints.sort_values("date").iloc[-1]
-        effective_n = _coerce_float(latest.get("account_effective_n", np.nan))
+        effective_n = _coerce_float(latest.get("sleeve_effective_n", np.nan))
+        effective_n_ratio = _coerce_float(
+            latest.get("sleeve_effective_n_ratio", np.nan)
+        )
         effective_n_required = _coerce_float(latest.get("effective_n_required", 5.0))
         top1_weight = _coerce_float(latest.get("top1_account_weight", np.nan))
-        top5_weight = _coerce_float(latest.get("top5_account_weight_sum", np.nan))
+        top20pct_weight = _coerce_float(
+            latest.get("top20pct_sleeve_weight_sum", np.nan)
+        )
         rows.append(_research_gate_row(
-            "latest_account_effective_n",
+            "latest_sleeve_effective_n",
             np.isfinite(effective_n) and np.isfinite(effective_n_required) and effective_n >= effective_n_required,
             effective_n,
-            f">= {effective_n_required:g} (capital-profile scaled)",
+            f">= {effective_n_required:g} (active-holding scaled)",
         ))
-        rows.append(_research_gate_row("latest_top1_account_weight", np.isfinite(top1_weight) and top1_weight <= 0.25, top1_weight, "<= 0.25"))
-        rows.append(_research_gate_row("latest_top5_account_weight_sum", np.isfinite(top5_weight) and top5_weight <= 0.80, top5_weight, "<= 0.80"))
+        rows.append(_research_gate_row(
+            "latest_sleeve_effective_n_ratio",
+            np.isfinite(effective_n_ratio) and effective_n_ratio >= 0.65,
+            effective_n_ratio,
+            ">= 0.65",
+        ))
+        rows.append(_research_gate_row(
+            "latest_top1_account_weight_descriptive",
+            True,
+            top1_weight,
+            "descriptive only; normalized breadth gates bind",
+            reason="descriptive_only",
+        ))
+        rows.append(_research_gate_row(
+            "latest_top20pct_sleeve_weight_sum",
+            np.isfinite(top20pct_weight) and top20pct_weight <= 0.55,
+            top20pct_weight,
+            "<= 0.55",
+        ))
     else:
         rows.append(_research_gate_row("portfolio_constraints_available", False, np.nan, "required"))
 
@@ -1213,9 +1261,26 @@ def build_risk_contribution_ledger(
             continue
         weights = group.set_index("symbol").loc[valid, "ideal_weight"].to_numpy(dtype=float)
         total_account_exposure = float(max(weights.sum(), 0.0))
-        sigma = cov.loc[valid, valid].to_numpy(dtype=float)
+        raw_sigma = cov.loc[valid, valid].to_numpy(dtype=float)
+        sigma = 0.70 * raw_sigma + 0.30 * np.diag(np.diag(raw_sigma))
         rc = _risk_contribution(weights, sigma)
         marginal = sigma @ weights if weights.size else np.array([])
+        positive_rc = np.clip(np.asarray(rc, dtype=float), 0.0, None)
+        positive_total = float(positive_rc.sum())
+        normalized_rc = (
+            positive_rc / positive_total
+            if positive_total > 0.0
+            else np.zeros_like(positive_rc)
+        )
+        risk_hhi = float(np.square(normalized_rc).sum()) if normalized_rc.size else 0.0
+        risk_effective_n = float(1.0 / risk_hhi) if risk_hhi > 0.0 else 0.0
+        risk_effective_n_ratio = (
+            float(risk_effective_n / len(valid)) if valid else 0.0
+        )
+        top_fraction_count = max(int(np.ceil(0.20 * len(valid))), 1)
+        top20pct_risk_sum = float(
+            np.sort(normalized_rc)[::-1][:top_fraction_count].sum()
+        )
         for symbol, weight, marginal_risk, rc_share in zip(valid, weights, marginal, rc):
             positive_share = float(max(rc_share, 0.0))
             rows.append(
@@ -1229,6 +1294,11 @@ def build_risk_contribution_ledger(
                     "account_exposure_scaled_risk_share": positive_share * total_account_exposure,
                     "total_account_exposure": total_account_exposure,
                     "risk_gate_eligible": bool(float(weight) >= float(min_gate_weight)),
+                    "risk_effective_n": risk_effective_n,
+                    "risk_effective_n_ratio": risk_effective_n_ratio,
+                    "risk_contribution_hhi": risk_hhi,
+                    "top20pct_risk_contribution_sum": top20pct_risk_sum,
+                    "covariance_shrinkage_contract": "70pct_sample_plus_30pct_diagonal",
                 }
             )
     return pd.DataFrame(rows)

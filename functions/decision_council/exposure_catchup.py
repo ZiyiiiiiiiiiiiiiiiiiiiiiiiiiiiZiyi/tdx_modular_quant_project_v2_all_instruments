@@ -32,6 +32,7 @@ class ExposureCatchupDecision:
     qualified_entry_count: int
     catchup_tier: str = "none"
     accuracy_multiplier: float = 0.0
+    catchup_gap_trigger: float = 0.0
 
 
 def decide_exposure_catchup(
@@ -46,8 +47,11 @@ def decide_exposure_catchup(
     trailing_buy_accuracy_5d: float | None = None,
     risk_contribution_gate_pass: bool = True,
     top5_risk_contribution_sum: float = 0.0,
+    top20pct_risk_contribution_sum: float = 0.0,
+    risk_effective_n_ratio: float = 1.0,
     risk_symbol_count: int = 999,
     hard_risk_gate_enabled: bool = False,
+    representative_one_lot_weight: float | None = None,
 ) -> ExposureCatchupDecision:
     """Decide whether and how much extra buy budget can pursue target exposure."""
     actual = max(float(actual_exposure), 0.0)
@@ -59,13 +63,24 @@ def decide_exposure_catchup(
     extra_budget = _extra_turnover_budget(risk)
     tier, tier_multiplier = _catchup_tier(int(qualified_entry_count))
     accuracy_multiplier = _accuracy_multiplier(trailing_buy_accuracy_5d)
+    configured_gap_trigger = float(GOVERNANCE_CATCHUP_GAP_TRIGGER)
+    if (
+        representative_one_lot_weight is not None
+        and float(representative_one_lot_weight) > 0.0
+    ):
+        adaptive_gap_trigger = min(
+            configured_gap_trigger,
+            max(float(representative_one_lot_weight), 0.01),
+        )
+    else:
+        adaptive_gap_trigger = configured_gap_trigger
 
     block_reason = "allowed"
     if not ENABLE_GOVERNANCE_EXPOSURE_CATCHUP:
         block_reason = "disabled"
     elif transition_only:
         block_reason = "transition_only"
-    elif gap < float(GOVERNANCE_CATCHUP_GAP_TRIGGER):
+    elif gap < adaptive_gap_trigger:
         block_reason = "gap_below_trigger"
     elif risk not in {"normal", "warning"}:
         block_reason = "risk_level_blocks_catchup"
@@ -75,8 +90,11 @@ def decide_exposure_catchup(
         block_reason = "insufficient_confirmed_entries"
     elif bool(hard_risk_gate_enabled) and not bool(risk_contribution_gate_pass):
         block_reason = "risk_contribution_gate_blocks_catchup"
-    elif bool(hard_risk_gate_enabled) and float(top5_risk_contribution_sum) > 0.80 and int(risk_symbol_count) < 8:
-        block_reason = "top5_risk_contribution_blocks_catchup"
+    elif bool(hard_risk_gate_enabled) and (
+        float(top20pct_risk_contribution_sum) > 0.55
+        or float(risk_effective_n_ratio) < 0.55
+    ):
+        block_reason = "scale_normalized_risk_contribution_blocks_catchup"
     elif rate <= 0.0:
         block_reason = "zero_catchup_rate"
 
@@ -99,6 +117,7 @@ def decide_exposure_catchup(
         qualified_entry_count=int(qualified_entry_count),
         catchup_tier=tier if allowed else "none",
         accuracy_multiplier=accuracy_multiplier if allowed else 0.0,
+        catchup_gap_trigger=float(adaptive_gap_trigger),
     )
 
 

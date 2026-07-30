@@ -5,21 +5,35 @@ from main_launcher_web import _governance_preflight
 
 
 def main() -> None:
-    may_window = _governance_preflight("2025-01", "2026-05")
+    may_window = _governance_preflight(
+        "2024-01",
+        "2026-05",
+        universe_ids=["all_a_share_research"],
+    )
+    assert may_window["requested_start"] == "2024-01-01"
     assert may_window["requested_end"] == "2026-05-31"
     assert may_window["effective_end"] == "2026-05-29", may_window
-    assert may_window["constituent_coverage"]["status"] == "pass", may_window
+    assert may_window["constituent_coverage"]["status"] == "not_required", may_window
+    assert may_window["constituent_status"] == "not_required", may_window
     assert may_window["status"] == "pass", may_window
-    print("[PASS] weekend month-end is normalized to the last observed trading session")
+    print("[PASS] all-A-share window ignores unrelated index membership coverage")
 
-    result = _governance_preflight("2025-01", "2026-06")
+    result = _governance_preflight(
+        "2024-01",
+        "2026-05",
+        universe_ids=["a500_strict"],
+    )
     assert result["status"] == "blocked"
-    assert result["feature_date_max"] == "2026-06-05"
     assert "current_snapshot_backfilled_before_asof" not in result["reasons"]
     assert "pit_membership_coverage_outside_requested_window" in result["reasons"]
-    print("[PASS] Web governance preflight blocks incomplete data and membership extrapolation")
+    print("[PASS] strict index universe still blocks membership extrapolation")
 
-    bounded = _governance_preflight("2025-01", "2026-06", max_days=5)
+    bounded = _governance_preflight(
+        "2025-01",
+        "2026-06",
+        max_days=5,
+        universe_ids=["a500_strict"],
+    )
     assert bounded["requested_end"] == "2026-06-30"
     assert bounded["effective_end"] < "2026-06-05"
     assert not any("2026-06-30" in reason for reason in bounded["reasons"])

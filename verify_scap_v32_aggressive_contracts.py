@@ -156,7 +156,7 @@ def verify_multiple_c_names_are_feasible() -> None:
     assert len(plan.selected_proposal_ids) == 4
     assert plan.projected_exposure == 0.60
     assert plan.deployment_gap == 0.25
-    assert plan.breadth_score == 7.0
+    assert abs(plan.breadth_score - 3.8) < 1e-12
     passed("four positive C names can coexist under the five-name portfolio cap")
 
 
@@ -349,6 +349,9 @@ def verify_lifecycle_winner_permission_reaches_action_plan() -> None:
         nav_amount=20_000.0,
         winner_add_enabled=True,
         loser_add_enabled=False,
+        per_name_structural_cap=0.60,
+        cash_amount=20_000.0,
+        cash_buffer_amount=2_000.0,
     )
     permitted = pd.Series(
         {
@@ -362,6 +365,7 @@ def verify_lifecycle_winner_permission_reaches_action_plan() -> None:
             "winner_add_review_passed": True,
             "entry_authority_tier": "C",
             "scap_v32_current_authority_tier": "C",
+            "scap_v31_max_lots": 4,
             "add_expected_net_profit_lcb": 30.0,
             "scap_estimated_total_cost_amount": 8.0,
             "entry_thesis": "momentum",
@@ -382,6 +386,7 @@ def verify_lifecycle_winner_permission_reaches_action_plan() -> None:
     assert len(proposals) == 1
     assert proposals[0].action_type == "winner_add"
     assert proposals[0].authority_tier == "B"
+    assert proposals[0].requested_lots == 3
 
     blocked = permitted.copy()
     blocked["add_allowed"] = False

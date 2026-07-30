@@ -207,6 +207,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "initial_cash": float(BACKTEST_INITIAL_CASH),
         "min_cash_buffer": 0.0,
         "max_positions": None,
+        "position_cap_mode": "auto",
+        "scap_search_position_cap": 40,
         "affordability_first": False,
         "skip_unaffordable_symbols": False,
         "notes": "Legacy baseline profile. Uses the existing strategy target breadth.",
@@ -216,6 +218,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "initial_cash": 10_000_000.0,
         "min_cash_buffer": 0.0,
         "max_positions": None,
+        "position_cap_mode": "auto",
+        "scap_search_position_cap": 60,
         "affordability_first": False,
         "skip_unaffordable_symbols": False,
         "notes": "Large-account comparison profile for high-capacity research.",
@@ -225,6 +229,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "initial_cash": 20_000.0,
         "min_cash_buffer": 500.0,
         "max_positions": 5,
+        "position_cap_mode": "fixed",
+        "scap_search_position_cap": 16,
         "affordability_first": True,
         "skip_unaffordable_symbols": True,
         "notes": "Small-account profile with lot-size and cash-buffer discipline.",
@@ -234,6 +240,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "initial_cash": 20_000.0,
         "min_cash_buffer": 2_000.0,
         "max_positions": 5,
+        "position_cap_mode": "fixed",
+        "scap_search_position_cap": 16,
         "affordability_first": True,
         "skip_unaffordable_symbols": True,
         "retail_lot_adapter": True,
@@ -284,6 +292,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "initial_cash": 20_000.0,
         "min_cash_buffer": 1_000.0,
         "max_positions": 5,
+        "position_cap_mode": "fixed",
+        "scap_search_position_cap": 32,
         "soft_target_positions": 4,
         "affordability_first": True,
         "skip_unaffordable_symbols": True,
@@ -312,6 +322,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_loss_stop_mode": "adaptive_volatility_or_disaster_floor",
         "scap_loss_stop_volatility_multiple": 2.50,
         "scap_loss_stop_confirmation_days": 2,
+        "scap_loss_soft_base": -0.16,
+        "scap_loss_tail_tightening": 0.04,
         "scap_profit_protection_arm": 0.12,
         "scap_profit_protection_min_net_profit": 0.03,
         "scap_profit_protection_giveback": 0.55,
@@ -410,6 +422,12 @@ def get_backtest_capital_profile(
     profile["min_cash_buffer"] = float(profile.get("min_cash_buffer", 0.0) or 0.0)
     max_positions = profile.get("max_positions")
     profile["max_positions"] = None if max_positions in (None, "", 0) else int(max_positions)
+    profile["position_cap_mode"] = str(
+        profile.get(
+            "position_cap_mode",
+            "fixed" if profile["max_positions"] is not None else "auto",
+        )
+    ).strip().lower()
     profile["affordability_first"] = bool(profile.get("affordability_first", False))
     profile["skip_unaffordable_symbols"] = bool(profile.get("skip_unaffordable_symbols", False))
     profile["retail_lot_adapter"] = bool(profile.get("retail_lot_adapter", False))
@@ -436,9 +454,11 @@ def get_backtest_capital_profile(
     if max_positions_override != "__profile_default__":
         if max_positions_override in (None, "", 0, "0"):
             profile["max_positions"] = None
-            override_parts.append("posall")
+            profile["position_cap_mode"] = "auto"
+            override_parts.append("posauto")
         else:
             profile["max_positions"] = int(max_positions_override)
+            profile["position_cap_mode"] = "fixed"
             if profile["max_positions"] <= 0:
                 raise ValueError("Backtest max positions must be positive or blank/0 for unlimited")
             override_parts.append(f"pos{profile['max_positions']}")

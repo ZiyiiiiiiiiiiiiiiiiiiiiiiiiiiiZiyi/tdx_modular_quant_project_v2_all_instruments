@@ -96,6 +96,10 @@ class PhaseOneDecisionCouncilEngine:
         forecast_kappa: float = 0.50,
         soft_target_positions: int = 4,
         execution_cost_profile: dict | None = None,
+        desired_exposure_target: float | None = None,
+        hard_exposure_ceiling: float | None = None,
+        confirmed_derisk_target: float | None = None,
+        current_lots_by_symbol: dict[str, int] | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         decision_date = pd.Timestamp(decision_date)
         if decision_date not in self.safety_signals.index:
@@ -149,14 +153,33 @@ class PhaseOneDecisionCouncilEngine:
             forecast_kappa=max(float(forecast_kappa), 0.0),
             soft_target_positions=max(int(soft_target_positions), 0),
             execution_cost_profile=dict(execution_cost_profile or {}),
+            desired_exposure_target=desired_exposure_target,
+            hard_exposure_ceiling=hard_exposure_ceiling,
+            confirmed_derisk_target=confirmed_derisk_target,
+            current_lots_by_symbol=dict(current_lots_by_symbol or {}),
         )
         ideal, orders, diagnostics = self.policy.decide(context)
         diagnostics["raw_safety_exposure_cap"] = raw_safety_exposure_cap
         diagnostics["effective_target_exposure_cap"] = float(safety.exposure_cap)
+        ledger_diagnostics = {
+            key: value
+            for key, value in diagnostics.items()
+            if not str(key).startswith("_")
+        }
         self.ledgers.append("ideal_portfolio_plan", ideal)
         self.ledgers.append("executable_order_plan", orders)
-        self.ledgers.append("safety_decision_ledger", {**safety.__dict__, **diagnostics})
-        self.ledgers.append("constraint_allocation_ledger", {"decision_id": decision_id, "date": decision_date, **diagnostics})
+        self.ledgers.append(
+            "safety_decision_ledger",
+            {**safety.__dict__, **ledger_diagnostics},
+        )
+        self.ledgers.append(
+            "constraint_allocation_ledger",
+            {
+                "decision_id": decision_id,
+                "date": decision_date,
+                **ledger_diagnostics,
+            },
+        )
         return ideal, orders, diagnostics
 
     def save(self, output_dir=GOVERNANCE_OUTPUT_DIR) -> dict[str, Path]:
