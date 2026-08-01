@@ -1934,11 +1934,16 @@
 - 提交范围：纳入当前29个已跟踪代码/WBS/验证文件、8个新增根目录`verify_*.py`专项脚本，以及4份正式SCAP数学、审计与改进方案Markdown报告；排除`reports/`下冒烟目录、CSV、GIF、stdout/stderr、JSON及其他临时运行产物，避免把不可控生成物带入主干。
 - 上下游影响链：配置与Web输入 -> 市场状态/退出反事实/动态容量/整数ActionPlan -> 订单与账本 -> NAV/质量报告/运行完整性 -> Web与验收脚本 -> Git分支、PR与主干。发布前需复核差异、执行`py_compile`、新增专项验证及关键跨模块回归；任何失败均不得伪报通过。
 - 计划发布流程：显式暂存确认范围，记录暂存清单与验证证据；提交并推送`取消上线`；创建面向`main`的PR，复核head/base和GitHub状态后合并；同步本地`main`，最后补录提交、PR、merge commit和远端一致性证据。
-- 当前状态：`release_process_in_progress`；正式上线门保持`blocked`。验证结果、提交哈希、PR编号和合并结果待本条后续补录。
+- 发布准备状态：`release_process_in_progress`；正式上线门保持`blocked`。以下条目补录验证、提交、PR与合并证据。
 - 发布前静态验证：指定解释器`C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe`为Python 3.10.19；`git diff --check`退出0；对29个已修改Python文件与8个新增专项脚本去重后共36个文件执行`py_compile`，全部退出0。
 - 变更专项验证：`verify_action_counterfactual_reward.py`、`verify_capital_scaling_contract.py`、`verify_scalable_optimizer_contract.py`、`verify_scap_profit_objective_audit.py`、`verify_scap_v2_property_contracts.py`、`verify_scap_v32_aggressive_contracts.py`、`verify_scap_v3_lean_chain.py`、`verify_web_v3_initialization.py`、`verify_dynamic_position_report_contract.py`、`verify_market_regime_pit_breadth_contract.py`、`verify_scap_20d_dynamic_regime_fullchain.py`、`verify_scap_benchmark_math_semantics.py`、`verify_scap_cash_cost_unit_contract.py`、`verify_scap_covariance_coverage_contract.py`、`verify_scap_integer_feasible_exposure.py`与`verify_scap_permission_fail_closed.py`共16项全部退出0。20日脚本首次无参数调用按设计返回usage/退出1，不属于实现失败；随后显式传入受控目录`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1800/v3/run20260731_205447`重跑并通过，未隐瞒首次调用错误。
 - 跨模块回归：`verify_decision_council_phase_one.py`、`verify_execution_rules.py`、`verify_governance_mainline_v3.py`、`verify_governance_mainline_v3_runner_smoke.py`、`verify_governance_v3_lifecycle_math.py`与`verify_interactive_worker_isolation.py`共6项全部退出0。
 - 验收判断：当前差异满足“主干保存与继续研究”的工程验收条件；测试不能消除长期盈利、真实熊市退出反事实、冲击模型校准及PIT研究状态缺口，因此不改变正式上线门`blocked`。
+- 暂存与提交证据：未使用`git add -A`；显式暂存41个文件，共3,747行新增、294行删除。首次`git diff --cached --check`发现`SCAP_20260731_REGIME_EXIT_DYNAMIC_HOLDINGS_IMPROVEMENT_PLAN.md`末尾多余空行，单文件修正并重新暂存后检查退出0。分支提交为`52add62af527e37dcd9bf17524ef04b84ecebeb7`，提交说明为“冻结取消上线开发审计基线”。
+- 排除与保护：所有未跟踪冒烟目录、CSV、GIF、stdout/stderr、JSON和其他临时产物均未提交、未删除；暂存后新出现且不在确认范围内的`reports/SCAP_20K_DYNAMIC_HOLDING_COUNT_AND_WINNER_COVERAGE_PLAN_20260802.md`也明确排除并原样保留。
+- GitHub发布证据：`取消上线`已推送并跟踪`origin/取消上线`；PR为[#9](https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/9)，head/base核对为`取消上线 -> main`，非草稿，合并前状态`MERGEABLE/CLEAN`，远端未配置额外CI checks。
+- 主干合并结果：PR #9于2026-08-02（Asia/Hong_Kong；GitHub时间2026-08-01T18:45:22Z）合并，merge commit为`77eded1c2d5b2adbee004871085ed10e0a7fd2dc`；本地`main`随后以fast-forward同步并核对与`origin/main`一致。远端`取消上线`分支未删除，继续作为冻结快照。
+- 最终状态：`merged_to_main`；本条WBS发布记录将作为后续单独主干提交推送。代码已完成工程合并，但研究门与正式上线门继续`blocked`，不得把Git合并解释为实盘授权。
 
 ### CHANGE-20260802-02：2万元动态持仓、费用吸血与赢家覆盖模型设计
 
