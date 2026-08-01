@@ -103,19 +103,33 @@ def build_runtime_integrity_audit(
             f"rows={len(accounts)}, failed={int((~passed).sum())}, max_abs_error={float(error.abs().max())}",
         ))
     daily = daily_result.copy() if daily_result is not None else pd.DataFrame()
-    if max_positions in (None, "", 0):
-        rows.append(_row("position_limit_contract", True, "max_positions not configured"))
-    elif daily.empty or "holding_count" not in daily.columns:
+    dynamic_cap_column = (
+        "effective_position_cap"
+        if not daily.empty and "effective_position_cap" in daily.columns
+        else None
+    )
+    if daily.empty or "holding_count" not in daily.columns:
         rows.append(_row("position_limit_contract", False, "daily holding_count missing"))
     else:
         observed = pd.to_numeric(daily["holding_count"], errors="coerce")
-        violations = observed.gt(int(max_positions))
+        if dynamic_cap_column is not None:
+            allowed = pd.to_numeric(daily[dynamic_cap_column], errors="coerce")
+            basis = "daily_effective_position_cap"
+        elif max_positions not in (None, "", 0):
+            allowed = pd.Series(float(max_positions), index=daily.index)
+            basis = f"configured_{int(max_positions)}"
+        else:
+            allowed = pd.Series(float("nan"), index=daily.index)
+            basis = "missing"
+        comparable_position_cap = observed.notna() & allowed.notna()
+        violations = comparable_position_cap & observed.gt(allowed)
         rows.append(_row(
             "position_limit_contract",
-            bool(observed.notna().all() and not violations.any()),
+            bool(comparable_position_cap.all() and not violations.any()),
             (
-                f"configured={int(max_positions)}, max_observed="
+                f"basis={basis}, max_observed="
                 f"{int(observed.max()) if observed.notna().any() else 'missing'}, "
+                f"max_allowed={int(allowed.max()) if allowed.notna().any() else 'missing'}, "
                 f"violation_days={int(violations.sum())}"
             ),
         ))

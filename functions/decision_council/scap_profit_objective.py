@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 
-SCAP_PROFIT_OBJECTIVE_VERSION = "scap_profit_objective_audit_v1"
+SCAP_PROFIT_OBJECTIVE_VERSION = "scap_counterfactual_forward_profit_audit_v2"
 
 
 def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame:
@@ -13,9 +13,22 @@ def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame
     if entry_audit is None or entry_audit.empty:
         return pd.DataFrame()
     data = entry_audit.copy()
-    notional = pd.to_numeric(
+    market_notional = pd.to_numeric(
+        data.get("one_lot_market_notional", pd.Series(np.nan, index=data.index)),
+        errors="coerce",
+    )
+    legacy_cash_notional = pd.to_numeric(
         data.get("one_lot_cash_required", pd.Series(np.nan, index=data.index)),
         errors="coerce",
+    )
+    notional = market_notional.combine_first(legacy_cash_notional)
+    notional_basis = pd.Series(
+        np.where(
+            market_notional.notna(),
+            "one_lot_market_notional",
+            "legacy_one_lot_cash_required_fallback",
+        ),
+        index=data.index,
     )
     forward = pd.to_numeric(
         data.get("forward_return_20d", pd.Series(np.nan, index=data.index)),
@@ -28,10 +41,17 @@ def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame
         ),
         errors="coerce",
     )
-    data["scap_realized_net_return_20d_audit"] = forward - cost_rate
-    data["scap_realized_net_profit_yuan_20d_audit"] = (
-        notional * data["scap_realized_net_return_20d_audit"]
+    data["scap_counterfactual_forward_net_return_20d_audit"] = forward - cost_rate
+    data["scap_counterfactual_forward_net_profit_yuan_20d_audit"] = (
+        notional * data["scap_counterfactual_forward_net_return_20d_audit"]
     )
+    # Deprecated compatibility aliases.  These are not fill-ledger realized PnL.
+    data["scap_realized_net_return_20d_audit"] = data[
+        "scap_counterfactual_forward_net_return_20d_audit"
+    ]
+    data["scap_realized_net_profit_yuan_20d_audit"] = data[
+        "scap_counterfactual_forward_net_profit_yuan_20d_audit"
+    ]
     data["scap_profit_objective_observed"] = (
         notional.gt(0.0)
         & forward.notna()
@@ -44,6 +64,10 @@ def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame
     data["scap_profit_objective_runtime_authority"] = (
         "audit_only_future_20d_not_available_at_decision_time"
     )
+    data["scap_profit_objective_notional_basis"] = notional_basis
+    data["scap_realized_field_compatibility_status"] = (
+        "deprecated_alias_not_fill_ledger_realized_pnl"
+    )
     columns = [
         "decision_id",
         "date",
@@ -52,6 +76,8 @@ def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame
         "one_lot_cash_required",
         "forward_return_20d",
         "scap_estimated_round_trip_cost_rate",
+        "scap_counterfactual_forward_net_return_20d_audit",
+        "scap_counterfactual_forward_net_profit_yuan_20d_audit",
         "scap_realized_net_return_20d_audit",
         "scap_realized_net_profit_yuan_20d_audit",
         "scap_profit_objective_observed",
@@ -59,6 +85,8 @@ def build_scap_profit_objective_audit(entry_audit: pd.DataFrame) -> pd.DataFrame
         "primary_score",
         "scap_profit_objective_version",
         "scap_profit_objective_runtime_authority",
+        "scap_profit_objective_notional_basis",
+        "scap_realized_field_compatibility_status",
     ]
     for column in columns:
         if column not in data.columns:
@@ -82,7 +110,7 @@ def summarize_scap_profit_objective(audit: pd.DataFrame) -> pd.DataFrame:
         ("all_observed", observed),
     ):
         pnl = pd.to_numeric(
-            group.get("scap_realized_net_profit_yuan_20d_audit"),
+            group.get("scap_counterfactual_forward_net_profit_yuan_20d_audit"),
             errors="coerce",
         ).dropna()
         rows.append(

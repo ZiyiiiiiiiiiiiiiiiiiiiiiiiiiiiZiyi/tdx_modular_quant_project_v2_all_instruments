@@ -14,9 +14,10 @@ from functions.decision_council.scap_v31_authority import attach_scap_v31_author
 
 root = Path(__file__).resolve().parent
 
-fixed = get_backtest_capital_profile("small_capital_lean")
-assert fixed["position_cap_mode"] == "fixed"
-assert fixed["max_positions"] == 5
+default_auto = get_backtest_capital_profile("small_capital_lean")
+assert default_auto["position_cap_mode"] == "auto"
+assert default_auto["max_positions"] is None
+assert default_auto["user_hard_position_cap"] is None
 
 auto = get_backtest_capital_profile(
     "small_capital_lean",
@@ -24,6 +25,13 @@ auto = get_backtest_capital_profile(
 )
 assert auto["position_cap_mode"] == "auto"
 assert auto["max_positions"] is None
+web_capped = get_backtest_capital_profile(
+    "small_capital_lean",
+    max_positions_override=7,
+)
+assert web_capped["position_cap_mode"] == "auto"
+assert web_capped["max_positions"] is None
+assert web_capped["user_hard_position_cap"] == 7
 
 candidates = pd.DataFrame(
     {"mainline_v3_one_lot_cash_required": [1000.0] * 30}
@@ -49,6 +57,41 @@ assert small.mode == "auto"
 assert small.effective_position_cap >= 1
 assert large.effective_position_cap >= small.effective_position_cap
 assert large.effective_position_cap <= large.search_cap
+assert 2_870.0 < small.minimum_economic_order_amount < 2_880.0
+
+capped = resolve_position_capacity(
+    capital_profile=web_capped,
+    nav_amount=100_000.0,
+    cash_amount=100_000.0,
+    risk_exposure_ceiling=0.85,
+    candidates=candidates,
+)
+assert capped.effective_position_cap == 7
+
+evidence_ranked = resolve_position_capacity(
+    capital_profile=auto,
+    nav_amount=20_000.0,
+    cash_amount=20_000.0,
+    risk_exposure_ceiling=0.85,
+    candidates=pd.DataFrame(
+        {
+            "mainline_v3_one_lot_cash_required": [8_000.0, 1_000.0, 1_000.0, 1_000.0, 1_000.0],
+            "primary_score": [1.0, 0.9, 0.8, 0.7, 0.6],
+        }
+    ),
+)
+assert evidence_ranked.effective_position_cap == 4
+
+risk_room_limited = resolve_position_capacity(
+    capital_profile=auto,
+    nav_amount=20_000.0,
+    cash_amount=10_000.0,
+    risk_exposure_ceiling=0.85,
+    current_exposure=0.70,
+    candidates=candidates,
+)
+assert risk_room_limited.capacity_risk_room_amount == 3_000.0
+assert risk_room_limited.effective_position_cap == 1
 
 held_without_cash = resolve_position_capacity(
     capital_profile=auto,
@@ -94,11 +137,15 @@ authority_input = pd.DataFrame(
         "scap_decision_expected_return": [0.02],
     }
 )
-fixed_authority = attach_scap_v31_authority(authority_input)
+fixed_authority = attach_scap_v31_authority(
+    authority_input,
+    allow_synthetic_compatibility=True,
+)
 auto_authority = attach_scap_v31_authority(
     authority_input,
     position_cap_mode="auto",
     target_position_cash=20_000.0,
+    allow_synthetic_compatibility=True,
 )
 assert int(fixed_authority.iloc[0]["scap_v31_max_lots"]) == 2
 assert int(auto_authority.iloc[0]["scap_v31_max_lots"]) == 20
@@ -106,7 +153,8 @@ assert int(auto_authority.iloc[0]["scap_v31_max_lots"]) == 20
 launcher = (root / "main_launcher_web.py").read_text(encoding="utf-8")
 assert 'id="initial_cash" min="1" step="1000" value=""' in launcher
 assert 'id="max_positions_account" min="0" step="1" value=""' in launcher
-assert "0=资金/整手/成本自动上限" in launcher
+assert "Web治理硬持仓上限（不是目标持仓数）" in launcher
+assert "留空或0=不加用户上限" in launcher
 assert "不是永久产品定义" in launcher
 
-print("[PASS] capital-scaled fixed/auto position identity and launcher contract")
+print("[PASS] Web hard ceiling, dynamic economic capacity, risk room and launcher contract")

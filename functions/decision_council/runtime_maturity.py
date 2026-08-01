@@ -1,6 +1,7 @@
 """Independent runtime maturity states for governance diagnostics."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from config import GOVERNANCE_REPUTATION_WARMUP_DAYS
@@ -26,7 +27,18 @@ def covariance_runtime_state(*, day_index: int, covariance_matrix: pd.DataFrame 
     if covariance_matrix.empty or len(covariance_matrix) < 3:
         return "warming_up"
     values = covariance_matrix.apply(pd.to_numeric, errors="coerce")
-    if values.isna().all().all():
+    if values.isna().any().any() or values.shape[0] != values.shape[1]:
+        return "degraded"
+    if list(values.index) != list(values.columns):
+        return "degraded"
+    array = values.to_numpy(dtype=float)
+    if not np.isfinite(array).all():
+        return "degraded"
+    if not np.allclose(array, array.T, rtol=1e-8, atol=1e-12):
+        return "degraded"
+    if float(np.linalg.eigvalsh(array).min()) < -1e-10:
+        return "degraded"
+    if float(getattr(covariance_matrix, "attrs", {}).get("pair_coverage_ratio", 1.0)) < 1.0:
         return "degraded"
     return "calibrated" if day_index >= 60 else "warming_up"
 

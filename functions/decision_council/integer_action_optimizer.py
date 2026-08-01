@@ -1,8 +1,8 @@
 """Unique integer action optimizer for SCAP-V2.
 
-The optimizer is deliberately small-capital specific: with at most five live
-names, an exhaustive bounded search is deterministic, auditable, and avoids
-the unit drift caused by continuous weights followed by lot rounding.
+The runtime position dimension is supplied by the Web/capital profile.  Small
+dimensions use exhaustive bounded search; larger dimensions use an explicitly
+labelled beam search.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def optimize_action_proposals(
     current_lots_by_symbol: Mapping[str, int] | None = None,
     current_weights_by_symbol: Mapping[str, float] | None = None,
     current_exposure: float = 0.0,
-    max_positions: int = 5,
+    max_positions: int | None = None,
     thesis_by_symbol: Mapping[str, str] | None = None,
     max_names_per_thesis: int = 2,
     correlation_matrix: pd.DataFrame | None = None,
@@ -44,6 +44,9 @@ def optimize_action_proposals(
     robust CNY profit, followed by lower downside/cost, then higher residual
     cash. Spending more is never a tie-break objective.
     """
+    if max_positions is None or int(max_positions) <= 0:
+        raise ValueError("max_positions must be supplied by the runtime capital profile")
+    max_positions = int(max_positions)
     items = tuple(proposals)
     current_lots = {
         str(symbol): max(int(lots), 0)
@@ -59,6 +62,7 @@ def optimize_action_proposals(
             current_lots=current_lots,
             current_weights=current_weights,
             current_exposure=current_exposure,
+            max_positions=max_positions,
         )
     if any(item.decision_id != authorization.decision_id for item in items):
         raise ValueError("all proposals and authorization must share decision_id")
@@ -144,8 +148,14 @@ def optimize_action_proposals(
                     best_nonbuy_key = key
                 if best_key is None or key > best_key:
                     best, best_key = selected, key
-        solver_status = "optimal_bounded_exhaustive"
+        full_universe_optimality = len(candidates) == len(candidate_pool)
+        solver_status = (
+            "optimal_full_universe_exhaustive"
+            if full_universe_optimality
+            else "optimal_reduced_universe_exhaustive"
+        )
     else:
+        full_universe_optimality = False
         states: dict[tuple[str, ...], tuple[tuple[ActionProposal, ...], tuple]] = {
             tuple(sorted(item.proposal_id for item in forced)): (forced, best_key)
         }
@@ -230,7 +240,14 @@ def optimize_action_proposals(
     projected_exposure = (
         min(sum(projected_weights.values()), 1.0)
         if current_weights
-        else min(current_exposure + funding / authorization.nav_amount, 1.0)
+        else min(
+            max(
+                float(current_exposure)
+                + sum(float(item.exposure_delta) for item in best),
+                0.0,
+            ),
+            1.0,
+        )
     )
     deployment_gap = max(
         float(authorization.effective_deployment_target)
@@ -276,6 +293,20 @@ def optimize_action_proposals(
         covariance_matrix=effective_covariance,
         authorization=authorization,
         covariance_risk_aversion=covariance_risk_aversion,
+    )
+    proposal_robust_profit = sum(
+        float(item.robust_net_profit_amount) for item in best
+    )
+    thesis_penalty = _soft_thesis_penalty(
+        best,
+        projected_weights=projected_weights,
+        thesis_map=thesis_map,
+        soft_max_names=authorization.thesis_soft_max_names,
+    )
+    deployment_penalty = (
+        float(authorization.nav_amount)
+        * float(authorization.cash_gap_penalty_rate)
+        * deployment_gap
     )
     buy_plan_dominates_nonbuy = bool(
         best_buy_key is not None
@@ -334,12 +365,20 @@ def optimize_action_proposals(
             "authority_penalty_amount": authority_penalty,
             "concentration_penalty_amount": concentration_penalty,
             "marginal_risk_penalty_amount": marginal_risk_penalty,
+            "proposal_robust_profit_amount": proposal_robust_profit,
+            "thesis_penalty_amount": thesis_penalty,
+            "deployment_penalty_amount": deployment_penalty,
             "cash_release_amount": cash_release,
             "solver_candidate_count": len(candidates),
+            "solver_original_candidate_count": len(candidate_pool),
+            "solver_reduced_candidate_count": len(candidates),
             "solver_beam_width": (
                 0 if exact_solver else max(int(beam_width), 1)
             ),
-            "solver_optimality_proven": int(exact_solver),
+            "solver_reduced_universe_optimality_proven": int(exact_solver),
+            "solver_optimality_proven": int(
+                exact_solver and full_universe_optimality
+            ),
         },
         solver_status=solver_status,
         plan_id=f"{authorization.decision_id}|action_plan",
@@ -349,10 +388,15 @@ def optimize_action_proposals(
         authority_penalty_amount=authority_penalty,
         concentration_penalty_amount=concentration_penalty,
         marginal_risk_penalty_amount=marginal_risk_penalty,
+        proposal_robust_profit_amount=proposal_robust_profit,
+        thesis_penalty_amount=thesis_penalty,
+        deployment_penalty_amount=deployment_penalty,
         risk_model_used=(
             "covariance"
-            if effective_covariance is not None
-            and not effective_covariance.empty
+            if _covariance_complete_for_weights(
+                projected_weights,
+                effective_covariance,
+            )
             else str(authorization.fallback_risk_model)
         ),
         risk_horizon_sessions=int(authorization.risk_horizon_sessions),
@@ -425,7 +469,11 @@ def _plan_key(
             return None
         projected_exposure = sum(projected_weights.values())
     else:
-        projected_exposure = float(current_exposure) + funding / authorization.nav_amount
+        projected_exposure = max(
+            float(current_exposure)
+            + sum(float(item.exposure_delta) for item in selected),
+            0.0,
+        )
     if projected_exposure > authorization.risk_exposure_ceiling + 1e-12:
         return None
     explicit_cash = float(authorization.current_cash_amount) > 0.0
@@ -483,20 +531,12 @@ def _plan_key(
         item.robust_net_profit_amount - item.authority_penalty_amount
         for item in selected
     )
-    soft_thesis_penalty = 0.0
-    if thesis_map:
-        for thesis, count in counts.items():
-            excess = max(count - int(authorization.thesis_soft_max_names), 0)
-            if excess:
-                thesis_profits = sorted(
-                    (
-                        max(item.robust_net_profit_amount, 0.0)
-                        for item in selected
-                        if thesis_map.get(item.symbol, "") == thesis
-                        and item.exposure_delta > 0.0
-                    )
-                )
-                soft_thesis_penalty += 0.10 * sum(thesis_profits[:excess])
+    soft_thesis_penalty = _soft_thesis_penalty(
+        selected,
+        projected_weights=projected_weights,
+        thesis_map=thesis_map,
+        soft_max_names=authorization.thesis_soft_max_names,
+    )
     robust -= soft_thesis_penalty
     robust -= _marginal_covariance_risk_penalty(
         current_weights,
@@ -617,6 +657,36 @@ def _concentration_penalty(
     )
 
 
+def _soft_thesis_penalty(
+    selected: tuple[ActionProposal, ...],
+    *,
+    projected_weights: Mapping[str, float],
+    thesis_map: Mapping[str, str],
+    soft_max_names: int,
+) -> float:
+    """Return the exact thesis penalty used by the objective ledger."""
+    if not thesis_map:
+        return 0.0
+    counts: dict[str, int] = {}
+    for symbol, weight in projected_weights.items():
+        thesis = thesis_map.get(symbol, "")
+        if float(weight) > 1e-12 and thesis:
+            counts[thesis] = counts.get(thesis, 0) + 1
+    penalty = 0.0
+    for thesis, count in counts.items():
+        excess = max(int(count) - int(soft_max_names), 0)
+        if not excess:
+            continue
+        thesis_profits = sorted(
+            max(float(item.robust_net_profit_amount), 0.0)
+            for item in selected
+            if thesis_map.get(item.symbol, "") == thesis
+            and item.exposure_delta > 0.0
+        )
+        penalty += 0.10 * sum(thesis_profits[:excess])
+    return float(penalty)
+
+
 def _projected_weights(
     selected: tuple[ActionProposal, ...],
     current_weights: Mapping[str, float],
@@ -641,17 +711,18 @@ def _projected_weights(
 def _portfolio_sigma(
     weights: Mapping[str, float],
     covariance_matrix: pd.DataFrame,
-) -> float:
+) -> float | None:
     """Daily portfolio volatility from a covariance matrix (not correlation)."""
-    symbols = [
+    required_symbols = [
         symbol
         for symbol, weight in weights.items()
         if weight > 1e-12
-        and symbol in covariance_matrix.index
-        and symbol in covariance_matrix.columns
     ]
-    if not symbols:
+    if not required_symbols:
         return 0.0
+    if not _covariance_complete_for_weights(weights, covariance_matrix):
+        return None
+    symbols = required_symbols
     vector = pd.Series(
         [float(weights[symbol]) for symbol in symbols],
         index=symbols,
@@ -660,10 +731,44 @@ def _portfolio_sigma(
     covariance = (
         covariance_matrix.loc[symbols, symbols]
         .apply(pd.to_numeric, errors="coerce")
-        .fillna(0.0)
     )
+    if covariance.isna().any().any():
+        return None
     variance = float(vector.T.dot(covariance).dot(vector))
     return max(variance, 0.0) ** 0.5
+
+
+def _covariance_complete_for_weights(
+    weights: Mapping[str, float],
+    covariance_matrix: pd.DataFrame | None,
+) -> bool:
+    """Require 100% selected-symbol and pair coverage before covariance use."""
+    if covariance_matrix is None or covariance_matrix.empty:
+        return False
+    symbols = [
+        str(symbol)
+        for symbol, weight in weights.items()
+        if float(weight) > 1e-12
+    ]
+    if not symbols:
+        return False
+    if any(
+        symbol not in covariance_matrix.index
+        or symbol not in covariance_matrix.columns
+        for symbol in symbols
+    ):
+        return False
+    block = covariance_matrix.loc[symbols, symbols].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+    if block.isna().any().any():
+        return False
+    values = block.to_numpy(dtype=float)
+    return bool(
+        math.isfinite(float(values.sum()))
+        and (abs(values - values.T) <= 1e-10).all()
+    )
 
 
 def _marginal_covariance_risk_penalty(
@@ -679,6 +784,8 @@ def _marginal_covariance_risk_penalty(
         return 0.0
     pre_sigma = _portfolio_sigma(current_weights, covariance_matrix)
     post_sigma = _portfolio_sigma(projected_weights, covariance_matrix)
+    if pre_sigma is None or post_sigma is None:
+        return 0.0
     horizon_scale = math.sqrt(max(int(authorization.risk_horizon_sessions), 1))
     return (
         max(post_sigma - pre_sigma, 0.0)
@@ -832,6 +939,7 @@ def _empty_plan(
     current_lots: Mapping[str, int],
     current_weights: Mapping[str, float],
     current_exposure: float,
+    max_positions: int,
 ) -> ActionPlan:
     """Return the factual no-action portfolio, not a synthetic zero account."""
     projected_exposure = (
@@ -875,15 +983,10 @@ def _empty_plan(
             - projected_exposure,
             0.0,
         ),
-        breadth_score=float(
-            min(
-                sum(
-                    1
-                    for weight in current_weights.values()
-                    if float(weight) > 1e-12
-                ),
-                4,
-            )
+        breadth_score=_normalized_breadth_score(
+            current_weights,
+            (),
+            max_positions=max(int(max_positions), 1),
         ),
         authority_penalty_amount=0.0,
         concentration_penalty_amount=_concentration_penalty(
@@ -891,6 +994,9 @@ def _empty_plan(
             authorization,
         ),
         marginal_risk_penalty_amount=0.0,
+        proposal_robust_profit_amount=0.0,
+        thesis_penalty_amount=0.0,
+        deployment_penalty_amount=0.0,
         risk_model_used=str(authorization.fallback_risk_model),
         risk_horizon_sessions=int(authorization.risk_horizon_sessions),
         risk_episode_id=str(authorization.risk_episode_id),

@@ -319,6 +319,8 @@ HTML = r"""<!doctype html>
         ["risk_level","风险等级"],["exposure_cap","仓位上限"],["target_exposure","战略期望仓位"],["optimizer_planned_exposure","优化器计划仓位"],["actual_exposure","实际仓位"],
         ["exposure_gap","仓位缺口"],["idle_cash_ratio","闲置现金比例"],["minimum_required_holding_count","最低持仓数"],
         ["soft_target_holding_count","软目标持仓数"],["maximum_allowed_holding_count","持仓硬上限"],
+        ["user_hard_position_cap","Web治理硬上限"],["economic_position_cap","经济可行上限"],
+        ["search_position_cap","求解资源上限"],["effective_position_cap","当日有效上限"],
         ["holding_shortfall_count","软目标不足数"],["tail_risk_proxy_mean","尾部风险均值"],["future_loss_risk_score_mean","未来亏损风险"],
         ["scap_v31_positive_c_fallback_count","C级试探候选"],["scap_v31_all_d_streak","全D连续日"],["scap_v31_normal_cash_zero_proposal_streak","正常高现金零提案连续日"],
         ["empirical_distribution_score_mean","经验分布均分"],["trend_direction_score_mean","趋势方向均值"],["peak_decay_score_mean","峰值衰退均值"],

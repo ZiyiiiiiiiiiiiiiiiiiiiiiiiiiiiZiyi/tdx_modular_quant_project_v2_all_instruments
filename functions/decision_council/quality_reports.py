@@ -261,6 +261,10 @@ def build_portfolio_constraint_report(
         "sleeve_effective_n",
         "sleeve_effective_n_ratio",
         "configured_max_positions",
+        "user_hard_position_cap",
+        "economic_position_cap",
+        "search_position_cap",
+        "effective_position_cap",
         "effective_n_required",
         "top1_account_weight",
         "top5_account_weight_sum",
@@ -270,6 +274,7 @@ def build_portfolio_constraint_report(
         "liquidity_bucket_exposure",
         "holding_count",
         "actual_exposure",
+        "position_limit_pass",
         "constraint_pass",
         "fail_reasons",
         "research_valid",
@@ -297,16 +302,29 @@ def build_portfolio_constraint_report(
         data[column] = pd.to_numeric(data.get(column, pd.Series(np.nan, index=data.index)), errors="coerce")
     rows = []
     for _, row in data.dropna(subset=["date"]).iterrows():
-        configured_max_positions = int(
-            _coerce_float(
-                row.get(
-                    "configured_max_positions",
-                    row.get("target_holding_count", row.get("holding_count", 0)),
-                )
-            )
-            or 0
+        def _optional_positive_int(value: object) -> object:
+            parsed = _coerce_float(value)
+            return int(parsed) if np.isfinite(parsed) and parsed > 0 else pd.NA
+
+        configured_max_positions = _optional_positive_int(
+            row.get("configured_max_positions")
+        )
+        user_hard_position_cap = _optional_positive_int(
+            row.get("user_hard_position_cap")
+        )
+        economic_position_cap = _optional_positive_int(
+            row.get("economic_position_cap")
+        )
+        search_position_cap = _optional_positive_int(
+            row.get("search_position_cap")
         )
         holding_count = max(int(_coerce_float(row.get("holding_count", 0)) or 0), 0)
+        effective_position_cap = _optional_positive_int(
+            row.get(
+                "effective_position_cap",
+                row.get("maximum_allowed_holding_count"),
+            )
+        )
         sleeve_effective_n = _coerce_float(row.get("sleeve_effective_n"))
         sleeve_effective_n_ratio = _coerce_float(row.get("sleeve_effective_n_ratio"))
         if not np.isfinite(sleeve_effective_n_ratio):
@@ -321,6 +339,12 @@ def build_portfolio_constraint_report(
             else 0.0
         )
         fail_reasons = []
+        position_limit_pass = bool(
+            pd.isna(effective_position_cap)
+            or holding_count <= int(effective_position_cap)
+        )
+        if not position_limit_pass:
+            fail_reasons.append("holding_count_above_daily_effective_cap")
         if holding_count > 0 and (
             not np.isfinite(sleeve_effective_n)
             or sleeve_effective_n < effective_n_required
@@ -342,6 +366,10 @@ def build_portfolio_constraint_report(
                 "sleeve_effective_n": sleeve_effective_n,
                 "sleeve_effective_n_ratio": sleeve_effective_n_ratio,
                 "configured_max_positions": configured_max_positions,
+                "user_hard_position_cap": user_hard_position_cap,
+                "economic_position_cap": economic_position_cap,
+                "search_position_cap": search_position_cap,
+                "effective_position_cap": effective_position_cap,
                 "effective_n_required": effective_n_required,
                 "top1_account_weight": row["top1_account_weight"],
                 "top5_account_weight_sum": row["top5_account_weight_sum"],
@@ -351,6 +379,7 @@ def build_portfolio_constraint_report(
                 "liquidity_bucket_exposure": row["liquidity_bucket_exposure"],
                 "holding_count": row["holding_count"],
                 "actual_exposure": row["actual_exposure"],
+                "position_limit_pass": position_limit_pass,
                 "constraint_pass": not fail_reasons,
                 "fail_reasons": "|".join(fail_reasons),
                 "research_valid": not fail_reasons,

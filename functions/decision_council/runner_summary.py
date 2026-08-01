@@ -1225,21 +1225,50 @@ def build_governance_summary(
         ml_weight_state = "reputation_ready_flat_weights"
     attribution = attribution_ledger.copy() if attribution_ledger is not None else pd.DataFrame()
     if not attribution.empty:
+        benchmark_valid = (
+            attribution[
+                attribution.get(
+                    "benchmark_return_valid",
+                    pd.Series(False, index=attribution.index),
+                )
+                .astype("boolean")
+                .fillna(False)
+                .astype(bool)
+            ]
+            .copy()
+        )
         avg_actual_exposure = _safe_numeric_mean(attribution.get("actual_exposure"))
         final_account_net_value = _safe_last(attribution.get("account_net_value"), default=1.0)
         final_invested_net_value = _safe_last(attribution.get("invested_capital_net_value"), default=1.0)
         final_valid_invested_net_value = _safe_last(attribution.get("valid_invested_capital_net_value"), default=1.0)
         final_holding_portfolio_net_value = _safe_last(attribution.get("holding_portfolio_net_value"), default=1.0)
         final_benchmark_net_value = _safe_last(attribution.get("benchmark_net_value"), default=1.0)
-        final_excess_net_value = _safe_last(attribution.get("excess_net_value"), default=1.0)
-        final_invested_excess_net_value = _safe_last(attribution.get("invested_excess_net_value"), default=1.0)
-        final_valid_invested_excess_net_value = _safe_last(attribution.get("valid_invested_excess_net_value"), default=1.0)
-        final_holding_excess_net_value = _safe_last(attribution.get("holding_portfolio_excess_net_value"), default=1.0)
+        final_excess_net_value = _safe_last(
+            benchmark_valid.get("excess_net_value"),
+            default=1.0,
+        )
+        final_active_difference_chain = _safe_last(
+            attribution.get("active_return_difference_chain_net_value"),
+            default=1.0,
+        )
+        final_invested_excess_net_value = _safe_last(
+            benchmark_valid.get("invested_excess_net_value"),
+            default=1.0,
+        )
+        final_valid_invested_excess_net_value = _safe_last(
+            benchmark_valid.get("valid_invested_excess_net_value"),
+            default=1.0,
+        )
+        final_holding_excess_net_value = _safe_last(
+            benchmark_valid.get("holding_portfolio_excess_net_value"),
+            default=1.0,
+        )
         invested_capital_return = final_invested_net_value - 1.0
         valid_invested_capital_return = final_valid_invested_net_value - 1.0
         holding_portfolio_return = final_holding_portfolio_net_value - 1.0
         benchmark_total_return = final_benchmark_net_value - 1.0
         benchmark_excess_return = final_excess_net_value - 1.0
+        benchmark_active_return_difference_chain = final_active_difference_chain - 1.0
         invested_excess_return = final_invested_excess_net_value - 1.0
         valid_invested_excess_return = final_valid_invested_excess_net_value - 1.0
         holding_portfolio_excess_return = final_holding_excess_net_value - 1.0
@@ -1259,6 +1288,7 @@ def build_governance_summary(
         holding_portfolio_return = pd.NA
         benchmark_total_return = pd.NA
         benchmark_excess_return = pd.NA
+        benchmark_active_return_difference_chain = pd.NA
         invested_excess_return = pd.NA
         valid_invested_excess_return = pd.NA
         holding_portfolio_excess_return = pd.NA
@@ -1379,9 +1409,14 @@ def build_governance_summary(
                     "geometric_chain_linked_net_value"
                 ),
                 "benchmark_excess_return": benchmark_excess_return,
+                "benchmark_excess_return_method": "geometric_nav_ratio",
+                "benchmark_excess_endpoint_contract": "last_valid_benchmark_return_day",
+                "benchmark_active_return_difference_chain": benchmark_active_return_difference_chain,
+                "benchmark_active_return_difference_chain_method": "compounded_daily_arithmetic_difference",
                 "invested_excess_return": invested_excess_return,
                 "valid_invested_excess_return": valid_invested_excess_return,
                 "holding_portfolio_excess_return": holding_portfolio_excess_return,
+                "holding_portfolio_return_method": "exposure_scaled_account_return_approximation",
                 "invested_capital_max_drawdown": invested_capital_max_drawdown,
                 "valid_invested_capital_max_drawdown": valid_invested_capital_max_drawdown,
                 "account_return_per_exposure": account_return_per_exposure,
@@ -1535,7 +1570,10 @@ def build_governance_summary(
                     )
                 ),
                 "reputation_control_enabled": runner._control_enabled("reputation"),
-                "regime_control_enabled": runner._control_enabled("regime"),
+                "regime_control_enabled": bool(
+                    runner.enable_market_regime_policy
+                    and runner._control_enabled("regime")
+                ),
                 "cooldown_control_enabled": runner._control_enabled("cooldown"),
                 "hard_stop_control_enabled": runner._control_enabled("hard_stop_exit"),
                 "alpha_collapse_exit_enabled": runner.alpha_collapse_exit_enabled,

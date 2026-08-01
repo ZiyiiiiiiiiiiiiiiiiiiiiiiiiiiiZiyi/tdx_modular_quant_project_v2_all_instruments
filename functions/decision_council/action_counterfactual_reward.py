@@ -1,4 +1,4 @@
-"""Decision-level, market-neutral rewards for hold, sell, buy and replace actions."""
+"""Decision-level cash, benchmark and replacement counterfactual rewards."""
 from __future__ import annotations
 
 import pandas as pd
@@ -10,7 +10,7 @@ from functions.execution.fee_schedule import stamp_duty_rate_for
 HORIZONS = (5, 10, 20)
 
 
-def build_action_decisions(*, date, candidates: pd.DataFrame, held_symbols, orders: pd.DataFrame, daily: pd.DataFrame) -> list[dict]:
+def build_action_decisions(*, date, candidates: pd.DataFrame, held_symbols, orders: pd.DataFrame, daily: pd.DataFrame, regime_name: str = "unknown") -> list[dict]:
     if candidates is None or candidates.empty:
         return []
     indexed = candidates.drop_duplicates("symbol", keep="first").set_index("symbol", drop=False)
@@ -37,6 +37,7 @@ def build_action_decisions(*, date, candidates: pd.DataFrame, held_symbols, orde
             date=date, symbol=symbol, action=action, reason=reason or "continue_holding",
             symbol_price=prices[symbol], alternative_symbol=alternative,
             alternative_price=prices.get(alternative), order=order,
+            regime_name=regime_name,
         ))
 
     if orders is not None and not orders.empty:
@@ -48,6 +49,7 @@ def build_action_decisions(*, date, candidates: pd.DataFrame, held_symbols, orde
             rows.extend(_decision_horizon_rows(
                 date=date, symbol=symbol, action="buy", reason=str(order.get("reason", "normal_buy")),
                 symbol_price=prices[symbol], alternative_symbol="", alternative_price=None, order=order,
+                regime_name=regime_name,
             ))
     return rows
 
@@ -101,11 +103,24 @@ def mature_action_rewards(
         benchmark_return, benchmark_maturity = _future_return(
             history.get(str(benchmark_symbol)), held_start_date, horizon, benchmark_start
         ) if benchmark_start is not None else (None, None)
-        if symbol_return is None or benchmark_return is None:
-            row.update({"maturity_status": "censored", "maturity_date": pd.NaT, "action_reward": pd.NA})
+        if symbol_return is None:
+            row.update({
+                "maturity_status": "censored",
+                "counterfactual_primary_status": "censored_symbol_horizon",
+                "maturity_date": pd.NaT,
+                "action_reward": pd.NA,
+                "cash_exit_reward_rate": pd.NA,
+                "benchmark_exit_reward_rate": pd.NA,
+                "replacement_exit_reward_rate": pd.NA,
+            })
             rows.append(row)
             continue
-        held_alpha = float(symbol_return - benchmark_return)
+        held_alpha = (
+            float(symbol_return - benchmark_return)
+            if benchmark_return is not None
+            else None
+        )
+        alternative_return = None
         alternative_alpha = None
         alternative_benchmark_return = None
         alternative_maturity = None
@@ -125,38 +140,100 @@ def mature_action_rewards(
                 alternative_alpha = float(alternative_return - alternative_benchmark_return)
                 alternative_maturity = max(alternative_maturity, alternative_benchmark_maturity)
         action = actual_action
+        cash_exit_reward = (
+            float(-symbol_return - cost)
+            if action in {"sell", "replace"}
+            else pd.NA
+        )
+        benchmark_exit_reward = (
+            float(benchmark_return - symbol_return - cost)
+            if action in {"sell", "replace"} and benchmark_return is not None
+            else pd.NA
+        )
+        replacement_exit_reward = (
+            float(alternative_return - symbol_return - cost)
+            if action == "replace" and alternative_return is not None
+            else pd.NA
+        )
         if action == "sell":
-            reward = -held_alpha - cost
+            reward = benchmark_exit_reward
         elif action == "replace":
-            reward = (alternative_alpha - held_alpha - cost) if alternative_alpha is not None else pd.NA
+            reward = replacement_exit_reward
         elif action == "hold":
-            reward = held_alpha - (alternative_alpha - cost) if alternative_alpha is not None else held_alpha
+            reward = (
+                held_alpha - (alternative_alpha - cost)
+                if held_alpha is not None and alternative_alpha is not None
+                else held_alpha
+            )
         elif action in {"buy", "add"}:
-            reward = held_alpha - cost
+            reward = held_alpha - cost if held_alpha is not None else pd.NA
         else:  # an unfilled planned buy is not a portfolio action
             reward = 0.0
+        notional = _number(actual.get("sell_trade_notional"))
+        if notional is None:
+            notional = _number(actual.get("trade_notional"))
+        reward_amount_scale = float(notional) if notional is not None else None
         row.update({
-            "maturity_status": "matured" if pd.notna(reward) else "censored_alternative",
+            "maturity_status": (
+                "matured"
+                if pd.notna(reward)
+                else "matured_cash_only"
+                if pd.notna(cash_exit_reward)
+                else "censored_alternative"
+            ),
+            "counterfactual_primary_status": (
+                "matured_all"
+                if pd.notna(cash_exit_reward)
+                and pd.notna(benchmark_exit_reward)
+                and (action != "replace" or pd.notna(replacement_exit_reward))
+                else "matured_cash_benchmark"
+                if pd.notna(cash_exit_reward) and pd.notna(benchmark_exit_reward)
+                else "matured_cash_only"
+                if pd.notna(cash_exit_reward)
+                else "not_exit_action"
+            ),
             "maturity_date": max(
                 value for value in (maturity_date, benchmark_maturity, alternative_maturity)
                 if value is not None
             ),
             "symbol_return": symbol_return,
             "benchmark_return": benchmark_return,
+            "cash_return": 0.0,
+            "alternative_return": alternative_return,
             "alternative_benchmark_return": alternative_benchmark_return,
             "market_neutral_symbol_return": held_alpha,
             "alternative_market_neutral_return": alternative_alpha,
             "actual_action_cost_rate": cost,
+            "counterfactual_notional": notional if notional is not None else pd.NA,
+            "counterfactual_executed_shares": actual.get("sell_executed_shares", actual.get("executed_shares", pd.NA)),
+            "cash_exit_reward_rate": cash_exit_reward,
+            "benchmark_exit_reward_rate": benchmark_exit_reward,
+            "replacement_exit_reward_rate": replacement_exit_reward,
+            "cash_exit_reward_amount": (
+                float(cash_exit_reward) * reward_amount_scale
+                if pd.notna(cash_exit_reward) and reward_amount_scale is not None
+                else pd.NA
+            ),
+            "benchmark_exit_reward_amount": (
+                float(benchmark_exit_reward) * reward_amount_scale
+                if pd.notna(benchmark_exit_reward) and reward_amount_scale is not None
+                else pd.NA
+            ),
+            "replacement_exit_reward_amount": (
+                float(replacement_exit_reward) * reward_amount_scale
+                if pd.notna(replacement_exit_reward) and reward_amount_scale is not None
+                else pd.NA
+            ),
             "reward_start_date": held_start_date,
             "alternative_reward_start_date": alternative_start_date if alternative else pd.NaT,
             "action_reward": reward,
-            "reward_formula_version": "market_neutral_actual_fill_cost_counterfactual_v3",
+            "reward_formula_version": "cash_benchmark_replacement_actual_fill_cost_counterfactual_v4",
         })
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _decision_horizon_rows(*, date, symbol, action, reason, symbol_price, alternative_symbol, alternative_price, order):
+def _decision_horizon_rows(*, date, symbol, action, reason, symbol_price, alternative_symbol, alternative_price, order, regime_name="unknown"):
     generic_one_way = COMMISSION_RATE + SLIPPAGE_RATE + TRANSFER_FEE_RATE
     sell_rate = generic_one_way + stamp_duty_rate_for(date, fallback_rate=STAMP_DUTY_RATE)
     if action == "replace":
@@ -172,6 +249,7 @@ def _decision_horizon_rows(*, date, symbol, action, reason, symbol_price, altern
         "decision_id": f"action_{pd.Timestamp(date).strftime('%Y%m%d')}_{symbol}_{horizon}",
         "decision_date": pd.Timestamp(date), "symbol": symbol, "action": action,
         "reason": reason, "horizon_days": horizon, "symbol_price": float(symbol_price),
+        "regime_name": str(regime_name or "unknown"),
         "alternative_symbol": str(alternative_symbol or ""),
         "alternative_price": alternative_price if alternative_price is not None else pd.NA,
         "estimated_action_cost_rate": cost, "maturity_status": "pending",
@@ -196,6 +274,86 @@ def _decision_horizon_rows(*, date, symbol, action, reason, symbol_price, altern
             else "unified_position_action_v1"
         ),
     } for horizon in HORIZONS]
+
+
+def summarize_exit_counterfactual_rewards(rewards: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate fixed-horizon exit value without using future window extrema."""
+    columns = [
+        "reason", "regime_name", "horizon_days", "matured_exit_count",
+        "avg_hold_return", "median_hold_return",
+        "avg_cash_exit_reward_rate", "cash_exit_positive_rate",
+        "avg_benchmark_exit_reward_rate", "benchmark_exit_positive_rate",
+        "avg_replacement_exit_reward_rate", "replacement_exit_positive_rate",
+        "cash_exit_reward_amount", "benchmark_exit_reward_amount",
+        "replacement_exit_reward_amount", "summary_contract",
+    ]
+    if rewards is None or rewards.empty:
+        return pd.DataFrame(columns=columns)
+    data = rewards.copy()
+    data = data[
+        data.get("actual_action", pd.Series("", index=data.index))
+        .astype(str).isin(["sell", "replace"])
+        & pd.to_numeric(data.get("symbol_return"), errors="coerce").notna()
+    ]
+    if data.empty:
+        return pd.DataFrame(columns=columns)
+    data["regime_name"] = data.get(
+        "regime_name", pd.Series("unknown", index=data.index)
+    ).fillna("unknown").astype(str)
+    rows = []
+    for keys, group in data.groupby(
+        ["reason", "regime_name", "horizon_days"],
+        dropna=False,
+        sort=True,
+    ):
+        reason, regime, horizon = keys
+        row = {
+            "reason": str(reason),
+            "regime_name": str(regime),
+            "horizon_days": int(horizon),
+            "matured_exit_count": int(len(group)),
+            "avg_hold_return": _series_mean(group, "symbol_return"),
+            "median_hold_return": _series_median(group, "symbol_return"),
+            "avg_cash_exit_reward_rate": _series_mean(group, "cash_exit_reward_rate"),
+            "cash_exit_positive_rate": _positive_rate(group, "cash_exit_reward_rate"),
+            "avg_benchmark_exit_reward_rate": _series_mean(group, "benchmark_exit_reward_rate"),
+            "benchmark_exit_positive_rate": _positive_rate(group, "benchmark_exit_reward_rate"),
+            "avg_replacement_exit_reward_rate": _series_mean(group, "replacement_exit_reward_rate"),
+            "replacement_exit_positive_rate": _positive_rate(group, "replacement_exit_reward_rate"),
+            "cash_exit_reward_amount": _series_sum(group, "cash_exit_reward_amount"),
+            "benchmark_exit_reward_amount": _series_sum(group, "benchmark_exit_reward_amount"),
+            "replacement_exit_reward_amount": _series_sum(group, "replacement_exit_reward_amount"),
+            "summary_contract": "fixed_horizon_cash_benchmark_replacement_v1",
+        }
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(
+        frame.get(column, pd.Series(index=frame.index, dtype=float)),
+        errors="coerce",
+    ).dropna()
+
+
+def _series_mean(frame: pd.DataFrame, column: str):
+    values = _numeric_series(frame, column)
+    return float(values.mean()) if not values.empty else pd.NA
+
+
+def _series_median(frame: pd.DataFrame, column: str):
+    values = _numeric_series(frame, column)
+    return float(values.median()) if not values.empty else pd.NA
+
+
+def _series_sum(frame: pd.DataFrame, column: str):
+    values = _numeric_series(frame, column)
+    return float(values.sum()) if not values.empty else pd.NA
+
+
+def _positive_rate(frame: pd.DataFrame, column: str):
+    values = _numeric_series(frame, column)
+    return float(values.gt(0.0).mean()) if not values.empty else pd.NA
 
 
 def _best_comparable_challenger(indexed, held_set, held_row) -> str:
@@ -229,11 +387,17 @@ def _history_lookup(prices):
     if prices is None or prices.empty:
         return {}
     col = "close" if "close" in prices.columns else "close_nominal"
-    data = prices[["date", "symbol", col]].copy()
+    columns = ["date", "symbol", col]
+    if "counterfactual_price_valid" in prices.columns:
+        columns.append("counterfactual_price_valid")
+    data = prices[columns].copy()
     data["date"] = pd.to_datetime(data["date"], errors="coerce")
     data[col] = pd.to_numeric(data[col], errors="coerce")
     data = data.dropna().sort_values(["symbol", "date"])
-    return {str(symbol): group[["date", col]].rename(columns={col: "close"}).reset_index(drop=True)
+    if "counterfactual_price_valid" not in data.columns:
+        data["counterfactual_price_valid"] = True
+    data["counterfactual_price_valid"] = data["counterfactual_price_valid"].fillna(False).astype(bool)
+    return {str(symbol): group[["date", col, "counterfactual_price_valid"]].rename(columns={col: "close"}).reset_index(drop=True)
             for symbol, group in data.groupby("symbol", sort=False)}
 
 
@@ -293,6 +457,9 @@ def _execution_lookup(executions):
             "trade_date": group["trade_date"].min(),
             "price": pd.to_numeric(group.get("price"), errors="coerce").dropna().iloc[0]
             if pd.to_numeric(group.get("price"), errors="coerce").notna().any() else pd.NA,
+            "executed_shares": float(pd.to_numeric(group.get("executed_shares"), errors="coerce").fillna(0.0).sum()),
+            "trade_notional": float(pd.to_numeric(group.get("trade_notional"), errors="coerce").fillna(0.0).sum()),
+            "total_cost_amount": float(pd.to_numeric(group.get("total_cost"), errors="coerce").fillna(0.0).sum()),
         }
         for side in ("sell", "buy"):
             leg = group[group["_side"].eq(side)].sort_values("trade_date")
@@ -302,6 +469,9 @@ def _execution_lookup(executions):
                     f"{side}_trade_date": item["trade_date"],
                     f"{side}_price": _number(item.get("price")),
                     f"{side}_cost_rate": float(item.get("_cost_rate", 0.0)),
+                    f"{side}_executed_shares": float(pd.to_numeric(leg.get("executed_shares"), errors="coerce").fillna(0.0).sum()),
+                    f"{side}_trade_notional": float(pd.to_numeric(leg.get("trade_notional"), errors="coerce").fillna(0.0).sum()),
+                    f"{side}_total_cost_amount": float(pd.to_numeric(leg.get("total_cost"), errors="coerce").fillna(0.0).sum()),
                 })
         for pair_id in ids:
             if pair_id:
@@ -325,7 +495,9 @@ def _price_asof(history, date):
     if history is None or history.empty:
         return None
     values = history[history["date"] <= pd.Timestamp(date)]
-    return float(values.iloc[-1]["close"]) if not values.empty else None
+    if values.empty or not bool(values.iloc[-1].get("counterfactual_price_valid", True)):
+        return None
+    return float(values.iloc[-1]["close"])
 
 
 def _future_return(history, date, horizon, start_price):
@@ -333,6 +505,11 @@ def _future_return(history, date, horizon, start_price):
         return None, None
     future = history[history["date"] > pd.Timestamp(date)].head(int(horizon))
     if len(future) < int(horizon):
+        return None, None
+    if not future.get(
+        "counterfactual_price_valid",
+        pd.Series(True, index=future.index),
+    ).fillna(False).astype(bool).all():
         return None, None
     return float(future.iloc[-1]["close"] / float(start_price) - 1.0), pd.Timestamp(future.iloc[-1]["date"])
 

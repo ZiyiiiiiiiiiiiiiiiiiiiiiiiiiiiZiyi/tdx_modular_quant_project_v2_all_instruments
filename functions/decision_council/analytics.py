@@ -100,14 +100,58 @@ def build_governance_attribution(
     data["matched_exposure_benchmark_net_value"] = (
         1.0 + data["matched_exposure_benchmark_daily_return"]
     ).cumprod()
-    data["excess_daily_return"] = data["account_daily_return"] - data["benchmark_daily_return"]
-    data["excess_net_value"] = (1.0 + data["excess_daily_return"]).cumprod()
-    data["invested_excess_daily_return"] = data["exposure_adjusted_daily_return"] - data["benchmark_daily_return"]
-    data["invested_excess_net_value"] = (1.0 + data["invested_excess_daily_return"]).cumprod()
-    data["valid_invested_excess_daily_return"] = data["valid_invested_capital_daily_return"] - data["benchmark_daily_return"]
-    data["valid_invested_excess_net_value"] = (1.0 + data["valid_invested_excess_daily_return"]).cumprod()
-    data["holding_portfolio_excess_daily_return"] = data["holding_portfolio_daily_return"] - data["benchmark_daily_return"]
-    data["holding_portfolio_excess_net_value"] = (1.0 + data["holding_portfolio_excess_daily_return"]).cumprod()
+    # Canonical relative wealth is a geometric NAV ratio.  Compounding the
+    # arithmetic daily return difference is a different statistic and must not
+    # be reported as benchmark excess return.
+    benchmark_nav = data["benchmark_net_value"].replace(0.0, np.nan)
+    data["excess_net_value"] = data["account_net_value"] / benchmark_nav
+    relative_return = data["excess_net_value"].pct_change(fill_method=None)
+    data["excess_daily_return"] = relative_return.where(
+        data["benchmark_return_valid"]
+    )
+    data.loc[
+        data["benchmark_return_valid"] & relative_return.isna(),
+        "excess_daily_return",
+    ] = 0.0
+    data["invested_excess_net_value"] = data["invested_capital_net_value"] / benchmark_nav
+    invested_relative_return = data["invested_excess_net_value"].pct_change(fill_method=None)
+    data["invested_excess_daily_return"] = invested_relative_return.where(
+        data["benchmark_return_valid"]
+    )
+    data.loc[
+        data["benchmark_return_valid"] & invested_relative_return.isna(),
+        "invested_excess_daily_return",
+    ] = 0.0
+    data["valid_invested_excess_net_value"] = data["valid_invested_capital_net_value"] / benchmark_nav
+    valid_invested_relative_return = data[
+        "valid_invested_excess_net_value"
+    ].pct_change(fill_method=None)
+    data["valid_invested_excess_daily_return"] = valid_invested_relative_return.where(
+        data["benchmark_return_valid"]
+    )
+    data.loc[
+        data["benchmark_return_valid"] & valid_invested_relative_return.isna(),
+        "valid_invested_excess_daily_return",
+    ] = 0.0
+    data["holding_portfolio_excess_net_value"] = data["holding_portfolio_net_value"] / benchmark_nav
+    holding_relative_return = data["holding_portfolio_excess_net_value"].pct_change(
+        fill_method=None
+    )
+    data["holding_portfolio_excess_daily_return"] = holding_relative_return.where(
+        data["benchmark_return_valid"]
+    )
+    data.loc[
+        data["benchmark_return_valid"] & holding_relative_return.isna(),
+        "holding_portfolio_excess_daily_return",
+    ] = 0.0
+    data["active_return_difference_daily"] = (
+        data["account_daily_return"] - data["benchmark_daily_return"]
+    )
+    data["active_return_difference_chain_net_value"] = (
+        1.0 + data["active_return_difference_daily"]
+    ).cumprod()
+    data["benchmark_relative_return_method"] = "geometric_nav_ratio"
+    data["holding_portfolio_return_method"] = "exposure_scaled_account_return_approximation"
 
     beta, upside_capture, downside_capture = _benchmark_capture_stats(
         account_return=data["account_daily_return"],

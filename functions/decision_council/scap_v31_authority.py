@@ -16,6 +16,7 @@ def attach_scap_v31_authority(
     position_cap_mode: str = "fixed",
     target_position_cash: float | None = None,
     authority_snapshot_id: str = "",
+    allow_synthetic_compatibility: bool = False,
 ) -> pd.DataFrame:
     """Attach A/B/C/D authority and a cost-before decision return.
 
@@ -30,6 +31,16 @@ def attach_scap_v31_authority(
         f"entry_calibration_effective_sample_size_{suffix}"
     )
     if required_evidence_column not in data.columns:
+        if not bool(allow_synthetic_compatibility):
+            data["scap_v31_authority_tier"] = "D"
+            data["scap_v31_decision_expected_return"] = 0.0
+            data["scap_v31_max_lots"] = 0
+            data["scap_v31_authority_contract"] = (
+                AUTHORITY_CONTRACT + "|fail_closed_missing_evidence"
+            )
+            data["scap_v31_authority_reason"] = "missing_authority_evidence"
+            data["scap_authority_snapshot_id"] = str(authority_snapshot_id)
+            return data
         legacy_return = pd.to_numeric(
             data.get(
                 "scap_decision_expected_return",

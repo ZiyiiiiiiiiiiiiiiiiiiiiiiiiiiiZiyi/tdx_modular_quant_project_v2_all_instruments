@@ -214,6 +214,7 @@ class MarketRegimeDetector:
         self.min_history_days = min_history_days
         self._regime_cache: dict[str, str] = {}
         self._precomputed_history: dict[str, pd.Series] = {}
+        self._precomputed_diagnostics: dict[str, pd.DataFrame] = {}
 
     def detect(
         self,
@@ -243,10 +244,8 @@ class MarketRegimeDetector:
 
         prepared = self._precomputed_history.get(str(benchmark_symbol))
         if prepared is not None and not prepared.empty:
-            try:
-                regime = prepared.asof(pd.Timestamp(date))
-            except Exception:
-                regime = None
+            key = pd.Timestamp(date).normalize()
+            regime = prepared.get(key)
             if isinstance(regime, str) and regime:
                 self._regime_cache[cache_key] = regime
                 return regime
@@ -254,6 +253,41 @@ class MarketRegimeDetector:
         regime = self._detect_internal(features_df, date, benchmark_symbol)
         self._regime_cache[cache_key] = regime
         return regime
+
+    def diagnostics(
+        self,
+        date: pd.Timestamp,
+        benchmark_symbol: str = "sh510300",
+    ) -> dict[str, Any]:
+        """Return the as-of input contract used by :meth:`detect`.
+
+        Missing benchmark observations or breadth are explicit.  They are not
+        silently converted into a neutral breadth score or an observed market
+        state.
+        """
+        frame = self._precomputed_diagnostics.get(str(benchmark_symbol))
+        default = {
+            "regime_input_valid": False,
+            "regime_input_status": "history_not_prepared",
+            "regime_benchmark_symbol": str(benchmark_symbol),
+            "regime_benchmark_role": "safety_control_proxy",
+            "regime_benchmark_observed": False,
+            "regime_benchmark_lag_days": pd.NA,
+            "regime_breadth_score": pd.NA,
+            "regime_breadth_coverage": 0.0,
+            "regime_as_of_date": pd.Timestamp(date),
+        }
+        if frame is None or frame.empty:
+            return default
+        key = pd.Timestamp(date).normalize()
+        if key not in frame.index:
+            default["regime_input_status"] = "date_not_prepared"
+            return default
+        row = frame.loc[key]
+        result = default.copy()
+        result.update(row.to_dict())
+        result["regime_as_of_date"] = key
+        return result
 
     def prepare_history(
         self,
@@ -265,14 +299,41 @@ class MarketRegimeDetector:
         if benchmark_symbol in self._precomputed_history:
             return self._precomputed_history[benchmark_symbol]
 
+        dates = pd.DatetimeIndex(
+            pd.to_datetime(features_df["date"], errors="coerce")
+            .dropna()
+            .drop_duplicates()
+            .sort_values()
+        ).normalize()
+        close_columns = [
+            column for column in ("close_nominal", "close")
+            if column in features_df.columns
+        ]
+        if not close_columns:
+            raise ValueError("market regime history requires close or close_nominal")
         benchmark = features_df.loc[
             features_df["symbol"].astype(str) == benchmark_symbol,
-            ["date", "close", "close_nominal"],
+            ["date", *close_columns],
         ].copy()
+        breadth = _breadth_history(features_df)
         if benchmark.empty:
-            prepared = pd.Series(dtype="object")
-            self._precomputed_history[benchmark_symbol] = prepared
-            return prepared
+            series = pd.Series("unknown", index=dates, dtype="object")
+            diagnostics = pd.DataFrame(index=dates)
+            diagnostics["regime_input_valid"] = False
+            diagnostics["regime_input_status"] = "benchmark_missing"
+            diagnostics["regime_benchmark_symbol"] = benchmark_symbol
+            diagnostics["regime_benchmark_role"] = "safety_control_proxy"
+            diagnostics["regime_benchmark_observed"] = False
+            diagnostics["regime_benchmark_lag_days"] = pd.NA
+            diagnostics["regime_breadth_score"] = breadth.reindex(dates).get(
+                "breadth_score", pd.Series(index=dates, dtype=float)
+            )
+            diagnostics["regime_breadth_coverage"] = breadth.reindex(dates).get(
+                "breadth_coverage", pd.Series(0.0, index=dates)
+            ).fillna(0.0)
+            self._precomputed_history[benchmark_symbol] = series
+            self._precomputed_diagnostics[benchmark_symbol] = diagnostics
+            return series
 
         benchmark["date"] = pd.to_datetime(benchmark["date"], errors="coerce")
         benchmark.sort_values("date", inplace=True)
@@ -285,32 +346,99 @@ class MarketRegimeDetector:
                 "date": benchmark["date"].to_numpy(),
                 "close": close.to_numpy(),
             }
-        ).dropna(subset=["date", "close"])
+        ).dropna(subset=["date"]).drop_duplicates("date", keep="last")
         if prepared.empty:
-            series = pd.Series(dtype="object")
+            series = pd.Series("unknown", index=dates, dtype="object")
             self._precomputed_history[benchmark_symbol] = series
+            diagnostics = pd.DataFrame(index=dates)
+            diagnostics["regime_input_valid"] = False
+            diagnostics["regime_input_status"] = "benchmark_price_missing"
+            diagnostics["regime_benchmark_symbol"] = benchmark_symbol
+            diagnostics["regime_benchmark_role"] = "safety_control_proxy"
+            diagnostics["regime_benchmark_observed"] = False
+            diagnostics["regime_benchmark_lag_days"] = pd.NA
+            diagnostics["regime_breadth_score"] = pd.NA
+            diagnostics["regime_breadth_coverage"] = 0.0
+            self._precomputed_diagnostics[benchmark_symbol] = diagnostics
             return series
 
-        prepared["ma20"] = prepared["close"].rolling(window=20, min_periods=20).mean()
-        prepared["ma60"] = prepared["close"].rolling(window=60, min_periods=40).mean()
-        prepared["ma120"] = prepared["close"].rolling(window=120, min_periods=80).mean()
-        prepared["ret_20d"] = prepared["close"] / prepared["close"].shift(self.ma_period - 1) - 1.0
-        prepared["ret_60d"] = prepared["close"] / prepared["close"].shift(60) - 1.0
-        prepared["ma_prev"] = prepared["ma20"].shift(self.ma_slope_lookback - 1)
-        prepared["recent_volatility"] = prepared["close"].pct_change().rolling(window=20, min_periods=1).std()
-        prepared["underwater"] = prepared["close"] / prepared["close"].cummax() - 1.0
-        prepared["history_count"] = np.arange(1, len(prepared) + 1, dtype=float)
-        prepared["regime"] = [
-            self._classify_market_row(row, breadth_score=np.nan)
-            for _, row in prepared.iterrows()
-        ]
-        prepared["regime"] = _apply_hysteresis(prepared["regime"], confirm_days=3)
-        series = pd.Series(
-            prepared["regime"].to_numpy(),
-            index=pd.DatetimeIndex(prepared["date"]),
-            dtype="object",
+        prepared["date"] = pd.to_datetime(prepared["date"]).dt.normalize()
+        prepared = prepared.set_index("date").reindex(dates)
+        prepared.index.name = "date"
+        prepared["benchmark_observed"] = prepared["close"].notna()
+        # Metrics use only observations available by the current date.  A
+        # missing same-day proxy is not silently treated as a valid state.
+        observed_close = prepared["close"].dropna()
+        metric = pd.DataFrame(index=observed_close.index)
+        metric["close"] = observed_close
+        metric["ma20"] = observed_close.rolling(window=20, min_periods=20).mean()
+        metric["ma60"] = observed_close.rolling(window=60, min_periods=40).mean()
+        metric["ma120"] = observed_close.rolling(window=120, min_periods=80).mean()
+        metric["ret_20d"] = observed_close / observed_close.shift(self.ma_period - 1) - 1.0
+        metric["ret_60d"] = observed_close / observed_close.shift(60) - 1.0
+        metric["ret_5d"] = observed_close / observed_close.shift(5) - 1.0
+        metric["ma_prev"] = metric["ma20"].shift(self.ma_slope_lookback - 1)
+        metric["recent_volatility"] = observed_close.pct_change().rolling(window=20, min_periods=1).std()
+        metric["underwater"] = observed_close / observed_close.cummax() - 1.0
+        metric["history_count"] = np.arange(1, len(metric) + 1, dtype=float)
+        prepared = prepared.drop(columns=["close"]).join(metric, how="left")
+        prepared = prepared.join(breadth, how="left")
+        prepared["breadth_coverage"] = pd.to_numeric(
+            prepared.get("breadth_coverage"), errors="coerce"
+        ).fillna(0.0)
+        prepared["input_valid"] = (
+            prepared["benchmark_observed"]
+            & prepared["history_count"].ge(float(self.min_history_days))
+            & pd.to_numeric(prepared.get("breadth_score"), errors="coerce").notna()
+            & prepared["breadth_coverage"].gt(0.0)
         )
+        raw_regimes = []
+        for _, row in prepared.iterrows():
+            if not bool(row.get("input_valid", False)):
+                raw_regimes.append("unknown")
+            else:
+                raw_regimes.append(
+                    self._classify_market_row(
+                        row,
+                        breadth_score=float(row["breadth_score"]),
+                    )
+                )
+        prepared["regime"] = _apply_hysteresis_preserving_unknown(
+            raw_regimes,
+            confirm_days=3,
+        )
+        series = pd.Series(prepared["regime"].to_numpy(), index=dates, dtype="object")
+        diagnostics = pd.DataFrame(index=dates)
+        diagnostics["regime_input_valid"] = prepared["input_valid"].astype(bool)
+        diagnostics["regime_input_status"] = np.select(
+            [
+                ~prepared["benchmark_observed"],
+                prepared["history_count"].fillna(0.0).lt(float(self.min_history_days)),
+                pd.to_numeric(prepared.get("breadth_score"), errors="coerce").isna(),
+                prepared["breadth_coverage"].le(0.0),
+            ],
+            [
+                "benchmark_missing_for_date",
+                "insufficient_benchmark_history",
+                "breadth_missing_for_date",
+                "breadth_zero_coverage",
+            ],
+            default="valid",
+        )
+        diagnostics["regime_benchmark_symbol"] = benchmark_symbol
+        diagnostics["regime_benchmark_role"] = "safety_control_proxy"
+        diagnostics["regime_benchmark_observed"] = prepared["benchmark_observed"].astype(bool)
+        diagnostics["regime_benchmark_lag_days"] = np.where(
+            prepared["benchmark_observed"], 0, np.nan
+        )
+        diagnostics["regime_breadth_score"] = pd.to_numeric(
+            prepared.get("breadth_score"), errors="coerce"
+        )
+        diagnostics["regime_breadth_coverage"] = prepared["breadth_coverage"]
+        diagnostics["regime_raw_label"] = raw_regimes
+        diagnostics["regime_confirmed_label"] = series
         self._precomputed_history[benchmark_symbol] = series
+        self._precomputed_diagnostics[benchmark_symbol] = diagnostics
         return series
     
     def _detect_internal(
@@ -331,6 +459,10 @@ class MarketRegimeDetector:
             return "bear"  # Default to bear if no data
         
         benchmark = benchmark.sort_values("date")
+        exact_date = pd.Timestamp(date).normalize()
+        observed_dates = pd.to_datetime(benchmark["date"], errors="coerce").dt.normalize()
+        if not observed_dates.eq(exact_date).any():
+            return "unknown"
         
         # Get close prices
         if "close_nominal" in benchmark.columns:
@@ -362,6 +494,8 @@ class MarketRegimeDetector:
         underwater = current_price / float(close.cummax().iloc[-1]) - 1.0 if float(close.cummax().iloc[-1]) > 0 else 0.0
         daily = features_df.loc[features_df["date"].eq(pd.Timestamp(date))]
         breadth_score = _breadth_score(daily)
+        if pd.isna(breadth_score):
+            return "unknown"
         row = pd.Series(
             {
                 "close": current_price,
@@ -392,7 +526,9 @@ class MarketRegimeDetector:
         ma_rising = ma20 > float(row.get("ma_prev", ma20))
         vol = float(row.get("recent_volatility", 0.0) or 0.0)
         underwater = float(row.get("underwater", 0.0) or 0.0)
-        breadth = 0.5 if pd.isna(breadth_score) else float(breadth_score)
+        if pd.isna(breadth_score):
+            raise ValueError("market regime classification requires observed PIT breadth")
+        breadth = float(breadth_score)
         if underwater <= -0.25 or vol >= self.volatility_threshold * 1.8:
             return "crisis"
         if price > ma20 > ma60 and ret20 > 0.02 and ret60 > 0.0 and ma_rising and breadth >= 0.55:
@@ -410,6 +546,8 @@ class MarketRegimeDetector:
     def clear_cache(self):
         """Clear the regime detection cache."""
         self._regime_cache.clear()
+        self._precomputed_history.clear()
+        self._precomputed_diagnostics.clear()
 
 
 class MarketRegimePolicy:
@@ -498,6 +636,7 @@ class MarketRegimePolicy:
         params = self.get_params(features_df, date, benchmark_symbol)
         return {
             "regime": self.get_current_regime(),
+            **self.detector.diagnostics(date, benchmark_symbol),
             "safety_warning_drawdown": params.safety_warning_drawdown,
             "safety_high_drawdown": params.safety_high_drawdown,
             "safety_crisis_drawdown": params.safety_crisis_drawdown,
@@ -531,6 +670,70 @@ def _breadth_score(daily: pd.DataFrame) -> float:
     if not scores:
         return float("nan")
     return float(np.mean(scores))
+
+
+def _breadth_history(features_df: pd.DataFrame) -> pd.DataFrame:
+    """Build same-day PIT breadth and coverage without future filling."""
+    columns = ["date"]
+    for column in ("ret_20", "close_to_ma20", "instrument_type", "is_trading"):
+        if column in features_df.columns:
+            columns.append(column)
+    data = features_df.loc[:, columns].copy()
+    data["date"] = pd.to_datetime(data["date"], errors="coerce").dt.normalize()
+    data = data.dropna(subset=["date"])
+    if "instrument_type" in data.columns:
+        data = data[data["instrument_type"].astype(str).eq("stock")]
+    if "is_trading" in data.columns:
+        data = data[data["is_trading"].fillna(False).astype(bool)]
+    rows = []
+    for date, group in data.groupby("date", sort=True):
+        score = _breadth_score(group)
+        available = pd.Series(False, index=group.index)
+        for column in ("ret_20", "close_to_ma20"):
+            if column in group.columns:
+                available |= pd.to_numeric(group[column], errors="coerce").notna()
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "breadth_score": score,
+                "breadth_coverage": float(available.mean()) if len(group) else 0.0,
+                "breadth_member_count": int(available.sum()),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=["breadth_score", "breadth_coverage", "breadth_member_count"],
+            index=pd.DatetimeIndex([], name="date"),
+        )
+    return pd.DataFrame(rows).set_index("date")
+
+
+def _apply_hysteresis_preserving_unknown(
+    regimes: pd.Series | list[str],
+    *,
+    confirm_days: int = 3,
+) -> list[str]:
+    """Confirm valid labels while preserving invalid dates as ``unknown``."""
+    confirmed = None
+    streak_value = None
+    streak = 0
+    output = []
+    for raw in list(regimes):
+        value = str(raw or "unknown")
+        if value == "unknown":
+            output.append("unknown")
+            streak_value = None
+            streak = 0
+            continue
+        if value == streak_value:
+            streak += 1
+        else:
+            streak_value = value
+            streak = 1
+        if confirmed is None or streak >= max(int(confirm_days), 1):
+            confirmed = value
+        output.append(str(confirmed or value))
+    return output
 
 
 def _apply_hysteresis(regimes: pd.Series | list[str], *, confirm_days: int = 3) -> list[str]:

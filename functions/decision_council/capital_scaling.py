@@ -23,14 +23,17 @@ LOT_CASH_COLUMNS = (
 class PositionCapacity:
     mode: str
     configured_cap: int | None
+    user_hard_cap: int | None
     search_cap: int
     eligible_symbol_count: int
     economic_position_cap: int
+    lot_cash_position_cap: int
     effective_position_cap: int
     soft_target_positions: int
     spendable_cash: float
     minimum_economic_order_amount: float
     median_one_lot_amount: float
+    capacity_risk_room_amount: float
     reason: str
 
     def as_dict(self) -> dict:
@@ -45,10 +48,12 @@ def resolve_position_capacity(
     risk_exposure_ceiling: float,
     candidates: pd.DataFrame | None,
     current_symbols=(),
+    current_exposure: float = 0.0,
 ) -> PositionCapacity:
     """Return a daily position ceiling without treating a search cap as finance."""
     profile = dict(capital_profile or {})
     configured = _optional_positive_int(profile.get("max_positions"))
+    user_hard_cap = _optional_positive_int(profile.get("user_hard_position_cap"))
     mode = str(
         profile.get(
             "position_cap_mode",
@@ -75,7 +80,9 @@ def resolve_position_capacity(
     cash = max(float(cash_amount), 0.0)
     buffer_amount = max(float(profile.get("min_cash_buffer", 0.0) or 0.0), 0.0)
     risk_budget = nav * min(max(float(risk_exposure_ceiling), 0.0), 1.0)
-    spendable = max(min(cash, risk_budget) - buffer_amount, 0.0)
+    current_invested = nav * min(max(float(current_exposure), 0.0), 1.0)
+    risk_room = max(risk_budget - current_invested, 0.0)
+    spendable = max(min(max(cash - buffer_amount, 0.0), risk_room), 0.0)
     minimum_commission = max(
         float(
             profile.get(
@@ -96,16 +103,23 @@ def resolve_position_capacity(
         ),
         1e-6,
     )
+    slippage_rate = max(float(profile.get("slippage_rate", 0.0) or 0.0), 0.0)
+    stamp_duty_rate = max(float(profile.get("stamp_duty_rate", 0.0) or 0.0), 0.0)
+    transfer_fee_rate = max(float(profile.get("transfer_fee_rate", 0.0) or 0.0), 0.0)
+    non_commission_round_trip_rate = (
+        2.0 * slippage_rate + stamp_duty_rate + 2.0 * transfer_fee_rate
+    )
+    residual_cost_budget = maximum_round_trip_cost_ratio - non_commission_round_trip_rate
     minimum_economic_order = (
-        2.0 * minimum_commission / maximum_round_trip_cost_ratio
-        if minimum_commission > 0.0
-        else 0.0
+        2.0 * minimum_commission / residual_cost_budget
+        if minimum_commission > 0.0 and residual_cost_budget > 0.0
+        else float("inf") if minimum_commission > 0.0 else 0.0
     )
-    economic_amounts = sorted(
+    economic_amounts = [
         max(float(value), minimum_economic_order)
-        for value in lot_cash.tolist()
+        for value in _ranked_lot_cash(frame, lot_cash).tolist()
         if float(value) > 0.0
-    )
+    ]
     cumulative = 0.0
     new_name_cap = 0
     for amount in economic_amounts:
@@ -115,16 +129,16 @@ def resolve_position_capacity(
         new_name_cap += 1
         if len(held) + new_name_cap >= search_cap:
             break
-    economic_cap = len(held) + new_name_cap
+    lot_cash_cap = len(held) + new_name_cap
+    economic_cap = lot_cash_cap
     if configured is not None and mode == "fixed":
         effective = min(configured, search_cap)
         reason = "fixed_profile_or_user_cap"
     else:
-        effective = min(
-            economic_cap,
-            len(held) + eligible_count,
-            search_cap,
-        )
+        auto_caps = [economic_cap, len(held) + eligible_count, search_cap]
+        if user_hard_cap is not None:
+            auto_caps.append(user_hard_cap)
+        effective = min(auto_caps)
         reason = (
             "auto_cash_lot_cost_capacity"
             if eligible_count
@@ -141,9 +155,11 @@ def resolve_position_capacity(
     return PositionCapacity(
         mode=mode,
         configured_cap=configured,
+        user_hard_cap=user_hard_cap,
         search_cap=search_cap,
         eligible_symbol_count=eligible_count,
         economic_position_cap=economic_cap,
+        lot_cash_position_cap=lot_cash_cap,
         effective_position_cap=max(int(effective), len(held), 1),
         soft_target_positions=max(int(soft_target), 0),
         spendable_cash=spendable,
@@ -151,6 +167,7 @@ def resolve_position_capacity(
         median_one_lot_amount=(
             float(lot_cash.median()) if not lot_cash.empty else 0.0
         ),
+        capacity_risk_room_amount=risk_room,
         reason=reason,
     )
 
@@ -235,6 +252,38 @@ def _candidate_lot_cash(candidates: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=float)
     prices = pd.to_numeric(candidates[price_column], errors="coerce")
     return (prices * 100.0)[prices.gt(0.0) & prices.notna()]
+
+
+def _ranked_lot_cash(candidates: pd.DataFrame, lot_cash: pd.Series) -> pd.Series:
+    """Order capacity tickets by decision evidence, never by cheapest price."""
+    if lot_cash.empty:
+        return lot_cash
+    frame = candidates.loc[lot_cash.index].copy()
+    score_column = next(
+        (
+            column
+            for column in (
+                "scap_candidate_utility",
+                "risk_adjusted_primary_score",
+                "cabinet_native_final_score",
+                "primary_score",
+            )
+            if column in frame.columns
+        ),
+        None,
+    )
+    frame["_lot_cash"] = lot_cash
+    if score_column is None:
+        # Preserve deterministic candidate order; price must not manufacture
+        # a larger capacity by moving cheap, weak names to the front.
+        return frame["_lot_cash"]
+    frame["_capacity_score"] = pd.to_numeric(frame[score_column], errors="coerce")
+    return frame.sort_values(
+        ["_capacity_score"],
+        ascending=[False],
+        na_position="last",
+        kind="mergesort",
+    )["_lot_cash"]
 
 
 def _optional_positive_int(value) -> int | None:

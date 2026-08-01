@@ -254,6 +254,7 @@ def verify_atomic_exit_releases_slot() -> None:
         ),
         action_type="hard_exit",
         funding_cash_amount=0.0,
+        buy_cash_required_amount=0.0,
         exposure_delta=-0.20,
     )
     remaining, released, available = _available_slots_after_exits(
@@ -352,6 +353,8 @@ def verify_lifecycle_winner_permission_reaches_action_plan() -> None:
         per_name_structural_cap=0.60,
         cash_amount=20_000.0,
         cash_buffer_amount=2_000.0,
+        decision_date=pd.Timestamp("2025-01-10"),
+        execution_cost_profile={"scap_max_winner_add_layers": 1},
     )
     permitted = pd.Series(
         {
@@ -369,6 +372,7 @@ def verify_lifecycle_winner_permission_reaches_action_plan() -> None:
             "add_expected_net_profit_lcb": 30.0,
             "scap_estimated_total_cost_amount": 8.0,
             "entry_thesis": "momentum",
+            "scap_authority_snapshot_id": "d|authority",
         }
     )
     proposals: list[ActionProposal] = []

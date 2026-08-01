@@ -11,7 +11,12 @@ import math
 
 import pandas as pd
 
-from functions.decision_council.action_utility import round_trip_cost_amount
+from functions.decision_council.action_utility import (
+    buy_cash_required_amount,
+    round_trip_cost_amount,
+    sell_cash_released_amount,
+    single_side_cost_amount,
+)
 from functions.decision_council.capital_scaling import scaled_candidate_budgets
 from functions.execution.security_trading_rules import trading_rule_for
 from functions.decision_council.integer_action_optimizer import (
@@ -67,6 +72,12 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 / max(int(context.top_n), 1)
             ),
             authority_snapshot_id=f"{context.decision_id}|authority",
+            allow_synthetic_compatibility=bool(
+                (context.execution_cost_profile or {}).get(
+                    "scap_allow_synthetic_authority",
+                    False,
+                )
+            ),
         )
     if "scap_authority_snapshot_id" not in data.columns:
         data["scap_authority_snapshot_id"] = f"{context.decision_id}|authority"
@@ -80,23 +91,55 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
     }
     proposals: list[ActionProposal] = []
     proposal_rows: dict[str, pd.Series] = {}
-    current_lots: dict[str, int] = {}
-    positive_signal_weights: list[float] = []
+    current_lots: dict[str, int] = {
+        str(symbol): max(int(lots), 1)
+        for symbol, lots in dict(
+            getattr(context, "current_lots_by_symbol", None) or {}
+        ).items()
+        if int(lots) > 0
+    }
     raw_entry_signal_symbols: set[str] = set()
     structural_entry_symbols: set[str] = set()
     proposal_entry_symbols: set[str] = set()
 
     for symbol, row in rows.items():
         old_weight = current_weights.get(symbol, 0.0)
-        lot_cash = _number(row.get("mainline_v3_one_lot_cash_required"))
-        lot_weight = _number(row.get("mainline_v3_one_lot_weight"))
-        if lot_weight <= 0.0 and lot_cash > 0.0:
-            lot_weight = lot_cash / max(float(context.nav_amount), 1e-12)
-        if lot_cash <= 0.0 and lot_weight > 0.0:
-            lot_cash = lot_weight * float(context.nav_amount)
-        exact_current_lots = dict(
-            getattr(context, "current_lots_by_symbol", None) or {}
+        minimum_quantity = max(
+            int(_number(row.get("mainline_v3_minimum_buy_quantity"), 100.0)),
+            1,
         )
+        price = _number(row.get("close_nominal", row.get("close")))
+        legacy_lot_cash = _number(
+            row.get("mainline_v3_one_lot_cash_required")
+        )
+        lot_market_notional = _number(
+            row.get("mainline_v3_one_lot_market_notional")
+        )
+        if lot_market_notional <= 0.0 and price > 0.0:
+            lot_market_notional = price * minimum_quantity
+        if lot_market_notional <= 0.0 and legacy_lot_cash > 0.0:
+            # Compatibility-only synthetic fixtures may lack a market price.
+            # Keep the fallback explicit; production rows carry close_nominal.
+            lot_market_notional = legacy_lot_cash
+        if price <= 0.0 and lot_market_notional > 0.0:
+            price = lot_market_notional / minimum_quantity
+        lot_cash = (
+            buy_cash_required_amount(
+                symbol=symbol,
+                price=price,
+                shares=float(minimum_quantity),
+                trade_date=context.decision_date,
+                cost_profile=context.execution_cost_profile,
+            )
+            if price > 0.0
+            else legacy_lot_cash
+        )
+        lot_weight = (
+            lot_market_notional / max(float(context.nav_amount), 1e-12)
+            if lot_market_notional > 0.0
+            else 0.0
+        )
+        exact_current_lots = dict(getattr(context, "current_lots_by_symbol", None) or {})
         if old_weight > 0.0:
             if symbol in exact_current_lots:
                 current_lots[symbol] = max(
@@ -118,6 +161,7 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 row=row,
                 old_weight=old_weight,
                 lot_cash=lot_cash,
+                lot_market_notional=lot_market_notional,
                 lot_weight=lot_weight,
             )
             continue
@@ -143,26 +187,26 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         max_by_name = int(
             math.floor(max(float(context.per_name_structural_cap), 0.0) / lot_weight)
         ) if lot_weight > 0.0 else 0
-        max_by_cash = int(
-            math.floor(
-                max(float(context.cash_amount) - float(context.cash_buffer_amount), 0.0)
-                / lot_cash
-            )
-        ) if lot_cash > 0.0 else 0
         max_lots = min(
             max(max_by_name, 0),
-            max(max_by_cash, 0),
             int(_number(row.get("scap_v31_max_lots"), 0.0)),
         )
         if max_lots > 0:
             proposal_entry_symbols.add(symbol)
-        symbol_has_positive_plan = False
         for lots in range(1, max_lots + 1):
-            minimum_quantity = max(
-                int(_number(row.get("mainline_v3_minimum_buy_quantity"), 100.0)),
-                1,
+            market_notional = lot_market_notional * lots
+            buy_cash = buy_cash_required_amount(
+                symbol=symbol,
+                price=price,
+                shares=float(minimum_quantity * lots),
+                trade_date=context.decision_date,
+                cost_profile=context.execution_cost_profile,
             )
-            price = lot_cash / minimum_quantity
+            if buy_cash > max(
+                float(context.cash_amount) - float(context.cash_buffer_amount),
+                0.0,
+            ) + 1e-8:
+                break
             exact_cost = round_trip_cost_amount(
                 symbol=symbol,
                 price=price,
@@ -192,13 +236,13 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 ),
                 0.0,
             )
-            authority_penalty = lot_cash * lots * authority_penalty_rate
+            authority_penalty = market_notional * authority_penalty_rate
             if decision_return > 0.0:
                 expected_profit = (
-                    point_return * lot_cash * lots - exact_cost
+                    point_return * market_notional - exact_cost
                 )
                 robust_profit = (
-                    decision_return * lot_cash * lots
+                    decision_return * market_notional
                     - exact_cost
                     - risk_penalty
                     - concentration_penalty
@@ -214,9 +258,11 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 lots=lots,
                 expected=expected_profit,
                 robust=robust_profit,
-                downside=lot_cash * lots * 0.15,
+                downside=market_notional * 0.15,
                 cost=exact_cost,
-                funding=lot_cash * lots,
+                funding=buy_cash,
+                market_notional=market_notional,
+                buy_cash_required=buy_cash,
                 suffix=f"entry_{lots}lot",
                 source="mainline_v3_score_contract",
                 authority_tier=authority_tier,
@@ -238,17 +284,12 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 primary_rank=_number(row.get("scap_v32_pool_rank"), 0.0),
                 unit_capital_robust_return=(
                     (robust_profit - authority_penalty)
-                    / max(lot_cash * lots, 1.0)
+                    / max(market_notional, 1.0)
                 ),
                 authority_penalty_amount=authority_penalty,
             )
             proposals.append(proposal)
             proposal_rows[proposal.proposal_id] = row
-            symbol_has_positive_plan = (
-                symbol_has_positive_plan or robust_profit > 0.0
-            )
-        if symbol_has_positive_plan:
-            positive_signal_weights.append(lot_weight)
 
     current_exposure = min(sum(current_weights.values()), 1.0)
     strategic_budget = min(
@@ -293,23 +334,23 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         derisk_confirmed=confirmed_derisk_target is not None,
     )
-    signal_supported = min(
-        current_exposure + sum(sorted(positive_signal_weights)[: max(int(context.top_n), 0)]),
-        strategic_budget,
-    )
-    spendable = max(float(context.cash_amount) - float(context.cash_buffer_amount), 0.0)
-    affordable_weights = [
-        weight
-        for weight in sorted(positive_signal_weights)
-        if weight * float(context.nav_amount) <= spendable + 1e-8
-    ]
-    integer_feasible = min(
-        current_exposure + sum(affordable_weights[: max(int(context.top_n), 0)]),
-        signal_supported,
+    signal_supported, integer_feasible = _constructive_entry_exposure_bounds(
+        proposals=proposals,
+        current_lots=current_lots,
+        current_exposure=current_exposure,
+        max_positions=max(int(context.top_n), 1),
+        available_cash=max(float(context.cash_amount), 0.0),
+        cash_buffer=max(float(context.cash_buffer_amount), 0.0),
+        strategic_budget=strategic_budget,
     )
     covariance = context.covariance_matrix
     covariance_state = (
-        "shrunk_covariance_70_30"
+        str(
+            getattr(covariance, "attrs", {}).get(
+                "estimator",
+                "covariance_complete_coverage",
+            )
+        )
         if covariance is not None and not covariance.empty
         else "fallback_thesis_caps"
     )
@@ -384,7 +425,9 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             not bool(context.safety.hard_freeze_active)
             and current_exposure < strategic_budget - 1e-12
         ),
-        replacement_allowed=bool(context.active_replacement_enabled),
+        # Lean has no atomic paired replacement proposal factory yet.  Fail
+        # closed instead of advertising an unreachable permission.
+        replacement_allowed=False,
         current_cash_amount=max(float(context.cash_amount), 0.0),
         strategic_exposure_budget=strategic_budget,
         signal_supported_exposure=signal_supported,
@@ -656,6 +699,16 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         "scap_v32_deduplicated_symbol_count": int(len(rows)),
         "scap_v32_pool_contract": "scap_v32_thesis_pool_preserving_v1",
+        "lean_replacement_requested": bool(context.active_replacement_enabled),
+        "lean_replacement_reachable": False,
+        "lean_replacement_status": (
+            "requested_but_fail_closed_no_atomic_pair_factory"
+            if bool(context.active_replacement_enabled)
+            else "disabled_by_profile"
+        ),
+        "held_symbol_missing_candidate_count": int(
+            len(set(current_lots) - set(rows))
+        ),
     }
     if diagnostics["optimizer_invocation_count"] != 1:
         raise RuntimeError("SCAP-V3 Lean optimizer invocation invariant failed")
@@ -736,16 +789,38 @@ def _append_exposure_cap_safety_exits(
         if planned_weight + 1e-12 >= required_reduction:
             break
         old_weight = float(current_weights.get(symbol, 0.0))
+        held_lots = max(int(current_lots.get(symbol, 1)), 1)
+        rule = trading_rule_for(symbol, trade_date=context.decision_date)
+        shares = float(held_lots * rule.minimum_buy_quantity)
+        price = _number(row.get("close_nominal", row.get("close")))
+        market_notional = max(price * shares, 0.0)
+        sell_cost = single_side_cost_amount(
+            symbol=symbol,
+            side="sell",
+            price=price,
+            shares=shares,
+            trade_date=context.decision_date,
+            cost_profile=context.execution_cost_profile,
+        )
+        sell_release = sell_cash_released_amount(
+            symbol=symbol,
+            price=price,
+            shares=shares,
+            trade_date=context.decision_date,
+            cost_profile=context.execution_cost_profile,
+        )
         proposal = _proposal(
             context,
             symbol=symbol,
             action_type="safety_exit",
-            lots=max(int(current_lots.get(symbol, 1)), 1),
+            lots=held_lots,
             expected=0.0,
             robust=0.0,
             downside=0.0,
-            cost=_number(row.get("scap_estimated_total_cost_amount")),
+            cost=sell_cost,
             funding=0.0,
+            market_notional=market_notional,
+            sell_cash_released=sell_release,
             suffix="exposure_cap_safety_exit",
             source="exposure_authorization",
         )
@@ -765,7 +840,10 @@ def _append_held_proposals(
     old_weight,
     lot_cash,
     lot_weight,
+    lot_market_notional=None,
 ) -> None:
+    if lot_market_notional is None:
+        lot_market_notional = max(float(lot_cash), 0.0)
     exit_reason = str(row.get("position_exit_reason", "") or "")
     exit_state = bool(row.get("exit_state", False))
     if exit_state:
@@ -777,16 +855,45 @@ def _append_held_proposals(
         position_amount = float(context.nav_amount) * old_weight
         robust = 0.0 if hard else max(-expected_hold * position_amount, 0.0)
         action_type = "hard_exit"
+        current_position_lots = max(
+            int(
+                dict(
+                    getattr(context, "current_lots_by_symbol", None) or {}
+                ).get(symbol, round(old_weight / max(lot_weight, 1e-12)))
+            ),
+            1,
+        )
+        rule = trading_rule_for(symbol, trade_date=context.decision_date)
+        current_shares = float(current_position_lots * rule.minimum_buy_quantity)
+        price = _number(row.get("close_nominal", row.get("close")))
+        position_market_notional = max(price * current_shares, 0.0)
+        sell_cost = single_side_cost_amount(
+            symbol=symbol,
+            side="sell",
+            price=price,
+            shares=current_shares,
+            trade_date=context.decision_date,
+            cost_profile=context.execution_cost_profile,
+        )
+        sell_release = sell_cash_released_amount(
+            symbol=symbol,
+            price=price,
+            shares=current_shares,
+            trade_date=context.decision_date,
+            cost_profile=context.execution_cost_profile,
+        )
         proposal = _proposal(
             context,
             symbol=symbol,
             action_type=action_type,
-            lots=max(int(round(old_weight / max(lot_weight, 1e-12))), 1),
+            lots=current_position_lots,
             expected=robust,
             robust=robust,
             downside=0.0,
-            cost=_number(row.get("scap_estimated_total_cost_amount")),
+            cost=sell_cost,
             funding=0.0,
+            market_notional=position_market_notional,
+            sell_cash_released=sell_release,
             suffix=action_type,
             source="position_lifecycle_evidence",
         )
@@ -898,12 +1005,13 @@ def _append_held_proposals(
         )
         rule = trading_rule_for(symbol, trade_date=decision_date)
         lot_shares = max(float(rule.minimum_buy_quantity), 1.0)
-        inferred_price = lot_cash / lot_shares
+        inferred_price = lot_market_notional / lot_shares
         exact_total_cost = round_trip_cost_amount(
             symbol=symbol,
             price=inferred_price,
             shares=lot_shares * add_lots,
             trade_date=decision_date,
+            cost_profile=context.execution_cost_profile,
         )
         one_lot_cost = max(
             _number(row.get("scap_estimated_total_cost_amount")),
@@ -916,6 +1024,13 @@ def _append_held_proposals(
         if scaled_base_utility <= 0.0:
             return
         scaled_robust = scaled_base_utility
+        add_buy_cash = buy_cash_required_amount(
+            symbol=symbol,
+            price=inferred_price,
+            shares=lot_shares * add_lots,
+            trade_date=decision_date,
+            cost_profile=context.execution_cost_profile,
+        )
         proposal = _proposal(
             context,
             symbol=symbol,
@@ -925,7 +1040,9 @@ def _append_held_proposals(
             robust=scaled_robust,
             downside=lot_cash * 0.15 * add_lots,
             cost=exact_total_cost,
-            funding=lot_cash * add_lots,
+            funding=add_buy_cash,
+            market_notional=lot_market_notional * add_lots,
+            buy_cash_required=add_buy_cash,
             suffix=f"winner_add_{layer + 1}",
             source="position_lifecycle_evidence",
             authority_tier=current_authority_tier,
@@ -934,7 +1051,20 @@ def _append_held_proposals(
         )
         proposals.append(proposal)
         proposal_rows[proposal.proposal_id] = row
-    if context.loser_add_enabled and -0.10 <= unrealized <= -0.04 and layer < 1:
+    lifecycle_loser_allowed = (
+        bool(row.get("add_allowed", False))
+        and str(row.get("add_decision_type", "")) == "loser_averaging"
+        and bool(row.get("loser_averaging", False))
+        and current_authority_tier in {"A", "B", "C"}
+        and bool(authority_snapshot_id)
+    )
+    if (
+        context.loser_add_enabled
+        and lifecycle_loser_allowed
+        and base_utility > 0.0
+        and -0.10 <= unrealized <= -0.04
+        and layer < 1
+    ):
         proposal = _proposal(
             context,
             symbol=symbol,
@@ -945,6 +1075,8 @@ def _append_held_proposals(
             downside=lot_cash * 0.20,
             cost=_number(row.get("scap_estimated_total_cost_amount")),
             funding=lot_cash,
+            market_notional=lot_market_notional,
+            buy_cash_required=lot_cash,
             suffix="loser_add_1",
             source="position_lifecycle_evidence",
         )
@@ -965,6 +1097,9 @@ def _proposal(
     funding,
     suffix,
     source,
+    market_notional=0.0,
+    buy_cash_required=0.0,
+    sell_cash_released=0.0,
     authority_tier="A",
     thesis="",
     pool_id="",
@@ -991,21 +1126,14 @@ def _proposal(
         downside_cvar_amount=max(float(downside), 0.0),
         exact_cost_amount=max(float(cost), 0.0),
         funding_cash_amount=max(float(funding), 0.0),
-        cash_release_amount=(
-            max(
-                float(context.current_weights.get(symbol, 0.0))
-                * float(context.nav_amount)
-                - max(float(cost), 0.0),
-                0.0,
-            )
-            if action_type
-            in {"exit", "hard_exit", "safety_exit", "replacement_sell"}
-            else 0.0
-        ),
+        cash_release_amount=max(float(sell_cash_released), 0.0),
+        market_notional_amount=max(float(market_notional), 0.0),
+        buy_cash_required_amount=max(float(buy_cash_required), 0.0),
+        sell_cash_released_amount=max(float(sell_cash_released), 0.0),
         exposure_delta=(
             -float(context.current_weights.get(symbol, 0.0))
             if action_type in {"exit", "hard_exit", "safety_exit", "replacement_sell"}
-            else float(funding) / max(float(context.nav_amount), 1e-12)
+            else float(market_notional) / max(float(context.nav_amount), 1e-12)
         ),
         authority_tier=str(authority_tier),
         thesis=str(thesis),
@@ -1134,16 +1262,88 @@ def _available_slots_after_exits(
     return remaining, released, remaining + released
 
 
+def _constructive_entry_exposure_bounds(
+    *,
+    proposals,
+    current_lots,
+    current_exposure: float,
+    max_positions: int,
+    available_cash: float,
+    cash_buffer: float,
+    strategic_budget: float,
+) -> tuple[float, float]:
+    """Build attainable signal and cash-feasible exposure without double counting.
+
+    One smallest-lot positive, authority-eligible proposal is retained per new
+    symbol.  Cash is deducted cumulatively and existing holdings consume the
+    Web-supplied slots.  The result is deliberately constructive: every amount
+    labelled integer-feasible corresponds to an explicit feasible sequence.
+    """
+    by_symbol: dict[str, ActionProposal] = {}
+    for proposal in proposals:
+        if (
+            proposal.action_type != "new_entry"
+            or proposal.symbol in current_lots
+            or proposal.authority_tier not in {"A", "B", "C"}
+            or proposal.hard_veto_reasons
+            or (
+                float(proposal.robust_net_profit_amount)
+                - float(proposal.authority_penalty_amount)
+            )
+            <= 0.0
+        ):
+            continue
+        incumbent = by_symbol.get(proposal.symbol)
+        if incumbent is None or int(proposal.requested_lots) < int(
+            incumbent.requested_lots
+        ):
+            by_symbol[proposal.symbol] = proposal
+    candidates = sorted(
+        by_symbol.values(),
+        key=lambda item: (
+            -float(item.unit_capital_robust_return),
+            -float(item.robust_net_profit_amount),
+            item.symbol,
+        ),
+    )
+    slots = max(int(max_positions) - len(current_lots), 0)
+    candidates = candidates[:slots]
+    signal_increment = sum(max(float(item.exposure_delta), 0.0) for item in candidates)
+    signal_supported = min(
+        max(float(current_exposure), 0.0) + signal_increment,
+        float(strategic_budget),
+    )
+    cash_remaining = max(float(available_cash) - float(cash_buffer), 0.0)
+    feasible_increment = 0.0
+    for item in candidates:
+        required = max(float(item.buy_cash_required_amount), 0.0)
+        if required <= cash_remaining + 1e-8:
+            cash_remaining -= required
+            feasible_increment += max(float(item.exposure_delta), 0.0)
+    integer_feasible = min(
+        max(float(current_exposure), 0.0) + feasible_increment,
+        signal_supported,
+    )
+    return float(signal_supported), float(integer_feasible)
+
+
 def _shrink_covariance(matrix: pd.DataFrame | None) -> tuple[pd.DataFrame | None, str]:
     if matrix is None or matrix.empty:
         return None, "fallback_thesis_caps"
-    numeric = matrix.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    if numeric.shape[0] != numeric.shape[1]:
+    numeric = matrix.apply(pd.to_numeric, errors="coerce")
+    if (
+        numeric.shape[0] != numeric.shape[1]
+        or list(numeric.index) != list(numeric.columns)
+        or numeric.isna().any().any()
+    ):
         return None, "fallback_thesis_caps"
     diagonal = pd.DataFrame(0.0, index=numeric.index, columns=numeric.columns)
     for symbol in numeric.index.intersection(numeric.columns):
         diagonal.at[symbol, symbol] = max(float(numeric.at[symbol, symbol]), 0.0)
-    return 0.70 * numeric + 0.30 * diagonal, "shrunk_covariance_70_30"
+    dimension = max(int(numeric.shape[0]), 1)
+    shrinkage = min(max(dimension / 60.0, 0.10), 0.90)
+    shrunk = (1.0 - shrinkage) * numeric + shrinkage * diagonal
+    return (shrunk + shrunk.T) / 2.0, "adaptive_diagonal_shrinkage"
 
 
 def _number(value, default: float = 0.0) -> float:

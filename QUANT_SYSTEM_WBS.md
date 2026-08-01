@@ -1811,3 +1811,142 @@
 - GitHub发布结果：黄金提交为`313d89a195e537918d80af8c7d6f683a0efad8ab`，已推送并永久保留在远端分支`origin/codex/golden-pre-calculation-fix-20260730`。PR为`#8`（`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/8`），head/base核对为黄金分支→`main`，状态`MERGEABLE/CLEAN`，远端未配置额外CI checks。
 - 主干合并结果：PR #8于2026-07-30合并，merge commit为`5d8d1e385812c75c46f6f69b1e6ad7dacaa668f8`；本地`main`随后以fast-forward同步并核对该merge commit，之后仅追加本条WBS发布结果记录并推送主干。GitHub连接器创建/合并PR均因integration权限返回403，按发布技能规定使用已认证的GitHub CLI完成，未产生重复PR或重复黄金提交。
 - 保留与清理：黄金远端分支不删除，作为后续修复前的可复现基线；本地大量未跟踪运行产物仍原样保留，没有暂存、提交或删除。主干合并只证明版本发布完成，不改变研究/上线`blocked`结论。
+
+### CHANGE-20260730-07：2万元小资金数学与金融模型修复方案
+
+- 用户目标：针对`CHANGE-20260730-05`发现的静默计算缺陷，从数学、金融模型和2万元真实可执行约束重新设计完整方案；本轮明确只做方案，不修改策略代码、不调整参数、不运行回测。
+- 基线复核：`small_capital_lean`为20,000元、1,000元现金缓冲、最多5只、软目标4只、单股软/硬上限25%/40%、正常目标暴露90%、100股整数交易、每边最低佣金5元、佣金率0.03%、每边滑点0.05%、卖出印花税0.05%、过户费模型每边0.001%、允许现金、loser add与active replacement关闭、winner add开启。该方向适合小资金，但当前部分变量仍混用市场金额、现金需求、收益本金和风险罚金。
+- 外部依据：复核上交所2026年现行交易规则、深交所2023年交易规则、财政部/税务总局证券交易印花税公告，以及Ledoit-Wolf协方差收缩、DeMiguel-Garlappi-Uppal样本外1/N比较、Boyd等含交易成本/约束的组合优化研究。结论是2万元必须直接使用整数手数，固定费用不可连续化，裸样本协方差和均值优化受估计误差影响，复杂模型必须与简单等权基准做样本外比较。
+- 成本复算：按当前费用档案、忽略市场冲击且买卖同价时，往返成本为`2×max(5,0.0003N)+0.00152N`。2,000/3,000/4,000/4,750/5,000/6,000/8,000元订单的成本率分别约0.652%/0.485%/0.402%/0.363%/0.352%/0.319%/0.277%；低于约2,900元的订单仅固定/比例费用就超过0.5%，因此经济持仓通常为3—4只而不是强制凑5只。
+- 数学主模型：严格拆分`market_notional`、`buy_cash_required`、`sell_cash_released`和`exposure`；账户相对基准使用`NAV_account/NAV_benchmark-1`；决策变量为每只股票目标整数手数；10日稳健收益为收缩点预测减同期限预测误差，再扣增量精确费用；主要组合风险统一为10日人民币压力损失/CVaR，避免固定downside、协方差、集中度和压力预算重复惩罚同一风险。
+- 硬约束：卖出净回款和买入现金累计进入同一个自融资约束；持仓数不超过5；已有持仓无论是否在候选表都占用槽位和暴露；单股风险=`权重×有效止损距离`；账户总开放风险为各持仓风险之和；强制退出优先；替换必须原子配对；没有正的成本后稳健边际价值时允许现金。
+- 建议研究起点：经济持仓3—4只、硬上限5；单股软上限20%—25%、硬上限30%；正常期望暴露80%—85%、硬上限90%；协方差冷启动暴露不高于65%；单股开放风险2.5%—3.0% NAV、总开放风险8% NAV；回撤预警/新开仓冻结先按10%/15%研究；继续关闭loser add、active replacement和force deploy。所有数值是待验证起点，不是最优参数或收益承诺。
+- 风险模型合同：只有runtime非cold-start、最终选中股票方差覆盖100%、两两协方差覆盖100%、矩阵有限/对称/半正定且期限换算明确时，ActionPlan才可写`risk_model_used=covariance`；采用决策日前数据和收缩估计。缺失股票进入因子/行业/市场压力fallback，不得以0协方差代表未知风险。
+- 缺陷映射：基准公式归`analytics/runner_summary/Web`；风险覆盖归`runner/runtime maturity/optimizer/ActionPlan`；整数可行暴露和signal-supported归Lean/optimizer；完整目标分解和最优性声明归optimizer；计划后补单归runner；卖出回款归统一费用原语；缺失候选持仓归账户状态；loser add/replacement/authority归生命周期和权限链；forward 20日“realized”字段改为counterfactual audit并与fill PnL分离。
+- 施工建议：Phase 0先建立失败测试；Phase 1修报表/字段语义；Phase 2建立唯一现金和费用原语；Phase 3改股票级整数手数优化；Phase 4落地风险覆盖、收缩协方差和fallback；Phase 5关闭旁路并统一动作权限；Phase 6依次完成纯函数手算、静态审查、专项测试、5日构造窗口、同spec 20日、180/338日、滚动/留出期和成本压力，并与3只/4只简单基准比较。
+- 详细方案：`reports/SCAP_20K_MATHEMATICAL_FINANCIAL_MODEL_REMEDIATION_PLAN_20260730.md`。该报告包含费用表、账户恒等式、整数目标、CVaR模型、建议风险档案、逐缺陷模块修改和验收门。当前仍是设计状态`planned`；未获新授权前不实施代码，研究门和上线门继续`blocked`。
+
+### CHANGE-20260730-08：静默计算缺陷全模块整改与20日全流程验收
+
+- 用户授权：实施`CHANGE-20260730-05/07`所列全部模块整改；每个模块先做不运行代码的静态语义审查，再做专项 bug 测试；全部完成后运行20个交易日，从决策开始直至全部账本、审计与报告保存完成。
+- 需求更正：持仓硬上限不得固定为5只。`max_positions`唯一运行时权威链为 Web 提交值 → 资本档案 → runner → Lean/优化器/执行完整性审计；2万元的3—4只仅是费用和分散之间的经济性建议，当前档案中的5只只可作为可编辑默认值，不能成为模块常量或未来上限。
+- 施工边界：修复基准相对收益语义、反事实字段命名、市场名义金额/买入现金/卖出净回款/费用原语、整数可行暴露、优化目标分解与最优性声明、协方差成熟度/覆盖/收缩/fallback、ActionPlan后补单旁路、缺失候选持仓占槽、加仓生命周期授权、替换可达性和authority缺字段fail-closed。
+- 比较纪律：本轮代码状态与此前黄金版本、旧20日或长窗结果不可直接作因果收益比较。最终20日实验只用于从开始到保存的工程和会计验收；研究门与上线门在完成更长受控样本外验证前继续`blocked`。
+- 阶段状态：Phase 0进行中。已确认固定解释器为`C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe`（Python 3.10.19），工作树中既有未跟踪运行产物全部保留，不暂存、不删除；已将详细方案中“硬上限5只”更正为“Web动态上限”。
+- Phase 0完成：静态追踪确认`main_launcher_web.py`的`max_positions_account`支持任意正整数，留空采用档案默认、0采用自动容量；`config.get_backtest_capital_profile()`把该值写入运行档案，runner再传给Lean、优化器和完整性审计。后续需消除优化器默认参数、候选上限和注释中把5当固定维度的残余。
+- Phase 1完成（基准与审计语义）：`analytics.py`将正式`excess_net_value`改为`account_net_value / benchmark_net_value`，日相对收益由相对财富序列计算；原“每日收益差复利”保留为明确命名的`active_return_difference_chain_net_value`，不再冒充几何超额。`runner_summary.py`同步保存公式方法；持仓组合收益明确标注为暴露缩放近似，不冒充fill级精确归因。`scap_profit_objective.py`把未来20日结果正式命名为`counterfactual_forward`，优先使用市场名义金额，旧`realized`字段只保留为带弃用状态的兼容别名。
+- Phase 1静态/动态验证：修改文件及两个专项脚本`py_compile`通过，`git diff --check`通过；`verify_scap_benchmark_math_semantics.py`证明几何NAV比值与收益差复利在构造路径上确实不同且正式字段取前者；`verify_scap_profit_objective_audit.py`证明市场名义金额优先、逐行旧字段fallback和audit-only约束。专项测试首次暴露“整列存在但单行缺失时没有逐行fallback”，已改为`combine_first`并复测通过。
+- Phase 2完成（金额与费用原语）：`mainline_v3.py`新增一手市场名义金额；`action_utility.py`新增统一的单边费用、精确买入现金和精确卖出净回款函数，全部复用执行层同一费用表；`ActionProposal`新增`market_notional_amount/buy_cash_required_amount/sell_cash_released_amount`并在类型边界校验旧别名一致性；Lean的新入场、赢家加仓、生命周期退出和安全退出分别使用市场金额算暴露/收益本金、买侧含费现金算融资约束、全部实际股数的卖侧费用算净回款，不再用“一手往返成本”替代整仓卖出费用。
+- Phase 2静态/动态验证：4个生产模块`py_compile`和`git diff --check`通过；`verify_scap_cash_cost_unit_contract.py`证明5手卖出印花税和费用按全部5手计提，且市场金额、买入现金、卖出净回款三者不混用；`verify_scap_v3_lean_chain.py`全组通过。首次复测发现无价格的旧合成fixture无法生成赢家加仓，已增加仅用于旧fixture的显式名义金额fallback；生产数据仍以`close_nominal × 最小买入数量`为权威。
+- Phase 3完成（动态维度与整数优化）：Web帮助文案不再把5只写成固定实验定义，输入仍可为任意正整数/档案默认/自动容量。Lean的signal-supported与integer-feasible改为可构造口径：已有持仓先占用Web槽位，每个新股票只取一手正净值且A/B/C授权提案，买入现金逐笔累计扣减；不再把单笔均可负担误当成组合同时可负担。优化器的暴露统一累加`exposure_delta`而非含费现金；空计划广度也按运行时上限归一化。
+- Phase 3目标账本：ActionPlan新增提案稳健利润、thesis软罚金和deployment罚金，连同已有authority、集中度和协方差罚金可逐项复算最终目标。精确枚举若经过候选裁剪，只声明`optimal_reduced_universe_exhaustive`并把全局最优证明置0；只有未裁剪全候选精确枚举才声明`optimal_full_universe_exhaustive`和全局证明1。大维度仍明确标为有界beam可行解。
+- Phase 3静态/动态验证：生产与测试文件`py_compile`、`git diff --check`通过；`verify_scap_integer_feasible_exposure.py`构造2个已有持仓、Web上限4、现金只能再买1只的案例，验证signal=80%而integer-feasible=60%；`verify_scalable_optimizer_contract.py`验证动态5/12维、全候选/裁剪候选最优性声明和目标逐项复算；V2属性、V3.1黄金恢复/持仓恢复、V3.2激进合同、Lean链、Web合同均通过。Web初始化测试另暴露两条已过时断言（仍期待旧`aggressive_profit`和换仓已开启），已按当前`aggressive_lean`、档案控制换仓及Web动态持仓设置更新后通过。
+- Phase 4完成（协方差成熟度与覆盖）：runner先计算原始候选协方差和成熟状态，只有`calibrated`才把矩阵交给决策引擎；20日内cold-start因此必走thesis/单名压力fallback，不再出现“报告cold-start但优化器仍用了协方差”。估计器先要求每列至少80%观察，再在收益观测层均值补齐，使用维度/样本自适应对角收缩并保存强度、样本数、候选覆盖和pair覆盖；不再把未知协方差填0。成熟合同额外验证方阵、同序标签、全有限、对称、半正定和pair覆盖。
+- Phase 4计划级风险标签：优化器仅在最终正权重股票及全部两两协方差100%覆盖时才计算协方差罚金并写`risk_model_used=covariance`；缺任何股票/配对即返回明确fallback，未知风险不再等于零风险。Lean残余收缩函数也改为缺失fail-closed并移除固定70/30和“五只组合”假设。
+- Phase 4静态/动态验证：4个生产模块编译和diff检查通过；`verify_scap_covariance_coverage_contract.py`验证Web上限7同样可用、缺失最终股票时fallback且不冒充covariance、完整覆盖才启用、19日必为cold-start、60日完整PSD矩阵才calibrated、单个NaN即degraded；runtime maturity、V2属性、V3.1黄金恢复和Lean全链专项全部通过。
+- Phase 5完成（唯一ActionPlan与权限fail-closed）：runner在`aggressive_lean`下禁止调用ActionPlan后的force-deploy/diversify补单器，并写入`post_action_plan_order_augmentation=disabled_unique_action_plan`；因此Web即使选择force-deploy，也只能通过唯一计划目标影响优化，不能追加无计划血缘订单。Lean初始化当前手数时直接读取全部账户持仓，缺失候选行的持仓仍保留原手数、占Web槽位并进入缺失计数。
+- Phase 5加仓/authority：loser add除档案开关和价格区间外，现在必须同时获得生命周期`add_allowed`、`add_decision_type=loser_averaging`、loser标记、A/B/C当前authority、非空authority snapshot和正增量效用，不能绕过生命周期仲裁。authority缺少校准证据字段时默认全部D/0手/fail-closed；仅专项合成测试显式传`allow_synthetic_compatibility=True`才允许旧兼容。
+- Phase 5替换边界：Lean尚没有生成同一ActionPlan内原子卖买配对的工厂，因此不再虚报`replacement_allowed=True`；即使未来档案请求开启，也明确保存`requested_but_fail_closed_no_atomic_pair_factory`。当前Lean资金档案本来关闭替换，故20日基线不变；若未来要启用，必须先实现原子配对提案及卖腿成交前买腿不得注册的完整测试。
+- Phase 5静态/动态验证：生产模块编译和diff检查通过；`verify_scap_permission_fail_closed.py`证明正旧utility不能在缺证据时合成A、未获生命周期许可的loser add不产生提案、许可齐全才产生、Lean补单旁路被关闭；资本缩放、风险/退出、V3.1黄金与持仓恢复、V3.2、统一动作和Lean链均通过。Lean链新增“候选表缺失的真实持仓仍占满Web槽位”用例并通过。
+- Phase 6完成（跨模块静态审阅与回归）：全局扫描清除Lean计算链中固定5只、固定70/30协方差、含费现金充当暴露、ActionPlan后补单和旧最优性标签残余；optimizer不再提供静默5只默认，调用者必须传运行资本档案上限；mainline V3直接调用未传上限时使用当前候选唯一数而非5。月度ML treatment Top-K改为Web上限/档案软目标/治理默认的显式优先链；方案中的整数约束改为`K_web`。
+- Phase 6测试结果：24个本轮修改/新增Python文件全部`py_compile`通过，`git diff --check`通过，目标静态残余扫描为0；35个专项回归脚本35/35通过，覆盖基准、费用、整数优化、协方差、权限、V2/V3.1/V3.2、唯一动作、pending、替换执行保护、执行规则、资本缩放、runtime、mainline和Web。首轮回归发现`verify_mainline_v3_single_score_chain`依赖旧默认5，已把无上限直接调用改为候选集动态维度；第二轮发现无效基准日的几何日相对收益不应为0，已保持NAV显示但将该日相对收益置NaN并通过原无效基准专项。summary进一步只在最后一个有效基准收益日读取几何相对终值。
+- Phase 7完成（20日从决策到保存全流程）：使用固定解释器、`small_capital_lean`、Web等价显式`max_positions=6`（专门证明下游不是固定5）、2万元档案、允许现金、E4、全A研究池、固定74因子柜、PIT research、Top100月度研究基准，运行2025-01-02至2025-02-06共20个交易日。运行目录为`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1800/v3/run20260730_230617`；stdout/stderr为`reports/scap_20260730_silent_calc_fix_20d_stdout.txt`和`...stderr.txt`，stderr为0字节；checkpoint、`COMPLETE.json`均为complete/20日/2025-02-06。
+- Phase 7工程结果：132个CSV全部可读且保留表头；NAV恒等式最大误差0，持仓上限记录全为6、实际最大4；4个ActionPlan新入场全部注册pending并全部成交，fill/order/registration key无重复，4个selected pending和4个selected fill的plan/proposal/cash reservation血缘完整，旧position-state未否决任何已授权计划。漏斗总计`3968→2862→2862→2862→4→4`，逐日无反单调；runtime integrity 12/12通过，行动血缘为proposals=3981、selected=4、selected_without_order=0、filled_without_selection=0。
+- Phase 7数学/费用结果：4个选中提案市场名义金额合计16,802元、计划买入现金16,830.56902元、计划往返精确费用65.53904元；实际4笔买入费用28.76245854元。20个ActionPlan目标分解复算最大误差`7.11e-15`；13日为全候选精确最优、7日为裁剪集合精确最优且不声称全局证明。20日协方差状态全部cold-start，20个计划全部明确使用`thesis_and_per_name_stress_caps` fallback。
+- Phase 7结果口径：期末净值1.0219618771、总收益+2.19618771%、最大回撤-2.30381229%；研究基准+6.67367682%，几何相对收益`1.0219618771/1.0667367682-1=-4.19737019%`，保存比值误差0。期末现金3,176.24元、持仓市值17,263元、4只持仓；本窗无卖出和闭合交易，因此不能用胜率/PF评价退出或盈利稳定性。
+- Phase 7产品验收：`verify_scap_fullchain_run_v2.py`全部检查通过并保存`fullchain_product_verification_v2.json`，逐因子曲线Excel状态`ok`且文件存在。该通过只证明20日工程、会计、权限和保存链闭合；`experiment_sample_role=development_audit`、`research_gate_status=blocked`，由于样本短、无闭合交易、PIT/税务/独立复核仍非正式，不构成上线或收益有效性证明。
+- Phase 8最终状态：本轮授权范围内代码、专项测试、静态审阅和20日全流程均已完成。既有大量未跟踪历史运行产物均保留，未删除、未暂存、未提交；本轮新代码与验证脚本仍在工作树，等待用户决定是否另建修复分支、提交并发起PR。上线门继续`blocked`。
+
+### CHANGE-20260731-01：31号完整输出与Excel全表只读审计
+
+- 用户目标：对31号保存完成的输出，从数学指标、金融模型、代码逻辑、买入/卖出/退出链以及全部Excel工作表逐项分析，识别已经发生的问题和未触发但可能改变计算的潜在问题，并形成详细说明。
+- 口径识别：31号没有以`run20260731_*`命名的新目录；当天唯一完整写入的正式运行是前一晚启动、31日02:27保存完成的`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1200/v3/run20260730_232541`。审计将以该运行的checkpoint、运行身份、产物清单和完成标记为边界，不把其他日期、窗口、资金档案或代码状态混入比较。
+- 操作边界：本轮只读核验运行产物和当前代码，不修改策略、参数、账户、执行或报表逻辑，不重新回测，不删除文件；仅新增审计报告并按变更控制补录本WBS。Excel工作簿只读检查工作表、值、公式、图表、格式、错误值和跨表勾稽，不覆盖原文件。
+- 影响链：WBS-00.07运行身份/可比性 → WBS-08 ActionPlan与整数约束 → WBS-09风险模型 → WBS-10买卖/退出/加仓 → WBS-11成交、费用和现金 → WBS-13研究门 → WBS-14报表/Excel/血缘 → WBS-16全链验收。当前状态为`audit_in_progress`，结论与证据待本条后续补录。
+- 完整性与账户证据：该run为338/338日complete；运行目录及持仓因子子目录154个CSV全部可解析、无无名列和完全重复行，15个表仅有表头。账户期末30,783.7021元、总收益+53.9185%、最大回撤-17.1645%、平均暴露74.421%；`NAV=cash+invested_value`最大误差`7.28e-12`。69笔闭合交易已实现11,612.1570元、3个期末头寸未实现-828.4550元，与账户利润10,783.7021元完全勾稽；147笔成交order/fill ID唯一、均晚于信号日、费用合计1,231.2979元。
+- P0基准数学缺陷：338个评估日中基准仅276日为100%成员收益覆盖，62个98%/99%覆盖日被标`benchmark_return_valid=False`，但`analytics.py`仍把缺失成员填0并让这些日进入`benchmark_net_value`复利。正式保存的基准+47.7568%、几何相对+4.1701%；只在共同完整276日复利时账户+61.2355%、基准+66.4696%、几何相对-3.1441%。后一数值仅作敏感性诊断，不替代正式指标，但证明当前超额方向依赖缺失日处理；summary的`degradation_flags`仍为空。
+- P0计划/执行裂缝：43,272个Proposal和338个唯一Plan中选中85个new entry、65个hard exit、4个safety exit、6个winner add。69个卖出和6个加仓全部成交，但13个已选new entry在`executable_order_plan`之后未进入pending/成交，全部由注册层以`lot_size_cash_insufficient`过滤。原因是优化器把同Plan普通卖出净回款用于买入，而`execution_runtime/retail_execution`只对显式replacement pair提供条件现金。候选漏斗仍把85个计划买入误记为85个registered buy，runtime action-lineage只核对proposal→order plan，未核对plan→pending completeness，因而误报通过。
+- P0硬上限/最优性缺陷：20个ActionPlan的`projected_exposure`高于`hard_exposure_ceiling`仍标`optimal_full_universe_exhaustive`；当`_plan_key`因当前状态超硬上限返回`None`且没有降仓提案时，主函数仍生成robust=0的“optimal”空动作计划，暴露松弛又被截成0。运行完整性最终11/12，通过项中唯一失败为`execution_exposure_authorization`：3个越权日、最大超额15.031个百分点。77个真正选中动作的计划目标分解可复算至`2.84e-14`，但261个空选择计划中25个显示了未进入robust值的集中度罚金，不能按账本字段全局复算。
+- 风险模型结论：covariance runtime为20日cold-start、40日warming-up、278日calibrated，但日账本338日`covariance_risk_model_used=False`；ActionPlan仅2日写covariance，分别为纯强制退出和空计划，边际罚金均为0，因此没有买入受到协方差风险罚金。`quality_reports.py`的风险贡献表又独立使用缺失填0、固定70/30收缩和ideal plan，46日输出与adaptive ActionPlan风险模型不是同一口径；日账本max risk全0、风险表最大1、summary最大1，状态不一致。
+- 卖出/金融模型结论：69笔闭合交易胜率68.12%、PF 2.251；37个profit-giveback退出贡献+18,043.12元且胜率94.59%，其他退出合计-6,430.97元，利润高度依赖单一退出模块。11个loss-containment全部亏损，合计-6,046.19元；entry-failure卖出滞后率45.83%。signal/thesis/loss-containment卖出后的10日前向股票收益约+8.96%/+8.65%/+2.75%，提示卖点偏向下跌后局部低位；6个winner add的20日前向平均收益-2.849%，样本小但未显示有效。
+- 成本压力缺陷：`cost_capacity_audit.py`和`scap_cost_stress.py`用一笔entry order价格乘加仓后总股数，未按全部买腿加权成本，也未完整纳入公司行动现金。6个加仓交易的重建净PnL高估1,077.41元，其他63笔合计低估353元，基础压力净PnL相对真实已实现PnL净高估724.41元；因此压力PF、break-even cost multiplier和production eligible不能作为正式容量证据，尽管实际成交费用和账户NAV本身正确。
+- 因子证据：74因子的冗余标记比例75.68%、最大成对秩相关1.0，alpha diversification gate失败；等权状态使factor entropy机械接近1，不能证明独立分散。factor validation实际覆盖89个因子，其中21个不在当前柜、当前柜6个未进入报告；110个pass中93个属于当前柜、17个来自柜外，summary字段不能理解为当前74因子的纯验证数。
+- Excel全表证据：唯一工作簿含60个工作表和108张图，全部60页成功渲染，未发现Excel错误值。`Checks!A1:F5`明确显示持仓-日期因子覆盖1513/1514 FAIL；缺口为`sz300965/2025-04-30`，该日只有全空占位记录。`Sell Diagnostics`的MAE 65/65为空，尽管生命周期CSV有MAE；该表65行还未披露其不含4个safety sell。Checks中的关键实际值是常量公式而非源数据动态统计，且未覆盖runtime integrity失败、13个计划买入未注册、基准无效日和硬暴露越权。54个股票页虽完整绘图，但74因子横向展开至约CN列，人工审查可用性较差。
+- 其他报告语义：15个空CSV没有在表内说明not-applicable/no-trigger/insufficient/failed；`runner_summary.py`把全部`exposure_cap<1`日命名为emergency deleveraging，导致338日全部被记为emergency而实际safety sell只有4笔；multiple-testing/overfit为0/3、PIT L1/L2为research-only、impact model未校准、failure lab为1/3。
+- 详细报告：`reports/SCAP_20260731_OUTPUT_MATH_FINANCE_CODE_EXCEL_AUDIT.md`。本轮未修改策略代码、参数或运行产物，未重新回测、未删除文件。最终状态：账户/已成交会计链`verified`；基准数学、Plan→pending、硬暴露可行性、统一风险模型、成本压力和Excel审计链为`remediation_required`；研究门和上线门继续`blocked`。
+### CHANGE-20260731-02：市场状态条件化退出与动态持仓数改进方案（分析阶段）
+
+- 任务边界：针对完整运行 `run20260730_232541` 重新评价 loss-containment、signal-failure 等退出模块；明确区分“退出前已经发生的亏损”与“退出后相对继续持有节省或错失的损益”。本轮只读分析，不修改策略逻辑、参数、数据、执行、会计或报表代码，不重新回测。
+- 受控口径：沿用 2025-01-02 至 2026-05-29、初始资金 20,000 元、`small_capital_lean + aggressive_lean + E4 + all_a_share_research + fixed 74-factor cabinet`、最大持仓 5 的同一运行身份；不得与其他日期、资金、代码指纹或因子柜结果直接比较。
+- 待验证假设一：已实现退出亏损不能单独归因于退出模块；主指标应为固定期限继续持有、现金、风格匹配基准和实际替代资产四种反事实之间的净差额，并扣除增量交易成本。窗口最低价避免损失只作压力指标，不作主要因果指标。
+- 待验证假设二：市场基准不宜作为硬止损的简单二元总开关；应区分始终启用的事实/灾难风险约束、可按市场状态调整强度的软信号退出、以及组合层总暴露控制，并要求全部状态特征仅使用决策时点已知数据。
+- 待验证假设三：持仓数不应永久固定为 5，也不应随净值机械同比例增长；运行时目标应由 Web 管理上限、整手与现金可行性、最低经济票面、有效信号数量、相关性/因子簇、流动性及换手成本共同取最小可行值。
+- 上下游影响链：市场/宽度/波动状态 -> 生命周期退出阈值与组合暴露 -> 唯一 ActionPlan -> 整数手数与现金优化 -> 订单/成交 -> NAV/归因；动态持仓上限 -> 候选槽位 -> 优化器可行域 -> 集中度/成本/容量 -> Excel 与研究门。任何后续代码阶段均须先补充方案验收标准和单变量 A/B 设计。
+- 事实复算：338日状态为bull 153、neutral 166、weak 19、bear/crisis均0；绩效基准有效276日、无效62日。loss-containment在成熟样本中继续持有5/10/20日平均约+1.44%/+2.75%/+6.67%，退出现金净增量约-1.70%/-3.00%/-6.92%；signal-failure对应继续持有约+3.83%/+5.58%/+6.16%，退出现金净增量约-4.03%/-5.78%/-6.36%。这证明退出时已实现亏损不是退出因果评价，但本样本的软退出固定期限价值仍偏弱；因没有熊市样本，不得外推为熊市无效。
+- 持仓复算：338日中258日持满5只，其中114日同时暴露缺口大于5个百分点；这114日平均`cash_feasible_count≈148.98`而`slot_feasible_count=0`，固定5在漏斗层形成约束，但不证明第6只必然有正边际净效用。按当前完整成本，往返成本率不超过0.50%的最低经济票面约2,874元；20,000元在85%目标暴露和1,000元缓冲下经济上界约5只，期末30,783.70元约8只，4,000元票面口径则分别约4只和6只。
+- 静态代码结论：`small_capital_lean`仍为`fixed + max_positions=5`；已有`capital_scaling.py`自动容量未被本run使用，且auto模式没有同时约束Web配置上限、按最低一手金额贪心会形成低价股容量偏差。`market_regime_policy.py`预计算路径向分类器传入缺失breadth并回填0.5，实际未兑现全市场宽度；控制状态默认`sh510300`与绩效`top_liquidity_100_equal_weight_monthly`身份不同。
+- 方案结论：硬风险/灾难约束始终启用；软退出确认、减仓比例与再入场由事前市场状态概率连续调整；组合状态独立控制总暴露和新买入。持仓采用“可空Web硬上限 + 经济/整手/现金可行上限 + 唯一整数ActionPlan内生选择”，不得机械按净值同比例扩张或强制买满。
+- 详细交付：`reports/SCAP_20260731_REGIME_EXIT_DYNAMIC_HOLDINGS_IMPROVEMENT_PLAN.md`，包含三反事实退出公式、真实分状态证据、动态容量与成本模型、原始论文/交易规则、模块级四阶段修改方案、静态/构造/运行/金融验收矩阵。本轮未修改策略代码、参数或运行产物，未重新回测；状态更新为`analysis_complete_remediation_planned`，研究门和上线门继续`blocked`。
+
+### CHANGE-20260731-03：市场状态、退出反事实与动态持仓全模块实施及20日验收
+
+- 用户决策：保留全部退出模块，接受退出控制不可能在所有市场时期最大化；不采用大盘二元总开关。市场状态只允许连续调整软退出强度、组合风险预算、新买入与加仓，灾难止损、现金、无杠杆和市场权限始终启用。
+- 实施范围：修复市场状态PIT宽度、控制/绩效基准身份、无效日期和状态证据；补全现金/匹配基准/替代资产退出反事实；把Web硬上限、经济可行上限、搜索上限和实际持仓分离；让唯一整数ActionPlan在完整成本、整手、现金、风险与相关性约束下内生选择持仓数；完成报表、Web和Excel语义接线。
+- 既有工作树保护：当前工作树已包含CHANGE-20260730系列尚未提交的基准几何超额、风险覆盖、整数可行性、目标审计等修改及专项验证脚本；本阶段以差异审计和基线测试确认后增量修改，不回退、不覆盖、不把既有用户变更冒充本阶段新改动。
+- 阶段验收：每个模块先静态审阅与`py_compile`，再运行构造/专项验证；模块全部通过后，执行数学可复算、金融语义和权限不变量验收，最后运行相同产品身份的20日小窗口，从初始化、PIT/warm-up、候选、唯一ActionPlan、订单、成交、持仓、NAV、反事实、CSV/Excel/Web到manifest/COMPLETE完整保存。
+- 可比性：最终20日只验证工程全链与账本语义，不作为盈利或样本外有效性结论；代码指纹、日期、资金、因子柜、成本、PIT、Web参数和动态容量身份必须写入产物。当前状态`implementation_in_progress`，研究门和上线门继续`blocked`。
+- Phase 1市场状态完成：`market_regime_policy.py`的预计算路径已按同日可交易股票计算`ret_20/close_to_ma20`宽度及覆盖率，控制ETF当日缺失或历史/宽度不足时显式输出`unknown`与失败原因，不再用breadth=0.5或陈旧as-of值伪造有效状态；预计算与历史截断PIT一致。`runner.py`不再吞掉状态准备异常，并保存控制基准角色、观测状态、宽度、覆盖、原始/确认标签和as-of日期；绩效基准角色保持独立。`verify_market_regime_pit_breadth_contract.py`、`verify_benchmark_role_separation.py`、`verify_benchmark_invalid_attribution.py`及相关`py_compile`全部退出0；未引入大盘二元退出总开关。
+- Phase 2退出反事实完成：保留E0-E4、loss/signal/thesis/profit/safety全部退出权限，不改变触发阈值且不增加市场二元总开关。`action_counterfactual_reward.py`对实际成交后的5/10/20日同时输出继续持有、现金、绩效基准和真实替代资产的成本后rate/CNY增量，保存实际成交金额/股数；基准无效时只冻结基准反事实，不能抹掉有效现金反事实。新增`governance_exit_counterfactual_summary.csv`按原因、事前状态和固定期限汇总均值/中位数/命中率，窗口未来最低价不进入主指标。`verify_action_counterfactual_reward.py`、SCAP exit contract/stage/stage5与capital-scaled risk/exit回归及`py_compile`全部退出0。
+- Phase 3动态持仓完成：`small_capital_lean`默认改为auto，Web输入改为`user_hard_position_cap`治理硬上限且不再把系统切回fixed；留空/0表示不加用户上限。`capital_scaling.py`分离Web、搜索、经济/整手现金和当日有效上限，按当前暴露扣减风险空间，最低经济票面使用最低佣金加滑点/税费/过户费完整往返成本，候选容量按决策证据顺序而非最低股价排序。`runner.py`把当日有效上限交给唯一整数ActionPlan，报告五类持仓数和现金/风险空间；runtime integrity按逐日有效上限核验。Web/monitor明确展示治理硬上限、经济上限、搜索上限、有效上限和实际持仓。资本、可扩展优化器、整数可行暴露、成本单位、权限fail-closed、Lean唯一链/静态权限和V3.2专项共8组测试及`py_compile`全部退出0。
+- Phase 4数学/金融依赖统一回归完成：几何账户/基准NAV比、无效基准归因排除、协方差成熟度及选中符号/配对100%覆盖、市场金额/买入现金/卖出净回款/数量缩放成本、累计现金与持仓槽位、20日利润审计字段、分数与人民币效用单位、相关性惩罚、卖出回款、现金预留、成本压力、整数优化和审计追踪共12组专项脚本全部退出0；16个相关模块`py_compile`退出0。当前未发现模块间口径冲突，下一步进入全回归与20日产品链。
+- Phase 5全回归与保存契约修复：首轮`verify_decision_council_phase_one.py`在32日合成回测完成交易后，质量报告把动态模式允许为空的`configured_max_positions=NaN`强制转为整数而失败。`quality_reports.py`已改为分别保存可空配置/Web硬上限、经济上限、搜索上限和当日有效上限，并以`holding_count <= effective_position_cap`为约束；新增`verify_dynamic_position_report_contract.py`覆盖空硬上限和真实越界。修复后32日从交易到96类附加表完整保存，专项测试退出0。
+- Phase 5跨模块回归：执行规则、V3主线/runner smoke、生命周期数学、PIT市场状态、退出反事实、基准角色、资本缩放、checkpoint/schema、实验卫生、运行身份、SCAP Stage0—7、Lean唯一ActionPlan/静态权限、V3.1恢复、V3.2合同、Web初始化和worker隔离全部退出0。测试清单最初引用了不存在的旧名`verify_scap_stage1_friction_and_tail_risk.py`，未伪报通过；改用仓库真实`verify_scap_stage1_exposure.py`及Stage2—7。Web旧断言“固定持仓上限”更新为“可选Web硬护栏且不是目标持仓数”。
+- 首次20日真实全链与二次缺陷发现：`run20260731_203757`使用2万元、auto动态持仓、Web硬上限空、允许现金、E4/-18%、全A、固定74因子柜、Top100月度绩效基准、PIT research，20/20日及121类附加表成功保存；但落盘复算发现`regime_input_valid=False`为20/20、宽度覆盖0。根因是`governance_layer_validation`有意关闭状态交易权限，而runner错误地把“无交易权限”等同于“不运行诊断器”。该run只作为失败接线证据，不是最终验收。
+- 市场状态权限解耦修复：runner现在在控制模式允许观察时始终预计算`sh510300`和同日全A宽度；`enable_market_regime_policy=False`只阻止状态参数改变订单/退出，不再关闭诊断。新增`regime_diagnostics_enabled`与`regime_control_authorized`，summary中的`regime_control_enabled`按变体授权与控制模式共同计算；`market_regime_policy.py`删除分类器内部最后一个breadth=0.5后备。专项测试用observation-only runner证明诊断有效、控制返回None、没有二元退出总开关。
+- 最终20日全链：最终目录为`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1800/v3/run20260731_205447`，runtime identity=`d10b97bac2203d12bc52603018fcdf2a19d396c83b1879b435691db71edb0a86`；checkpoint、`COMPLETE.json`和artifact manifest均complete，日期`2025-01-02..2025-02-06`，20个交易日，core/audit/Web三阶段完整，顶层133个CSV逐个可读。运行命令显式`--max-positions 0`，表示不加Web硬上限。
+- 最终数学与金融复算：最终NAV=1.013065094984498（20,261.30元，成本后+1.306509%），最大回撤-1.838491%；绩效基准+6.673677%，几何相对收益`1.013065094984498/1.066736768162241-1=-5.031389%`，与保存值误差`1.39e-17`；20日账户独立NAV重建最大误差0，6笔成交总成本38.698100元。133个CSV全部可解析，runtime integrity 12/12通过。
+- 最终动态容量证据：20日均为auto，`configured_max_positions`和`user_hard_position_cap`全部为空；经济/有效上限随日为3/4/5/6，实际最高持有6只，逐日持仓越界0、质量报告越界0。完整往返摩擦0.50%阈值对应最低经济订单`10/(0.005-(2*0.0005+0.0005+2*0.00001))=2873.563218`元，落盘逐日一致，证明不是固定5只或固定6只。
+- 最终市场状态证据：20/20日输入有效，`sh510300`当日观测且lag=0；全A宽度覆盖99.7851%—99.8826%，宽度值8.1227%—64.0732%且20日各不相同，不再是0.5常数。窗口确认标签为bear，但`regime_control_authorized=False`、`regime_diagnostics_enabled=True`；与修复前`run20260731_203757`比较，6笔成交的symbol/date/side/shares/price/cost完全一致、每日NAV最大差0，证明诊断修复没有偷偷获得交易总开关权限。绩效Top100月度股票池与控制ETF角色明确分离；绩效序列319行中307行有效、12行显式无效，20个决策日全部有效，无效日不填零参与归因。
+- 退出与风险边界：本20日没有卖出或成熟退出样本，因此`governance_exit_counterfactual_summary.csv`为空但完整保存现金/基准/替代资产三反事实schema；该窗口不能证明退出有效或无效。专项测试已验证成交后反事实公式、CNY金额、无效基准隔离和固定期限汇总。协方差在20日仍诚实标记`cold_start/used=False`，ActionPlan明确使用`thesis_and_per_name_stress_caps`且不虚称covariance；因此短窗也不能验证协方差风险模型的经济增益。
+- 最终自动验收：新增`verify_scap_20d_dynamic_regime_fullchain.py`复算完成标记、全部CSV、动态容量成本公式、状态PIT/权限、基准角色、几何超额、账户勾稽、执行成本、完整性、协方差声明和退出schema，全部通过。之后再次运行32日phase-one全链、V3 runner smoke、市场状态、退出反事实、资本缩放和动态报告回归，全部退出0；警告仅为合成常数序列Spearman不可定义，不是失败。
+- 结论边界：本次已把工程状态从`implementation_in_progress`更新为`engineering_fullchain_verified`；未证明长期盈利、退出在熊市的因果收益、协方差模型增益或可上线。当前样本仍为`development_audit`，研究门`blocked`且正式上线门继续阻断；下一步应在固定代码/因子/成本/PIT身份下运行包含真实卖出的长窗和滚动样本外反事实评估，不应根据本20日+1.31%调参。
+
+### CHANGE-20260801-01：8月1日三种绩效基准输出与黄金版本只读审计
+
+- 用户目标：分析8月1日早间月度、周度、日度三个版本为何曲线基本一致，并从数学、金融和各模块输出审查全部结果；追加要求与前次约+54%的黄金运行比较，但明确暂不修改代码，且不把收益差直接等同于策略差。
+- 运行边界：新版月度`run20260731_224446`为338日，周度`run20260801_022540`与日度`run20260801_022614`为180日；黄金对照`run20260730_232541`为338日。本轮只读分析运行产物和代码接线，不改策略/参数/运行产物，不重新回测，不删除文件；仅形成审计报告并补录WBS。
+- 曲线事实：三个新版在共同180日的账户NAV、现金、持仓数和逐日收益完全一致，周/日98笔成交的股票、日期、方向、股数、价格、费用完全一致。147个同名CSV中123个逐字节相同，24个差异均可归入基准下游归因或运行实例ID；周/日Excel 49/51页数值完全相同，仅Summary和Daily Constraints的基准字段变化。
+- 模块定位：Web“daily/weekly/monthly”值只传入`runner._build_benchmark_nav_lookup -> analytics.build_top_pool_benchmark_series`，策略V3普通调仓仍由`_allow_normal_rebalance`固定每5个决策日一次。因此这是三种绩效基准，不是三种策略频率；账户曲线一致符合当前代码逻辑，但界面命名容易误导。
+- 基准数学：共同180日月/周/日Top100流动性等权基准分别+32.2809%/+25.3530%/+21.2229%，日收益相关0.9814—0.9969；换仓次数9/38/180，累计换手3.3083/5.1474/7.3095，有效日152/163/175。高相关来自同一股票池和高度重叠成分，终值差来自成分路径、权重漂移和成本。周转日后几何相对收益改善仅是基准下降，策略收益未变。
+- P0身份问题：周/日`runtime_identity_hash`完全相同，当前身份未纳入绩效基准TopN/再平衡频率，尽管该参数改变超额、rolling beat、退出基准反事实和研究门；不同完整研究规格因此共享hash，属于静默可比性缺陷。本轮仅诊断，不修复。
+- 黄金比较：同338日同月度基准下黄金+53.9185%、新版+29.9722%，排除了日期/基准解释，但不是单变量实验。黄金为fixed/5只，新版auto/无Web硬上限且加入0.50%完整往返固定成本率阈值；首个非空ActionPlan已从4只完全不同股票变为5只股票，两个完整运行只有7笔成交语义完全相同。新版平均/最大持仓6.92/13只，黄金4.48/5只；新版成本1,516.82元、黄金1,231.30元。
+- 分段证据：前180日黄金+40.4386%、新版+16.0366%；后158日独立复利黄金+9.5984%、新版+12.0097%。新版年化波动和最大回撤分别改善约2.14和0.57个百分点，但Sharpe从1.446降至0.995。证据支持“早期选择路径明显较弱、风险略降”，不支持“新版在所有时期系统性退化”。
+- 退出/风险：新版99笔闭合交易，PF1.611；profit-giveback仍为主要盈利来源，loss/signal退出在neutral/weak上涨修复期的固定期限现金反事实多为负，但样本无bear/crisis，不能据此删除保护。协方差账本278日为adaptive状态，但338个ActionPlan全部使用thesis/per-name fallback且边际协方差罚金为0，说明风险模型仍未影响实际组合选择。
+- 工程与研究状态：账户重建、成交时序、唯一ID、持仓上限和动作血缘等runtime integrity 12/12通过；投资组合研究约束338日中3日失败。统一研究门13项仅7项通过，PIT L1/L2仍research-only、冲击模型未校准，上线门继续blocked。
+- Excel缺口：三个新版工作簿均生成成功但Checks失败15个持仓-日期因子覆盖。缺口固定为`sz301112`停牌/缺失行情区间10日及`sz002762`5日，因子长表仅有全空占位；账户用结转价格，NAV不受影响，但逐因子审计不完整。`workbook_status=ok`不得解释为内容检查全部通过。
+- 详细报告：`reports/SCAP_20260801_THREE_BENCHMARK_OUTPUT_AUDIT.md`。建议后续先做同代码同窗口fixed5/auto与经济订单阈值的正交A/B，再判断策略退化；本轮遵守用户要求，不实施任何代码修改。
+
+### CHANGE-20260802-01：取消上线分支冻结、GitHub发布与主干合并
+
+- 用户目标：把当前代码冻结为名为`取消上线`的分支，完成适合合并前的代码验收，上传GitHub并最终合并到`main`。
+- 客观边界：本次“适合合并”只表示代码快照、专项验证和发布流程达到主干保存要求，不代表策略已获实盘上线资格。沿用`CHANGE-20260731-03`与`CHANGE-20260801-01`结论：工程全链已验证，但研究门与正式上线门仍为`blocked`，PIT L1/L2、冲击模型、长窗卖出反事实和滚动样本外证据仍不充分。
+- 基线与分支：发布基线为`main`/`origin/main`提交`56cca22`；已核对本地与远端均不存在同名分支，Git ref格式有效，并从该基线创建本地分支`取消上线`。不改写历史、不删除任何文件。
+- 提交范围：纳入当前29个已跟踪代码/WBS/验证文件、8个新增根目录`verify_*.py`专项脚本，以及4份正式SCAP数学、审计与改进方案Markdown报告；排除`reports/`下冒烟目录、CSV、GIF、stdout/stderr、JSON及其他临时运行产物，避免把不可控生成物带入主干。
+- 上下游影响链：配置与Web输入 -> 市场状态/退出反事实/动态容量/整数ActionPlan -> 订单与账本 -> NAV/质量报告/运行完整性 -> Web与验收脚本 -> Git分支、PR与主干。发布前需复核差异、执行`py_compile`、新增专项验证及关键跨模块回归；任何失败均不得伪报通过。
+- 计划发布流程：显式暂存确认范围，记录暂存清单与验证证据；提交并推送`取消上线`；创建面向`main`的PR，复核head/base和GitHub状态后合并；同步本地`main`，最后补录提交、PR、merge commit和远端一致性证据。
+- 当前状态：`release_process_in_progress`；正式上线门保持`blocked`。验证结果、提交哈希、PR编号和合并结果待本条后续补录。
+- 发布前静态验证：指定解释器`C:\Users\Ziyi Wang\.conda\envs\stock_ai\python.exe`为Python 3.10.19；`git diff --check`退出0；对29个已修改Python文件与8个新增专项脚本去重后共36个文件执行`py_compile`，全部退出0。
+- 变更专项验证：`verify_action_counterfactual_reward.py`、`verify_capital_scaling_contract.py`、`verify_scalable_optimizer_contract.py`、`verify_scap_profit_objective_audit.py`、`verify_scap_v2_property_contracts.py`、`verify_scap_v32_aggressive_contracts.py`、`verify_scap_v3_lean_chain.py`、`verify_web_v3_initialization.py`、`verify_dynamic_position_report_contract.py`、`verify_market_regime_pit_breadth_contract.py`、`verify_scap_20d_dynamic_regime_fullchain.py`、`verify_scap_benchmark_math_semantics.py`、`verify_scap_cash_cost_unit_contract.py`、`verify_scap_covariance_coverage_contract.py`、`verify_scap_integer_feasible_exposure.py`与`verify_scap_permission_fail_closed.py`共16项全部退出0。20日脚本首次无参数调用按设计返回usage/退出1，不属于实现失败；随后显式传入受控目录`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1800/v3/run20260731_205447`重跑并通过，未隐瞒首次调用错误。
+- 跨模块回归：`verify_decision_council_phase_one.py`、`verify_execution_rules.py`、`verify_governance_mainline_v3.py`、`verify_governance_mainline_v3_runner_smoke.py`、`verify_governance_v3_lifecycle_math.py`与`verify_interactive_worker_isolation.py`共6项全部退出0。
+- 验收判断：当前差异满足“主干保存与继续研究”的工程验收条件；测试不能消除长期盈利、真实熊市退出反事实、冲击模型校准及PIT研究状态缺口，因此不改变正式上线门`blocked`。
+
+### CHANGE-20260802-02：2万元动态持仓、费用吸血与赢家覆盖模型设计
+
+- 用户目标：保留自动经济容量、Web无默认硬上限和最多扩展到13只的方向，但重新分析0.50%往返成本、费用吸血、赢家覆盖亏损与实际持仓数控制；基于前180日黄金+40.4386%/新版+16.0366%、后158日黄金+9.5984%/新版+12.0097%的事实提出完整方案。本轮遵守“先方案后代码”，不修改交易逻辑、不回测。
+- 数据结论：新版盈利交易59笔对黄金47笔，说明扩大覆盖确实多捕获赢家；但亏损交易40笔对22笔增速更快，且新版毛盈利17,568.21元低于黄金20,894.01元、毛亏损10,902.91元高于黄金9,281.85元。新版最小名义金额四分位均值约1,520元、胜率44%、合计亏损约756元，支持优先检查过小边际仓位，但不构成因果或“最优6只”的证明。
+- 确定代码缺口：`capital_scaling.py`计算的最低经济订单2,873.563218元只用于把候选金额放大后估算容量和落盘报告；`scap_v3_lean.py`与`integer_action_optimizer.py`未据此拒绝真实小单。自动容量上限又通过`runner.py/scap_v31_authority.py`按`1/K`压缩目标现金和单股上限；优化器主要线性累计正稳健利润，候选下行统一按15%名义金额，且本次协方差边际罚金实际为0。
+- 数学冻结方向：严格分离`K_feasible`与`K_selected`；真实订单同时通过绝对往返费率、生命周期费用/毛利润、人民币稳健利润和整手/现金/风险门；使用PIT收缩后的胜率、盈亏金额和ES；组合以成本后预期对数终值、CVaR、估计误差和相关情景内生选择K。
+- 用户“赢家覆盖”改进：不设置“单只赢家必须覆盖N只亏损”的硬规则，改为组合利润覆盖率PCR和相关情景下盈利覆盖亏损与费用的概率PCP；最大赢家覆盖倍数仅作事后诊断，防止模型追逐彩票型极值。保留探索/覆盖池与核心/赢家池分权，亏损加仓继续关闭、退出全部保留、市场状态不获得二元总开关。
+- 参数纪律：0.50%保留为首轮绝对护栏而非宣称最优；费用/毛利润、人民币门槛、PCR/PCP、探索/核心池比例全部作为正交研究网格，经滚动样本外决定。2万元在约85%—90%暴露和2,873.56元完整经济订单下通常只能支持约5—6个完整经济仓位；更高K只能来自经审计的一手高置信例外或NAV增长，不能强制凑数。
+- 上下游影响：`config/Web -> capital_scaling -> entry_calibration/action_utility -> scap_v31_authority/scap_v3_lean -> integer_action_optimizer -> position_lifecycle/runner -> runtime_identity -> summary/Excel/Web`。每模块先静态审阅与构造测试，再全回归和20日工程全链；最后以fixed5/当前auto/改进auto做同身份180日、后158日和滚动样本外受控比较。
+- 详细方案：`reports/SCAP_20K_DYNAMIC_HOLDING_COUNT_AND_WINNER_COVERAGE_PLAN_20260802.md`。本条只形成分析文档与WBS变更控制，未执行策略代码、未生成新绩效、未改变任何历史产物。研究门和正式上线门继续`blocked`。
