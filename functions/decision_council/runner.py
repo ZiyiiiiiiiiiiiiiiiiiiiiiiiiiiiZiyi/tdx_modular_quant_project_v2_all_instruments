@@ -170,6 +170,7 @@ from functions.decision_council.multi_horizon_value import attach_multi_horizon_
 from functions.decision_council.action_counterfactual_reward import (
     build_action_decisions,
     mature_action_rewards,
+    summarize_exit_counterfactual_rewards,
 )
 from functions.decision_council.flow_state_features import attach_flow_state_features
 from functions.decision_council.monthly_lgbm_hybrid import (
@@ -687,6 +688,11 @@ class GovernanceBacktestRunner:
         self._enable_quality_filters = bool(enable_quality_filters)
         self._max_positions_override = int(max_positions) if max_positions not in (None, "", 0) else None
         self.capital_profile = dict(capital_profile or {})
+        self._user_hard_position_cap = (
+            int(self.capital_profile.get("user_hard_position_cap"))
+            if self.capital_profile.get("user_hard_position_cap") not in (None, "", 0, "0")
+            else self._max_positions_override
+        )
         self.factor_source_spec = factor_source_spec or FactorSourceSpec(
             factor_source=FACTOR_SOURCE_LEGACY,
             alpha_bundle=LEGACY_GOVERNANCE_ALPHA_BUNDLE,
@@ -724,7 +730,11 @@ class GovernanceBacktestRunner:
                 allow_pit_restricted_features=str(pit_level2_runtime_state).strip().lower() in {
                     "formal", "formal_ready", "production", "production_ready", "ready"
                 },
-                treatment_top_k=int(self._max_positions_override or 5),
+                treatment_top_k=int(
+                    self._max_positions_override
+                    or self.capital_profile.get("soft_target_positions")
+                    or GOVERNANCE_DEFAULT_TOP_N
+                ),
             )
         if self.strategy_logic_version == MAINLINE_V31_RELIABILITY:
             self.role_reliability_controller = RollingRoleReliabilityController(
@@ -840,21 +850,21 @@ class GovernanceBacktestRunner:
         self._pending_alpha_collapse_exits = []
         self._normal_rebalance_dates = frozenset()
         # Market regime policy for dynamic parameter adjustment
+        # Diagnostics are prepared independently from trading authority.  The
+        # layer-validation variant intentionally keeps adaptive regime control
+        # disabled, but it must still observe the real benchmark and PIT market
+        # breadth so a future authorization decision has factual evidence.
         self.market_regime_policy = (
-            MarketRegimePolicy()
-            if self.enable_market_regime_policy and self._control_enabled("regime")
-            else None
+            MarketRegimePolicy() if self._control_enabled("regime") else None
         )
         self._current_regime = "bear"  # Default to bear
         self._regime_params_cache: dict[pd.Timestamp, object | None] = {}
+        self._regime_diagnostics_cache: dict[pd.Timestamp, dict] = {}
         if self.market_regime_policy is not None:
-            try:
-                self.market_regime_policy.detector.prepare_history(
-                    self.features,
-                    benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
-                )
-            except Exception:
-                pass
+            self.market_regime_policy.detector.prepare_history(
+                self.features,
+                benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
+            )
         self._record_leakage_audit()
 
     def run(
@@ -1201,10 +1211,10 @@ class GovernanceBacktestRunner:
         self.trading_calendar = TradingCalendar(self._daily_feature_indices.keys())
         self._execute_pending(date, daily)
         self._prune_empty_positions()
-        if self._max_positions_override is not None and len(self.positions) > self._max_positions_override:
+        if self._user_hard_position_cap is not None and len(self.positions) > self._user_hard_position_cap:
             raise RuntimeError(
                 "governance position limit invariant failed at start of decision: "
-                f"positions={len(self.positions)}, max_positions={self._max_positions_override}"
+                f"positions={len(self.positions)}, user_hard_position_cap={self._user_hard_position_cap}"
             )
         self._mature_alpha_collapse_diagnostics(date)
         exposure = self._record_exposure(date, daily)
@@ -1281,6 +1291,10 @@ class GovernanceBacktestRunner:
             risk_exposure_ceiling=preliminary_risk_cap,
             candidates=candidates,
             current_symbols=self.positions,
+            current_exposure=(
+                float(exposure.get("invested_value", 0.0) or 0.0)
+                / max(float(exposure.get("nominal_nav", self.initial_cash) or self.initial_cash), 1e-12)
+            ),
         )
         if position_capacity.mode == "auto":
             dynamic_soft_cap, dynamic_hard_cap = scaled_position_weight_caps(
@@ -1438,7 +1452,14 @@ class GovernanceBacktestRunner:
             candidates = apply_mainline_v2_entry_policy(
                 candidates,
                 risk_level=risk_level,
-                max_new_candidates=self._max_positions_override or 5,
+                max_new_candidates=(
+                    self._max_positions_override
+                    or (
+                        regime_params.max_positions
+                        if regime_params is not None
+                        else GOVERNANCE_DEFAULT_TOP_N
+                    )
+                ),
             )
         elif is_mainline_v3_version(self.strategy_logic_version):
             candidates = apply_mainline_v3_entry_policy(
@@ -1709,6 +1730,11 @@ class GovernanceBacktestRunner:
         if self.governance_variant == "governance_layer_validation" and self.governance_control_mode == "factor_only":
             covariance_matrix = None
         covariance_state = covariance_runtime_state(day_index=day_index, covariance_matrix=covariance_matrix)
+        covariance_for_decision = (
+            covariance_matrix
+            if covariance_state == "calibrated"
+            else None
+        )
         runtime_maturity_state = combined_runtime_maturity(
             probability_state=calibration_state,
             reputation_state=reputation_state,
@@ -1754,7 +1780,7 @@ class GovernanceBacktestRunner:
                 or 0
             ),
             target_exposure_cap=target_exposure_proxy,
-            covariance_matrix=covariance_matrix,
+            covariance_matrix=covariance_for_decision,
             nav_amount=float(exposure["nominal_nav"]),
             cash_amount=float(self.cash),
             cash_buffer_amount=float(
@@ -1875,23 +1901,27 @@ class GovernanceBacktestRunner:
                         str(row.get("symbol", ""))
                         in selected_entry_symbols
                     )
-        orders = self._augment_force_deploy_diversify_orders(
-            orders=orders,
-            candidates=candidates,
-            defensive_candidates=defensive_candidates,
-            decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
-            decision_date=date,
-            current_weights=self._current_weights(daily, exposure["nominal_nav"]),
-            nominal_nav=exposure["nominal_nav"],
-            daily=daily,
-            target_exposure=target_exposure_proxy,
-        )
+        if self.governance_control_mode != "aggressive_lean":
+            orders = self._augment_force_deploy_diversify_orders(
+                orders=orders,
+                candidates=candidates,
+                defensive_candidates=defensive_candidates,
+                decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
+                decision_date=date,
+                current_weights=self._current_weights(daily, exposure["nominal_nav"]),
+                nominal_nav=exposure["nominal_nav"],
+                daily=daily,
+                target_exposure=target_exposure_proxy,
+            )
+        else:
+            diagnostics["post_action_plan_order_augmentation"] = "disabled_unique_action_plan"
         self.action_decision_rows.extend(build_action_decisions(
             date=date,
             candidates=candidates,
             held_symbols=self.positions,
             orders=orders,
             daily=daily,
+            regime_name=regime_name,
         ))
         diagnostics.update(catchup_decision.__dict__)
         diagnostics.update(
@@ -1965,6 +1995,13 @@ class GovernanceBacktestRunner:
         ):
             diagnostics["catchup_block_reason"] = f"high_exposure_gate:{high_exposure_gate['gate_reason']}"
         diagnostics["regime_name"] = str(regime_name)
+        diagnostics.update(self._regime_diagnostics_cache.get(pd.Timestamp(date), {}))
+        diagnostics["regime_diagnostics_enabled"] = self.market_regime_policy is not None
+        diagnostics["regime_control_authorized"] = bool(
+            self.enable_market_regime_policy and self._control_enabled("regime")
+        )
+        diagnostics["performance_benchmark_role"] = "performance_attribution"
+        diagnostics["performance_benchmark_distinct_from_regime_proxy"] = True
         diagnostics["base_exposure_by_regime"] = _base_exposure_by_regime(regime_name)
         diagnostics.update(exposure_authorization)
         diagnostics["trailing_buy_accuracy_5d"] = trailing_buy_accuracy_5d
@@ -2097,7 +2134,7 @@ class GovernanceBacktestRunner:
         holding_targets = _holding_target_contract(
             self.capital_profile,
             actual_holding_count=int(exposure.get("holding_count", 0) or 0),
-            max_positions_override=self._max_positions_override,
+            max_positions_override=position_capacity.effective_position_cap,
         )
         action_plan_target_holding_count = int(
             diagnostics.get(
@@ -2113,6 +2150,18 @@ class GovernanceBacktestRunner:
                 "calibration_runtime_state": calibration_state,
                 "reputation_runtime_state": reputation_state,
                 "covariance_runtime_state": covariance_state,
+                "covariance_candidate_coverage_ratio": float(
+                    getattr(covariance_matrix, "attrs", {}).get(
+                        "candidate_coverage_ratio",
+                        0.0,
+                    )
+                ) if covariance_matrix is not None else 0.0,
+                "covariance_estimator": str(
+                    getattr(covariance_matrix, "attrs", {}).get(
+                        "estimator",
+                        "fallback",
+                    )
+                ) if covariance_matrix is not None else "fallback",
                 "trade_accuracy_runtime_state": trade_accuracy_state,
                 "runtime_maturity_state": runtime_maturity_state,
                 "pit_runtime_state": self.pit_runtime_state,
@@ -2125,9 +2174,24 @@ class GovernanceBacktestRunner:
                 # Keep the account configuration distinct from the minimum/target
                 # holding count.  Reports must not infer a hard position limit
                 # from the profile's diversification target.
-                "configured_max_positions": int(
-                    position_capacity.effective_position_cap
+                "configured_max_positions": (
+                    int(position_capacity.user_hard_cap)
+                    if position_capacity.user_hard_cap is not None
+                    else pd.NA
                 ),
+                "user_hard_position_cap": (
+                    int(position_capacity.user_hard_cap)
+                    if position_capacity.user_hard_cap is not None
+                    else pd.NA
+                ),
+                "economic_position_cap": int(position_capacity.economic_position_cap),
+                "lot_cash_position_cap": int(position_capacity.lot_cash_position_cap),
+                "search_position_cap": int(position_capacity.search_cap),
+                "effective_position_cap": int(position_capacity.effective_position_cap),
+                "capacity_spendable_cash": float(position_capacity.spendable_cash),
+                "capacity_risk_room_amount": float(position_capacity.capacity_risk_room_amount),
+                "capacity_minimum_economic_order_amount": float(position_capacity.minimum_economic_order_amount),
+                "capacity_median_one_lot_amount": float(position_capacity.median_one_lot_amount),
                 "position_capacity_mode": position_capacity.mode,
                 "position_capacity_reason": position_capacity.reason,
                 "cabinet_raw_factor_count": diagnostics.get(
@@ -2205,6 +2269,21 @@ class GovernanceBacktestRunner:
                 "optimizer_selected_entry_count": diagnostics.get("optimizer_selected_entry_count", 0),
                 "exposure_signal_count": diagnostics.get("exposure_signal_count", 0),
                 "regime_name": diagnostics.get("regime_name", ""),
+                "regime_input_valid": diagnostics.get("regime_input_valid", False),
+                "regime_input_status": diagnostics.get("regime_input_status", "unknown"),
+                "regime_benchmark_symbol": diagnostics.get("regime_benchmark_symbol", str(MARKET_REGIME_BENCHMARK_SYMBOL)),
+                "regime_benchmark_role": diagnostics.get("regime_benchmark_role", "safety_control_proxy"),
+                "regime_benchmark_observed": diagnostics.get("regime_benchmark_observed", False),
+                "regime_benchmark_lag_days": diagnostics.get("regime_benchmark_lag_days", pd.NA),
+                "regime_breadth_score": diagnostics.get("regime_breadth_score", pd.NA),
+                "regime_breadth_coverage": diagnostics.get("regime_breadth_coverage", 0.0),
+                "regime_raw_label": diagnostics.get("regime_raw_label", "unknown"),
+                "regime_confirmed_label": diagnostics.get("regime_confirmed_label", diagnostics.get("regime_name", "unknown")),
+                "regime_as_of_date": diagnostics.get("regime_as_of_date", pd.Timestamp(date)),
+                "regime_diagnostics_enabled": diagnostics.get("regime_diagnostics_enabled", False),
+                "regime_control_authorized": diagnostics.get("regime_control_authorized", False),
+                "performance_benchmark_role": diagnostics.get("performance_benchmark_role", "performance_attribution"),
+                "performance_benchmark_distinct_from_regime_proxy": diagnostics.get("performance_benchmark_distinct_from_regime_proxy", True),
                 "base_exposure_by_regime": diagnostics.get("base_exposure_by_regime", 0.0),
                 "raw_safety_exposure_cap": diagnostics.get("raw_safety_exposure_cap", safety_exposure_cap),
                 "effective_target_exposure_cap": diagnostics.get("effective_target_exposure_cap", target_exposure_proxy),
@@ -2232,7 +2311,9 @@ class GovernanceBacktestRunner:
                 "exposure_authorization_block_reasons": diagnostics.get("exposure_authorization_block_reasons", ""),
                 "governance_control_mode": self.governance_control_mode,
                 "reputation_control_enabled": self._control_enabled("reputation"),
-                "regime_control_enabled": self._control_enabled("regime"),
+                "regime_control_enabled": bool(
+                    self.enable_market_regime_policy and self._control_enabled("regime")
+                ),
                 "cooldown_control_enabled": self._control_enabled("cooldown"),
                 "hard_stop_control_enabled": self._control_enabled("hard_stop_exit"),
                 "alpha_collapse_exit_enabled": self.alpha_collapse_exit_enabled,
@@ -2489,6 +2570,19 @@ class GovernanceBacktestRunner:
                 pd.to_numeric(pd.Series([benchmark_audit.get("benchmark_turnover", 0.0)]), errors="coerce").fillna(0.0).iloc[0]
             ),
             "safety_benchmark_id": str(MARKET_REGIME_BENCHMARK_SYMBOL or ""),
+            "regime_input_valid": bool(diagnostics.get("regime_input_valid", False)),
+            "regime_input_status": str(diagnostics.get("regime_input_status", "unknown")),
+            "regime_benchmark_symbol": str(diagnostics.get("regime_benchmark_symbol", MARKET_REGIME_BENCHMARK_SYMBOL or "")),
+            "regime_benchmark_role": str(diagnostics.get("regime_benchmark_role", "safety_control_proxy")),
+            "regime_benchmark_observed": bool(diagnostics.get("regime_benchmark_observed", False)),
+            "regime_benchmark_lag_days": diagnostics.get("regime_benchmark_lag_days", pd.NA),
+            "regime_breadth_score": diagnostics.get("regime_breadth_score", pd.NA),
+            "regime_breadth_coverage": float(diagnostics.get("regime_breadth_coverage", 0.0) or 0.0),
+            "regime_raw_label": str(diagnostics.get("regime_raw_label", "unknown")),
+            "regime_confirmed_label": str(diagnostics.get("regime_confirmed_label", diagnostics.get("regime_name", "unknown"))),
+            "regime_as_of_date": diagnostics.get("regime_as_of_date", pd.Timestamp(date)),
+            "performance_benchmark_role": str(diagnostics.get("performance_benchmark_role", "performance_attribution")),
+            "performance_benchmark_distinct_from_regime_proxy": bool(diagnostics.get("performance_benchmark_distinct_from_regime_proxy", True)),
             "account_net_value": float(account_net_value),
             "excess_net_value": float(excess_net_value),
             "structural_regime_level": str(safety_row.get("structural_regime_level", "bull")),
@@ -2530,7 +2624,9 @@ class GovernanceBacktestRunner:
             "exposure_authorization_block_reasons": str(diagnostics.get("exposure_authorization_block_reasons", "")),
             "governance_control_mode": self.governance_control_mode,
             "reputation_control_enabled": bool(self._control_enabled("reputation")),
-            "regime_control_enabled": bool(self._control_enabled("regime")),
+            "regime_control_enabled": bool(
+                self.enable_market_regime_policy and self._control_enabled("regime")
+            ),
             "cooldown_control_enabled": bool(self._control_enabled("cooldown")),
             "hard_stop_control_enabled": bool(self._control_enabled("hard_stop_exit")),
             "alpha_collapse_exit_enabled": bool(self.alpha_collapse_exit_enabled),
@@ -2548,6 +2644,15 @@ class GovernanceBacktestRunner:
             "maximum_allowed_holding_count": int(
                 factual_exposure_row.get("maximum_allowed_holding_count", 0)
             ),
+            "user_hard_position_cap": factual_exposure_row.get("user_hard_position_cap", pd.NA),
+            "economic_position_cap": int(factual_exposure_row.get("economic_position_cap", 0) or 0),
+            "lot_cash_position_cap": int(factual_exposure_row.get("lot_cash_position_cap", 0) or 0),
+            "search_position_cap": int(factual_exposure_row.get("search_position_cap", 0) or 0),
+            "effective_position_cap": int(factual_exposure_row.get("effective_position_cap", 0) or 0),
+            "capacity_spendable_cash": float(factual_exposure_row.get("capacity_spendable_cash", 0.0) or 0.0),
+            "capacity_risk_room_amount": float(factual_exposure_row.get("capacity_risk_room_amount", 0.0) or 0.0),
+            "capacity_minimum_economic_order_amount": float(factual_exposure_row.get("capacity_minimum_economic_order_amount", 0.0) or 0.0),
+            "capacity_median_one_lot_amount": float(factual_exposure_row.get("capacity_median_one_lot_amount", 0.0) or 0.0),
             "target_holding_count": int(
                 factual_exposure_row.get("target_holding_count", 0)
             ),
@@ -2702,7 +2807,17 @@ class GovernanceBacktestRunner:
             "holding_lifecycle_preview": lifecycle_preview,
             "lifecycle_alert_count": lifecycle_alert_count,
             "regime": getattr(regime_params, "regime_name", "default") if regime_params is not None else "default",
-            "top_n": self._max_positions_override or (getattr(regime_params, "max_positions", GOVERNANCE_DEFAULT_TOP_N) if regime_params is not None else GOVERNANCE_DEFAULT_TOP_N),
+            "top_n": int(
+                factual_exposure_row.get(
+                    "effective_position_cap",
+                    self._user_hard_position_cap
+                    or (
+                        getattr(regime_params, "max_positions", GOVERNANCE_DEFAULT_TOP_N)
+                        if regime_params is not None
+                        else GOVERNANCE_DEFAULT_TOP_N
+                    ),
+                )
+            ),
             "turnover_budget": float(turnover_budget),
         }
 
@@ -4087,20 +4202,29 @@ class GovernanceBacktestRunner:
 
     def _get_regime_params(self, date):
         """Get regime-adjusted parameters for the current date."""
-        if not self.enable_market_regime_policy or self.market_regime_policy is None:
+        if self.market_regime_policy is None:
             return None
         date_key = pd.Timestamp(date)
         if date_key in self._regime_params_cache:
             return self._regime_params_cache[date_key]
-        try:
-            params_dict = self.market_regime_policy.get_params_dict(
-                self.features,
-                date_key,
-                benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
-            )
-            self._current_regime = params_dict.get("regime", "bear")
-            from functions.decision_council.market_regime_policy import RegimeParams
-            params = RegimeParams(
+        params_dict = self.market_regime_policy.get_params_dict(
+            self.features,
+            date_key,
+            benchmark_symbol=MARKET_REGIME_BENCHMARK_SYMBOL,
+        )
+        self._current_regime = params_dict.get("regime", "unknown")
+        self._regime_diagnostics_cache[date_key] = {
+            key: value
+            for key, value in params_dict.items()
+            if key.startswith("regime_")
+        }
+        if not self.enable_market_regime_policy:
+            # Observation-only path: preserve the repaired state diagnostics
+            # without allowing the regime parameters to change orders/exits.
+            self._regime_params_cache[date_key] = None
+            return None
+        from functions.decision_council.market_regime_policy import RegimeParams
+        params = RegimeParams(
                 safety_warning_drawdown=params_dict["safety_warning_drawdown"],
                 safety_high_drawdown=params_dict["safety_high_drawdown"],
                 safety_crisis_drawdown=params_dict["safety_crisis_drawdown"],
@@ -4116,13 +4240,10 @@ class GovernanceBacktestRunner:
                 max_position_weight=params_dict["max_position_weight"],
                 max_sector_weight=params_dict["max_sector_weight"],
                 rebalance_interval_days=params_dict["rebalance_interval_days"],
-                regime_name=params_dict.get("regime", "bear"),
-            )
-            self._regime_params_cache[date_key] = params
-            return params
-        except Exception:
-            self._regime_params_cache[date_key] = None
-            return None
+                regime_name=params_dict.get("regime", "unknown"),
+        )
+        self._regime_params_cache[date_key] = params
+        return params
 
     def _allow_normal_rebalance(self, date, day_index):
         if self._normal_rebalance_dates:
@@ -4293,15 +4414,28 @@ class GovernanceBacktestRunner:
         ].tail(int(lookback_days))
         if returns.empty:
             return pd.DataFrame()
-        returns = returns.dropna(axis=1, thresh=max(int(lookback_days * 0.50), 10)).dropna(how="all")
+        minimum_observations = max(int(min(int(lookback_days), len(returns)) * 0.80), 10)
+        returns = returns.dropna(axis=1, thresh=minimum_observations).dropna(how="all")
         if returns.shape[1] < 2:
             return pd.DataFrame()
-        covariance = returns.cov()
+        # Mean imputation occurs at the return-observation layer after an 80%
+        # coverage gate. Unknown covariance pairs are never converted to zero.
+        complete_returns = returns.apply(
+            lambda series: series.fillna(series.mean()),
+            axis=0,
+        ).dropna(axis=1, how="any")
+        if complete_returns.shape[1] < 2 or len(complete_returns) < 10:
+            return pd.DataFrame()
+        covariance = complete_returns.cov(ddof=1)
         if covariance.empty:
             return covariance
-        # A fixed diagonal shrinkage keeps the short 60-session estimate
-        # positive and stable enough for a five-name integer decision. Missing
-        # pairs remain conservative zero-covariance fallback in the optimizer.
+        if covariance.isna().any().any():
+            return pd.DataFrame()
+        # Dimension/sample adaptive diagonal shrinkage stabilizes the estimate
+        # without claiming unknown pairs have zero covariance.
+        dimension = int(covariance.shape[0])
+        observations = int(len(complete_returns))
+        shrinkage = min(max(dimension / max(observations - 1, 1), 0.10), 0.90)
         diagonal = pd.DataFrame(
             0.0,
             index=covariance.index,
@@ -4309,7 +4443,23 @@ class GovernanceBacktestRunner:
         )
         for symbol in covariance.index.intersection(covariance.columns):
             diagonal.at[symbol, symbol] = covariance.at[symbol, symbol]
-        return 0.70 * covariance.fillna(0.0) + 0.30 * diagonal.fillna(0.0)
+        shrunk = (
+            (1.0 - shrinkage) * covariance
+            + shrinkage * diagonal
+        )
+        shrunk = (shrunk + shrunk.T) / 2.0
+        shrunk.attrs.update(
+            {
+                "estimator": "adaptive_diagonal_shrinkage",
+                "shrinkage_intensity": float(shrinkage),
+                "lookback_observations": observations,
+                "candidate_symbol_count": len(symbols),
+                "covered_symbol_count": dimension,
+                "candidate_coverage_ratio": dimension / max(len(symbols), 1),
+                "pair_coverage_ratio": 1.0,
+            }
+        )
+        return shrunk
 
     def _latest_price_frame_for_trade_pairing(self, execution_ledger: pd.DataFrame) -> pd.DataFrame:
         return latest_price_frame_for_trade_pairing_runtime(self, execution_ledger)
@@ -4422,12 +4572,20 @@ class GovernanceBacktestRunner:
         reward_prices = self.audit_prices.copy()
         performance_benchmark_symbol = "__TOP_POOL_PERFORMANCE_BENCHMARK__"
         if not getattr(self, "_performance_benchmark_frame", pd.DataFrame()).empty:
-            benchmark_prices = self._performance_benchmark_frame[["date", "benchmark_net_value"]].rename(
+            benchmark_columns = ["date", "benchmark_net_value"]
+            if "benchmark_return_valid" in self._performance_benchmark_frame.columns:
+                benchmark_columns.append("benchmark_return_valid")
+            benchmark_prices = self._performance_benchmark_frame[benchmark_columns].rename(
                 columns={"benchmark_net_value": "close"}
             )
             benchmark_prices["symbol"] = performance_benchmark_symbol
+            benchmark_prices["counterfactual_price_valid"] = benchmark_prices.get(
+                "benchmark_return_valid",
+                pd.Series(True, index=benchmark_prices.index),
+            ).fillna(False).astype(bool)
+            reward_prices["counterfactual_price_valid"] = True
             reward_prices = pd.concat(
-                [reward_prices, benchmark_prices[["date", "symbol", "close"]]],
+                [reward_prices, benchmark_prices[["date", "symbol", "close", "counterfactual_price_valid"]]],
                 ignore_index=True,
             )
         performance_benchmark_output = getattr(self, "_performance_benchmark_frame", pd.DataFrame()).copy()
@@ -4438,6 +4596,12 @@ class GovernanceBacktestRunner:
                 performance_benchmark_output.loc[benchmark_dates < self._run_decision_start, "benchmark_scope"] = "preload"
             if self._run_decision_end is not None:
                 performance_benchmark_output.loc[benchmark_dates > self._run_decision_end, "benchmark_scope"] = "forward_audit"
+        action_counterfactual = mature_action_rewards(
+            pd.DataFrame(self.action_decision_rows),
+            reward_prices,
+            benchmark_symbol=performance_benchmark_symbol,
+            executions=pd.DataFrame(self.execution_rows),
+        )
         extra = {
             "governance_daily_result": daily_result,
             "governance_holdings_ledger": _frame_with_columns(self.holdings_rows, HOLDINGS_LEDGER_COLUMNS),
@@ -4453,11 +4617,9 @@ class GovernanceBacktestRunner:
             "governance_action_plan_ledger": pd.DataFrame(
                 self.action_plan_rows
             ),
-            "governance_action_counterfactual_reward": mature_action_rewards(
-                pd.DataFrame(self.action_decision_rows),
-                reward_prices,
-                benchmark_symbol=performance_benchmark_symbol,
-                executions=pd.DataFrame(self.execution_rows),
+            "governance_action_counterfactual_reward": action_counterfactual,
+            "governance_exit_counterfactual_summary": summarize_exit_counterfactual_rewards(
+                action_counterfactual
             ),
             "governance_performance_benchmark": performance_benchmark_output,
             "governance_performance_benchmark_sensitivity": build_top_pool_benchmark_sensitivity(
@@ -4693,7 +4855,7 @@ class GovernanceBacktestRunner:
             daily_result=extra["governance_daily_result"],
             holdings_ledger=extra["governance_holdings_ledger"],
             position_state_ledger=extra["governance_position_state_ledger"],
-            max_positions=self._max_positions_override,
+            max_positions=self._user_hard_position_cap,
             action_proposal_ledger=extra[
                 "governance_action_proposal_ledger"
             ],

@@ -291,8 +291,9 @@ BACKTEST_CAPITAL_PROFILES = {
         "label": "20,000 SCAP-V3 aggressive lean",
         "initial_cash": 20_000.0,
         "min_cash_buffer": 1_000.0,
-        "max_positions": 5,
-        "position_cap_mode": "fixed",
+        "max_positions": None,
+        "user_hard_position_cap": None,
+        "position_cap_mode": "auto",
         "scap_search_position_cap": 32,
         "soft_target_positions": 4,
         "affordability_first": True,
@@ -338,6 +339,7 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_forecast_kappa": 0.50,
         "scap_warmup_sessions": 252,
         "scap_candidate_minimum_commission": 5.0,
+        "scap_max_round_trip_fixed_cost_ratio": 0.005,
         "execution_cost_profile_id": "cn_a_share_retail_min5_v1",
         "commission_rate": COMMISSION_RATE,
         "minimum_commission": 5.0,
@@ -428,6 +430,10 @@ def get_backtest_capital_profile(
             "fixed" if profile["max_positions"] is not None else "auto",
         )
     ).strip().lower()
+    user_hard_cap = profile.get("user_hard_position_cap")
+    profile["user_hard_position_cap"] = (
+        None if user_hard_cap in (None, "", 0, "0") else int(user_hard_cap)
+    )
     profile["affordability_first"] = bool(profile.get("affordability_first", False))
     profile["skip_unaffordable_symbols"] = bool(profile.get("skip_unaffordable_symbols", False))
     profile["retail_lot_adapter"] = bool(profile.get("retail_lot_adapter", False))
@@ -453,15 +459,24 @@ def get_backtest_capital_profile(
         override_parts.append(f"cash{_profile_number_slug(profile['initial_cash'])}")
     if max_positions_override != "__profile_default__":
         if max_positions_override in (None, "", 0, "0"):
-            profile["max_positions"] = None
-            profile["position_cap_mode"] = "auto"
+            profile["user_hard_position_cap"] = None
+            if selected == "small_capital_lean":
+                profile["max_positions"] = None
+                profile["position_cap_mode"] = "auto"
             override_parts.append("posauto")
         else:
-            profile["max_positions"] = int(max_positions_override)
-            profile["position_cap_mode"] = "fixed"
-            if profile["max_positions"] <= 0:
+            profile["user_hard_position_cap"] = int(max_positions_override)
+            if profile["user_hard_position_cap"] <= 0:
                 raise ValueError("Backtest max positions must be positive or blank/0 for unlimited")
-            override_parts.append(f"pos{profile['max_positions']}")
+            if selected == "small_capital_lean":
+                # The Web value is a hard governance ceiling.  Daily breadth
+                # remains endogenous to cash, lots, costs, signals and risk.
+                profile["max_positions"] = None
+                profile["position_cap_mode"] = "auto"
+            else:
+                profile["max_positions"] = profile["user_hard_position_cap"]
+                profile["position_cap_mode"] = "fixed"
+            override_parts.append(f"pos{profile['user_hard_position_cap']}")
     if min_cash_buffer not in (None, ""):
         profile["min_cash_buffer"] = float(min_cash_buffer)
         if profile["min_cash_buffer"] < 0:

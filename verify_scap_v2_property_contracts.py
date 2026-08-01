@@ -303,6 +303,7 @@ exit_plan = optimize_action_proposals(
     current_lots_by_symbol={"A": 1},
     current_weights_by_symbol={"A": 0.30},
     current_exposure=0.30,
+    max_positions=5,
 )
 assert exit_plan.projected_cash == 6_900.0
 assert exit_plan.target_lots_by_symbol["A"] == 0
@@ -327,12 +328,14 @@ covariance = pd.DataFrame([[0.0004]], index=["A"], columns=["A"])
 risk_1d = optimize_action_proposals(
     (risk_proposal,),
     authorization=risk_base,
+    max_positions=5,
     covariance_matrix=covariance,
     covariance_risk_aversion=1.0,
 )
 risk_4d = optimize_action_proposals(
     (risk_proposal,),
     authorization=replace(risk_base, risk_horizon_sessions=4),
+    max_positions=5,
     covariance_matrix=covariance,
     covariance_risk_aversion=1.0,
 )

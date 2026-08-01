@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pandas as pd
 
-from functions.decision_council.action_counterfactual_reward import build_action_decisions, mature_action_rewards
+from functions.decision_council.action_counterfactual_reward import (
+    build_action_decisions,
+    mature_action_rewards,
+    summarize_exit_counterfactual_rewards,
+)
 
 
 def expect(condition: bool, message: str) -> None:
@@ -48,6 +52,12 @@ def main() -> int:
            "a superior replacement earns a positive cost-after-market reward")
     expect(float(out.at["s5", "action_reward"]) < 0.0,
            "selling a stock that subsequently has positive market-neutral return is penalized")
+    expect(float(out.at["s5", "cash_exit_reward_rate"]) < 0.0,
+           "cash counterfactual separately records the opportunity cost of a rebound")
+    expect(abs(float(out.at["s5", "benchmark_exit_reward_rate"]) - float(out.at["s5", "action_reward"])) < 1e-12,
+           "legacy action reward remains the explicit benchmark counterfactual for a sell")
+    expect(float(out.at["r5", "replacement_exit_reward_rate"]) > 0.0,
+           "replacement counterfactual is reported independently from cash and benchmark")
     expect(out.at["c20", "maturity_status"] == "censored",
            "an incomplete horizon is censored rather than scored with partial future data")
     unfilled = mature_action_rewards(
@@ -73,8 +83,37 @@ def main() -> int:
            "filled replacement reward starts the challenger at its buy fill")
     expect(abs(float(filled["actual_action_cost_rate"]) - 0.0015) < 1e-12,
            "filled replacement reward uses reconciled sell and buy ledger costs")
-    expect(filled["reward_formula_version"] == "market_neutral_actual_fill_cost_counterfactual_v3",
+    expect(abs(float(filled["counterfactual_notional"]) - 10010.0) < 1e-12,
+           "filled sell notional is preserved for CNY counterfactual rewards")
+    expect(pd.notna(filled["replacement_exit_reward_amount"]),
+           "filled replacement exposes a CNY incremental value")
+    expect(filled["reward_formula_version"] == "cash_benchmark_replacement_actual_fill_cost_counterfactual_v4",
            "reward output discloses the actual-fill formula contract")
+    invalid_prices = pd.DataFrame(rows)
+    invalid_prices["counterfactual_price_valid"] = True
+    invalid_prices.loc[
+        (invalid_prices["symbol"] == "benchmark")
+        & (invalid_prices["date"] == dates[3]),
+        "counterfactual_price_valid",
+    ] = False
+    cash_only = mature_action_rewards(
+        decisions.iloc[[1]], invalid_prices, benchmark_symbol="benchmark",
+        executions=executions.iloc[[0]],
+    ).iloc[0]
+    expect(cash_only["maturity_status"] == "matured_cash_only",
+           "an invalid benchmark horizon cannot erase a valid cash counterfactual")
+    expect(pd.notna(cash_only["cash_exit_reward_rate"]) and pd.isna(cash_only["benchmark_exit_reward_rate"]),
+           "invalid benchmark dates are excluded rather than filled with zero reward")
+    summary = summarize_exit_counterfactual_rewards(
+        mature_action_rewards(
+            decisions.iloc[[1]], pd.DataFrame(rows), benchmark_symbol="benchmark",
+            executions=executions.iloc[[0]],
+        )
+    ).iloc[0]
+    expect(int(summary["matured_exit_count"]) == 1,
+           "exit summary groups actual filled exits at a fixed horizon")
+    expect(summary["summary_contract"] == "fixed_horizon_cash_benchmark_replacement_v1",
+           "exit summary rejects future-window extrema as its primary contract")
     print("[PASS] action counterfactual reward verification completed")
     return 0
 

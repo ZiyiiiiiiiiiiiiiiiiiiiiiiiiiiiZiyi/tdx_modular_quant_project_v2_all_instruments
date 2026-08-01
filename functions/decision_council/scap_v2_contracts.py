@@ -119,6 +119,9 @@ class ActionProposal:
     exact_cost_amount: float
     funding_cash_amount: float
     cash_release_amount: float = 0.0
+    market_notional_amount: float = 0.0
+    buy_cash_required_amount: float = 0.0
+    sell_cash_released_amount: float = 0.0
     exposure_delta: float = 0.0
     scenario_delta_wealth: tuple[float, ...] = ()
     hard_veto_reasons: tuple[str, ...] = ()
@@ -139,6 +142,21 @@ class ActionProposal:
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
+        # Normalize legacy constructors at the typed boundary.  New code must
+        # populate the explicit fields; historical proposal factories still
+        # map their funding/release aliases deterministically.
+        if self.buy_cash_required_amount == 0.0 and self.funding_cash_amount > 0.0:
+            object.__setattr__(
+                self,
+                "buy_cash_required_amount",
+                float(self.funding_cash_amount),
+            )
+        if self.sell_cash_released_amount == 0.0 and self.cash_release_amount > 0.0:
+            object.__setattr__(
+                self,
+                "sell_cash_released_amount",
+                float(self.cash_release_amount),
+            )
         if not self.proposal_id or not self.decision_id or not self.symbol:
             raise ValueError("proposal_id, decision_id and symbol are required")
         if int(self.requested_lots) < 0:
@@ -152,6 +170,9 @@ class ActionProposal:
             "exact_cost_amount",
             "funding_cash_amount",
             "cash_release_amount",
+            "market_notional_amount",
+            "buy_cash_required_amount",
+            "sell_cash_released_amount",
             "exposure_delta",
             "primary_score",
             "primary_rank",
@@ -163,9 +184,16 @@ class ActionProposal:
             self.exact_cost_amount < 0.0
             or self.funding_cash_amount < 0.0
             or self.cash_release_amount < 0.0
+            or self.market_notional_amount < 0.0
+            or self.buy_cash_required_amount < 0.0
+            or self.sell_cash_released_amount < 0.0
             or self.authority_penalty_amount < 0.0
         ):
             raise ValueError("cost and funding amounts must be non-negative")
+        if abs(self.funding_cash_amount - self.buy_cash_required_amount) > 1e-8:
+            raise ValueError("funding_cash_amount must equal buy_cash_required_amount")
+        if abs(self.cash_release_amount - self.sell_cash_released_amount) > 1e-8:
+            raise ValueError("cash_release_amount must equal sell_cash_released_amount")
         for value in self.scenario_delta_wealth:
             _finite(value, name="scenario_delta_wealth")
 
@@ -284,6 +312,9 @@ class ActionPlan:
     authority_penalty_amount: float = 0.0
     concentration_penalty_amount: float = 0.0
     marginal_risk_penalty_amount: float = 0.0
+    proposal_robust_profit_amount: float = 0.0
+    thesis_penalty_amount: float = 0.0
+    deployment_penalty_amount: float = 0.0
     risk_model_used: str = "fallback_per_name_stress_cap"
     risk_horizon_sessions: int = 1
     risk_episode_id: str = ""
@@ -312,6 +343,9 @@ class ActionPlan:
             "authority_penalty_amount",
             "concentration_penalty_amount",
             "marginal_risk_penalty_amount",
+            "proposal_robust_profit_amount",
+            "thesis_penalty_amount",
+            "deployment_penalty_amount",
         ):
             _finite(getattr(self, name), name=name)
         if int(self.risk_horizon_sessions) <= 0:

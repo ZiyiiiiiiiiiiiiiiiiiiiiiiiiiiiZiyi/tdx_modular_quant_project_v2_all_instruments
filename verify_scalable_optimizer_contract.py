@@ -86,8 +86,31 @@ small_plan = optimize_action_proposals(
     max_names_per_thesis=3,
     candidate_limit=24,
 )
-assert small_plan.solver_status == "optimal_bounded_exhaustive"
+assert small_plan.solver_status == "optimal_full_universe_exhaustive"
 assert int(small_plan.constraint_slacks["solver_optimality_proven"]) == 1
+recomputed_objective = (
+    small_plan.proposal_robust_profit_amount
+    - small_plan.authority_penalty_amount
+    - small_plan.thesis_penalty_amount
+    - small_plan.concentration_penalty_amount
+    - small_plan.marginal_risk_penalty_amount
+    - small_plan.deployment_penalty_amount
+)
+assert abs(recomputed_objective - small_plan.robust_net_profit_amount) < 1e-10
+
+reduced_plan = optimize_action_proposals(
+    items[:10],
+    authorization=authorization(nav),
+    current_lots_by_symbol={},
+    current_weights_by_symbol={},
+    current_exposure=0.0,
+    max_positions=5,
+    max_names_per_thesis=3,
+    candidate_limit=5,
+)
+assert reduced_plan.solver_status == "optimal_reduced_universe_exhaustive"
+assert int(reduced_plan.constraint_slacks["solver_optimality_proven"]) == 0
+assert int(reduced_plan.constraint_slacks["solver_reduced_universe_optimality_proven"]) == 1
 
 balanced = _normalized_breadth_score(
     {f"s{i}": 0.10 for i in range(8)},

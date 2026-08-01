@@ -50,7 +50,10 @@ def context(*, cash: float = 19_000.0) -> DecisionContext:
         forecast_horizon_sessions=10,
         forecast_kappa=0.50,
         soft_target_positions=4,
-        execution_cost_profile={"scap_max_winner_add_layers": 2},
+        execution_cost_profile={
+            "scap_max_winner_add_layers": 2,
+            "scap_allow_synthetic_authority": True,
+        },
     )
 
 
@@ -152,6 +155,25 @@ exact_lot_decision = build_lean_decision(
 )
 assert exact_lot_decision.plan.target_lots_by_symbol["H"] == 7
 passed("ActionPlan preserves exact account lots instead of weight inference")
+
+missing_held = build_lean_decision(
+    replace(
+        context(),
+        current_weights={"H": 0.20, "MISSING": 0.20},
+        current_lots_by_symbol={"H": 2, "MISSING": 3},
+        top_n=2,
+        winner_add_enabled=False,
+    ),
+    frame(),
+)
+assert missing_held.plan.target_lots_by_symbol["MISSING"] == 3
+assert not any(
+    proposal.action_type == "new_entry"
+    and proposal.proposal_id in set(missing_held.plan.selected_proposal_ids)
+    for proposal in missing_held.proposals
+)
+assert missing_held.diagnostics["held_symbol_missing_candidate_count"] == 1
+passed("a held symbol missing from candidates still occupies its Web position slot")
 
 assert any(proposal.action_type == "winner_add" for proposal in base.proposals)
 assert not any(proposal.action_type == "loser_add" for proposal in base.proposals)

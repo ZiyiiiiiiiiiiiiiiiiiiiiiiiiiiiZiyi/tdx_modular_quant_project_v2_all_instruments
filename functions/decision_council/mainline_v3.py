@@ -32,7 +32,7 @@ def _pre_slot_qualified_mask(
 def apply_mainline_v3_entry_policy(
     candidates: pd.DataFrame,
     *,
-    max_new_candidates: int = 5,
+    max_new_candidates: int | None = None,
     available_cash: float | None = None,
     nominal_nav: float | None = None,
     min_cash_buffer: float = 0.0,
@@ -105,7 +105,9 @@ def apply_mainline_v3_entry_policy(
     )
     data["mainline_v3_minimum_buy_quantity"] = minimum_buy_quantity
     data["mainline_v3_market_permission_feasible"] = permission_feasible
-    one_lot_cash = price * minimum_buy_quantity * (1.0 + max(float(estimated_cost_rate), 0.0))
+    one_lot_market_notional = price * minimum_buy_quantity
+    one_lot_cash = one_lot_market_notional * (1.0 + max(float(estimated_cost_rate), 0.0))
+    data["mainline_v3_one_lot_market_notional"] = one_lot_market_notional
     data["mainline_v3_one_lot_cash_required"] = one_lot_cash
     if nominal_nav is not None and float(nominal_nav) > 0.0:
         one_lot_weight = one_lot_cash / float(nominal_nav)
@@ -193,7 +195,12 @@ def apply_mainline_v3_entry_policy(
     selected = pd.Series(False, index=data.index)
     cash_budget = float(available_cash) if available_cash is not None else float("inf")
     remaining_cash = max(cash_budget - float(min_cash_buffer), 0.0)
-    remaining_slots = max(max(int(max_new_candidates), 0) - len(held), 0)
+    runtime_candidate_cap = (
+        int(max_new_candidates)
+        if max_new_candidates is not None
+        else int(data["symbol"].astype(str).nunique())
+    )
+    remaining_slots = max(max(runtime_candidate_cap, 0) - len(held), 0)
     data["mainline_v3_slot_feasible"] = cash_signal & bool(remaining_slots > 0)
     selected_index = []
     if bool(use_scap_candidate_utility):

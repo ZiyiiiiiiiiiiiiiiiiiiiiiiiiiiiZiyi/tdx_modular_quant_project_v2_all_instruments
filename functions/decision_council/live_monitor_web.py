@@ -328,6 +328,10 @@ HTML = """<!doctype html>
       ["minimum_required_holding_count", "最低持仓数"],
       ["soft_target_holding_count", "软目标持仓数"],
       ["maximum_allowed_holding_count", "持仓硬上限"],
+      ["user_hard_position_cap", "Web治理硬上限"],
+      ["economic_position_cap", "经济可行上限"],
+      ["search_position_cap", "求解资源上限"],
+      ["effective_position_cap", "当日有效上限"],
       ["holding_shortfall_count", "软目标不足数"],
       ["idle_cash_ratio", "闲置现金比例"],
       ["scap_v31_positive_c_fallback_count", "C级试探候选"],
@@ -952,6 +956,10 @@ HTML = """<!doctype html>
       setMetric("minimum_required_holding_count", String(Number(ms.minimum_required_holding_count || 0)), 0);
       setMetric("soft_target_holding_count", String(Number(ms.soft_target_holding_count || 0)), 0);
       setMetric("maximum_allowed_holding_count", String(Number(ms.maximum_allowed_holding_count || 0)), 0);
+      setMetric("user_hard_position_cap", Number.isFinite(Number(ms.user_hard_position_cap)) ? String(Number(ms.user_hard_position_cap)) : "未设置", 0);
+      setMetric("economic_position_cap", String(Number(ms.economic_position_cap || 0)), 0);
+      setMetric("search_position_cap", String(Number(ms.search_position_cap || 0)), 0);
+      setMetric("effective_position_cap", String(Number(ms.effective_position_cap || 0)), 0);
       setMetric("holding_shortfall_count", String(Number(ms.holding_shortfall_count || 0)), -Number(ms.holding_shortfall_count || 0));
       setMetric("idle_cash_ratio", fmtPct(Number(ms.idle_cash_ratio)), -Number(ms.idle_cash_ratio || 0));
       setMetric("scap_v31_positive_c_fallback_count", String(Number(ms.scap_v31_positive_c_fallback_count || 0)), Number(ms.scap_v31_positive_c_fallback_count || 0));

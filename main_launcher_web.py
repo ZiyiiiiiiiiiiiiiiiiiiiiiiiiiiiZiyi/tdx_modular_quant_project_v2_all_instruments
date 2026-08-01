@@ -310,7 +310,7 @@ RUN_HTML = """<!doctype html>
       <label class="item"><input type="checkbox" id="registered_mainline_v2_suite">预登记主线 v1/v2 对照：固定运行四组实验，不临时扩充消融组合。</label>
 
       <div class="hint">
-        20日SCAP-V2全链工程验收已通过。下一步默认运行“层验证线”的180日受控开发窗口，固定当前因子柜、2万元、5只、允许现金、E4和全A研究池。<br>
+        20日SCAP-V2全链工程验收已通过。下一步默认运行“层验证线”的180日受控开发窗口，固定当前因子柜、2万元、Web所选持仓上限、允许现金、E4和全A研究池。<br>
         用于复核真实成交→pending→T+1→费用→账户→保存，并检查空仓、加仓和完整替换的真实触发；不要同时勾选其他任务。<br>
         180日仍是开发证据，不是最终样本外证据或实盘授权。
       </div>
@@ -332,8 +332,8 @@ RUN_HTML = """<!doctype html>
           <input type="number" id="initial_cash" min="1" step="1000" value="" placeholder="留空=使用所选资金档位">
         </div>
         <div class="field">
-          <label for="max_positions_account">最多买入/持有股票数量</label>
-          <input type="number" id="max_positions_account" min="0" step="1" value="" placeholder="留空=档位默认；0=资金/整手/成本自动上限">
+          <label for="max_positions_account">Web治理硬持仓上限（不是目标持仓数）</label>
+          <input type="number" id="max_positions_account" min="0" step="1" value="" placeholder="留空或0=不加用户上限；系统仍按资金/整手/成本自动决定">
         </div>
         <div class="field">
           <label for="min_cash_buffer">现金缓冲，可选</label>

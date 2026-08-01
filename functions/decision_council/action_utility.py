@@ -70,6 +70,50 @@ def round_trip_cost_amount(
     return float(pd.to_numeric(costs["total_cost"], errors="coerce").fillna(0.0).sum())
 
 
+def single_side_cost_amount(
+    *,
+    symbol: str,
+    side: str,
+    price: float,
+    shares: float,
+    trade_date=None,
+    cost_profile=None,
+) -> float:
+    """Return the exact configured one-side cost for one factual quantity."""
+    normalized_side = str(side).strip().lower()
+    if normalized_side not in {"buy", "sell"}:
+        raise ValueError(f"side must be buy or sell, got {side!r}")
+    if float(price) <= 0.0 or float(shares) <= 0.0:
+        return 0.0
+    costs = estimate_trade_costs(
+        pd.DataFrame(
+            [
+                {
+                    "symbol": str(symbol),
+                    "trade_date": trade_date,
+                    "side": normalized_side,
+                    "price": float(price),
+                    "target_shares": float(shares),
+                }
+            ]
+        ),
+        **cost_kwargs_from_profile(cost_profile),
+    )
+    return float(pd.to_numeric(costs["total_cost"], errors="coerce").fillna(0.0).iloc[0])
+
+
+def buy_cash_required_amount(**kwargs) -> float:
+    """Market notional plus exact configured buy-side costs."""
+    notional = max(float(kwargs["price"]), 0.0) * max(float(kwargs["shares"]), 0.0)
+    return notional + single_side_cost_amount(side="buy", **kwargs)
+
+
+def sell_cash_released_amount(**kwargs) -> float:
+    """Market notional less exact configured sell-side costs."""
+    notional = max(float(kwargs["price"]), 0.0) * max(float(kwargs["shares"]), 0.0)
+    return max(notional - single_side_cost_amount(side="sell", **kwargs), 0.0)
+
+
 def build_incremental_action_utility(
     *,
     action_type: str,
