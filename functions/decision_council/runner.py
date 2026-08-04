@@ -153,6 +153,9 @@ from functions.decision_council.exposure_runtime import (
 from functions.decision_council.fast_shadow import FastShadowPortfolioRunner
 from functions.decision_council.leakage import validate_governance_split
 from functions.decision_council.market_regime_policy import MarketRegimePolicy
+from functions.decision_council.market_state_semantics import (
+    build_market_state_authority_disclosure,
+)
 from functions.decision_council.mainline_v2 import (
     MAINLINE_V2,
     MAINLINE_V3,
@@ -1212,11 +1215,11 @@ class GovernanceBacktestRunner:
         finally:
             if live_monitor is not None:
                 finish_messages = {
-                    "running": "回测计算完成，正在保存结果。",
-                    "interrupted": "回测已由 Ctrl+C 中断；最后完成交易日已写入 checkpoint。",
-                    "failed": "回测失败；请查看 checkpoint 和命令窗口错误。",
+                    "running": "??????????????",
+                    "interrupted": "???? Ctrl+C ????????????? checkpoint?",
+                    "failed": "???????? checkpoint ????????",
                 }
-                live_monitor.finish(finish_messages.get(run_outcome, "回测已停止。"))
+                live_monitor.finish(finish_messages.get(run_outcome, "??????"))
         
         for model_name, shadow in shadows.items():
             shadow_frame = pd.DataFrame(shadow.exposure_rows)
@@ -2230,6 +2233,16 @@ class GovernanceBacktestRunner:
         diagnostics["regime_control_authorized"] = bool(
             self.enable_market_regime_policy and self._control_enabled("regime")
         )
+        diagnostics.update(
+            build_market_state_authority_disclosure(
+                safety_structural_state=structural_regime_level,
+                safety_agent_enabled=self.enable_safety_agent,
+                optional_overlay_enabled=self.enable_market_regime_policy,
+                optional_overlay_authorized=diagnostics["regime_control_authorized"],
+                optional_input_valid=bool(diagnostics.get("regime_input_valid", False)),
+                optional_confirmed_label=str(diagnostics.get("regime_confirmed_label", "unknown")),
+            )
+        )
         diagnostics["performance_benchmark_role"] = "performance_attribution"
         diagnostics["performance_benchmark_distinct_from_regime_proxy"] = True
         diagnostics["base_exposure_by_regime"] = _base_exposure_by_regime(regime_name)
@@ -2728,6 +2741,16 @@ class GovernanceBacktestRunner:
                 "regime_as_of_date": diagnostics.get("regime_as_of_date", pd.Timestamp(date)),
                 "regime_diagnostics_enabled": diagnostics.get("regime_diagnostics_enabled", False),
                 "regime_control_authorized": diagnostics.get("regime_control_authorized", False),
+                "market_state_semantics_contract_version": diagnostics.get("market_state_semantics_contract_version", ""),
+                "safety_market_state_active": diagnostics.get("safety_market_state_active", False),
+                "safety_structural_state": diagnostics.get("safety_structural_state", "unknown"),
+                "safety_market_state_authority": diagnostics.get("safety_market_state_authority", "disabled"),
+                "optional_regime_overlay_enabled": diagnostics.get("optional_regime_overlay_enabled", False),
+                "optional_regime_overlay_authorized": diagnostics.get("optional_regime_overlay_authorized", False),
+                "optional_regime_overlay_state": diagnostics.get("optional_regime_overlay_state", "unknown"),
+                "optional_regime_overlay_authority": diagnostics.get("optional_regime_overlay_authority", "diagnostics_only_no_trade_authority"),
+                "performance_benchmark_authority": diagnostics.get("performance_benchmark_authority", "attribution_only_no_trade_authority"),
+                "safety_benchmark_authority": diagnostics.get("safety_benchmark_authority", "safety_market_state_input"),
                 "performance_benchmark_role": diagnostics.get("performance_benchmark_role", "performance_attribution"),
                 "performance_benchmark_distinct_from_regime_proxy": diagnostics.get("performance_benchmark_distinct_from_regime_proxy", True),
                 "base_exposure_by_regime": diagnostics.get("base_exposure_by_regime", 0.0),
@@ -3028,6 +3051,16 @@ class GovernanceBacktestRunner:
             "regime_raw_label": str(diagnostics.get("regime_raw_label", "unknown")),
             "regime_confirmed_label": str(diagnostics.get("regime_confirmed_label", diagnostics.get("regime_name", "unknown"))),
             "regime_as_of_date": diagnostics.get("regime_as_of_date", pd.Timestamp(date)),
+            "market_state_semantics_contract_version": str(diagnostics.get("market_state_semantics_contract_version", "")),
+            "safety_market_state_active": bool(diagnostics.get("safety_market_state_active", False)),
+            "safety_structural_state": str(diagnostics.get("safety_structural_state", safety_row.get("structural_regime_level", "unknown"))),
+            "safety_market_state_authority": str(diagnostics.get("safety_market_state_authority", "disabled")),
+            "optional_regime_overlay_enabled": bool(diagnostics.get("optional_regime_overlay_enabled", False)),
+            "optional_regime_overlay_authorized": bool(diagnostics.get("optional_regime_overlay_authorized", False)),
+            "optional_regime_overlay_state": str(diagnostics.get("optional_regime_overlay_state", "unknown")),
+            "optional_regime_overlay_authority": str(diagnostics.get("optional_regime_overlay_authority", "diagnostics_only_no_trade_authority")),
+            "performance_benchmark_authority": str(diagnostics.get("performance_benchmark_authority", "attribution_only_no_trade_authority")),
+            "safety_benchmark_authority": str(diagnostics.get("safety_benchmark_authority", "safety_market_state_input")),
             "performance_benchmark_role": str(diagnostics.get("performance_benchmark_role", "performance_attribution")),
             "performance_benchmark_distinct_from_regime_proxy": bool(diagnostics.get("performance_benchmark_distinct_from_regime_proxy", True)),
             "account_net_value": float(account_net_value),
@@ -4151,7 +4184,10 @@ class GovernanceBacktestRunner:
         )
         family_score_fields = tuple(
             column for column in candidates.columns
-            if column.startswith("cabinet_family_") and column.endswith("_score")
+            if (
+                column.startswith("cabinet_family_")
+                or column.startswith("cabinet_entry_family_")
+            ) and column.endswith("_score")
         )
         score_fields = score_fields + family_score_fields
         day_rows = []
@@ -4167,6 +4203,7 @@ class GovernanceBacktestRunner:
                 "state_machine_role_block_reason": str(candidate.get("state_machine_role_block_reason", "")),
                 "position_state": str(candidate.get("position_state", "")),
                 "cabinet_entry_thesis": str(candidate.get("cabinet_entry_thesis", "")),
+                "cabinet_entry_thesis_support": candidate.get("cabinet_entry_thesis_support", pd.NA),
                 "hybrid_fusion_status": str(candidate.get("hybrid_fusion_status", "")),
                 "hybrid_fusion_formula_version": str(candidate.get("hybrid_fusion_formula_version", "")),
                 "hybrid_score_authority": str(candidate.get("hybrid_score_authority", "")),

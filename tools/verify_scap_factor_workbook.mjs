@@ -35,7 +35,7 @@ const summaryInspect = await workbook.inspect({
 const checksInspect = await workbook.inspect({
   kind: "table",
   sheetId: "Checks",
-  range: "A1:F5",
+  range: "A1:F6",
   include: "values,formulas",
   tableMaxRows: 8,
   tableMaxCols: 8,

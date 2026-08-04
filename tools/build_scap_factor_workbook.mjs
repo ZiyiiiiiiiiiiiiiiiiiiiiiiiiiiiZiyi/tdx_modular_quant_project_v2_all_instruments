@@ -6,7 +6,7 @@ import { SpreadsheetFile, Workbook } from "@oai/artifact-tool";
 const workDir = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.resolve(process.argv[2] || workDir);
 const outputPath = path.resolve(
-  process.argv[3] || path.join(dataDir, "SCAP_持仓逐因子曲线.xlsx"),
+  process.argv[3] || path.join(dataDir, "SCAP_???????.xlsx"),
 );
 const payload = JSON.parse(await fs.readFile(path.join(dataDir, "workbook_payload.json"), "utf8"));
 const workbook = Workbook.create();
@@ -54,30 +54,30 @@ function styleTable(sheet, topRow, leftCol, rowCount, colCount) {
 const summary = workbook.worksheets.add("Summary");
 summary.showGridLines = false;
 summary.getRange("A1:H2").merge();
-summary.getRange("A1").values = [["SCAP 持仓逐因子评分曲线"]];
+summary.getRange("A1").values = [["SCAP ?????????"]];
 summary.getRange("A1:H2").format.fill = navy;
 summary.getRange("A1:H2").format.font = { bold: true, color: white, size: 18 };
 summary.getRange("A1:H2").format.verticalAlignment = "center";
-summary.getRange("A4:B4").values = [["指标", "结果"]];
+summary.getRange("A4:B4").values = [["??", "??"]];
 summary.getRange("A4:B4").format.fill = navy;
 summary.getRange("A4:B4").format.font = { bold: true, color: white };
 const summaryLabels = [
-  "交易日",
-  "初始资金",
-  "最终资金",
-  "总收益",
-  "达到当日经济容量的天数",
-  "达到经济容量且仓位缺口>5%的天数",
-  "平均实际仓位",
-  "达到经济容量时平均仓位缺口",
-  "窗口归一化基准净值（首日=1）",
-  "基准总收益",
-  "策略-基准收益差（百分点）",
-  "闭合交易数",
-  "已实现PnL",
-  "因子数",
-  "持仓股票数",
-  "持仓-日期因子覆盖率",
+  "???",
+  "????",
+  "????",
+  "???",
+  "???????????",
+  "???????????>5%???",
+  "??????",
+  "?????????????",
+  "????????????=1?",
+  "?????",
+  "??-??????????",
+  "?????",
+  "???PnL",
+  "???",
+  "?????",
+  "?????-?????????",
 ];
 summary.getRange(`A5:A${4 + summaryLabels.length}`).values = summaryLabels.map(x => [x]);
 
@@ -138,7 +138,7 @@ const bFormulas = [
   `=SUM('Closed Trades'!H2:H${payload.closed_trades.length + 1})`,
   payload.summary.factor_model_count,
   payload.summary.held_symbol_count,
-  `=IF(${payload.summary.holding_symbol_days}=0,0,${payload.summary.covered_holding_symbol_days}/${payload.summary.holding_symbol_days})`,
+  `=IF(${payload.summary.observable_holding_symbol_days}=0,0,${payload.summary.covered_observable_holding_symbol_days}/${payload.summary.observable_holding_symbol_days})`,
 ];
 summary.getRange(`B5:B${4 + bFormulas.length}`).formulas = bFormulas.map(value =>
   typeof value === "string" && value.startsWith("=") ? [value] : [null]
@@ -148,22 +148,22 @@ for (let i = 0; i < bFormulas.length; i++) {
     summary.getCell(4 + i, 1).values = [[bFormulas[i]]];
   }
 }
-summary.getRange("B6:B7").format.numberFormat = "¥#,##0.00;[Red](¥#,##0.00);-";
+summary.getRange("B6:B7").format.numberFormat = "?#,##0.00;[Red](?#,##0.00);-";
 summary.getRange("B8:B8").format.numberFormat = "0.00%";
 summary.getRange("B11:B15").format.numberFormat = "0.00%";
-summary.getRange("B17:B17").format.numberFormat = "¥#,##0.00;[Red](¥#,##0.00);-";
+summary.getRange("B17:B17").format.numberFormat = "?#,##0.00;[Red](?#,##0.00);-";
 summary.getRange("B20:B20").format.numberFormat = "0.00%";
 summary.getRange("A22:H22").merge();
-summary.getRange("A22").values = [["说明：本工作簿逐日保存每只历史持仓的单因子原始分、角色和权重；它是只读诊断，不取得交易决策权。"]];
+summary.getRange("A22").values = [[`???????????????????????????????${payload.summary.justified_unobserved_holding_days || 0}??????????????????????????????????`]];
 summary.getRange("A22:H22").format.fill = amber;
 summary.getRange("A22:H22").format.font = { bold: true, color: "#7F6000" };
 summary.getRange("A24:H24").merge();
-summary.getRange("A24").values = [[`数据源：${payload.summary.source_run}`]];
+summary.getRange("A24").values = [[`????${payload.summary.source_run}`]];
 summary.getRange("A24:H24").format.font = { color: "#008000", italic: true };
 summary.getRange("A24:H24").format.wrapText = true;
 summary.getRange("A24:H24").format.rowHeight = 42;
 summary.getRange("A26:H26").merge();
-summary.getRange("A26").values = [["蓝色表头=源数据；黑色公式=可追溯计算；各股票页前两张图为波动最大的12个单因子曲线，右侧矩阵保存全部74个因子。"]];
+summary.getRange("A26").values = [["????=????????=????????????????????12???????????????74????"]];
 summary.getRange("A26:H26").format.fill = blue;
 summary.getRange("A26:H26").format.wrapText = true;
 
@@ -174,7 +174,7 @@ for (const item of payload.symbols) {
   const sheet = workbook.worksheets.add(sheetName);
   sheet.showGridLines = false;
   sheet.getRange("A1:N1").merge();
-  sheet.getRange("A1").values = [[`${item.symbol} · 单因子5日预测收益曲线`]];
+  sheet.getRange("A1").values = [[`${item.symbol} ? ???5???????`]];
   sheet.getRange("A1:N1").format.fill = navy;
   sheet.getRange("A1:N1").format.font = { bold: true, color: white, size: 15 };
   const factors = item.factors;
@@ -214,12 +214,12 @@ for (const item of payload.symbols) {
 
   const firstEnd = helperStart + helperOne.length;
   const chart1 = sheet.charts.add("line", sheet.getRange(`A42:G${firstEnd}`));
-  chart1.titleText = `${item.symbol}｜波动最大因子 1-6`;
+  chart1.titleText = `${item.symbol}??????? 1-6`;
   chart1.hasLegend = true;
   chart1.legend.position = "bottom";
   chart1.setPosition("A3", "N19");
   const chart2 = sheet.charts.add("line", sheet.getRange(`H42:N${firstEnd}`));
-  chart2.titleText = `${item.symbol}｜波动最大因子 7-12`;
+  chart2.titleText = `${item.symbol}??????? 7-12`;
   chart2.hasLegend = true;
   chart2.legend.position = "bottom";
   chart2.setPosition("A21", "N37");
@@ -227,41 +227,46 @@ for (const item of payload.symbols) {
 
 const checks = workbook.worksheets.add("Checks");
 checks.showGridLines = false;
-checks.getRange("A1:F1").values = [["检查项", "实际", "预期", "差异", "状态", "说明"]];
+checks.getRange("A1:F1").values = [["???", "??", "??", "??", "??", "??"]];
 checks.getRange("A1:F1").format.fill = navy;
 checks.getRange("A1:F1").format.font = { bold: true, color: white };
-checks.getRange("A2:A5").values = [
-  ["持仓-日期因子覆盖"],
-  ["因子数量"],
-  ["活跃卖出行数"],
-  ["股票工作表数量"],
+checks.getRange("A2:A6").values = [
+  ["?????-??????"],
+  ["??????????"],
+  ["????"],
+  ["??????"],
+  ["???????"],
 ];
-checks.getRange("B2:B5").formulas = [
-  [`=${payload.summary.covered_holding_symbol_days}`],
+checks.getRange("B2:B6").formulas = [
+  [`=${payload.summary.covered_observable_holding_symbol_days}`],
+  [`=${payload.summary.justified_unobserved_holding_days}`],
   [`=${payload.summary.factor_model_count}`],
   [`=MAX(COUNTA('Sell Diagnostics'!A:A)-1,0)`],
   [`=${symbolSheetNames.length}`],
 ];
-checks.getRange("C2:C5").values = [
-  [payload.summary.holding_symbol_days],
+checks.getRange("C2:C6").values = [
+  [payload.summary.observable_holding_symbol_days],
+  [payload.summary.justified_unobserved_holding_days],
   [payload.summary.factor_model_count],
   [payload.summary.active_exit_rows ?? payload.summary.active_signal_failure_rows],
   [payload.summary.held_symbol_count],
 ];
-checks.getRange("D2:D5").formulas = [["=B2-C2"], ["=B3-C3"], ["=B4-C4"], ["=B5-C5"]];
-checks.getRange("E2:E5").formulas = [
+checks.getRange("D2:D6").formulas = [["=B2-C2"], ["=B3-C3"], ["=B4-C4"], ["=B5-C5"], ["=B6-C6"]];
+checks.getRange("E2:E6").formulas = [
   ['=IF(D2=0,"OK","FAIL")'],
-  ['=IF(D3=0,"OK","FAIL")'],
+  ['=IF(D3=0,"DISCLOSED","FAIL")'],
   ['=IF(D4=0,"OK","FAIL")'],
   ['=IF(D5=0,"OK","FAIL")'],
+  ['=IF(D6=0,"OK","FAIL")'],
 ];
-checks.getRange("F2:F5").values = [
-  ["每一个持仓股票-日期均应有74条因子记录"],
-  ["固定因子柜模型数"],
-  ["与运行中全部实际退出状态行数一致"],
-  ["每只历史持仓股票一个曲线页"],
+checks.getRange("F2:F6").values = [
+  ["?????????????-?????74?????"],
+  ["???????????????????????????"],
+  ["????????"],
+  ["????????????????"],
+  ["?????????????"],
 ];
-styleTable(checks, 0, 0, 5, 6);
+styleTable(checks, 0, 0, 6, 6);
 
 for (const sheet of [summary, daily, trades, sell, factorMap, checks]) {
   const used = sheet.getUsedRange();

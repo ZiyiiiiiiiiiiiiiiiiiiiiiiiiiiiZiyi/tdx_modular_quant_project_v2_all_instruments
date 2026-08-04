@@ -20,20 +20,125 @@ DEFAULT_ARTIFACT_NODE = Path(
     r"\dependencies\node\bin\node.exe"
 )
 FACTOR_PRODUCT_DIRNAME = "holding_factor_curves"
-FACTOR_WORKBOOK_NAME = "SCAP_持仓逐因子曲线.xlsx"
+FACTOR_WORKBOOK_NAME = "SCAP_???????.xlsx"
 
 
 def workbook_content_check_failures(summary: dict) -> list[str]:
     failures: list[str] = []
-    if int(summary.get("covered_holding_symbol_days", 0)) != int(
-        summary.get("holding_symbol_days", 0)
-    ):
+    if int(summary.get("unexpected_holding_factor_coverage_gap_count", 0)) > 0:
         failures.append("holding_symbol_day_factor_coverage")
     if int(summary.get("held_symbol_count", 0)) > 0 and int(
         summary.get("factor_model_count", 0)
     ) <= 0:
         failures.append("held_positions_without_factor_models")
     return failures
+
+
+def classify_holding_factor_coverage(
+    holding_keys: pd.DataFrame,
+    observed_counts: pd.DataFrame,
+    position_state: pd.DataFrame,
+    *,
+    expected_factor_count: int,
+) -> pd.DataFrame:
+    """Classify held-symbol-day factor coverage without inventing stale scores.
+
+    A held position can legitimately have no same-day factor observation when
+    the persisted lifecycle ledger proves that the current feature row was
+    unavailable and valuation used the last known close.  This is disclosed,
+    but it is not repaired by forward filling.  Any observable or ambiguous
+    held day with missing/partial factor records remains a strict failure.
+    """
+    keys = holding_keys[["date", "symbol"]].drop_duplicates().copy()
+    keys["date"] = pd.to_datetime(keys["date"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    keys["symbol"] = keys["symbol"].astype(str)
+    counts = observed_counts[["date", "symbol", "observed_factor_count"]].copy()
+    counts["date"] = pd.to_datetime(
+        counts["date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    counts["symbol"] = counts["symbol"].astype(str)
+    state_columns = [
+        column
+        for column in (
+            "date",
+            "symbol",
+            "position_state",
+            "state_observation_status",
+            "state_source_date",
+            "valuation_source",
+            "stale_days",
+        )
+        if column in position_state.columns
+    ]
+    states = position_state[state_columns].copy()
+    states["date"] = pd.to_datetime(
+        states["date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    states["symbol"] = states["symbol"].astype(str)
+    states = states.drop_duplicates(["date", "symbol"], keep="last")
+
+    detail = keys.merge(counts, on=["date", "symbol"], how="left").merge(
+        states,
+        on=["date", "symbol"],
+        how="left",
+        validate="one_to_one",
+    )
+    detail["observed_factor_count"] = pd.to_numeric(
+        detail["observed_factor_count"], errors="coerce"
+    ).fillna(0).astype(int)
+    detail["expected_factor_count"] = max(int(expected_factor_count), 0)
+    position_value = detail.get(
+        "position_state", pd.Series("", index=detail.index)
+    ).fillna("").astype(str)
+    observation_value = detail.get(
+        "state_observation_status", pd.Series("", index=detail.index)
+    ).fillna("").astype(str)
+    valuation_value = detail.get(
+        "valuation_source", pd.Series("", index=detail.index)
+    ).fillna("").astype(str)
+    stale_days = pd.to_numeric(
+        detail.get("stale_days", pd.Series(float("nan"), index=detail.index)),
+        errors="coerce",
+    )
+    detail["market_observed"] = ~observation_value.eq(
+        "carried_forward_missing_current_feature"
+    )
+    detail["justified_unobserved_holding"] = (
+        position_value.eq("held_unobserved")
+        & observation_value.eq("carried_forward_missing_current_feature")
+        & valuation_value.eq("last_known_close")
+        & stale_days.gt(0.0)
+    )
+    complete = detail["observed_factor_count"].eq(
+        detail["expected_factor_count"]
+    ) & detail["expected_factor_count"].gt(0)
+    partial = detail["observed_factor_count"].between(
+        1,
+        max(int(expected_factor_count) - 1, 0),
+        inclusive="both",
+    )
+    detail["coverage_status"] = "unexpected_no_factor_record"
+    detail.loc[partial, "coverage_status"] = "unexpected_partial_factor_record"
+    detail.loc[
+        detail["justified_unobserved_holding"]
+        & detail["observed_factor_count"].eq(0),
+        "coverage_status",
+    ] = "justified_unobserved_holding"
+    detail.loc[complete, "coverage_status"] = "complete"
+    detail.loc[
+        detail["justified_unobserved_holding"]
+        & detail["observed_factor_count"].gt(0),
+        "coverage_status",
+    ] = "unexpected_factor_record_for_unobserved_holding"
+    detail["coverage_complete"] = complete
+    detail["coverage_gate_passed"] = detail["coverage_status"].isin(
+        {"complete", "justified_unobserved_holding"}
+    )
+    detail["coverage_gate_failure"] = ~detail["coverage_gate_passed"]
+    detail["coverage_reason"] = detail["coverage_status"]
+    return detail.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
 HOLDING_COLUMNS = [
@@ -222,7 +327,21 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
         encoding="utf-8-sig",
     )
 
-    factor_model_count = int(factor_long["model_name"].nunique())
+    factor_runtime_path = run_dir / "factor_runtime_audit.json"
+    factor_runtime = (
+        json.loads(factor_runtime_path.read_text(encoding="utf-8-sig"))
+        if factor_runtime_path.is_file()
+        else {}
+    )
+    runtime_factor_count = int(
+        factor_runtime.get(
+            "loaded_factor_count",
+            factor_runtime.get("runtime_model_count", 0),
+        )
+        or 0
+    )
+    observed_factor_model_count = int(factor_long["model_name"].nunique())
+    factor_model_count = runtime_factor_count or observed_factor_model_count
     observed_counts = (
         factor_long.loc[factor_long["model_name"].notna()]
         .groupby(["date", "symbol"])["model_name"]
@@ -230,33 +349,36 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
         .rename("observed_factor_count")
         .reset_index()
     )
-    coverage_detail = holding_keys.merge(
+    coverage_detail = classify_holding_factor_coverage(
+        holding_keys,
         observed_counts,
-        on=["date", "symbol"],
-        how="left",
+        position_state,
+        expected_factor_count=factor_model_count,
     )
-    coverage_detail["observed_factor_count"] = pd.to_numeric(
-        coverage_detail["observed_factor_count"], errors="coerce"
-    ).fillna(0).astype(int)
-    coverage_detail["expected_factor_count"] = factor_model_count
-    coverage_detail["coverage_complete"] = coverage_detail[
-        "observed_factor_count"
-    ].eq(factor_model_count)
-    coverage_detail["coverage_reason"] = coverage_detail.apply(
-        lambda row: (
-            "complete"
-            if bool(row["coverage_complete"])
-            else (
-                "no_factor_record_for_held_symbol_day"
-                if int(row["observed_factor_count"]) == 0
-                else "partial_factor_record_for_held_symbol_day"
-            )
-        ),
-        axis=1,
+    coverage_detail.to_csv(
+        output_dir / "holding_factor_coverage_detail.csv",
+        index=False,
+        encoding="utf-8-sig",
     )
-    coverage_gaps = coverage_detail.loc[~coverage_detail["coverage_complete"]].copy()
-    coverage_gaps.to_csv(output_dir / "holding_factor_coverage_gaps.csv", index=False)
-    coverage = int(coverage_detail["coverage_complete"].sum())
+    coverage_gaps = coverage_detail.loc[
+        coverage_detail["coverage_gate_failure"]
+    ].copy()
+    coverage_gaps.to_csv(
+        output_dir / "holding_factor_coverage_gaps.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    unobserved_holding_days = coverage_detail.loc[
+        coverage_detail["coverage_status"].eq("justified_unobserved_holding")
+    ].copy()
+    unobserved_holding_days.to_csv(
+        output_dir / "holding_factor_unobserved_holding_days.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    complete_coverage = int(coverage_detail["coverage_complete"].sum())
+    gate_passed_coverage = int(coverage_detail["coverage_gate_passed"].sum())
+    observable_holding_days = int(coverage_detail["market_observed"].sum())
     holding_count = pd.to_numeric(daily["holding_count"], errors="coerce").fillna(0.0)
     economic_cap = pd.to_numeric(
         daily.get("economic_position_cap", pd.Series(index=daily.index, dtype=float)),
@@ -276,8 +398,15 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
         "held_symbol_count": int(holdings["symbol"].nunique()),
         "holding_symbol_days": int(len(holding_keys)),
         "factor_model_count": factor_model_count,
+        "observed_factor_model_count": observed_factor_model_count,
         "factor_score_rows": int(len(factor_long)),
-        "covered_holding_symbol_days": int(coverage),
+        # Compatibility field now means strict-gate-passed held days.  The
+        # observable/full distinction below is the authoritative disclosure.
+        "covered_holding_symbol_days": int(gate_passed_coverage),
+        "observable_holding_symbol_days": observable_holding_days,
+        "covered_observable_holding_symbol_days": complete_coverage,
+        "justified_unobserved_holding_days": int(len(unobserved_holding_days)),
+        "unexpected_holding_factor_coverage_gap_count": int(len(coverage_gaps)),
         "holding_factor_coverage_gap_count": int(len(coverage_gaps)),
         "holding_factor_coverage_gap_preview": coverage_gaps.head(20)[
             [
@@ -286,6 +415,17 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
                 "observed_factor_count",
                 "expected_factor_count",
                 "coverage_reason",
+            ]
+        ].to_dict("records"),
+        "justified_unobserved_holding_preview": unobserved_holding_days.head(20)[
+            [
+                "date",
+                "symbol",
+                "position_state",
+                "state_observation_status",
+                "valuation_source",
+                "stale_days",
+                "coverage_status",
             ]
         ].to_dict("records"),
         "economic_capacity_observed_days": int(valid_capacity.sum()),
@@ -310,6 +450,12 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
     )
     symbol_payloads = []
     for symbol, symbol_rows in factor_long.groupby("symbol", sort=True):
+        held = (
+            holdings[holdings["symbol"].astype(str).eq(str(symbol))]
+            .sort_values("date")
+            .drop_duplicates("date", keep="last")
+            .set_index("date")
+        )
         matrix = (
             symbol_rows.pivot_table(
                 index="date",
@@ -318,6 +464,7 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
                 aggfunc="last",
             )
             .sort_index()
+            .reindex(held.index.astype(str))
         )
         top_factors = (
             matrix.std(axis=0)
@@ -326,12 +473,6 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
             .head(12)
             .index.astype(str)
             .tolist()
-        )
-        held = (
-            holdings[holdings["symbol"].astype(str).eq(str(symbol))]
-            .sort_values("date")
-            .drop_duplicates("date", keep="last")
-            .set_index("date")
         )
         symbol_payloads.append(
             {
@@ -392,6 +533,7 @@ def build_integrated_products(
     *,
     build_workbook: bool = True,
     strict: bool = True,
+    output_dir: Path | None = None,
 ) -> dict[str, object]:
     """Create the standard post-run factor dataset and Excel product.
 
@@ -399,7 +541,11 @@ def build_integrated_products(
     persisted run ledgers.  It never participates in same-run decisions.
     """
     run_dir = Path(run_dir).resolve()
-    output_dir = run_dir / FACTOR_PRODUCT_DIRNAME
+    output_dir = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else run_dir / FACTOR_PRODUCT_DIRNAME
+    )
     summary = build_dataset(run_dir, output_dir)
     product_status: dict[str, object] = {
         **summary,

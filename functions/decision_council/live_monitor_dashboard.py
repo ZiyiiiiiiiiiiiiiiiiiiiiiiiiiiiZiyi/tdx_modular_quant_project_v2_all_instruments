@@ -7,7 +7,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>治理实时监控</title>
+  <title>??????</title>
   <style>
     :root {
       --bg: #f2f4f1;
@@ -196,15 +196,15 @@ HTML = r"""<!doctype html>
   <header class="topbar">
     <div class="topbar-main">
       <div class="brand">
-        <div class="brand-title">治理实时监控</div>
-        <div class="brand-subtitle" id="runTitle">等待治理运行会话</div>
+        <div class="brand-title">??????</div>
+        <div class="brand-subtitle" id="runTitle">????????</div>
         <div class="product-links">
-          <a class="product-link" href="/factors" target="_blank">持仓逐因子曲线</a>
-          <a class="product-link" href="/factor-workbook" target="_blank">下载逐因子Excel</a>
+          <a class="product-link" href="/factors" target="_blank">???????</a>
+          <a class="product-link" href="/factor-workbook" target="_blank">?????Excel</a>
         </div>
       </div>
       <div class="run-state">
-        <div class="run-state-line"><span class="status-dot" id="statusDot"></span><span class="status-text" id="status">正在连接运行状态</span></div>
+        <div class="run-state-line"><span class="status-dot" id="statusDot"></span><span class="status-text" id="status">????????</span></div>
         <div class="run-detail" id="runDetail">-- / --</div>
       </div>
     </div>
@@ -214,129 +214,145 @@ HTML = r"""<!doctype html>
   <main class="workspace">
     <section class="kpi-grid" id="kpiGrid"></section>
 
-    <nav class="tabs" aria-label="监控视图">
-      <button class="tab active" data-tab="overview">总览</button>
-      <button class="tab" data-tab="risk">风险与仓位</button>
-      <button class="tab" data-tab="execution">候选与执行</button>
-      <button class="tab" data-tab="factors">因子权重</button>
-      <button class="tab" data-tab="holdings">持仓路径</button>
+    <nav class="tabs" aria-label="????">
+      <button class="tab active" data-tab="overview">??</button>
+      <button class="tab" data-tab="risk">?????</button>
+      <button class="tab" data-tab="execution">?????</button>
+      <button class="tab" data-tab="factors">????</button>
+      <button class="tab" data-tab="holdings">????</button>
     </nav>
 
     <section class="tab-panel active" id="tab-overview">
       <div class="layout-main">
         <article class="panel">
           <div class="panel-header">
-            <div><div class="panel-title">账户净值与基准</div><div class="panel-note">统一以 1.0000 为起点；不混用资金金额与净值倍数</div></div>
-            <div class="range-control" aria-label="曲线区间">
+            <div><div class="panel-title">???????</div><div class="panel-note">??? 1.0000 ????????????????</div></div>
+            <div class="range-control" aria-label="????">
               <button class="range-button" data-range="60">60</button>
               <button class="range-button active" data-range="180">180</button>
-              <button class="range-button" data-range="0">全部</button>
+              <button class="range-button" data-range="0">??</button>
             </div>
           </div>
           <div class="chart-body"><canvas class="chart" id="perfChart"></canvas></div>
           <div class="panel-body legend">
-            <span class="legend-item"><i class="legend-line" style="background:#087a55"></i>账户净值</span>
-            <span class="legend-item"><i class="legend-line" style="background:#246b9e"></i>固定 Top-N 流动性基准</span>
+            <span class="legend-item"><i class="legend-line" style="background:#087a55"></i>????</span>
+            <span class="legend-item"><i class="legend-line" style="background:#246b9e"></i>?? Top-N ?????</span>
           </div>
         </article>
         <aside class="panel">
-          <div class="panel-header"><div class="panel-title">当前账户状态</div><div class="panel-note" id="asOfDate">--</div></div>
+          <div class="panel-header"><div class="panel-title">??????</div><div class="panel-note" id="asOfDate">--</div></div>
           <div class="panel-body">
             <dl class="summary-list" id="accountSummary"></dl>
-            <div class="exposure-row"><div class="exposure-label"><span>实际仓位</span><span id="actualExposureLabel">--</span></div><div class="exposure-bar"><div id="actualExposureBar"></div></div></div>
-            <div class="exposure-row"><div class="exposure-label"><span>目标仓位</span><span id="targetExposureLabel">--</span></div><div class="exposure-bar"><div id="targetExposureBar" style="background:#a87518"></div></div></div>
+            <div class="exposure-row"><div class="exposure-label"><span>????</span><span id="actualExposureLabel">--</span></div><div class="exposure-bar"><div id="actualExposureBar"></div></div></div>
+            <div class="exposure-row"><div class="exposure-label"><span>????</span><span id="targetExposureLabel">--</span></div><div class="exposure-bar"><div id="targetExposureBar" style="background:#a87518"></div></div></div>
           </div>
         </aside>
       </div>
       <div class="layout-half">
-        <article class="panel"><div class="panel-header"><div><div class="panel-title">超额净值</div><div class="panel-note">账户净值 / 基准净值</div></div></div><div class="chart-body"><canvas class="chart medium" id="excessChart"></canvas></div></article>
-        <article class="panel"><div class="panel-header"><div><div class="panel-title">账户回撤</div><div class="panel-note">相对历史净值峰值</div></div></div><div class="chart-body"><canvas class="chart medium" id="drawdownChart"></canvas></div></article>
+        <article class="panel"><div class="panel-header"><div><div class="panel-title">????</div><div class="panel-note">???? / ????</div></div></div><div class="chart-body"><canvas class="chart medium" id="excessChart"></canvas></div></article>
+        <article class="panel"><div class="panel-header"><div><div class="panel-title">????</div><div class="panel-note">????????</div></div></div><div class="chart-body"><canvas class="chart medium" id="drawdownChart"></canvas></div></article>
       </div>
-      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">运营指标</div><div class="panel-note">详细指标保留，但不与主 KPI 争夺视觉优先级</div></div><div class="detail-grid" id="overviewDetails"></div></div>
+      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">????</div><div class="panel-note">??????????? KPI ???????</div></div><div class="detail-grid" id="overviewDetails"></div></div>
     </section>
 
     <section class="tab-panel" id="tab-risk">
-      <div class="panel"><div class="panel-header"><div class="panel-title">风险与仓位指标</div></div><div class="detail-grid" id="riskDetails"></div></div>
+      <div class="panel"><div class="panel-header"><div class="panel-title">???????</div></div><div class="detail-grid" id="riskDetails"></div></div>
+      <article class="panel" style="margin-top:12px">
+        <div class="panel-header"><div><div class="panel-title">??????</div><div class="panel-note">?????????????/??/????????60/180/????</div></div></div>
+        <div class="chart-body"><canvas class="chart medium" id="holdingCountChart"></canvas></div>
+        <div class="panel-body legend">
+          <span class="legend-item"><i class="legend-line" style="background:#087a55"></i>????</span>
+          <span class="legend-item"><i class="legend-line" style="background:#246b9e"></i>?????</span>
+          <span class="legend-item"><i class="legend-line" style="background:#bd3d39"></i>????</span>
+          <span class="legend-item"><i class="legend-line" style="background:#a87518"></i>????</span>
+          <span class="legend-item"><i class="legend-line" style="background:#705a9f"></i>????</span>
+        </div>
+      </article>
       <div class="layout-third">
-        <article class="panel"><div class="panel-header"><div class="panel-title">安全状态</div></div><div class="panel-body"><pre class="text-report" id="safetyText">等待数据</pre></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">风险模型</div></div><div class="panel-body"><pre class="text-report" id="riskModelText">等待数据</pre></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">基准与超额</div></div><div class="panel-body"><pre class="text-report" id="benchmarkText">等待数据</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="safetyText">????</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="riskModelText">????</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">?????</div></div><div class="panel-body"><pre class="text-report" id="benchmarkText">????</pre></div></article>
       </div>
-      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">仓位与现金</div></div><div class="panel-body"><pre class="text-report" id="exposureText">等待数据</pre></div></div>
+      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">?????</div></div><div class="panel-body"><pre class="text-report" id="exposureText">????</pre></div></div>
     </section>
 
     <section class="tab-panel" id="tab-execution">
-      <div class="panel"><div class="panel-header"><div class="panel-title">候选与执行指标</div></div><div class="detail-grid" id="executionDetails"></div></div>
+      <div class="panel"><div class="panel-header"><div class="panel-title">???????</div></div><div class="detail-grid" id="executionDetails"></div></div>
       <div class="layout-half">
-        <article class="panel"><div class="panel-header"><div class="panel-title">买入门控</div></div><div class="panel-body"><pre class="text-report" id="entryGateText">等待数据</pre></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">交易质量</div></div><div class="panel-body"><pre class="text-report" id="tradeQualityText">等待数据</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="entryGateText">????</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="tradeQualityText">????</pre></div></article>
       </div>
       <div class="layout-third">
-        <article class="panel"><div class="panel-header"><div class="panel-title">最新订单</div></div><div class="panel-body"><pre class="text-report" id="ordersText">暂无订单</pre></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">订单原因</div></div><div class="panel-body"><pre class="text-report" id="orderReasonText">暂无订单原因</pre></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">未完成订单</div></div><div class="panel-body"><pre class="text-report" id="pendingText">暂无未完成订单</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="ordersText">????</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="panel-body"><pre class="text-report" id="orderReasonText">??????</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">?????</div></div><div class="panel-body"><pre class="text-report" id="pendingText">???????</pre></div></article>
       </div>
-      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">候选漏斗预览</div></div><div class="panel-body"><pre class="text-report" id="candidatesText">等待候选数据</pre></div></div>
+      <div class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">??????</div></div><div class="panel-body"><pre class="text-report" id="candidatesText">??????</pre></div></div>
     </section>
 
     <section class="tab-panel" id="tab-factors">
       <div class="layout-half">
-        <article class="panel"><div class="panel-header"><div class="panel-title">Alpha 因子权重</div><div class="panel-note">当前权重前八项</div></div><div class="chart-body"><canvas class="chart medium" id="factorChart"></canvas></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">Alpha 模块权重</div><div class="panel-note">按经济模块聚合</div></div><div class="chart-body"><canvas class="chart medium" id="moduleChart"></canvas></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">Alpha ????</div><div class="panel-note">???????</div></div><div class="chart-body"><canvas class="chart medium" id="factorChart"></canvas></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">Alpha ????</div><div class="panel-note">???????</div></div><div class="chart-body"><canvas class="chart medium" id="moduleChart"></canvas></div></article>
       </div>
       <div class="layout-half">
-        <article class="panel"><div class="panel-header"><div class="panel-title">当前持仓</div></div><div class="table-scroll"><table><thead><tr><th>代码</th><th>市值</th><th>账户权重</th></tr></thead><tbody id="holdingsBody"></tbody></table></div></article>
-        <article class="panel"><div class="panel-header"><div class="panel-title">模块权重明细</div></div><div class="table-scroll"><table><thead><tr><th>模块</th><th>占比</th><th>因子数</th><th>5 日预测</th></tr></thead><tbody id="moduleWeightsBody"></tbody></table></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">????</div></div><div class="table-scroll"><table><thead><tr><th>??</th><th>??</th><th>????</th></tr></thead><tbody id="holdingsBody"></tbody></table></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">??????</div></div><div class="table-scroll"><table><thead><tr><th>??</th><th>??</th><th>???</th><th>5 ???</th></tr></thead><tbody id="moduleWeightsBody"></tbody></table></div></article>
       </div>
-      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">因子权重明细</div></div><div class="table-scroll"><table><thead><tr><th>模块</th><th>角色</th><th>因子</th><th>权重</th><th>占比</th><th>变化</th><th>5 日预测</th><th>说明</th></tr></thead><tbody id="factorWeightsBody"></tbody></table></div></article>
+      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">??????</div></div><div class="table-scroll"><table><thead><tr><th>??</th><th>??</th><th>??</th><th>??</th><th>??</th><th>??</th><th>5 ???</th><th>??</th></tr></thead><tbody id="factorWeightsBody"></tbody></table></div></article>
     </section>
 
     <section class="tab-panel" id="tab-holdings">
       <article class="panel">
-        <div class="panel-header"><div><div class="panel-title">当前持仓价格路径</div><div class="panel-note">每只股票按实际入场价归一化为 1.0000；实心圆标记实际买入节点；最多展示市值前六只</div></div></div>
+        <div class="panel-header"><div><div class="panel-title">????????</div><div class="panel-note">?????????????? 1.0000??????????????????????</div></div></div>
         <div class="chart-body"><canvas class="chart" id="holdingPathChart"></canvas></div>
-        <div class="panel-body legend" id="holdingPathLegend"><span class="panel-note">尚无有效持仓路径</span></div>
+        <div class="panel-body legend" id="holdingPathLegend"><span class="panel-note">????????</span></div>
       </article>
-      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">持仓生命周期</div><div class="panel-note">入场、浮盈亏和退出警报使用同一持仓状态快照</div></div><div class="table-scroll"><table><thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>MFE</th><th>MAE</th><th>回吐</th><th>趋势</th><th>峰值衰减</th><th>亏损风险</th><th>状态</th><th>警报</th></tr></thead><tbody id="lifecycleBody"></tbody></table></div></article>
+      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">??????</div><div class="panel-note">?????????????????????</div></div><div class="table-scroll"><table><thead><tr><th>??</th><th>??</th><th>???</th><th>MFE</th><th>MAE</th><th>??</th><th>??</th><th>????</th><th>????</th><th>??</th><th>??</th></tr></thead><tbody id="lifecycleBody"></tbody></table></div></article>
     </section>
   </main>
 
   <script>
     const KPI_DEFS = [
-      ["total_return", "账户收益", "自运行起点"], ["nav", "账户净值", "归一化净值"],
-      ["excess_nav", "超额净值", "相对固定 Top-N 流动性基准"], ["current_drawdown", "当前回撤", "相对账户峰值"],
-      ["actual_exposure", "实际仓位", "账户口径"], ["holdings", "持仓数", "当前有效持仓"],
-      ["candidate_count", "候选数", "当日原始候选"], ["risk_level", "风险等级", "治理安全状态"],
+      ["total_return", "????", "?????"], ["nav", "????", "?????"],
+      ["excess_nav", "????", "???? Top-N ?????"], ["current_drawdown", "????", "??????"],
+      ["actual_exposure", "????", "????"], ["holdings", "???", "??????"],
+      ["candidate_count", "???", "??????"], ["risk_level", "????", "??????"],
+      ["strategic_exposure_budget", "??????", "SCAP????"], ["signal_supported_exposure", "??????", "????"],
+      ["integer_feasible_exposure", "??????", "?????"], ["planned_exposure", "????", "ActionPlan"],
+      ["selected_position_count", "?????", "ActionPlan"], ["incremental_expected_wealth_amount", "??????", "???"],
+      ["incremental_cvar_amount", "??CVaR", "???"], ["model_uncertainty_amount", "??????", "???"],
+      ["scenario_risk_penalty_amount", "??????", "???"], ["best_rejected_objective_amount", "??????", "???"],
     ];
     const DETAIL_GROUPS = {
       overviewDetails: [
-        ["benchmark_nav","基准净值"],["valid_invested_nav","持仓/投入净值"],["account_max_drawdown","账户最大回撤"],
-        ["holding_max_drawdown","持仓最大回撤"],["benchmark_max_drawdown","基准最大回撤"],["excess_max_drawdown","超额最大回撤"],
-        ["sharpe","年化夏普"],["sortino","年化索提诺"],["annual_volatility","年化波动"],["cash","现金"],["cash_drag","现金拖累"],
-        ["closed_trade_win_rate","平仓胜率"],["profit_factor","利润因子"],
+        ["benchmark_nav","????"],["valid_invested_nav","??/????"],["account_max_drawdown","??????"],
+        ["holding_max_drawdown","??????"],["benchmark_max_drawdown","??????"],["excess_max_drawdown","??????"],
+        ["sharpe","????"],["sortino","?????"],["annual_volatility","????"],["cash","??"],["cash_drag","????"],
+        ["closed_trade_win_rate","????"],["profit_factor","????"],
       ],
       riskDetails: [
-        ["risk_level","风险等级"],["exposure_cap","仓位上限"],["target_exposure","战略期望仓位"],["optimizer_planned_exposure","优化器计划仓位"],["actual_exposure","实际仓位"],
-        ["exposure_gap","交易前低于政策下界"],["idle_cash_ratio","闲置现金比例"],["minimum_required_holding_count","当日条件最低持仓"],
-        ["soft_target_holding_count","政策目标持仓"],["maximum_allowed_holding_count","当日有效持仓上限"],
-        ["user_hard_position_cap","Web治理硬上限"],["economic_position_cap","经济可行上限"],
-        ["search_position_cap","求解资源上限"],["effective_position_cap","当日有效上限"],
-        ["holding_shortfall_count","软目标不足数"],["tail_risk_proxy_mean","尾部风险均值"],["future_loss_risk_score_mean","未来亏损风险"],
-        ["scap_v31_positive_c_fallback_count","C级试探候选"],["scap_v31_all_d_streak","全D连续日"],["scap_v31_normal_cash_zero_proposal_streak","正常高现金零提案连续日"],
-        ["empirical_distribution_score_mean","经验分布均分"],["trend_direction_score_mean","趋势方向均值"],["peak_decay_score_mean","峰值衰退均值"],
-        ["defensive_eligible_count","防守候选数"],["downtrend_decay_count","阴跌风险"],["lifecycle_alerts","生命周期警报"],
-        ["buy_sell_conflict_cooldown_days","买卖冲突冷却天数"],
+        ["risk_level","????"],["exposure_cap","????"],["target_exposure","??????"],["optimizer_planned_exposure","???????"],["actual_exposure","????"],
+        ["exposure_gap","?????????"],["idle_cash_ratio","??????"],["minimum_required_holding_count","????????"],
+        ["soft_target_holding_count","??????"],["maximum_allowed_holding_count","????????"],
+        ["user_hard_position_cap","Web?????"],["economic_position_cap","??????"],
+        ["search_position_cap","??????"],["effective_position_cap","??????"],
+        ["holding_shortfall_count","??????"],["tail_risk_proxy_mean","??????"],["future_loss_risk_score_mean","??????"],
+        ["scap_v31_positive_c_fallback_count","C?????"],["scap_v31_all_d_streak","?D???"],["scap_v31_normal_cash_zero_proposal_streak","???????????"],
+        ["empirical_distribution_score_mean","??????"],["trend_direction_score_mean","??????"],["peak_decay_score_mean","??????"],
+        ["defensive_eligible_count","?????"],["downtrend_decay_count","????"],["lifecycle_alerts","??????"],
+        ["buy_sell_conflict_cooldown_days","????????"],
       ],
       executionDetails: [
-        ["candidate_count","候选数"],["confirmed_count","确认数"],["order_count","订单数"],["pending_orders","未完成订单"],
-        ["buy_accuracy_5d","买入 5 日准确率"],["sell_accuracy_5d","卖出 5 日准确率"],["realized_pnl","已实现盈亏"],
-        ["gross_profit","平仓总盈利"],["gross_loss","平仓总亏损"],["control_exit_count","控制卖出次数"],
-        ["retail_lot_cash_insufficient_count","一手资金不足"],["retail_state_block_count","状态拦截买单"],
-        ["surge_candidate_count","急涨候选"],["strong_starter_count","强启动候选"],["exhaustion_block_count","衰竭拦截"],
-        ["protecting_profit_count","利润保护持仓"],["retail_upgraded_to_one_lot_count","小资金一手升级"],
-        ["starter_2_lot_count","两手首买候选"],["diversify_1_lot_count","分散一手候选"],
-        ["control_avoided_loss","控制避免亏损"],["hard_stop_avoided_loss","硬止损避免亏损"],
-        ["alpha_collapse_avoided_loss","Alpha 塌陷避免亏损"],["safety_deleveraging_avoided_loss","安全降仓避免亏损"],
+        ["candidate_count","???"],["confirmed_count","???"],["order_count","???"],["pending_orders","?????"],
+        ["buy_accuracy_5d","?? 5 ????"],["sell_accuracy_5d","?? 5 ????"],["realized_pnl","?????"],
+        ["gross_profit","?????"],["gross_loss","?????"],["control_exit_count","??????"],
+        ["retail_lot_cash_insufficient_count","??????"],["retail_state_block_count","??????"],
+        ["surge_candidate_count","????"],["strong_starter_count","?????"],["exhaustion_block_count","????"],
+        ["protecting_profit_count","??????"],["retail_upgraded_to_one_lot_count","???????"],
+        ["starter_2_lot_count","??????"],["diversify_1_lot_count","??????"],
+        ["control_avoided_loss","??????"],["hard_stop_avoided_loss","???????"],
+        ["alpha_collapse_avoided_loss","Alpha ??????"],["safety_deleveraging_avoided_loss","????????"],
       ],
     };
     const metricValues = {};
@@ -347,6 +363,7 @@ HTML = r"""<!doctype html>
 
     function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
     function finite(value, fallback=0) { const n = Number(value); return Number.isFinite(n) ? n : fallback; }
+    function nullableNumber(value) { if(value===null||value===undefined||value==="")return null;const n=Number(value);return Number.isFinite(n)?n:null; }
     function fmtPct(value) { const n = Number(value); return Number.isFinite(n) ? `${(n*100).toFixed(2)}%` : "--"; }
     function fmtNum(value, digits=2) { const n = Number(value); return Number.isFinite(n) ? n.toFixed(digits) : "--"; }
     function fmtMoney(value) { const n = Number(value); return Number.isFinite(n) ? n.toLocaleString("zh-CN", {maximumFractionDigits:0}) : "--"; }
@@ -377,7 +394,7 @@ HTML = r"""<!doctype html>
         drawAllCharts();
       }));
       window.addEventListener("resize", () => requestAnimationFrame(drawAllCharts));
-      for (const id of ["perfChart","excessChart","drawdownChart"]) {
+      for (const id of ["perfChart","excessChart","drawdownChart","holdingCountChart"]) {
         document.getElementById(id).addEventListener("mousemove", event => {
           const rect = event.currentTarget.getBoundingClientRect();
           const points = visibleHistory();
@@ -408,10 +425,12 @@ HTML = r"""<!doctype html>
       ctx.textAlign="left"; return p;
     }
     function drawLine(ctx,values,p,bounds,color,width=2) { ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineJoin="round";ctx.lineCap="round";ctx.beginPath();values.forEach((v,i)=>{const x=values.length===1?p.l:p.l+(p.r-p.l)*i/(values.length-1);const y=p.b-(finite(v)-bounds.min)/Math.max(bounds.max-bounds.min,1e-12)*(p.b-p.t);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke(); }
+    function drawStepLine(ctx,values,p,bounds,color,width=2) { ctx.strokeStyle=color;ctx.lineWidth=width;ctx.lineJoin="round";ctx.lineCap="round";ctx.beginPath();let active=false,lastX=0,lastY=0;values.forEach((raw,i)=>{const v=nullableNumber(raw),x=values.length===1?p.l:p.l+(p.r-p.l)*i/(values.length-1);if(v===null){active=false;return;}const y=p.b-(v-bounds.min)/Math.max(bounds.max-bounds.min,1e-12)*(p.b-p.t);if(!active){ctx.moveTo(x,y);active=true;}else{ctx.lineTo(x,lastY);ctx.lineTo(x,y);}lastX=x;lastY=y;});ctx.stroke(); }
     function drawHover(ctx,p,points,series) { if(hoverIndex===null || !points.length) return; const i=Math.min(hoverIndex,points.length-1); const x=points.length===1?p.l:p.l+(p.r-p.l)*i/(points.length-1);ctx.strokeStyle="#9aa4a0";ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(x,p.t);ctx.lineTo(x,p.b);ctx.stroke();ctx.setLineDash([]);const lines=[points[i].date,...series.map(s=>`${s.label} ${s.format(s.values[i])}`)];ctx.font="11px Consolas";const width=Math.max(...lines.map(x=>ctx.measureText(x).width))+18;const boxX=x+width+10>p.r?x-width-8:x+8;ctx.fillStyle="rgba(31,45,41,.94)";ctx.fillRect(boxX,p.t+8,width,lines.length*17+8);lines.forEach((line,j)=>{ctx.fillStyle=j===0?"#aebbb6":"#fff";ctx.fillText(line,boxX+9,p.t+24+j*17);}); }
-    function drawPerformance() { const c=prepareCanvas("perfChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"等待净值数据");const a=points.map(x=>x.navMultiple),b=points.map(x=>x.benchmarkNav),bounds=chartBounds([...a,...b],1),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),v=>fmtNum(v,4));drawLine(ctx,a,p,bounds,"#087a55",2.2);drawLine(ctx,b,p,bounds,"#246b9e",1.8);drawHover(ctx,p,points,[{label:"账户",values:a,format:v=>fmtNum(v,4)},{label:"基准",values:b,format:v=>fmtNum(v,4)}]); }
-    function drawExcess() { const c=prepareCanvas("excessChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"等待超额净值数据");const v=points.map(x=>x.excessNav),bounds=chartBounds(v,1),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),x=>fmtNum(x,4));const y0=p.b-(1-bounds.min)/(bounds.max-bounds.min)*(p.b-p.t);ctx.strokeStyle="#b8c0bc";ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(p.l,y0);ctx.lineTo(p.r,y0);ctx.stroke();ctx.setLineDash([]);drawLine(ctx,v,p,bounds,"#a87518",2.2);drawHover(ctx,p,points,[{label:"超额",values:v,format:x=>fmtNum(x,4)}]); }
-    function drawDrawdown() { const c=prepareCanvas("drawdownChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"等待回撤数据");const v=points.map(x=>x.drawdown),bounds={min:Math.min(...v,-.01)*1.12,max:0},p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);drawLine(ctx,v,p,bounds,"#bd3d39",2);drawHover(ctx,p,points,[{label:"回撤",values:v,format:fmtPct}]); }
+    function drawPerformance() { const c=prepareCanvas("perfChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"??????");const a=points.map(x=>x.navMultiple),b=points.map(x=>x.benchmarkNav),bounds=chartBounds([...a,...b],1),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),v=>fmtNum(v,4));drawLine(ctx,a,p,bounds,"#087a55",2.2);drawLine(ctx,b,p,bounds,"#246b9e",1.8);drawHover(ctx,p,points,[{label:"??",values:a,format:v=>fmtNum(v,4)},{label:"??",values:b,format:v=>fmtNum(v,4)}]); }
+    function drawExcess() { const c=prepareCanvas("excessChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"????????");const v=points.map(x=>x.excessNav),bounds=chartBounds(v,1),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),x=>fmtNum(x,4));const y0=p.b-(1-bounds.min)/(bounds.max-bounds.min)*(p.b-p.t);ctx.strokeStyle="#b8c0bc";ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(p.l,y0);ctx.lineTo(p.r,y0);ctx.stroke();ctx.setLineDash([]);drawLine(ctx,v,p,bounds,"#a87518",2.2);drawHover(ctx,p,points,[{label:"??",values:v,format:x=>fmtNum(x,4)}]); }
+    function drawDrawdown() { const c=prepareCanvas("drawdownChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"??????");const v=points.map(x=>x.drawdown),bounds={min:Math.min(...v,-.01)*1.12,max:0},p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);drawLine(ctx,v,p,bounds,"#bd3d39",2);drawHover(ctx,p,points,[{label:"??",values:v,format:fmtPct}]); }
+    function drawHoldingCount() { const c=prepareCanvas("holdingCountChart"),points=visibleHistory();if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,"????????");const actual=points.map(x=>nullableNumber(x.actualHoldingCount)),planned=points.map(x=>nullableNumber(x.plannedHoldingCount)),minimum=points.map(x=>nullableNumber(x.minimumHoldingCount)),target=points.map(x=>nullableNumber(x.targetHoldingCount)),maximum=points.map(x=>nullableNumber(x.maximumHoldingCount));const observed=[...actual,...planned,...minimum,...target,...maximum].filter(x=>x!==null);if(!observed.length)return drawEmpty(ctx,"????????????");const bounds={min:Math.min(0,...observed)-.5,max:Math.max(...observed)+.5},p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),x=>fmtNum(x,0));drawStepLine(ctx,actual,p,bounds,"#087a55",2.6);drawStepLine(ctx,planned,p,bounds,"#246b9e",1.8);drawStepLine(ctx,minimum,p,bounds,"#bd3d39",1.2);drawStepLine(ctx,target,p,bounds,"#a87518",1.4);drawStepLine(ctx,maximum,p,bounds,"#705a9f",1.2);const show=x=>x===null?"--":fmtNum(x,0);drawHover(ctx,p,points,[{label:"??",values:actual,format:show},{label:"??",values:planned,format:show},{label:"??",values:minimum,format:show},{label:"??",values:target,format:show},{label:"??",values:maximum,format:show}]); }
     function drawEmpty(ctx,text){ctx.fillStyle="#7c8783";ctx.font="12px Microsoft YaHei UI";ctx.fillText(text,18,28);}
     function annualizedSortino(returns,navMultiple,tradingDays){
       const values=(returns||[]).map(Number).filter(Number.isFinite),downside=values.filter(value=>value<0);
@@ -424,14 +443,14 @@ HTML = r"""<!doctype html>
       return annualDownsideVolatility>1e-12?annualReturn/annualDownsideVolatility:NaN;
     }
     function aggregateModules(weights){const map={};for(const item of weights||[]){const key=String(item.factor_module||"unknown");if(!map[key])map[key]={factor_module:key,weight_share:0,weight:0,factor_count:0,avg_predicted_return_5d:0};map[key].weight_share+=finite(item.weight_share);map[key].weight+=finite(item.weight);map[key].factor_count+=1;map[key].avg_predicted_return_5d+=finite(item.avg_predicted_return_5d);}return Object.values(map).sort((a,b)=>b.weight_share-a.weight_share);}
-    function drawMulti(id,points,nameKey,label){const c=prepareCanvas(id);if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,`等待${label}数据`);const latest=points[points.length-1].weights||[];const names=latest.slice().sort((a,b)=>finite(b.weight_share)-finite(a.weight_share)).slice(0,8).map(x=>String(x[nameKey]));const all=[];for(const point of points){const map=Object.fromEntries((point.weights||[]).map(x=>[String(x[nameKey]),finite(x.weight_share)]));names.forEach(n=>all.push(map[n]||0));}const bounds=chartBounds(all,0),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);names.forEach((name,j)=>{const vals=points.map(point=>{const found=(point.weights||[]).find(x=>String(x[nameKey])===name);return finite(found&&found.weight_share);});drawLine(ctx,vals,p,bounds,palette[j%palette.length],1.7);ctx.fillStyle=palette[j%palette.length];ctx.font="10px Microsoft YaHei UI";ctx.fillText(name.slice(0,18),p.l+(j%4)*Math.max((p.r-p.l)/4,100),10+Math.floor(j/4)*12);});}
+    function drawMulti(id,points,nameKey,label){const c=prepareCanvas(id);if(!c)return;const {ctx,w,h}=c;if(!points.length)return drawEmpty(ctx,`??${label}??`);const latest=points[points.length-1].weights||[];const names=latest.slice().sort((a,b)=>finite(b.weight_share)-finite(a.weight_share)).slice(0,8).map(x=>String(x[nameKey]));const all=[];for(const point of points){const map=Object.fromEntries((point.weights||[]).map(x=>[String(x[nameKey]),finite(x.weight_share)]));names.forEach(n=>all.push(map[n]||0));}const bounds=chartBounds(all,0),p=drawFrame(ctx,w,h,bounds,points.map(x=>x.date),fmtPct);names.forEach((name,j)=>{const vals=points.map(point=>{const found=(point.weights||[]).find(x=>String(x[nameKey])===name);return finite(found&&found.weight_share);});drawLine(ctx,vals,p,bounds,palette[j%palette.length],1.7);ctx.fillStyle=palette[j%palette.length];ctx.font="10px Microsoft YaHei UI";ctx.fillText(name.slice(0,18),p.l+(j%4)*Math.max((p.r-p.l)/4,100),10+Math.floor(j/4)*12);});}
     function drawHoldingPaths(paths) {
       const c=prepareCanvas("holdingPathChart"); if(!c)return;
       const {ctx,w,h}=c,legend=document.getElementById("holdingPathLegend");
       const usable=(paths||[]).filter(x=>(x.points||[]).length>1).slice(0,6);
       if(!usable.length){
-        if(legend)legend.innerHTML='<span class="panel-note">当前没有可绘制的持仓；成交并完成首日收盘标记后自动出现。</span>';
-        return drawEmpty(ctx,"暂无有效持仓价格路径");
+        if(legend)legend.innerHTML='<span class="panel-note">????????????????????????????</span>';
+        return drawEmpty(ctx,"??????????");
       }
       const values=usable.flatMap(x=>x.points.map(point=>finite(point.value,1)));
       const longest=usable.slice().sort((a,b)=>b.points.length-a.points.length)[0];
@@ -451,7 +470,7 @@ HTML = r"""<!doctype html>
         const x=vals.length===1?p.l:p.l+(p.r-p.l)*entryIndex/(vals.length-1);
         const entryDate=String(path.entry_date||path.points[entryIndex].date||"").slice(5);
         const entryPrice=Number(path.entry_price);
-        const label=`买入 ${entryDate}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}`;
+        const label=`?? ${entryDate}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}`;
         ctx.save();
         ctx.strokeStyle=`${color}66`;ctx.setLineDash([3,4]);ctx.beginPath();ctx.moveTo(x,p.t);ctx.lineTo(x,p.b);ctx.stroke();ctx.setLineDash([]);
         ctx.fillStyle="#fff";ctx.beginPath();ctx.arc(x,y0,6,0,Math.PI*2);ctx.fill();
@@ -467,31 +486,32 @@ HTML = r"""<!doctype html>
       });
       if(legend)legend.innerHTML=usable.map((path,j)=>{
         const color=palette[j%palette.length],entryDate=String(path.entry_date||"").slice(0,10);
-        const entryPrice=Number(path.entry_price),outside=path.entry_visible===false?"（窗口外）":"";
-        const entryText=entryDate?`买入 ${escapeHtml(entryDate)}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}${outside}`:"买入信息缺失";
-        return `<span class="legend-item" style="color:${color}"><i class="legend-line" style="background:${color}"></i><i class="legend-entry-dot" style="background:${color}"></i><span style="color:var(--muted)">${escapeHtml(String(path.symbol||""))} ${fmtPct(finite(path.unrealized_return))} · ${entryText}</span></span>`;
+        const entryPrice=Number(path.entry_price),outside=path.entry_visible===false?"?????":"";
+        const entryText=entryDate?`?? ${escapeHtml(entryDate)}${Number.isFinite(entryPrice)?` @ ${entryPrice.toFixed(2)}`:""}${outside}`:"??????";
+        return `<span class="legend-item" style="color:${color}"><i class="legend-line" style="background:${color}"></i><i class="legend-entry-dot" style="background:${color}"></i><span style="color:var(--muted)">${escapeHtml(String(path.symbol||""))} ${fmtPct(finite(path.unrealized_return))} ? ${entryText}</span></span>`;
       }).join("");
     }
-    function drawAllCharts(){drawPerformance();drawExcess();drawDrawdown();drawMulti("factorChart",factorHistory,"model_name","因子权重");drawMulti("moduleChart",moduleHistory,"factor_module","模块权重");drawHoldingPaths(window.latestHoldingPaths||[]);}
-    function summaryLines(items,empty="暂无记录"){const rows=(items||[]).slice(0,10);return rows.length?rows.map(x=>`${String(x.name||"").padEnd(26)} ${String(x.count??"").padStart(5)} ${fmtPct(finite(x.share)).padStart(9)}`):[empty];}
-    function renderTable(id,rows,columns,colspan){const body=document.getElementById(id);body.innerHTML=rows.length?rows.map(row=>`<tr>${columns.map(column=>`<td class="${column.tone?column.tone(row):""}">${column.render(row)}</td>`).join("")}</tr>`).join(""):`<tr><td colspan="${colspan}" class="empty">暂无数据</td></tr>`;}
+    function drawAllCharts(){drawPerformance();drawExcess();drawDrawdown();drawHoldingCount();drawMulti("factorChart",factorHistory,"model_name","????");drawMulti("moduleChart",moduleHistory,"factor_module","????");drawHoldingPaths(window.latestHoldingPaths||[]);}
+    function summaryLines(items,empty="????"){const rows=(items||[]).slice(0,10);return rows.length?rows.map(x=>`${String(x.name||"").padEnd(26)} ${String(x.count??"").padStart(5)} ${fmtPct(finite(x.share)).padStart(9)}`):[empty];}
+    function renderTable(id,rows,columns,colspan){const body=document.getElementById(id);body.innerHTML=rows.length?rows.map(row=>`<tr>${columns.map(column=>`<td class="${column.tone?column.tone(row):""}">${column.render(row)}</td>`).join("")}</tr>`).join(""):`<tr><td colspan="${colspan}" class="empty">????</td></tr>`;}
     function updateReports(exposure,ms,computed){
       const {navMultiple,totalReturn,benchmarkNav,excessNav,maxDrawdown,actualExposure,targetExposure,exposureGap,cashDrag}=computed;
-      document.getElementById("benchmarkText").textContent=[`账户净值              : ${fmtNum(navMultiple,4)} (${fmtPct(totalReturn)})`,`基准净值              : ${fmtNum(benchmarkNav,4)} (${fmtPct(benchmarkNav-1)})`,`超额净值              : ${fmtNum(excessNav,4)} (${fmtPct(excessNav-1)})`,`账户最大回撤          : ${fmtPct(maxDrawdown)}`,`基准 5 日收益         : ${fmtPct(finite(ms.benchmark_return_5d,NaN))}`,`基准 20 日收益        : ${fmtPct(finite(ms.benchmark_return_20d,NaN))}`,`基准水下幅度          : ${fmtPct(finite(ms.benchmark_underwater_from_peak,NaN))}`].join("\n");
-      document.getElementById("exposureText").textContent=[`现金                  : ${fmtMoney(exposure.cash)}`,`已投入市值            : ${fmtMoney(exposure.invested_value)}`,`实际仓位              : ${fmtPct(actualExposure)}`,`目标仓位              : ${fmtPct(targetExposure)}`,`有效目标上限          : ${fmtPct(finite(ms.effective_target_exposure_cap))}`,`仓位缺口              : ${fmtPct(exposureGap)}`,`现金拖累              : ${fmtPct(cashDrag)}`,`换手预算              : ${fmtPct(finite(ms.turnover_budget))}`,`允许追仓              : ${Boolean(ms.catchup_allowed)}`,`追仓拦截原因          : ${ms.catchup_block_reason||"--"}`].join("\n");
-      document.getElementById("entryGateText").textContent=[`候选数量              : ${ms.candidate_count??0}`,`买入确认数量          : ${ms.entry_confirmed_count??0}`,`确认比例              : ${fmtPct(finite(ms.candidate_count)>0?finite(ms.entry_confirmed_count)/finite(ms.candidate_count):0)}`,`订单流通过数          : ${ms.orderflow_candidate_pass_count??0}`,`反转通过数            : ${ms.reversal_confirm_pass_count??0}`,`突破通过数            : ${ms.breakout_gate_pass_count??0}`,`Entry Alpha 均分      : ${fmtNum(ms.entry_alpha_score_mean,3)}`,`Timing 均分           : ${fmtNum(ms.entry_timing_score_mean,3)}`,`Liquidity 均分        : ${fmtNum(ms.entry_liquidity_score_mean,3)}`,`Entry Matrix 均分     : ${fmtNum(ms.entry_matrix_score_mean,3)}`,`成功概率均值          : ${fmtPct(finite(ms.entry_success_probability_mean))}`,"","主要拦截原因",...summaryLines(ms.entry_block_summary,"暂无拦截记录")].join("\n");
-      document.getElementById("tradeQualityText").textContent=[`买入 5 日准确率       : ${fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN))}`,`卖出 5 日准确率       : ${fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN))}`,`最佳替换优势          : ${fmtPct(finite(ms.best_replacement_edge_10d))}`,`替换卖出数量          : ${ms.replacement_opportunity_sell_count??0}`,`利润回吐观察数        : ${ms.profit_giveback_observation_count??0}`,`买后表现失败卖出数    : ${ms.post_entry_failure_exit_count??0}`,`生命周期警报数        : ${ms.lifecycle_alert_count??0}`,`计划订单数            : ${ms.order_count??0}`,`未完成订单数          : ${ms.pending_order_count??0}`,"","订单原因",...summaryLines(ms.order_reason_summary,"暂无订单原因")].join("\n");
-      document.getElementById("riskModelText").textContent=[`协方差模型启用        : ${Boolean(ms.covariance_risk_model_used)}`,`组合协方差波动        : ${fmtPct(finite(ms.portfolio_covariance_volatility))}`,`最大风险贡献          : ${fmtPct(finite(ms.max_risk_contribution))}`,`前五风险贡献（描述）  : ${fmtPct(finite(ms.top5_risk_contribution_sum))}`,`头部20%风险贡献       : ${fmtPct(finite(ms.top20pct_risk_contribution_sum))}`,`风险有效N/K           : ${fmtNum(ms.risk_effective_n_ratio,3)}`,`风险HHI               : ${fmtNum(ms.risk_contribution_hhi,3)}`,`风险门控通过          : ${Boolean(ms.risk_contribution_gate_pass??true)}`,`风险仓位缩放          : ${fmtNum(ms.risk_contribution_exposure_scale,3)}`,`风险股票数            : ${ms.risk_symbol_count??0}`,`平均两两相关          : ${fmtNum(ms.avg_pairwise_correlation,3)}`,`风险等级              : ${ms.risk_level||"--"}`,`流动性压力            : ${fmtPct(finite(ms.market_liquidity_stress_ratio))}`,`未解决安全仓位        : ${fmtPct(finite(ms.unresolved_safety_exposure))}`].join("\n");
-      document.getElementById("safetyText").textContent=[`风险等级              : ${ms.risk_level||"--"}`,`原始风险等级          : ${ms.raw_risk_level||"--"}`,`触发连续天数          : ${ms.trigger_streak_days??"--"}`,`触发来源              : ${ms.trigger_source||"--"}`,`结构性市场状态        : ${ms.structural_regime_level||"--"}`,`状态仓位预算          : ${fmtPct(finite(ms.regime_exposure_budget))}`,`安全仓位上限          : ${fmtPct(finite(ms.safety_exposure_cap))}`,`硬冻结                : ${Boolean(ms.hard_freeze_active)}`,`允许追仓              : ${Boolean(ms.catchup_allowed)}`,`准确率乘数            : ${fmtNum(ms.accuracy_multiplier,2)}`,`运行状态              : ${ms.regime||"--"}`,`最大持股数            : ${ms.top_n??"--"}`].join("\n");
+      document.getElementById("benchmarkText").textContent=[`????              : ${fmtNum(navMultiple,4)} (${fmtPct(totalReturn)})`,`????              : ${fmtNum(benchmarkNav,4)} (${fmtPct(benchmarkNav-1)})`,`????              : ${fmtNum(excessNav,4)} (${fmtPct(excessNav-1)})`,`??????          : ${fmtPct(maxDrawdown)}`,`?? 5 ???         : ${fmtPct(finite(ms.benchmark_return_5d,NaN))}`,`?? 20 ???        : ${fmtPct(finite(ms.benchmark_return_20d,NaN))}`,`??????          : ${fmtPct(finite(ms.benchmark_underwater_from_peak,NaN))}`].join("\n");
+      document.getElementById("exposureText").textContent=[`??                  : ${fmtMoney(exposure.cash)}`,`?????            : ${fmtMoney(exposure.invested_value)}`,`????              : ${fmtPct(actualExposure)}`,`????              : ${fmtPct(targetExposure)}`,`??????          : ${fmtPct(finite(ms.effective_target_exposure_cap))}`,`????              : ${fmtPct(exposureGap)}`,`????              : ${fmtPct(cashDrag)}`,`????              : ${fmtPct(finite(ms.turnover_budget))}`,`????              : ${Boolean(ms.catchup_allowed)}`,`??????          : ${ms.catchup_block_reason||"--"}`].join("\n");
+      document.getElementById("entryGateText").textContent=[`????              : ${ms.candidate_count??0}`,`??????          : ${ms.entry_confirmed_count??0}`,`????              : ${fmtPct(finite(ms.candidate_count)>0?finite(ms.entry_confirmed_count)/finite(ms.candidate_count):0)}`,`??????          : ${ms.orderflow_candidate_pass_count??0}`,`?????            : ${ms.reversal_confirm_pass_count??0}`,`?????            : ${ms.breakout_gate_pass_count??0}`,`Entry Alpha ??      : ${fmtNum(ms.entry_alpha_score_mean,3)}`,`Timing ??           : ${fmtNum(ms.entry_timing_score_mean,3)}`,`Liquidity ??        : ${fmtNum(ms.entry_liquidity_score_mean,3)}`,`Entry Matrix ??     : ${fmtNum(ms.entry_matrix_score_mean,3)}`,`??????          : ${fmtPct(finite(ms.entry_success_probability_mean))}`,"","??????",...summaryLines(ms.entry_block_summary,"??????")].join("\n");
+      document.getElementById("tradeQualityText").textContent=[`?? 5 ????       : ${fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN))}`,`?? 5 ????       : ${fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN))}`,`??????          : ${fmtPct(finite(ms.best_replacement_edge_10d))}`,`??????          : ${ms.replacement_opportunity_sell_count??0}`,`???????        : ${ms.profit_giveback_observation_count??0}`,`?????????    : ${ms.post_entry_failure_exit_count??0}`,`???????        : ${ms.lifecycle_alert_count??0}`,`?????            : ${ms.order_count??0}`,`??????          : ${ms.pending_order_count??0}`,"","????",...summaryLines(ms.order_reason_summary,"??????")].join("\n");
+      document.getElementById("riskModelText").textContent=[`???????        : ${Boolean(ms.covariance_risk_model_used)}`,`???????        : ${fmtPct(finite(ms.portfolio_covariance_volatility))}`,`??????          : ${fmtPct(finite(ms.max_risk_contribution))}`,`??????????  : ${fmtPct(finite(ms.top5_risk_contribution_sum))}`,`??20%????       : ${fmtPct(finite(ms.top20pct_risk_contribution_sum))}`,`????N/K           : ${fmtNum(ms.risk_effective_n_ratio,3)}`,`??HHI               : ${fmtNum(ms.risk_contribution_hhi,3)}`,`??????          : ${Boolean(ms.risk_contribution_gate_pass??true)}`,`??????          : ${fmtNum(ms.risk_contribution_exposure_scale,3)}`,`?????            : ${ms.risk_symbol_count??0}`,`??????          : ${fmtNum(ms.avg_pairwise_correlation,3)}`,`????              : ${ms.risk_level||"--"}`,`?????            : ${fmtPct(finite(ms.market_liquidity_stress_ratio))}`,`???????        : ${fmtPct(finite(ms.unresolved_safety_exposure))}`].join("\n");
+      document.getElementById("safetyText").textContent=[`????              : ${ms.risk_level||"--"}`,`??????          : ${ms.raw_risk_level||"--"}`,`??????          : ${ms.trigger_streak_days??"--"}`,`????              : ${ms.trigger_source||"--"}`,`????????      : ${ms.safety_structural_state||ms.structural_regime_level||"--"}`,`??????          : ${Boolean(ms.safety_market_state_active)}`,`??????          : ${ms.safety_market_state_authority||"--"}`,`??????          : ${fmtPct(finite(ms.regime_exposure_budget))}`,`??????          : ${fmtPct(finite(ms.safety_exposure_cap))}`,`???                : ${Boolean(ms.hard_freeze_active)}`,`????              : ${Boolean(ms.catchup_allowed)}`,`?????            : ${fmtNum(ms.accuracy_multiplier,2)}`,`????              : ${ms.regime||"--"}`,`?????            : ${ms.top_n??"--"}`].join("\n");
       const appendReport=(id,lines)=>{const node=document.getElementById(id);node.textContent+=`\n${lines.join("\n")}`;};
       if(String(ms.strategy_logic_version||"").startsWith("mainline_v3")) appendReport("entryGateText",["",`Cabinet-native v3 (${String(ms.strategy_logic_version||"not_initialized")})`,`Strict entry family : ${fmtNum(ms.cabinet_strict_entry_score_mean,3)}`,`Proxy entry family  : ${fmtNum(ms.cabinet_proxy_entry_score_mean,3)}`,`Timing role         : ${fmtNum(ms.cabinet_timing_score_mean,3)}`,`Liquidity health    : ${fmtNum(ms.cabinet_liquidity_health_score_mean,3)}`,`Risk safety         : ${fmtNum(ms.cabinet_risk_safety_score_mean,3)}`,`Hold support        : ${fmtNum(ms.cabinet_hold_support_score_mean,3)}`,`ML fusion weight    : ${fmtNum(ms.monthly_lgbm_effective_weight||0,3)}`,`Temporal isolation  : ${String(ms.factor_temporal_isolation_status||"NOT_EVALUATED")}`,`Family replacement  : ${String(ms.factor_family_replacement_status||"NOT_EVALUATED")}`,`Causal audit        : ${String(ms.factor_causal_audit_status||"NOT_EVALUATED")}`,`PIT Level-2         : ${String(ms.pit_level2_runtime_state||"degraded")}`]);
-      appendReport("benchmarkText",[`业绩基准ID            : ${ms.performance_benchmark_id||"--"}`,`基准成员数            : ${ms.performance_benchmark_member_count??0}`,`基准收益覆盖率        : ${fmtPct(finite(ms.performance_benchmark_return_coverage))}`,`本期是否调仓          : ${Boolean(ms.performance_benchmark_rebalanced)}`,`基准换手率            : ${fmtPct(finite(ms.performance_benchmark_turnover))}`,`安全基准ID            : ${ms.safety_benchmark_id||"--"}`,`基准 5 日回撤         : ${fmtPct(finite(ms.benchmark_drawdown_5d))}`,`基准 20 日回撤        : ${fmtPct(finite(ms.benchmark_drawdown_20d))}`]);
-      appendReport("exposureText",[`基础状态仓位          : ${fmtPct(finite(ms.base_exposure_by_regime))}`,`原始安全上限          : ${fmtPct(finite(ms.raw_safety_exposure_cap))}`,`经济容量/估仓位数     : ${ms.economic_position_cap??"--"} / ${ms.sizing_reference_positions??"--"}`,`优化后计划持仓数      : ${ms.planned_holding_count??ms.optimizer_planned_holding_count??"--"}`,`选中动作涉及名称数    : ${ms.selected_position_count??"--"}`,`盈利覆盖比/概率下界   : ${fmtNum(finite(ms.profit_coverage_ratio),2)} / ${fmtPct(finite(ms.profit_coverage_probability_lower))}`,`覆盖证据股票数        : ${ms.coverage_evidence_name_count??0}`,`原始正效用信号        : ${ms.raw_signal_count??0}`,`结构可行              : ${ms.structural_feasible_count??0}`,`现金可行              : ${ms.cash_feasible_count??0}`,`槽位可行              : ${ms.slot_feasible_count??0}`,`优化器选中            : ${ms.optimizer_selected_entry_count??0}`,`计划安全卖出          : ${fmtPct(finite(ms.planned_safety_sell_weight))}`,`约束现金保留          : ${fmtPct(finite(ms.constraint_cash_reserve))}`,`普通换手权重          : ${fmtPct(finite(ms.normal_turnover_weight))}`,`目标总漂移            : ${fmtPct(finite(ms.total_target_drift))}`,`追仓预算              : ${fmtPct(finite(ms.catchup_buy_budget))}`,`追仓档位              : ${ms.catchup_tier||"--"}`,`退出阶段/止损         : ${ms.scap_exit_stage||"--"} / ${fmtPct(finite(ms.scap_loss_stop))}`,`运行身份              : ${String(ms.runtime_identity_hash||"--").slice(0,16)}`]);
-      appendReport("entryGateText",[`订单流候选均分        : ${fmtNum(ms.orderflow_candidate_score_mean,3)}`,`反转入场均分          : ${fmtNum(ms.reversal_entry_score_mean,3)}`,`突破门控均分          : ${fmtNum(ms.breakout_gate_score_mean,3)}`,`趋势持有均分          : ${fmtNum(ms.trend_hold_score_mean,3)}`,`模块候选均分          : ${fmtNum(ms.module_candidate_score_mean,3)}`,`模块入场均分          : ${fmtNum(ms.module_entry_score_mean,3)}`,`模块持有均分          : ${fmtNum(ms.module_hold_score_mean,3)}`,`股票质量均分          : ${fmtNum(ms.alpha_quality_score_mean,3)}`,`急涨捕捉均分          : ${fmtNum(ms.surge_capture_score_mean,3)}`,`跟随确认均分          : ${fmtNum(ms.follow_through_score_mean,3)}`,`衰竭风险均分          : ${fmtNum(ms.exhaustion_score_mean,3)}`,`经验分布均分          : ${fmtNum(ms.empirical_distribution_score_mean,3)}`,`趋势方向均分          : ${fmtNum(ms.trend_direction_score_mean,3)}`,`峰值衰退均分          : ${fmtNum(ms.peak_decay_score_mean,3)}`,`阴跌衰减均分          : ${fmtNum(ms.downtrend_decay_score_mean,3)}`,`买后表现失败均分      : ${fmtNum(ms.post_entry_failure_score_mean,3)}`,`防守候选数            : ${ms.defensive_eligible_count??0}`]);
-      appendReport("tradeQualityText",[`控制避免亏损        : ${fmtMoney(ms.avoided_loss_to_window_low)}`,`硬止损避免亏损        : ${fmtMoney(ms.hard_stop_avoided_loss_to_window_low)}`,`Alpha 塌陷避免亏损   : ${fmtMoney(ms.alpha_collapse_avoided_loss_to_window_low)}`,`安全降仓避免亏损      : ${fmtMoney(ms.safety_deleveraging_avoided_loss_to_window_low)}`,`趋势破坏观察数        : ${ms.trend_break_observation_count??0}`,`量价分布观察数        : ${ms.volume_distribution_observation_count??0}`,`一手升级数            : ${ms.retail_upgraded_to_one_lot_count??0}`,`两手首买候选          : ${ms.starter_2_lot_count??0}`,`分散一手候选          : ${ms.diversify_1_lot_count??0}`]);
-      appendReport("riskModelText",[`风险拦截原因          : ${ms.risk_contribution_block_reason||"--"}`,`协方差条件数          : ${fmtNum(ms.covariance_condition_number,1)}`,`新买风险拦截          : ${Boolean(ms.risk_new_buy_block)}`,`新买拦截已应用        : ${Boolean(ms.risk_new_buy_block_applied)}`,`追仓风险拦截          : ${Boolean(ms.risk_catchup_block)}`,`追仓拦截已应用        : ${Boolean(ms.risk_catchup_block_applied)}`,`风险拦截买入权重      : ${fmtPct(finite(ms.risk_blocked_new_buy_weight))}`]);
-      appendReport("safetyText",[`授权 10 日优势均值     : ${fmtPct(finite(ms.authorization_expected_edge_10d_mean))}`,`授权胜率均值          : ${fmtPct(finite(ms.authorization_p_win_10d_mean))}`,`授权档位              : ${ms.exposure_authorization_tier||"--"}`,`授权拦截原因          : ${ms.exposure_authorization_block_reasons||"--"}`,`市场状态叠加模式      : ${ms.regime_overlay_mode||"--"}`,`市场状态叠加封顶      : ${Boolean(ms.regime_overlay_capped)}`,`买卖冲突冷却天数      : ${ms.buy_sell_conflict_cooldown_days??0}`]);
-      appendReport("exposureText",[`覆盖模式              : ${ms.coverage_mode||"--"}`,`增量期望/CVaR         : ${fmtMoney(finite(ms.incremental_expected_wealth_amount))} / ${fmtMoney(finite(ms.incremental_cvar_amount))}`,`模型不确定性/风险罚金 : ${fmtMoney(finite(ms.model_uncertainty_amount))} / ${fmtMoney(finite(ms.scenario_risk_penalty_amount))}`,`情景证据状态          : ${ms.scenario_evidence_state||"--"}`,`最佳被拒目标          : ${fmtMoney(finite(ms.best_rejected_objective_amount))}`]);
+      appendReport("benchmarkText",[`????ID            : ${ms.performance_benchmark_id||"--"}`,`?????            : ${ms.performance_benchmark_member_count??0}`,`???????        : ${fmtPct(finite(ms.performance_benchmark_return_coverage))}`,`??????          : ${Boolean(ms.performance_benchmark_rebalanced)}`,`?????            : ${fmtPct(finite(ms.performance_benchmark_turnover))}`,`????ID            : ${ms.safety_benchmark_id||"--"}`,`?? 5 ???         : ${fmtPct(finite(ms.benchmark_drawdown_5d))}`,`?? 20 ???        : ${fmtPct(finite(ms.benchmark_drawdown_20d))}`]);
+      appendReport("exposureText",[`??????          : ${fmtPct(finite(ms.base_exposure_by_regime))}`,`??????          : ${fmtPct(finite(ms.raw_safety_exposure_cap))}`,`????/????     : ${ms.economic_position_cap??"--"} / ${ms.sizing_reference_positions??"--"}`,`????????      : ${ms.planned_holding_count??ms.optimizer_planned_holding_count??"--"}`,`?????????    : ${ms.selected_position_count??"--"}`,`?????/????   : ${fmtNum(finite(ms.profit_coverage_ratio),2)} / ${fmtPct(finite(ms.profit_coverage_probability_lower))}`,`???????        : ${ms.coverage_evidence_name_count??0}`,`???????        : ${ms.raw_signal_count??0}`,`????              : ${ms.structural_feasible_count??0}`,`????              : ${ms.cash_feasible_count??0}`,`????              : ${ms.slot_feasible_count??0}`,`?????            : ${ms.optimizer_selected_entry_count??0}`,`??????          : ${fmtPct(finite(ms.planned_safety_sell_weight))}`,`??????          : ${fmtPct(finite(ms.constraint_cash_reserve))}`,`??????          : ${fmtPct(finite(ms.normal_turnover_weight))}`,`?????            : ${fmtPct(finite(ms.total_target_drift))}`,`????              : ${fmtPct(finite(ms.catchup_buy_budget))}`,`????              : ${ms.catchup_tier||"--"}`,`????/??         : ${ms.scap_exit_stage||"--"} / ${fmtPct(finite(ms.scap_loss_stop))}`,`????              : ${String(ms.runtime_identity_hash||"--").slice(0,16)}`]);
+      appendReport("entryGateText",[`???????        : ${fmtNum(ms.orderflow_candidate_score_mean,3)}`,`??????          : ${fmtNum(ms.reversal_entry_score_mean,3)}`,`??????          : ${fmtNum(ms.breakout_gate_score_mean,3)}`,`??????          : ${fmtNum(ms.trend_hold_score_mean,3)}`,`??????          : ${fmtNum(ms.module_candidate_score_mean,3)}`,`??????          : ${fmtNum(ms.module_entry_score_mean,3)}`,`??????          : ${fmtNum(ms.module_hold_score_mean,3)}`,`??????          : ${fmtNum(ms.alpha_quality_score_mean,3)}`,`??????          : ${fmtNum(ms.surge_capture_score_mean,3)}`,`??????          : ${fmtNum(ms.follow_through_score_mean,3)}`,`??????          : ${fmtNum(ms.exhaustion_score_mean,3)}`,`??????          : ${fmtNum(ms.empirical_distribution_score_mean,3)}`,`??????          : ${fmtNum(ms.trend_direction_score_mean,3)}`,`??????          : ${fmtNum(ms.peak_decay_score_mean,3)}`,`??????          : ${fmtNum(ms.downtrend_decay_score_mean,3)}`,`????????      : ${fmtNum(ms.post_entry_failure_score_mean,3)}`,`?????            : ${ms.defensive_eligible_count??0}`]);
+      appendReport("tradeQualityText",[`??????        : ${fmtMoney(ms.avoided_loss_to_window_low)}`,`???????        : ${fmtMoney(ms.hard_stop_avoided_loss_to_window_low)}`,`Alpha ??????   : ${fmtMoney(ms.alpha_collapse_avoided_loss_to_window_low)}`,`????????      : ${fmtMoney(ms.safety_deleveraging_avoided_loss_to_window_low)}`,`???????        : ${ms.trend_break_observation_count??0}`,`???????        : ${ms.volume_distribution_observation_count??0}`,`?????            : ${ms.retail_upgraded_to_one_lot_count??0}`,`??????          : ${ms.starter_2_lot_count??0}`,`??????          : ${ms.diversify_1_lot_count??0}`]);
+      appendReport("riskModelText",[`??????          : ${ms.risk_contribution_block_reason||"--"}`,`??????          : ${fmtNum(ms.covariance_condition_number,1)}`,`??????          : ${Boolean(ms.risk_new_buy_block)}`,`???????        : ${Boolean(ms.risk_new_buy_block_applied)}`,`??????          : ${Boolean(ms.risk_catchup_block)}`,`???????        : ${Boolean(ms.risk_catchup_block_applied)}`,`????????      : ${fmtPct(finite(ms.risk_blocked_new_buy_weight))}`]);
+      appendReport("safetyText",[`?? 10 ?????     : ${fmtPct(finite(ms.authorization_expected_edge_10d_mean))}`,`??????          : ${fmtPct(finite(ms.authorization_p_win_10d_mean))}`,`????              : ${ms.exposure_authorization_tier||"--"}`,`??????          : ${ms.exposure_authorization_block_reasons||"--"}`,`????????      : ${Boolean(ms.optional_regime_overlay_enabled)}`,`????????      : ${ms.optional_regime_overlay_state||"unknown"}`,`????????      : ${ms.optional_regime_overlay_authority||"--"}`,`????????      : ${ms.regime_overlay_mode||"--"}`,`????????      : ${Boolean(ms.regime_overlay_capped)}`,`????????      : ${ms.buy_sell_conflict_cooldown_days??0}`]);
+      appendReport("exposureText",[`????              : ${ms.coverage_mode||"--"}`,`????/CVaR         : ${fmtMoney(finite(ms.incremental_expected_wealth_amount))} / ${fmtMoney(finite(ms.incremental_cvar_amount))}`,`??????/???? : ${fmtMoney(finite(ms.model_uncertainty_amount))} / ${fmtMoney(finite(ms.scenario_risk_penalty_amount))}`,`??????          : ${ms.scenario_evidence_state||"--"}`,`??????          : ${fmtMoney(finite(ms.best_rejected_objective_amount))}`,
+        "",`??????          : ${fmtPct(finite(ms.strategic_exposure_budget,NaN))}`,`??????          : ${fmtPct(finite(ms.signal_supported_exposure,NaN))}`,`??????          : ${fmtPct(finite(ms.integer_feasible_exposure,NaN))}`,`????              : ${fmtPct(finite(ms.planned_exposure,NaN))}`,`???????        : ${ms.user_hard_position_cap??"--"}`,`????????      : ${ms.cost_feasible_position_cap??"--"}`,`????????      : ${ms.lot_cash_position_cap??"--"}`,`????????      : ${ms.risk_feasible_position_cap??"--"}`,`??????          : ${ms.search_position_cap??"--"}`,`??????          : ${ms.effective_position_cap??"--"}`,`??????          : ${ms.grandfathered_excess_names??0}`,`????????      : ${ms.max_daily_new_names??"--"}`,`????????      : ${fmtPct(finite(ms.max_daily_new_exposure_ratio,NaN))}`,`?????????    : ${ms.portfolio_normal_rebalance_frequency||"--"}`,`???????        : ${ms.portfolio_normal_rebalance_anchor||"--"}`,`????????      : ${ms.monthly_plan_execution_window_sessions??"--"}`]);
     }
     function renderOperational(exposure,ms,holdings,nav){
       renderTable("holdingsBody",(holdings||[]).filter(x=>String(x.symbol||"").trim()).sort((a,b)=>finite(b.market_value)-finite(a.market_value)).slice(0,16),[
@@ -501,14 +521,14 @@ HTML = r"""<!doctype html>
       const factors=(ms.factor_weights||[]).slice().sort((a,b)=>finite(b.weight_share)-finite(a.weight_share)).slice(0,18);
       renderTable("factorWeightsBody",factors,[{render:x=>escapeHtml(String(x.factor_module||"unknown").slice(0,18))},{render:x=>escapeHtml(String(x.factor_role||"entry_alpha").slice(0,18))},{render:x=>escapeHtml(String(x.model_name||"").slice(0,28))},{render:x=>fmtNum(x.weight,2)},{render:x=>fmtPct(x.weight_share)},{render:x=>`${finite(x.weight_delta)>=0?"+":""}${fmtNum(x.weight_delta,3)}`,tone:x=>tone(finite(x.weight_delta))},{render:x=>fmtPct(x.avg_predicted_return_5d)},{render:x=>escapeHtml(String(x.weight_explanation||"").slice(0,42))}],8);
       const lifecycle=(ms.holding_lifecycle_preview||[]).slice(0,14);
-      renderTable("lifecycleBody",lifecycle,[{render:x=>escapeHtml(x.symbol)},{render:x=>escapeHtml(x.entry_date||"--")},{render:x=>fmtPct(x.unrealized_return),tone:x=>tone(finite(x.unrealized_return))},{render:x=>fmtPct(x.mfe)},{render:x=>fmtPct(x.mae)},{render:x=>x.giveback_armed?fmtPct(x.giveback_from_peak):"--"},{render:x=>fmtNum(x.trend_direction_score,2)},{render:x=>fmtNum(x.peak_decay_score,2)},{render:x=>fmtNum(x.future_loss_risk_score,2)},{render:x=>escapeHtml(x.position_state||"--")},{render:x=>{const paper={profit_giveback_exit:"利润回吐",profit_hard_stop_exit:"利润保护",loss_containment_exit:"损失控制",signal_failure_exit:"信号失效",thesis_failure_exit:"投资逻辑失效",post_entry_failure_exit:"买后表现失败",stale_time_exit:"持仓陈旧"};return escapeHtml(x.position_exit_reason||(x.paper_exit_reason?`纸面观察：${paper[x.paper_exit_reason]||x.paper_exit_reason}（未执行）`:x.profit_giveback_flag?"利润回吐观察":x.post_entry_failure_flag?"买后表现失败观察":"正常"));}}],11);
-      const candidates=[`候选股票前列（${ms.candidate_count??0}）`,"","代码       分数    矩阵    状态        5日预期   拦截原因"];
+      renderTable("lifecycleBody",lifecycle,[{render:x=>escapeHtml(x.symbol)},{render:x=>escapeHtml(x.entry_date||"--")},{render:x=>fmtPct(x.unrealized_return),tone:x=>tone(finite(x.unrealized_return))},{render:x=>fmtPct(x.mfe)},{render:x=>fmtPct(x.mae)},{render:x=>x.giveback_armed?fmtPct(x.giveback_from_peak):"--"},{render:x=>fmtNum(x.trend_direction_score,2)},{render:x=>fmtNum(x.peak_decay_score,2)},{render:x=>fmtNum(x.future_loss_risk_score,2)},{render:x=>escapeHtml(x.position_state||"--")},{render:x=>{const paper={profit_giveback_exit:"????",profit_hard_stop_exit:"????",loss_containment_exit:"????",signal_failure_exit:"????",thesis_failure_exit:"??????",post_entry_failure_exit:"??????",stale_time_exit:"????"};return escapeHtml(x.position_exit_reason||(x.paper_exit_reason?`?????${paper[x.paper_exit_reason]||x.paper_exit_reason}?????`:x.profit_giveback_flag?"??????":x.post_entry_failure_flag?"????????":"??"));}}],11);
+      const candidates=[`???????${ms.candidate_count??0}?`,"","??       ??    ??    ??        5???   ????"];
       for(const x of ms.candidate_preview||[]) candidates.push(`${String(x.symbol||"").padEnd(10)} ${fmtNum(x.primary_score,3).padStart(6)} ${fmtNum(x.entry_matrix_score,2).padStart(6)} ${String(x.position_state||"--").slice(0,10).padEnd(10)} ${fmtPct(finite(x.expected_return_5d)).padStart(9)} ${String(x.entry_block_reason||x.add_block_reason||"").slice(0,24)}`);
-      if((ms.confirmed_preview||[]).length){candidates.push("","已确认候选","代码       分数    矩阵    状态        5日预期");for(const x of ms.confirmed_preview)candidates.push(`${String(x.symbol||"").padEnd(10)} ${fmtNum(x.primary_score,3).padStart(6)} ${fmtNum(x.entry_matrix_score,2).padStart(6)} ${String(x.position_state||"confirmed").slice(0,10).padEnd(10)} ${fmtPct(finite(x.expected_return_5d)).padStart(9)}`);}
-      if(!(ms.candidate_preview||[]).length)candidates.push("暂无候选预览"); document.getElementById("candidatesText").textContent=candidates.join("\n");
-      const orders=["最新计划订单",""];for(const x of ms.order_preview||[])orders.push(`${String(x.side||"").toUpperCase().padEnd(5)} ${String(x.symbol||"").padEnd(10)} ${fmtPct(finite(x.delta_weight)).padStart(9)}  P=${x.priority??""}  ${x.reason||""}`);if(!(ms.order_preview||[]).length)orders.push("本次刷新没有新订单");document.getElementById("ordersText").textContent=orders.join("\n");
-      const pending=[`未完成订单（${ms.pending_order_count??0}）`,""];for(const x of ms.pending_preview||[])pending.push(`${String(x.side||"").toUpperCase().padEnd(5)} ${String(x.symbol||"").padEnd(10)} shares=${fmtNum(x.remaining_shares,0).padStart(8)} ${String(x.status||"").padEnd(14)} 当前=${x.reason||""} 历史=${x.reason_history||x.reason||""}`);if(!(ms.pending_preview||[]).length)pending.push("暂无未完成订单");document.getElementById("pendingText").textContent=pending.join("\n");
-      document.getElementById("orderReasonText").textContent=summaryLines(ms.order_reason_summary,"暂无计划订单").join("\n");
+      if((ms.confirmed_preview||[]).length){candidates.push("","?????","??       ??    ??    ??        5???");for(const x of ms.confirmed_preview)candidates.push(`${String(x.symbol||"").padEnd(10)} ${fmtNum(x.primary_score,3).padStart(6)} ${fmtNum(x.entry_matrix_score,2).padStart(6)} ${String(x.position_state||"confirmed").slice(0,10).padEnd(10)} ${fmtPct(finite(x.expected_return_5d)).padStart(9)}`);}
+      if(!(ms.candidate_preview||[]).length)candidates.push("??????"); document.getElementById("candidatesText").textContent=candidates.join("\n");
+      const orders=["??????",""];for(const x of ms.order_preview||[])orders.push(`${String(x.side||"").toUpperCase().padEnd(5)} ${String(x.symbol||"").padEnd(10)} ${fmtPct(finite(x.delta_weight)).padStart(9)}  P=${x.priority??""}  ${x.reason||""}`);if(!(ms.order_preview||[]).length)orders.push("?????????");document.getElementById("ordersText").textContent=orders.join("\n");
+      const pending=[`??????${ms.pending_order_count??0}?`,""];for(const x of ms.pending_preview||[])pending.push(`${String(x.side||"").toUpperCase().padEnd(5)} ${String(x.symbol||"").padEnd(10)} shares=${fmtNum(x.remaining_shares,0).padStart(8)} ${String(x.status||"").padEnd(14)} ??=${x.reason||""} ??=${x.reason_history||x.reason||""}`);if(!(ms.pending_preview||[]).length)pending.push("???????");document.getElementById("pendingText").textContent=pending.join("\n");
+      document.getElementById("orderReasonText").textContent=summaryLines(ms.order_reason_summary,"??????").join("\n");
       window.latestHoldingPaths=ms.holding_price_paths||[];
     }
     function hydrateChartHistory(rows){
@@ -519,19 +539,19 @@ HTML = r"""<!doctype html>
         const benchmarkNav=normalizeNav(row.benchmark_nav,1),excessNav=normalizeNav(row.excess_net_value,navMultiple/Math.max(benchmarkNav,1e-12));
         const actualExposure=finite(row.actual_exposure),latestRet=previousNav>0?nav/previousNav-1:0,investedRet=actualExposure>=.05?latestRet/actualExposure:0;
         validInvestedNav*=1+investedRet;peak=Math.max(peak,nav);
-        restored.push({key:`${dayIndex}|${date}`,date,nav,navMultiple,benchmarkNav,excessNav,drawdown:peak>0?nav/peak-1:0,cash:finite(row.cash),invested:finite(row.invested_value),actualExposure,validInvestedNav});
+        restored.push({key:`${dayIndex}|${date}`,date,nav,navMultiple,benchmarkNav,excessNav,drawdown:peak>0?nav/peak-1:0,cash:finite(row.cash),invested:finite(row.invested_value),actualExposure,validInvestedNav,actualHoldingCount:nullableNumber(row.actual_holding_count),plannedHoldingCount:nullableNumber(row.optimizer_planned_holding_count),minimumHoldingCount:nullableNumber(row.minimum_required_holding_count),targetHoldingCount:nullableNumber(row.soft_target_holding_count),maximumHoldingCount:nullableNumber(row.maximum_allowed_holding_count),policyBandState:String(row.policy_band_state||"")});
         previousNav=nav;
       }
       return restored.slice(-1200);
     }
     function renderState(payload){
       let command=String(payload.command||"update").toLowerCase();const stageCommand=command==="stage",finishCommand=command==="finish";
-      if(command==="session"){activeRunId=String(payload.run_id||"");totalDays=Math.max(finite(payload.total_days,1),1);initialNav=Math.max(finite(payload.initial_nav,1),1e-12);history=[];factorHistory=[];moduleHistory=[];lastProgressPct=0;document.getElementById("runTitle").textContent=payload.title||"治理运行";document.title=payload.title||"治理实时监控";setStatus("准备运行",0,"session");drawAllCharts();return;}
+      if(command==="session"){activeRunId=String(payload.run_id||"");totalDays=Math.max(finite(payload.total_days,1),1);initialNav=Math.max(finite(payload.initial_nav,1),1e-12);history=[];factorHistory=[];moduleHistory=[];lastProgressPct=0;document.getElementById("runTitle").textContent=payload.title||"????";document.title=payload.title||"??????";setStatus("????",0,"session");drawAllCharts();return;}
       if(payload.title){document.getElementById("runTitle").textContent=payload.title;document.title=payload.title;}
       if((stageCommand||finishCommand)&&payload.exposure)command="update";
-      else if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");return;}
-      else if(finishCommand){if(Array.isArray(payload.chart_history)&&payload.chart_history.length)history=hydrateChartHistory(payload.chart_history);setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";drawAllCharts();return;}
-      if(command==="close"){setStatus("监控已关闭",lastProgressPct,"closed");return;}
+      else if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"????",progress,payload.detail||payload.step||"");return;}
+      else if(finishCommand){if(Array.isArray(payload.chart_history)&&payload.chart_history.length)history=hydrateChartHistory(payload.chart_history);setStatus(payload.message||"????",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";drawAllCharts();return;}
+      if(command==="close"){setStatus("?????",lastProgressPct,"closed");return;}
       if(command!=="update")return;
       const runId=String(payload.run_id||"");if(runId&&runId!==activeRunId){activeRunId=runId;history=[];factorHistory=[];moduleHistory=[];}
       totalDays=Math.max(finite(payload.total_days,totalDays),1);initialNav=Math.max(finite(payload.initial_nav,initialNav),1e-12);
@@ -543,13 +563,13 @@ HTML = r"""<!doctype html>
       const benchmarkNav=normalizeNav(ms.benchmark_nav,1),excessNav=normalizeNav(ms.excess_net_value,navMultiple/Math.max(benchmarkNav,1e-12));
       const actualExposure=finite(exposure.actual_exposure??ms.actual_exposure),targetExposure=finite(ms.policy_exposure_target??ms.target_exposure),exposureGap=finite(ms.pretrade_policy_lower_shortfall??ms.exposure_gap,0);
       const latestRet=priorHistory.length&&priorHistory[priorHistory.length-1].nav>0?nav/priorHistory[priorHistory.length-1].nav-1:0,investedRet=actualExposure>=.05?latestRet/actualExposure:0,previousInvested=priorHistory.length?finite(priorHistory[priorHistory.length-1].validInvestedNav,1):1;
-      const currentPoint={key:pointKey,date:dateKey,nav,navMultiple,benchmarkNav,excessNav,drawdown,cash:finite(exposure.cash),invested:finite(exposure.invested_value),actualExposure,validInvestedNav:previousInvested*(1+investedRet)};if(hasCurrent)history[history.length-1]=currentPoint;else history.push(currentPoint);if(history.length>1200)history=history.slice(-1200);
+      const currentPoint={key:pointKey,date:dateKey,nav,navMultiple,benchmarkNav,excessNav,drawdown,cash:finite(exposure.cash),invested:finite(exposure.invested_value),actualExposure,validInvestedNav:previousInvested*(1+investedRet),actualHoldingCount:nullableNumber(exposure.holding_count),plannedHoldingCount:nullableNumber(ms.optimizer_planned_holding_count??ms.planned_holding_count),minimumHoldingCount:nullableNumber(ms.minimum_required_holding_count),targetHoldingCount:nullableNumber(ms.soft_target_holding_count),maximumHoldingCount:nullableNumber(ms.maximum_allowed_holding_count),policyBandState:String(ms.policy_band_state||"")};if(hasCurrent)history[history.length-1]=currentPoint;else history.push(currentPoint);if(history.length>1200)history=history.slice(-1200);
       const factorPoint={key:pointKey,date:dateKey,weights:ms.factor_weights||[]},modulePoint={key:pointKey,date:dateKey,weights:aggregateModules(ms.factor_weights||[])};if(factorHistory.length&&factorHistory[factorHistory.length-1].key===pointKey)factorHistory[factorHistory.length-1]=factorPoint;else factorHistory.push(factorPoint);if(moduleHistory.length&&moduleHistory[moduleHistory.length-1].key===pointKey)moduleHistory[moduleHistory.length-1]=modulePoint;else moduleHistory.push(modulePoint);if(factorHistory.length>1200)factorHistory=factorHistory.slice(-1200);if(moduleHistory.length>1200)moduleHistory=moduleHistory.slice(-1200);
       const returns=history.slice(1).map((x,i)=>x.nav/history[i].nav-1),mean=returns.length?returns.reduce((a,b)=>a+b,0)/returns.length:0,sd=returns.length>1?Math.sqrt(returns.reduce((a,b)=>a+(b-mean)**2,0)/returns.length):0;
       const totalReturn=navMultiple-1,maxDrawdown=Math.min(...history.map(x=>x.drawdown)),annualVol=sd*Math.sqrt(252),sharpe=sd>1e-12?mean/sd*Math.sqrt(252):NaN,sortino=annualizedSortino(returns,navMultiple,history.length),cashDrag=investedRet-latestRet;
       const seriesDrawdown=values=>Math.min(...values.map((v,i)=>v/Math.max(...values.slice(0,i+1))-1));
-      const grossProfit=finite(ms.gross_profit),grossLoss=finite(ms.gross_loss),profitFactor=Math.abs(grossLoss)<=1e-12&&grossProfit>0?"∞":fmtNum(ms.profit_factor,2);
-      const metrics={total_return:[fmtPct(totalReturn),totalReturn],nav:[fmtNum(navMultiple,4),totalReturn],excess_nav:[fmtNum(excessNav,4),excessNav-1],current_drawdown:[fmtPct(drawdown),drawdown],account_max_drawdown:[fmtPct(maxDrawdown),maxDrawdown],holding_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.validInvestedNav))),-1],benchmark_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.benchmarkNav))),-1],excess_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.excessNav))),-1],benchmark_nav:[fmtNum(benchmarkNav,4),benchmarkNav-1],valid_invested_nav:[fmtNum(history[history.length-1].validInvestedNav,4),history[history.length-1].validInvestedNav-1],sharpe:[fmtNum(sharpe,2),sharpe],sortino:[fmtNum(sortino,2),sortino],annual_volatility:[fmtPct(annualVol),-annualVol],cash:[fmtMoney(exposure.cash),0],cash_drag:[fmtPct(cashDrag),-cashDrag],holdings:[String(exposure.holding_count??0),0],risk_level:[String(ms.risk_level||"--").toUpperCase(),String(ms.risk_level||"").toLowerCase()==="normal"?1:-1],exposure_cap:[fmtPct(finite(ms.exposure_cap)),-finite(ms.exposure_cap)],target_exposure:[fmtPct(targetExposure),targetExposure],optimizer_planned_exposure:[fmtPct(finite(ms.optimizer_planned_exposure)),finite(ms.optimizer_planned_exposure)],actual_exposure:[fmtPct(actualExposure),actualExposure],exposure_gap:[fmtPct(exposureGap),-exposureGap],idle_cash_ratio:[fmtPct(finite(ms.idle_cash_ratio)),-finite(ms.idle_cash_ratio)],minimum_required_holding_count:[String(ms.minimum_required_holding_count??0),0],soft_target_holding_count:[String(ms.soft_target_holding_count??0),0],maximum_allowed_holding_count:[String(ms.maximum_allowed_holding_count??0),0],holding_shortfall_count:[String(ms.holding_shortfall_count??0),-finite(ms.holding_shortfall_count)],tail_risk_proxy_mean:[fmtNum(ms.tail_risk_proxy_mean,3),.5-finite(ms.tail_risk_proxy_mean)],future_loss_risk_score_mean:[fmtNum(ms.future_loss_risk_score_mean,3),.5-finite(ms.future_loss_risk_score_mean)],downtrend_decay_count:[String(ms.downtrend_decay_count??0),-finite(ms.downtrend_decay_count)],lifecycle_alerts:[String(ms.lifecycle_alert_count??0),-finite(ms.lifecycle_alert_count)],candidate_count:[String(ms.candidate_count??0),0],confirmed_count:[String(ms.entry_confirmed_count??0),finite(ms.entry_confirmed_count)],order_count:[String(ms.order_count??0),0],pending_orders:[String(ms.pending_order_count??0),-finite(ms.pending_order_count)],buy_accuracy_5d:[fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN)),finite(ms.trailing_buy_accuracy_5d)-.5],sell_accuracy_5d:[fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN)),finite(ms.trailing_sell_accuracy_5d)-.5],closed_trade_win_rate:[fmtPct(finite(ms.closed_trade_win_rate,NaN)),finite(ms.closed_trade_win_rate)-.5],realized_pnl:[fmtMoney(ms.realized_pnl),finite(ms.realized_pnl)],gross_profit:[fmtMoney(grossProfit),grossProfit],gross_loss:[fmtMoney(grossLoss),grossLoss],profit_factor:[profitFactor,profitFactor==="∞"?1:finite(ms.profit_factor)-1],control_exit_count:[String(ms.control_exit_count??0),0],retail_lot_cash_insufficient_count:[String(ms.retail_lot_cash_insufficient_count??0),-finite(ms.retail_lot_cash_insufficient_count)],retail_state_block_count:[String(ms.retail_state_block_count??0),-finite(ms.retail_state_block_count)],surge_candidate_count:[String(ms.surge_candidate_count??0),finite(ms.surge_candidate_count)],strong_starter_count:[String(ms.strong_starter_count??0),finite(ms.strong_starter_count)],exhaustion_block_count:[String(ms.exhaustion_block_count??0),-finite(ms.exhaustion_block_count)],protecting_profit_count:[String(ms.protecting_profit_count??0),finite(ms.protecting_profit_count)]};
+      const grossProfit=finite(ms.gross_profit),grossLoss=finite(ms.gross_loss),profitFactor=Math.abs(grossLoss)<=1e-12&&grossProfit>0?"?":fmtNum(ms.profit_factor,2);
+      const metrics={total_return:[fmtPct(totalReturn),totalReturn],nav:[fmtNum(navMultiple,4),totalReturn],excess_nav:[fmtNum(excessNav,4),excessNav-1],current_drawdown:[fmtPct(drawdown),drawdown],account_max_drawdown:[fmtPct(maxDrawdown),maxDrawdown],holding_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.validInvestedNav))),-1],benchmark_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.benchmarkNav))),-1],excess_max_drawdown:[fmtPct(seriesDrawdown(history.map(x=>x.excessNav))),-1],benchmark_nav:[fmtNum(benchmarkNav,4),benchmarkNav-1],valid_invested_nav:[fmtNum(history[history.length-1].validInvestedNav,4),history[history.length-1].validInvestedNav-1],sharpe:[fmtNum(sharpe,2),sharpe],sortino:[fmtNum(sortino,2),sortino],annual_volatility:[fmtPct(annualVol),-annualVol],cash:[fmtMoney(exposure.cash),0],cash_drag:[fmtPct(cashDrag),-cashDrag],holdings:[String(exposure.holding_count??0),0],risk_level:[String(ms.risk_level||"--").toUpperCase(),String(ms.risk_level||"").toLowerCase()==="normal"?1:-1],exposure_cap:[fmtPct(finite(ms.exposure_cap)),-finite(ms.exposure_cap)],target_exposure:[fmtPct(targetExposure),targetExposure],optimizer_planned_exposure:[fmtPct(finite(ms.optimizer_planned_exposure)),finite(ms.optimizer_planned_exposure)],actual_exposure:[fmtPct(actualExposure),actualExposure],exposure_gap:[fmtPct(exposureGap),-exposureGap],idle_cash_ratio:[fmtPct(finite(ms.idle_cash_ratio)),-finite(ms.idle_cash_ratio)],minimum_required_holding_count:[String(ms.minimum_required_holding_count??0),0],soft_target_holding_count:[String(ms.soft_target_holding_count??0),0],maximum_allowed_holding_count:[String(ms.maximum_allowed_holding_count??0),0],holding_shortfall_count:[String(ms.holding_shortfall_count??0),-finite(ms.holding_shortfall_count)],tail_risk_proxy_mean:[fmtNum(ms.tail_risk_proxy_mean,3),.5-finite(ms.tail_risk_proxy_mean)],future_loss_risk_score_mean:[fmtNum(ms.future_loss_risk_score_mean,3),.5-finite(ms.future_loss_risk_score_mean)],downtrend_decay_count:[String(ms.downtrend_decay_count??0),-finite(ms.downtrend_decay_count)],lifecycle_alerts:[String(ms.lifecycle_alert_count??0),-finite(ms.lifecycle_alert_count)],candidate_count:[String(ms.candidate_count??0),0],confirmed_count:[String(ms.entry_confirmed_count??0),finite(ms.entry_confirmed_count)],order_count:[String(ms.order_count??0),0],pending_orders:[String(ms.pending_order_count??0),-finite(ms.pending_order_count)],buy_accuracy_5d:[fmtPct(finite(ms.trailing_buy_accuracy_5d,NaN)),finite(ms.trailing_buy_accuracy_5d)-.5],sell_accuracy_5d:[fmtPct(finite(ms.trailing_sell_accuracy_5d,NaN)),finite(ms.trailing_sell_accuracy_5d)-.5],closed_trade_win_rate:[fmtPct(finite(ms.closed_trade_win_rate,NaN)),finite(ms.closed_trade_win_rate)-.5],realized_pnl:[fmtMoney(ms.realized_pnl),finite(ms.realized_pnl)],gross_profit:[fmtMoney(grossProfit),grossProfit],gross_loss:[fmtMoney(grossLoss),grossLoss],profit_factor:[profitFactor,profitFactor==="?"?1:finite(ms.profit_factor)-1],control_exit_count:[String(ms.control_exit_count??0),0],retail_lot_cash_insufficient_count:[String(ms.retail_lot_cash_insufficient_count??0),-finite(ms.retail_lot_cash_insufficient_count)],retail_state_block_count:[String(ms.retail_state_block_count??0),-finite(ms.retail_state_block_count)],surge_candidate_count:[String(ms.surge_candidate_count??0),finite(ms.surge_candidate_count)],strong_starter_count:[String(ms.strong_starter_count??0),finite(ms.strong_starter_count)],exhaustion_block_count:[String(ms.exhaustion_block_count??0),-finite(ms.exhaustion_block_count)],protecting_profit_count:[String(ms.protecting_profit_count??0),finite(ms.protecting_profit_count)]};
       Object.entries(metrics).forEach(([key,value])=>setMetric(key,value[0],value[1]));
       const parityMetrics={
         scap_v31_positive_c_fallback_count:[String(ms.scap_v31_positive_c_fallback_count??0),finite(ms.scap_v31_positive_c_fallback_count)],
@@ -562,16 +582,21 @@ HTML = r"""<!doctype html>
         buy_sell_conflict_cooldown_days:[String(ms.buy_sell_conflict_cooldown_days??0),-finite(ms.buy_sell_conflict_cooldown_days)],control_avoided_loss:[fmtMoney(ms.avoided_loss_to_window_low),finite(ms.avoided_loss_to_window_low)],
         hard_stop_avoided_loss:[fmtMoney(ms.hard_stop_avoided_loss_to_window_low),finite(ms.hard_stop_avoided_loss_to_window_low)],alpha_collapse_avoided_loss:[fmtMoney(ms.alpha_collapse_avoided_loss_to_window_low),finite(ms.alpha_collapse_avoided_loss_to_window_low)],
         safety_deleveraging_avoided_loss:[fmtMoney(ms.safety_deleveraging_avoided_loss_to_window_low),finite(ms.safety_deleveraging_avoided_loss_to_window_low)],
+        strategic_exposure_budget:[fmtPct(finite(ms.strategic_exposure_budget,NaN)),finite(ms.strategic_exposure_budget)],signal_supported_exposure:[fmtPct(finite(ms.signal_supported_exposure,NaN)),finite(ms.signal_supported_exposure)],
+        integer_feasible_exposure:[fmtPct(finite(ms.integer_feasible_exposure,NaN)),finite(ms.integer_feasible_exposure)],planned_exposure:[fmtPct(finite(ms.planned_exposure,NaN)),finite(ms.planned_exposure)],
+        selected_position_count:[String(ms.selected_position_count??0),finite(ms.selected_position_count)],incremental_expected_wealth_amount:[fmtMoney(ms.incremental_expected_wealth_amount),finite(ms.incremental_expected_wealth_amount)],
+        incremental_cvar_amount:[fmtMoney(ms.incremental_cvar_amount),-finite(ms.incremental_cvar_amount)],model_uncertainty_amount:[fmtMoney(ms.model_uncertainty_amount),-finite(ms.model_uncertainty_amount)],
+        scenario_risk_penalty_amount:[fmtMoney(ms.scenario_risk_penalty_amount),-finite(ms.scenario_risk_penalty_amount)],best_rejected_objective_amount:[fmtMoney(ms.best_rejected_objective_amount),finite(ms.best_rejected_objective_amount)],
       };Object.entries(parityMetrics).forEach(([key,value])=>setMetric(key,value[0],value[1]));
-      const progress=Number.isFinite(Number(payload.progress_pct))?finite(payload.progress_pct):Math.min((dayIndex+1)/totalDays*100,100);setStatus(String(payload.date||"").slice(0,10),progress,`${dayIndex+1} / ${totalDays} 个交易日`);document.getElementById("asOfDate").textContent=String(payload.date||"").slice(0,10);
-      document.getElementById("accountSummary").innerHTML=[["账户资产",fmtMoney(nav)],["现金",fmtMoney(exposure.cash)],["已投入市值",fmtMoney(exposure.invested_value)],["风险等级",String(ms.risk_level||"--").toUpperCase()],["计划订单",String(ms.order_count??0)],["未完成订单",String(ms.pending_order_count??0)]].map(x=>`<dt>${x[0]}</dt><dd>${x[1]}</dd>`).join("");
+      const progress=Number.isFinite(Number(payload.progress_pct))?finite(payload.progress_pct):Math.min((dayIndex+1)/totalDays*100,100);setStatus(String(payload.date||"").slice(0,10),progress,`${dayIndex+1} / ${totalDays} ????`);document.getElementById("asOfDate").textContent=String(payload.date||"").slice(0,10);
+      document.getElementById("accountSummary").innerHTML=[["????",fmtMoney(nav)],["??",fmtMoney(exposure.cash)],["?????",fmtMoney(exposure.invested_value)],["????",String(ms.risk_level||"--").toUpperCase()],["????",String(ms.order_count??0)],["?????",String(ms.pending_order_count??0)]].map(x=>`<dt>${x[0]}</dt><dd>${x[1]}</dd>`).join("");
       document.getElementById("actualExposureLabel").textContent=fmtPct(actualExposure);document.getElementById("actualExposureBar").style.width=`${Math.min(Math.max(actualExposure*100,0),100)}%`;document.getElementById("targetExposureLabel").textContent=fmtPct(targetExposure);document.getElementById("targetExposureBar").style.width=`${Math.min(Math.max(targetExposure*100,0),100)}%`;
       updateReports(exposure,ms,{navMultiple,totalReturn,benchmarkNav,excessNav,maxDrawdown,actualExposure,targetExposure,exposureGap,cashDrag});renderOperational(exposure,ms,holdings,nav);drawAllCharts();
-      if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");}
-      if(finishCommand){setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";}
+      if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"????",progress,payload.detail||payload.step||"");}
+      if(finishCommand){setStatus(payload.message||"????",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";}
     }
-    function setStatus(message,progress,detail){lastProgressPct=Math.max(0,Math.min(finite(progress),100));document.getElementById("status").textContent=message||"运行中";document.getElementById("runDetail").textContent=`${lastProgressPct.toFixed(1)}% · ${detail||""}`;document.getElementById("progressBar").style.width=`${lastProgressPct}%`;}
-    async function poll(){try{const response=await fetch(`/state?ts=${Date.now()}`,{cache:"no-store"});if(response.ok)renderState(await response.json());else setStatus("状态接口异常",lastProgressPct,`HTTP ${response.status}`);}catch(error){setStatus("监控连接中断",lastProgressPct,String(error));document.getElementById("statusDot").style.background="#bd3d39";}setTimeout(poll,1000);}
+    function setStatus(message,progress,detail){lastProgressPct=Math.max(0,Math.min(finite(progress),100));document.getElementById("status").textContent=message||"???";document.getElementById("runDetail").textContent=`${lastProgressPct.toFixed(1)}% ? ${detail||""}`;document.getElementById("progressBar").style.width=`${lastProgressPct}%`;}
+    async function poll(){try{const response=await fetch(`/state?ts=${Date.now()}`,{cache:"no-store"});if(response.ok)renderState(await response.json());else setStatus("??????",lastProgressPct,`HTTP ${response.status}`);}catch(error){setStatus("??????",lastProgressPct,String(error));document.getElementById("statusDot").style.background="#bd3d39";}setTimeout(poll,1000);}
     buildStaticUi(); drawAllCharts(); poll();
   </script>
 </body>
