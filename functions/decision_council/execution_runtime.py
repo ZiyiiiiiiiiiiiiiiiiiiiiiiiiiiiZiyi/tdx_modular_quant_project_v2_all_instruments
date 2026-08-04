@@ -22,6 +22,34 @@ class Position:
     acquired_date: pd.Timestamp
 
 
+def authoritative_action_plan_buy_shares(
+    order,
+    *,
+    strategy_logic_version: str,
+    minimum_buy_quantity: float,
+) -> float | None:
+    """Return the immutable ActionPlan buy quantity when it has authority.
+
+    ``None`` means the order is outside the cabinet-native ActionPlan contract.
+    A selected V3 buy without a positive integer lot count is a broken lineage
+    contract and must fail closed instead of silently becoming one lot.
+    """
+    if not (
+        is_mainline_v3_version(strategy_logic_version)
+        and str(order.get("side", "")).strip().lower() == "buy"
+        and str(order.get("action_plan_selected", False)).strip().lower()
+        in {"true", "1"}
+    ):
+        return None
+    raw_lots = pd.to_numeric(pd.Series([order.get("planned_entry_lots")]), errors="coerce").iloc[0]
+    if pd.isna(raw_lots) or float(raw_lots) <= 0.0 or abs(float(raw_lots) - round(float(raw_lots))) > 1e-9:
+        raise RuntimeError("selected ActionPlan buy is missing a positive integer planned_entry_lots")
+    minimum = float(minimum_buy_quantity)
+    if minimum <= 0.0:
+        raise RuntimeError("selected ActionPlan buy has an invalid minimum buy quantity")
+    return float(int(round(float(raw_lots))) * int(round(minimum)))
+
+
 def execute_pending(runner, date, daily):
     active = runner.engine.pending_orders.orders
     active = active[
@@ -38,10 +66,73 @@ def execute_pending(runner, date, daily):
     blocked_symbols = set()
     blocked_reasons = {}
     fill_map = {}
+    profile = dict(getattr(runner, "capital_profile", {}) or {})
+    max_new_names = max(int(profile.get("scap_max_daily_new_names", 2) or 2), 1)
+    max_new_exposure_ratio = min(
+        max(float(profile.get("scap_max_daily_new_exposure_ratio", 0.35) or 0.35), 0.0),
+        1.0,
+    )
+    prior_exposure = getattr(runner, "exposure_rows", [])
+    nominal_nav = float(
+        prior_exposure[-1].get("nominal_nav", runner.initial_cash)
+        if prior_exposure
+        else runner.initial_cash
+    )
+    max_new_notional = max(nominal_nav * max_new_exposure_ratio, 0.0)
+    prior_authorized_exposure = float(
+        prior_exposure[-1].get("authorized_exposure_max", 1.0)
+        if prior_exposure
+        else 1.0
+    )
+    market_by_symbol = daily.set_index("symbol", drop=False)
+    invested_at_open = 0.0
+    for held_symbol, position in runner.positions.items():
+        if held_symbol in market_by_symbol.index:
+            held_quote = market_by_symbol.loc[held_symbol]
+            held_open = float(
+                pd.to_numeric(
+                    pd.Series([held_quote.get("open_nominal", held_quote.get("close_nominal", 0.0))]),
+                    errors="coerce",
+                ).fillna(0.0).iloc[0]
+            )
+            invested_at_open += max(float(position.shares), 0.0) * max(held_open, 0.0)
+    authorization_buy_room = max(
+        prior_authorized_exposure * nominal_nav - invested_at_open,
+        0.0,
+    )
+    max_new_notional = min(max_new_notional, authorization_buy_room)
+    accepted_new_names = 0
+    accepted_buy_notional = 0.0
+    session_ordinals = getattr(runner, "_decision_session_ordinal", {})
+    current_ordinal = session_ordinals.get(pd.Timestamp(date))
     for _, order in active.sort_values(["priority", "created_date"]).iterrows():
         symbol = str(order["symbol"])
+        execution_policy = str(order.get("order_execution_policy", "")).strip().lower()
+        created_ordinal = session_ordinals.get(pd.Timestamp(order["created_date"]))
+        signal_age_sessions = (
+            int(current_ordinal - created_ordinal)
+            if current_ordinal is not None and created_ordinal is not None
+            else int(order.get("retry_count", 0) or 0) + 1
+        )
+        order_index = runner.engine.pending_orders.orders.index[
+            runner.engine.pending_orders.orders["order_id"].astype(str).eq(str(order["order_id"]))
+        ]
+        if len(order_index):
+            runner.engine.pending_orders.orders.at[
+                order_index[0], "signal_age_sessions"
+            ] = signal_age_sessions
+        maximum_age_sessions = max(int(order.get("maximum_age_sessions", 1) or 1), 1)
+        if (
+            str(order["side"]).lower() == "buy"
+            and execution_policy == "monthly_plan_window"
+            and signal_age_sessions > maximum_age_sessions
+        ):
+            blocked_symbols.add(symbol)
+            blocked_reasons[symbol] = "monthly_plan_signal_expired"
+            continue
         if symbol not in market.index:
             blocked_symbols.add(symbol)
+            blocked_reasons[symbol] = "market_data_unavailable"
             continue
         quote = market.loc[symbol]
         pair_id = str(order.get("replacement_pair_id", "") or "")
@@ -57,6 +148,28 @@ def execute_pending(runner, date, daily):
             continue
         price = float(quote["open_nominal"])
         requested = float(order["remaining_shares"])
+        if str(order["side"]).lower() == "buy" and execution_policy == "monthly_plan_window":
+            requested_notional = max(price * requested, 0.0)
+            is_new_name = symbol not in runner.positions
+            execution_permission_now = bool(quote["is_trading"]) and not open_price_limit_blocked(
+                side=order["side"],
+                open_price=price,
+                limit_up_price=quote.get("limit_up_price"),
+                limit_down_price=quote.get("limit_down_price"),
+            )
+            exceeds_name_limit = is_new_name and accepted_new_names >= max_new_names
+            exceeds_exposure_limit = (
+                accepted_buy_notional > 0.0
+                and accepted_buy_notional + requested_notional > max_new_notional + 1e-8
+            )
+            if exceeds_name_limit or exceeds_exposure_limit:
+                blocked_symbols.add(symbol)
+                blocked_reasons[symbol] = "monthly_plan_deployment_limit"
+                continue
+            if execution_permission_now:
+                accepted_buy_notional += requested_notional
+                if is_new_name:
+                    accepted_new_names += 1
         if str(order["side"]) == "sell":
             position = runner.positions.get(symbol)
             requested = min(requested, position.shares if position else 0.0)
@@ -91,6 +204,9 @@ def execute_pending(runner, date, daily):
             "order_id": order["order_id"],
             "decision_id": order["decision_id"],
             "reason": order["reason"],
+            "order_execution_policy": order.get("order_execution_policy", ""),
+            "maximum_age_sessions": order.get("maximum_age_sessions", pd.NA),
+            "signal_age_sessions": signal_age_sessions,
             "origin_reason": order.get("origin_reason", order.get("reason", "")),
             "latest_reason": order.get("latest_reason", order.get("reason", "")),
             "highest_priority_reason": order.get(
@@ -475,17 +591,25 @@ def register_orders(runner, orders, daily, nominal_nav):
             shares = float(int(shares)) if shares >= rule.minimum_buy_quantity else 0.0
         else:
             shares = float(int(shares // rule.standard_sell_step) * rule.standard_sell_step)
-        cabinet_native_new_entry = (
-            is_mainline_v3_version(getattr(runner, "strategy_logic_version", ""))
-            and str(order["side"]).strip().lower() == "buy"
-            and float(pd.to_numeric(pd.Series([order.get("current_weight", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
-            <= 1e-12
+        action_plan_shares = authoritative_action_plan_buy_shares(
+            order,
+            strategy_logic_version=getattr(runner, "strategy_logic_version", ""),
+            minimum_buy_quantity=rule.minimum_buy_quantity,
         )
-        if cabinet_native_new_entry:
-            # V3 entry admission already performs its factual one-lot cash and
-            # position-cap checks.  Do not let target-weight sizing recreate a
-            # multi-lot order when the optional retail adapter is disabled.
-            shares = float(rule.minimum_buy_quantity)
+        if action_plan_shares is not None:
+            # The unique ActionPlan already solved integer lots, exact cash and
+            # portfolio risk.  Execution may block the order on new factual
+            # constraints, but it must never resize it without re-authorization.
+            shares = legal_buy_quantity(
+                symbol,
+                action_plan_shares,
+                trade_date=actual_execution_date,
+            )
+            if abs(float(shares) - float(action_plan_shares)) > 1e-9:
+                raise RuntimeError(
+                    "selected ActionPlan buy quantity is not board-lot legal: "
+                    f"symbol={symbol}, planned={action_plan_shares}, legal={shares}"
+                )
         strategy_target_notional = abs(float(order["delta_weight"])) * float(nominal_nav)
         retail_action = "unchanged"
         retail_block_reason = ""
@@ -597,23 +721,42 @@ def register_orders(runner, orders, daily, nominal_nav):
             )
             order = order.copy()
             order["_cash_reservation_id"] = reservation_id
+        order_reason = str(order.get("reason", "") or "")
+        monthly_normal_buy = is_monthly_normal_buy(
+            side=order.get("side", ""),
+            order_reason=order_reason,
+            rebalance_frequency=getattr(
+                runner, "portfolio_normal_rebalance_frequency", ""
+            ),
+        )
+        if monthly_normal_buy:
+            order_reason = "monthly_normal_buy"
         payload = {
             "decision_id": order["decision_id"],
             "symbol": symbol,
             "side": order["side"],
-            "reason": order["reason"],
-            "origin_reason": order.get("origin_reason", order.get("reason", "")),
-            "latest_reason": order.get("latest_reason", order.get("reason", "")),
+            "reason": order_reason,
+            "origin_reason": order_reason,
+            "latest_reason": order_reason,
             "highest_priority_reason": order.get(
-                "highest_priority_reason", order.get("reason", "")
+                "highest_priority_reason", order_reason
             ),
-            "reason_history": order.get("reason_history", order.get("reason", "")),
+            "reason_history": order_reason,
             "reason_schema_version": order.get(
                 "reason_schema_version", "scap_exit_reason_contract_v1"
             ),
             "priority": int(order["priority"]),
             "created_date": decision_date,
             "scheduled_execution_date": actual_execution_date,
+            "order_execution_policy": (
+                "monthly_plan_window" if monthly_normal_buy else "next_session_only"
+            ),
+            "maximum_age_sessions": (
+                int(runner.capital_profile.get("scap_monthly_plan_execution_window_sessions", 5) or 5)
+                if monthly_normal_buy
+                else 1
+            ),
+            "signal_age_sessions": 0,
             "target_shares": shares,
             "position_state": order.get("position_state", ""),
             "position_exit_reason": order.get("position_exit_reason", ""),
@@ -759,3 +902,12 @@ def register_orders(runner, orders, daily, nominal_nav):
     diagnostics["cash_available_after_reservations"] = cash_ledger.available()
     diagnostics["cash_reservation_contract"] = "cash_reservation_ledger_v1"
     return diagnostics
+
+
+def is_monthly_normal_buy(*, side: str, order_reason: str, rebalance_frequency: str) -> bool:
+    """Return whether a buy belongs to the persistent monthly plan window."""
+    return (
+        str(side).strip().lower() == "buy"
+        and str(rebalance_frequency).strip().lower() == "monthly"
+        and str(order_reason).strip().lower() in {"normal_buy", "confirmed_entry_buy"}
+    )

@@ -23,6 +23,25 @@ const errorRecords = errorScan.ndjson
   .map((line) => JSON.parse(line))
   .filter((item) => item.kind === "match");
 
+const summaryInspect = await workbook.inspect({
+  kind: "table",
+  sheetId: "Summary",
+  range: "A1:B20",
+  include: "values,formulas",
+  tableMaxRows: 24,
+  tableMaxCols: 4,
+  maxChars: 12000,
+});
+const checksInspect = await workbook.inspect({
+  kind: "table",
+  sheetId: "Checks",
+  range: "A1:F5",
+  include: "values,formulas",
+  tableMaxRows: 8,
+  tableMaxCols: 8,
+  maxChars: 12000,
+});
+
 const renderPaths = [];
 for (const sheetName of sheetNames) {
   const preview = await workbook.render({
@@ -43,6 +62,9 @@ const report = {
   sheetCount: sheetNames.length,
   formulaErrorCount: errorRecords.length,
   formulaErrorScan: errorScan.ndjson,
+  summaryInspect: summaryInspect.ndjson,
+  checksInspect: checksInspect.ndjson,
+  checksFailureCount: (checksInspect.ndjson.match(/FAIL/g) || []).length,
   renderPaths,
 };
 await fs.writeFile(
@@ -51,6 +73,6 @@ await fs.writeFile(
   "utf8",
 );
 console.log(JSON.stringify(report));
-if (report.formulaErrorCount > 0) {
+if (report.formulaErrorCount > 0 || report.checksFailureCount > 0) {
   process.exitCode = 1;
 }

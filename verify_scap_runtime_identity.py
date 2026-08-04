@@ -15,7 +15,7 @@ class _FactorSpec:
         }
 
 
-def _runner(stage: str):
+def _runner(stage: str, *, benchmark_top_n: int = 100):
     return SimpleNamespace(
         capital_profile={
             "name": "small_capital_20k",
@@ -38,6 +38,8 @@ def _runner(stage: str):
         pit_runtime_state="formal",
         pit_level2_runtime_state="degraded",
         factor_temporal_isolation_pass=True,
+        performance_benchmark_top_n=benchmark_top_n,
+        performance_benchmark_rebalance="monthly",
     )
 
 
@@ -50,9 +52,13 @@ other_output = build_runtime_identity(
 stage_changed = build_runtime_identity(
     _runner("E1"), dates=dates, output_dir=Path("results/test")
 )
+benchmark_changed = build_runtime_identity(
+    _runner("E0", benchmark_top_n=200), dates=dates, output_dir=Path("results/test")
+)
 
 assert first == repeat
 assert first["runtime_identity_hash"] != stage_changed["runtime_identity_hash"]
+assert first["runtime_identity_hash"] != benchmark_changed["runtime_identity_hash"]
 assert first["experiment_spec_hash"] == other_output["experiment_spec_hash"]
 assert first["runtime_identity_hash"] == other_output["runtime_identity_hash"]
 assert first["run_instance_hash"] != other_output["run_instance_hash"]
@@ -64,4 +70,6 @@ assert first["effective_trading_days"] == 3
 assert first["scap_exit_stage"] == "E0"
 assert first["objective_metric"] == "terminal_net_profit_after_cost"
 assert first["factor_cabinet_run_id"] == "cab_test"
+assert first["performance_benchmark_top_n"] == 100
+assert first["performance_benchmark_rebalance"] == "monthly"
 print("[PASS] SCAP runtime identity contract")

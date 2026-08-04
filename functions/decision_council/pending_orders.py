@@ -24,6 +24,9 @@ PENDING_ORDER_COLUMNS = [
     "priority",
     "created_date",
     "last_retry_date",
+    "order_execution_policy",
+    "maximum_age_sessions",
+    "signal_age_sessions",
     "target_shares",
     "executed_shares",
     "processed_fill_ids",
@@ -127,6 +130,18 @@ FATAL_REPLACEMENT_BUY_REASONS = {
 }
 
 
+def build_pending_order_snapshot(
+    orders: pd.DataFrame, *, snapshot_date, event_type: str = "terminal_state_snapshot"
+) -> pd.DataFrame:
+    """Build an append-only snapshot of active and terminal pending-order state."""
+    frame = _ensure_columns(orders).copy()
+    if frame.empty:
+        return frame
+    frame["snapshot_date"] = pd.Timestamp(snapshot_date)
+    frame["event_type"] = str(event_type)
+    return frame
+
+
 class PendingOrderBook:
     """Maintain active orders without duplicating locked sell intents."""
 
@@ -181,6 +196,15 @@ class PendingOrderBook:
         )
         order["created_date"] = pd.Timestamp(order["created_date"])
         order["last_retry_date"] = pd.Timestamp(_value_or(order.get("last_retry_date"), order["created_date"]))
+        order["order_execution_policy"] = str(
+            _value_or(order.get("order_execution_policy"), "next_session_only")
+        )
+        order["maximum_age_sessions"] = int(
+            _value_or(order.get("maximum_age_sessions"), 1)
+        )
+        order["signal_age_sessions"] = int(
+            _value_or(order.get("signal_age_sessions"), 0)
+        )
         order["target_shares"] = float(_value_or(order.get("target_shares"), 0.0))
         order["executed_shares"] = float(_value_or(order.get("executed_shares"), 0.0))
         order["processed_fill_ids"] = str(
@@ -359,6 +383,26 @@ class PendingOrderBook:
             if symbol in blocked:
                 block_reason = reason_by_symbol.get(symbol, "liquidity_locked")
                 if str(order["side"]) == "buy":
+                    monthly_window = str(
+                        order.get("order_execution_policy", "")
+                    ).strip().lower() == "monthly_plan_window"
+                    if block_reason == "monthly_plan_signal_expired":
+                        self.orders.at[index, "status"] = "expired"
+                        self.orders.at[index, "expired_reason"] = block_reason
+                        self.orders.at[index, "block_reason"] = block_reason
+                        continue
+                    if monthly_window and block_reason in {
+                        "monthly_plan_deployment_limit",
+                        "market_data_unavailable",
+                        "liquidity_locked",
+                        "price_limit_blocked",
+                        "suspension_blocked",
+                    }:
+                        self.orders.at[index, "status"] = "pending"
+                        self.orders.at[index, "last_retry_date"] = trade_date
+                        self.orders.at[index, "retry_count"] = int(order["retry_count"]) + 1
+                        self.orders.at[index, "block_reason"] = block_reason
+                        continue
                     if str(order.get("replacement_pair_leg", "")).lower() == "buy":
                         next_retry = int(order["retry_count"]) + 1
                         horizon = pd.to_numeric(
@@ -438,7 +482,12 @@ class PendingOrderBook:
                 pair_leg = str(order.get("replacement_pair_leg", "")).lower()
                 if pair_leg in {"sell", "buy"}:
                     self.orders.at[index, "replacement_pair_status"] = f"{pair_leg}_filled"
-            elif str(order["side"]) == "buy" and str(order.get("replacement_pair_leg", "")).lower() != "buy":
+            elif (
+                str(order["side"]) == "buy"
+                and str(order.get("replacement_pair_leg", "")).lower() != "buy"
+                and str(order.get("order_execution_policy", "")).strip().lower()
+                != "monthly_plan_window"
+            ):
                 self.orders.at[index, "status"] = "expired"
                 self.orders.at[index, "expired_reason"] = "daily_expiry"
         changed = []

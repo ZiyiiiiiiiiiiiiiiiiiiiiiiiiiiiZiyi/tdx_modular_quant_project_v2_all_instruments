@@ -12,11 +12,17 @@ from typing import Iterable, Mapping
 
 import pandas as pd
 
+from functions.decision_council.portfolio_scenario_model import (
+    evaluate_incremental_scenario_risk,
+)
 from functions.decision_council.scap_v2_contracts import (
     ActionPlan,
     ActionProposal,
     ExposureAuthorization,
 )
+
+
+PLAN_KEY_ROBUST_INDEX = 9
 
 
 def optimize_action_proposals(
@@ -31,10 +37,31 @@ def optimize_action_proposals(
     max_names_per_thesis: int = 2,
     correlation_matrix: pd.DataFrame | None = None,
     covariance_matrix: pd.DataFrame | None = None,
+    scenario_return_matrix: pd.DataFrame | None = None,
     covariance_risk_aversion: float = 0.05,
-    candidate_limit: int = 24,
-    exhaustive_max_positions: int = 8,
-    beam_width: int = 512,
+    candidate_limit: int = 12,
+    exhaustive_max_positions: int = 5,
+    beam_width: int = 256,
+    minimum_profit_coverage_ratio: float = 1.25,
+    minimum_profit_coverage_probability: float = 0.55,
+    coverage_correlation_floor: float = 0.35,
+    minimum_coverage_evidence_names: int = 1,
+    coverage_mode: str = "diagnostic_shadow",
+    incremental_cvar_confidence: float = 0.95,
+    incremental_cvar_risk_aversion: float = 0.05,
+    model_uncertainty_risk_aversion: float = 0.10,
+    calibration_warming_effective_samples: int = 30,
+    calibration_mature_effective_samples: int = 100,
+    max_new_buy_names: int | None = None,
+    max_incremental_buy_exposure: float | None = None,
+    minimum_positions: int = 0,
+    minimum_exposure: float = 0.0,
+    target_positions: int | None = None,
+    target_exposure: float | None = None,
+    wealth_materiality_epsilon_amount: float = 0.0,
+    minimum_active_pool_size: int = 0,
+    minimum_effective_n_ratio: float = 0.0,
+    minimum_pool_count: int = 0,
 ) -> ActionPlan:
     """Return the sole strategy-authorized integer ActionPlan.
 
@@ -47,6 +74,30 @@ def optimize_action_proposals(
     if max_positions is None or int(max_positions) <= 0:
         raise ValueError("max_positions must be supplied by the runtime capital profile")
     max_positions = int(max_positions)
+    minimum_positions = min(max(int(minimum_positions), 0), max_positions)
+    minimum_exposure = min(max(float(minimum_exposure), 0.0), 1.0)
+    target_positions = (
+        minimum_positions
+        if target_positions is None
+        else min(max(int(target_positions), minimum_positions), max_positions)
+    )
+    target_exposure = (
+        minimum_exposure
+        if target_exposure is None
+        else min(max(float(target_exposure), minimum_exposure), 1.0)
+    )
+    wealth_materiality_epsilon_amount = max(
+        float(wealth_materiality_epsilon_amount),
+        0.0,
+    )
+    # Do not rewrite a product minimum merely because today's dynamic capacity
+    # is smaller.  From cash, the optimizer must choose either zero names or a
+    # complete minimum pool; an infeasible day remains cash and is audited.
+    minimum_active_pool_size = max(int(minimum_active_pool_size), 0)
+    minimum_effective_n_ratio = min(
+        max(float(minimum_effective_n_ratio), 0.0), 1.0
+    )
+    minimum_pool_count = max(int(minimum_pool_count), 0)
     items = tuple(proposals)
     current_lots = {
         str(symbol): max(int(lots), 0)
@@ -63,6 +114,14 @@ def optimize_action_proposals(
             current_weights=current_weights,
             current_exposure=current_exposure,
             max_positions=max_positions,
+            minimum_positions=minimum_positions,
+            minimum_exposure=minimum_exposure,
+            target_positions=target_positions,
+            target_exposure=target_exposure,
+            wealth_materiality_epsilon_amount=wealth_materiality_epsilon_amount,
+            minimum_active_pool_size=minimum_active_pool_size,
+            minimum_effective_n_ratio=minimum_effective_n_ratio,
+            minimum_pool_count=minimum_pool_count,
         )
     if any(item.decision_id != authorization.decision_id for item in items):
         raise ValueError("all proposals and authorization must share decision_id")
@@ -94,7 +153,7 @@ def optimize_action_proposals(
     # preserving diverse actions/symbols.
     candidates = _pareto_reduce(
         candidate_pool,
-        limit=max(int(candidate_limit), int(max_positions)),
+        limit=max(int(candidate_limit), 1),
     )
     reduced_ids = {item.proposal_id for item in candidates}
     pair_expected_counts: dict[str, int] = {}
@@ -122,16 +181,38 @@ def optimize_action_proposals(
             max_names_per_thesis=max_names_per_thesis,
             pair_expected_counts=pair_expected_counts,
             covariance_matrix=effective_covariance,
+            scenario_return_matrix=scenario_return_matrix,
             covariance_risk_aversion=covariance_risk_aversion,
+            minimum_profit_coverage_ratio=minimum_profit_coverage_ratio,
+            minimum_profit_coverage_probability=minimum_profit_coverage_probability,
+            coverage_correlation_floor=coverage_correlation_floor,
+            minimum_coverage_evidence_names=minimum_coverage_evidence_names,
+            coverage_mode=coverage_mode,
+            incremental_cvar_confidence=incremental_cvar_confidence,
+            incremental_cvar_risk_aversion=incremental_cvar_risk_aversion,
+            model_uncertainty_risk_aversion=model_uncertainty_risk_aversion,
+            calibration_warming_effective_samples=calibration_warming_effective_samples,
+            calibration_mature_effective_samples=calibration_mature_effective_samples,
+            max_new_buy_names=max_new_buy_names,
+            max_incremental_buy_exposure=max_incremental_buy_exposure,
+            minimum_positions=minimum_positions,
+            minimum_exposure=minimum_exposure,
+            target_positions=target_positions,
+            target_exposure=target_exposure,
+            wealth_materiality_epsilon_amount=wealth_materiality_epsilon_amount,
+            minimum_active_pool_size=minimum_active_pool_size,
+            minimum_effective_n_ratio=minimum_effective_n_ratio,
+            minimum_pool_count=minimum_pool_count,
         )
 
     best = forced
     best_key = evaluate(forced)
     best_nonbuy_key = best_key
     best_buy_key = None
+    best_buy = None
     exact_solver = bool(
         int(max_positions) <= max(int(exhaustive_max_positions), 1)
-        and len(candidates) <= 24
+        and len(candidates) <= 12
     )
     if exact_solver:
         max_optional = min(max(int(max_positions), 0), len(candidates))
@@ -144,6 +225,7 @@ def optimize_action_proposals(
                 if any(_is_buy_action(item.action_type) for item in selected):
                     if best_buy_key is None or key > best_buy_key:
                         best_buy_key = key
+                        best_buy = selected
                 elif best_nonbuy_key is None or key > best_nonbuy_key:
                     best_nonbuy_key = key
                 if best_key is None or key > best_key:
@@ -187,6 +269,7 @@ def optimize_action_proposals(
             if any(_is_buy_action(item.action_type) for item in selected):
                 if best_buy_key is None or key > best_buy_key:
                     best_buy_key = key
+                    best_buy = selected
             elif best_nonbuy_key is None or key > best_nonbuy_key:
                 best_nonbuy_key = key
             if best_key is None or key > best_key:
@@ -194,6 +277,37 @@ def optimize_action_proposals(
         solver_status = "feasible_bounded_beam_search"
 
     selected_ids = {item.proposal_id for item in best}
+    selected_optional = tuple(item for item in best if item not in forced)
+    selected_marginals = []
+    for unit in _candidate_units(selected_optional):
+        reduced = tuple(item for item in best if item not in unit)
+        reduced_key = evaluate(reduced)
+        if best_key is not None and reduced_key is not None:
+            selected_marginals.append(
+                float(
+                    best_key[PLAN_KEY_ROBUST_INDEX]
+                    - reduced_key[PLAN_KEY_ROBUST_INDEX]
+                )
+            )
+    rejected_marginals = []
+    rejected_marginal_by_id: dict[str, float] = {}
+    for item in candidates:
+        if item.proposal_id in selected_ids:
+            continue
+        expanded_key = evaluate(best + (item,))
+        if best_key is not None and expanded_key is not None:
+            marginal = float(
+                expanded_key[PLAN_KEY_ROBUST_INDEX]
+                - best_key[PLAN_KEY_ROBUST_INDEX]
+            )
+            rejected_marginals.append(marginal)
+            rejected_marginal_by_id[item.proposal_id] = marginal
+    minimum_selected_marginal = (
+        min(selected_marginals) if selected_marginals else 0.0
+    )
+    maximum_rejected_marginal = (
+        max(rejected_marginals) if rejected_marginals else 0.0
+    )
     rejected = tuple(
         {
             "proposal_id": item.proposal_id,
@@ -211,6 +325,15 @@ def optimize_action_proposals(
                 thesis_map=thesis_map,
                 thesis_hard_max=max_names_per_thesis,
             ),
+            "marginal_utility_amount": rejected_marginal_by_id.get(
+                item.proposal_id
+            ),
+            "robust_net_profit_amount": float(item.robust_net_profit_amount),
+            "downside_cvar_amount": float(item.downside_cvar_amount),
+            "lifecycle_cost_amount": float(item.lifecycle_cost_amount),
+            "coverage_evidence_authorized": bool(
+                item.coverage_evidence_authorized
+            ),
         }
         for item in items
         if item.proposal_id not in selected_ids
@@ -226,7 +349,11 @@ def optimize_action_proposals(
     funding = sum(item.funding_cash_amount for item in best)
     cash_release = sum(item.cash_release_amount for item in best)
     expected = sum(item.expected_net_profit_amount for item in best)
-    robust = float(best_key[0]) if best_key is not None else 0.0
+    robust = (
+        float(best_key[PLAN_KEY_ROBUST_INDEX])
+        if best_key is not None
+        else 0.0
+    )
     downside = sum(max(item.downside_cvar_amount, 0.0) for item in best)
     cost = sum(item.exact_cost_amount for item in best)
     available_cash = (
@@ -279,6 +406,24 @@ def optimize_action_proposals(
         selected_pools,
         max_positions=max_positions,
     )
+    positive_weights = [
+        float(projected_weights[symbol])
+        for symbol in held_symbols
+        if float(projected_weights.get(symbol, 0.0)) > 1e-12
+    ]
+    positive_total = sum(positive_weights)
+    planned_effective_n = (
+        1.0
+        / max(
+            sum(
+                (weight / max(positive_total, 1e-12)) ** 2
+                for weight in positive_weights
+            ),
+            1e-12,
+        )
+        if positive_weights
+        else 0.0
+    )
     authority_penalty = sum(
         max(float(item.authority_penalty_amount), 0.0)
         for item in best
@@ -287,13 +432,18 @@ def optimize_action_proposals(
         projected_weights,
         authorization,
     )
-    marginal_risk_penalty = _marginal_covariance_risk_penalty(
-        current_weights,
-        projected_weights,
+    scenario_risk = evaluate_incremental_scenario_risk(
+        best,
         covariance_matrix=effective_covariance,
-        authorization=authorization,
-        covariance_risk_aversion=covariance_risk_aversion,
+        scenario_return_matrix=scenario_return_matrix,
+        correlation_floor=coverage_correlation_floor,
+        cvar_confidence=incremental_cvar_confidence,
+        cvar_risk_aversion=incremental_cvar_risk_aversion,
+        model_uncertainty_risk_aversion=model_uncertainty_risk_aversion,
+        warming_effective_samples=calibration_warming_effective_samples,
+        mature_effective_samples=calibration_mature_effective_samples,
     )
+    marginal_risk_penalty = float(scenario_risk.scenario_risk_penalty_amount)
     proposal_robust_profit = sum(
         float(item.robust_net_profit_amount) for item in best
     )
@@ -303,14 +453,79 @@ def optimize_action_proposals(
         thesis_map=thesis_map,
         soft_max_names=authorization.thesis_soft_max_names,
     )
-    deployment_penalty = (
-        float(authorization.nav_amount)
-        * float(authorization.cash_gap_penalty_rate)
-        * deployment_gap
+    # Deployment gap is a diagnostic/tie-break dimension only.  Charging
+    # whole-account NAV for holding cash would make the factual no-trade
+    # baseline negative and reintroduce capital-scale-driven forced buying.
+    deployment_penalty = 0.0
+    coverage = _portfolio_coverage_metrics(
+        best,
+        covariance_matrix=effective_covariance,
+        correlation_floor=coverage_correlation_floor,
+        minimum_evidence_names=minimum_coverage_evidence_names,
+    )
+    coverage_penalty = 0.0
+    best_rejected = (
+        tuple(best_buy)
+        if best_buy is not None
+        and {item.proposal_id for item in best_buy} != selected_ids
+        else ()
+    )
+    best_rejected_risk = evaluate_incremental_scenario_risk(
+        best_rejected,
+        covariance_matrix=effective_covariance,
+        scenario_return_matrix=scenario_return_matrix,
+        correlation_floor=coverage_correlation_floor,
+        cvar_confidence=incremental_cvar_confidence,
+        cvar_risk_aversion=incremental_cvar_risk_aversion,
+        model_uncertainty_risk_aversion=model_uncertainty_risk_aversion,
+        warming_effective_samples=calibration_warming_effective_samples,
+        mature_effective_samples=calibration_mature_effective_samples,
+    )
+    expected_log_growth = math.log1p(
+        max(float(robust) / max(float(authorization.nav_amount), 1e-12), -0.999999)
     )
     buy_plan_dominates_nonbuy = bool(
         best_buy_key is not None
         and (best_nonbuy_key is None or best_buy_key > best_nonbuy_key)
+    )
+    planned_holding_count = sum(
+        int(lots) > 0 for lots in target_lots.values()
+    )
+    holding_floor_violation = max(
+        int(minimum_positions) - int(planned_holding_count),
+        0,
+    )
+    exposure_floor_violation = max(
+        float(minimum_exposure) - float(projected_exposure),
+        0.0,
+    )
+    initial_holding_count = sum(
+        int(lots) > 0 for lots in current_lots.values()
+    )
+    atomic_pool_violation = (
+        max(int(minimum_active_pool_size) - planned_holding_count, 0)
+        if initial_holding_count == 0
+        and 0 < planned_holding_count < int(minimum_active_pool_size)
+        else 0
+    )
+    required_effective_n = (
+        float(minimum_effective_n_ratio) * planned_holding_count
+        if planned_holding_count > 0
+        else 0.0
+    )
+    effective_n_violation = max(
+        required_effective_n - float(planned_effective_n),
+        0.0,
+    )
+    planned_pool_count = len({value for value in selected_pools if value})
+    required_pool_count = (
+        min(int(minimum_pool_count), planned_holding_count)
+        if planned_holding_count > 0
+        else 0
+    )
+    pool_count_violation = max(
+        required_pool_count - planned_pool_count,
+        0,
     )
     return ActionPlan(
         decision_id=authorization.decision_id,
@@ -351,11 +566,37 @@ def optimize_action_proposals(
                 - sum(1 for lots in target_lots.values() if int(lots) > 0),
                 0,
             ),
+            "holding_floor": max(
+                int(planned_holding_count) - int(minimum_positions),
+                0,
+            ),
+            "exposure_floor": max(
+                float(projected_exposure) - float(minimum_exposure),
+                0.0,
+            ),
+            "holding_floor_violation_count": holding_floor_violation,
+            "exposure_floor_violation": exposure_floor_violation,
+            "minimum_active_pool_size": int(minimum_active_pool_size),
+            "planned_effective_n": float(planned_effective_n),
+            "required_effective_n": float(
+                minimum_effective_n_ratio * planned_holding_count
+            ),
+            "effective_n_violation": max(
+                float(minimum_effective_n_ratio * planned_holding_count)
+                - float(planned_effective_n),
+                0.0,
+            ),
+            "atomic_pool_violation_count": int(atomic_pool_violation),
+            "planned_pool_count": int(planned_pool_count),
+            "required_pool_count": int(required_pool_count),
+            "pool_count_violation": int(pool_count_violation),
             "best_feasible_buy_robust_objective": (
-                float(best_buy_key[0]) if best_buy_key is not None else 0.0
+                float(best_buy_key[PLAN_KEY_ROBUST_INDEX])
+                if best_buy_key is not None
+                else 0.0
             ),
             "best_feasible_nonbuy_robust_objective": (
-                float(best_nonbuy_key[0])
+                float(best_nonbuy_key[PLAN_KEY_ROBUST_INDEX])
                 if best_nonbuy_key is not None
                 else 0.0
             ),
@@ -368,6 +609,20 @@ def optimize_action_proposals(
             "proposal_robust_profit_amount": proposal_robust_profit,
             "thesis_penalty_amount": thesis_penalty,
             "deployment_penalty_amount": deployment_penalty,
+            "coverage_penalty_amount": coverage_penalty,
+            "profit_coverage_ratio": coverage["profit_coverage_ratio"],
+            "profit_coverage_probability_lower": coverage[
+                "profit_coverage_probability_lower"
+            ],
+            "coverage_evidence_name_count": coverage["evidence_name_count"],
+            "expected_positive_pnl_amount": coverage[
+                "expected_positive_pnl_amount"
+            ],
+            "expected_loss_pnl_amount": coverage["expected_loss_pnl_amount"],
+            "lifecycle_cost_amount": coverage["lifecycle_cost_amount"],
+            "expected_log_growth": expected_log_growth,
+            "minimum_selected_marginal_utility_amount": minimum_selected_marginal,
+            "maximum_rejected_marginal_utility_amount": maximum_rejected_marginal,
             "cash_release_amount": cash_release,
             "solver_candidate_count": len(candidates),
             "solver_original_candidate_count": len(candidate_pool),
@@ -391,8 +646,63 @@ def optimize_action_proposals(
         proposal_robust_profit_amount=proposal_robust_profit,
         thesis_penalty_amount=thesis_penalty,
         deployment_penalty_amount=deployment_penalty,
+        selected_position_count=sum(
+            1 for lots in target_lots.values() if int(lots) > 0
+        ),
+        coverage_evidence_name_count=int(coverage["evidence_name_count"]),
+        expected_positive_pnl_amount=float(coverage["expected_positive_pnl_amount"]),
+        expected_loss_pnl_amount=float(coverage["expected_loss_pnl_amount"]),
+        lifecycle_cost_amount=float(coverage["lifecycle_cost_amount"]),
+        profit_coverage_ratio=float(coverage["profit_coverage_ratio"]),
+        profit_coverage_probability_lower=float(
+            coverage["profit_coverage_probability_lower"]
+        ),
+        coverage_penalty_amount=float(coverage_penalty),
+        expected_log_growth=float(expected_log_growth),
+        minimum_selected_marginal_utility_amount=float(
+            minimum_selected_marginal
+        ),
+        maximum_rejected_marginal_utility_amount=float(
+            maximum_rejected_marginal
+        ),
+        coverage_state=str(coverage["state"]),
+        coverage_mode=str(coverage_mode),
+        hold_baseline_objective_amount=float(
+            scenario_risk.hold_baseline_objective_amount
+        ),
+        incremental_expected_wealth_amount=float(
+            scenario_risk.incremental_expected_wealth_amount
+        ),
+        incremental_cvar_amount=float(scenario_risk.incremental_cvar_amount),
+        model_uncertainty_amount=float(scenario_risk.model_uncertainty_amount),
+        scenario_risk_penalty_amount=float(
+            scenario_risk.scenario_risk_penalty_amount
+        ),
+        scenario_evidence_state=str(scenario_risk.evidence_state),
+        scenario_contract_id=str(scenario_risk.contract_version),
+        scenario_risk_measure=str(scenario_risk.risk_measure_name),
+        joint_scenario_count=int(scenario_risk.joint_scenario_count),
+        best_rejected_proposal_ids=tuple(
+            item.proposal_id for item in best_rejected
+        ),
+        best_rejected_objective_amount=(
+            float(best_buy_key[PLAN_KEY_ROBUST_INDEX])
+            if best_rejected and best_buy_key is not None
+            else 0.0
+        ),
+        best_rejected_expected_wealth_amount=float(
+            best_rejected_risk.incremental_expected_wealth_amount
+        ),
+        best_rejected_cvar_amount=float(
+            best_rejected_risk.incremental_cvar_amount
+        ),
+        best_rejected_model_uncertainty_amount=float(
+            best_rejected_risk.model_uncertainty_amount
+        ),
         risk_model_used=(
-            "covariance"
+            "joint_historical_scenario_cvar"
+            if scenario_risk.risk_measure_name == "joint_historical_scenario_cvar"
+            else "covariance_with_correlated_tail_loss_proxy"
             if _covariance_complete_for_weights(
                 projected_weights,
                 effective_covariance,
@@ -401,6 +711,28 @@ def optimize_action_proposals(
         ),
         risk_horizon_sessions=int(authorization.risk_horizon_sessions),
         risk_episode_id=str(authorization.risk_episode_id),
+        planned_holding_count=int(planned_holding_count),
+        holding_floor_violation_count=int(holding_floor_violation),
+        exposure_floor_violation=float(exposure_floor_violation),
+        wealth_materiality_epsilon_amount=float(
+            wealth_materiality_epsilon_amount
+        ),
+        objective_components={
+            "atomic_pool_violation_count": float(atomic_pool_violation),
+            "holding_floor_violation_count": float(holding_floor_violation),
+            "exposure_floor_violation": float(exposure_floor_violation),
+            "effective_n_violation": float(effective_n_violation),
+            "pool_count_violation": float(pool_count_violation),
+            "robust_wealth_amount": float(robust),
+            "target_holding_gap": float(
+                abs(int(target_positions) - int(planned_holding_count))
+            ),
+            "target_exposure_gap": float(
+                abs(float(target_exposure) - float(projected_exposure))
+            ),
+            "breadth_score": float(breadth_score),
+            "exact_cost_amount": float(cost),
+        },
     )
 
 
@@ -416,8 +748,29 @@ def _plan_key(
     max_names_per_thesis: int,
     pair_expected_counts: Mapping[str, int],
     covariance_matrix: pd.DataFrame | None,
+    scenario_return_matrix: pd.DataFrame | None,
     covariance_risk_aversion: float,
-) -> tuple[float, float, float, float, float, float, tuple[str, ...]] | None:
+    minimum_profit_coverage_ratio: float,
+    minimum_profit_coverage_probability: float,
+    coverage_correlation_floor: float,
+    minimum_coverage_evidence_names: int,
+    coverage_mode: str,
+    incremental_cvar_confidence: float,
+    incremental_cvar_risk_aversion: float,
+    model_uncertainty_risk_aversion: float,
+    calibration_warming_effective_samples: int,
+    calibration_mature_effective_samples: int,
+    max_new_buy_names: int | None,
+    max_incremental_buy_exposure: float | None,
+    minimum_positions: int,
+    minimum_exposure: float,
+    target_positions: int,
+    target_exposure: float,
+    wealth_materiality_epsilon_amount: float,
+    minimum_active_pool_size: int,
+    minimum_effective_n_ratio: float,
+    minimum_pool_count: int,
+) -> tuple | None:
     by_symbol: dict[str, list[ActionProposal]] = {}
     for item in selected:
         by_symbol.setdefault(item.symbol, []).append(item)
@@ -458,6 +811,27 @@ def _plan_key(
             symbols.add(item.symbol)
             funding += item.funding_cash_amount
         downside += max(item.downside_cvar_amount, 0.0)
+    new_buy_names = {
+        item.symbol
+        for item in selected
+        if _is_buy_action(item.action_type)
+        and int(current_lots.get(item.symbol, 0)) <= 0
+    }
+    if max_new_buy_names is not None and len(new_buy_names) > max(
+        int(max_new_buy_names), 0
+    ):
+        return None
+    incremental_buy_exposure = sum(
+        max(float(item.exposure_delta), 0.0)
+        for item in selected
+        if _is_buy_action(item.action_type)
+    )
+    if (
+        max_incremental_buy_exposure is not None
+        and incremental_buy_exposure
+        > max(float(max_incremental_buy_exposure), 0.0) + 1e-12
+    ):
+        return None
     if len(symbols) > int(max_positions):
         return None
     projected_weights = _projected_weights(selected, current_weights)
@@ -488,8 +862,6 @@ def _plan_key(
         available_cash + cash_release - required_buffer,
         0.0,
     ) + 1e-8:
-        return None
-    if downside > authorization.portfolio_stress_budget_amount + 1e-12:
         return None
     tier_b_exposure = sum(
         max(item.exposure_delta, 0.0)
@@ -527,10 +899,22 @@ def _plan_key(
             if count > int(max_names_per_thesis) and count > baseline:
                 return None
 
-    robust = sum(
-        item.robust_net_profit_amount - item.authority_penalty_amount
-        for item in selected
+    scenario_risk = evaluate_incremental_scenario_risk(
+        selected,
+        covariance_matrix=covariance_matrix,
+        scenario_return_matrix=scenario_return_matrix,
+        correlation_floor=coverage_correlation_floor,
+        cvar_confidence=incremental_cvar_confidence,
+        cvar_risk_aversion=incremental_cvar_risk_aversion,
+        model_uncertainty_risk_aversion=model_uncertainty_risk_aversion,
+        warming_effective_samples=calibration_warming_effective_samples,
+        mature_effective_samples=calibration_mature_effective_samples,
     )
+    if float(scenario_risk.incremental_cvar_amount) > float(
+        authorization.portfolio_stress_budget_amount
+    ) + 1e-12:
+        return None
+    robust = float(scenario_risk.incremental_robust_wealth_amount)
     soft_thesis_penalty = _soft_thesis_penalty(
         selected,
         projected_weights=projected_weights,
@@ -538,13 +922,7 @@ def _plan_key(
         soft_max_names=authorization.thesis_soft_max_names,
     )
     robust -= soft_thesis_penalty
-    robust -= _marginal_covariance_risk_penalty(
-        current_weights,
-        projected_weights,
-        covariance_matrix=covariance_matrix,
-        authorization=authorization,
-        covariance_risk_aversion=covariance_risk_aversion,
-    )
+    robust -= float(scenario_risk.scenario_risk_penalty_amount)
     concentration_penalty = _concentration_penalty(
         projected_weights,
         authorization,
@@ -555,11 +933,15 @@ def _plan_key(
         - float(projected_exposure),
         0.0,
     )
-    robust -= (
-        authorization.nav_amount
-        * authorization.cash_gap_penalty_rate
-        * deployment_gap
-    )
+    # The no-trade baseline is exactly zero incremental wealth.  Deployment
+    # gap may break otherwise equal plans, but never becomes a CNY penalty.
+    coverage_mode_normalized = str(coverage_mode).strip().lower()
+    if coverage_mode_normalized not in {
+        "diagnostic_shadow",
+        "diagnostic_only",
+        "authorized_ceiling_only",
+    }:
+        raise ValueError("unsupported profit coverage authority mode")
     active_symbols = {
         symbol
         for symbol, weight in projected_weights.items()
@@ -589,7 +971,101 @@ def _plan_key(
         0.0,
     )
     ids = tuple(sorted(item.proposal_id for item in selected))
-    return robust, -deployment_gap, breadth, expected, -downside, -cost, ids
+    holding_floor_violation = max(int(minimum_positions) - len(symbols), 0)
+    exposure_floor_violation = max(
+        float(minimum_exposure) - float(projected_exposure),
+        0.0,
+    )
+    target_holding_gap = abs(int(target_positions) - len(symbols))
+    target_exposure_gap = abs(float(target_exposure) - float(projected_exposure))
+    initial_position_count = sum(int(lots) > 0 for lots in current_lots.values())
+    planned_position_count = len(symbols)
+    # Coverage has deliberately narrow authority: it can veto only expansion
+    # above the product target.  It cannot force an entry, penalize cash by
+    # account NAV, or fabricate evidence when PIT calibration is unavailable.
+    if (
+        coverage_mode_normalized == "authorized_ceiling_only"
+        and new_buy_names
+        and planned_position_count > int(target_positions)
+    ):
+        coverage = _portfolio_coverage_metrics(
+            selected,
+            covariance_matrix=covariance_matrix,
+            correlation_floor=coverage_correlation_floor,
+            minimum_evidence_names=minimum_coverage_evidence_names,
+        )
+        if (
+            int(coverage["evidence_name_count"])
+            < int(minimum_coverage_evidence_names)
+            or float(coverage["profit_coverage_ratio"])
+            < float(minimum_profit_coverage_ratio)
+            or float(coverage["profit_coverage_probability_lower"])
+            < float(minimum_profit_coverage_probability)
+        ):
+            return None
+    atomic_pool_violation = (
+        max(int(minimum_active_pool_size) - planned_position_count, 0)
+        if initial_position_count == 0
+        and 0 < planned_position_count < int(minimum_active_pool_size)
+        else 0
+    )
+    positive_weights = [
+        max(float(projected_weights.get(symbol, 0.0)), 0.0)
+        for symbol in symbols
+        if float(projected_weights.get(symbol, 0.0)) > 1e-12
+    ]
+    total_positive_weight = sum(positive_weights)
+    effective_n = (
+        1.0
+        / max(
+            sum(
+                (weight / max(total_positive_weight, 1e-12)) ** 2
+                for weight in positive_weights
+            ),
+            1e-12,
+        )
+        if positive_weights
+        else 0.0
+    )
+    required_effective_n = (
+        float(minimum_effective_n_ratio) * planned_position_count
+        if planned_position_count > 0
+        else 0.0
+    )
+    effective_n_violation = max(required_effective_n - effective_n, 0.0)
+    active_pool_names = {
+        thesis_map.get(symbol, "")
+        for symbol in symbols
+        if thesis_map.get(symbol, "")
+    }
+    required_pool_count = (
+        min(int(minimum_pool_count), planned_position_count)
+        if planned_position_count > 0
+        else 0
+    )
+    pool_count_violation = max(required_pool_count - len(active_pool_names), 0)
+    epsilon = max(float(wealth_materiality_epsilon_amount), 0.0)
+    robust_material_bucket = (
+        int(math.floor((robust + epsilon * 0.5) / epsilon))
+        if epsilon > 0.0
+        else robust
+    )
+    return (
+        -atomic_pool_violation,
+        -holding_floor_violation,
+        -exposure_floor_violation,
+        -effective_n_violation,
+        -pool_count_violation,
+        robust_material_bucket,
+        -target_holding_gap,
+        -target_exposure_gap,
+        breadth,
+        robust,
+        expected,
+        -downside,
+        -cost,
+        ids,
+    )
 
 
 def _normalized_breadth_score(
@@ -618,6 +1094,108 @@ def _normalized_breadth_score(
         else 1.0
     )
     return float(name_ratio + effective_ratio + pool_ratio + entropy_ratio)
+
+
+def _portfolio_coverage_metrics(
+    selected: tuple[ActionProposal, ...],
+    *,
+    covariance_matrix: pd.DataFrame | None,
+    correlation_floor: float,
+    minimum_evidence_names: int,
+) -> dict[str, float | int | str]:
+    """Conservative portfolio profit/loss coverage from PIT proposal evidence.
+
+    Cantelli's one-sided inequality supplies a distribution-free lower bound.
+    Dependence inflates Bernoulli variance by at least ``correlation_floor``;
+    when a complete covariance block exists its average absolute correlation
+    may increase, but never reduce, that conservative floor.
+    """
+    selected_buys = tuple(
+        item for item in selected if _is_buy_action(item.action_type)
+    )
+    evidence = tuple(
+        item
+        for item in selected_buys
+        if bool(item.coverage_evidence_authorized)
+    )
+    positive = sum(float(item.expected_positive_pnl_amount) for item in evidence)
+    loss = sum(float(item.expected_loss_pnl_amount) for item in evidence)
+    # Lifecycle cost is factual for every selected buy.  PIT evidence governs
+    # whether profit/loss coverage can be estimated, not whether costs exist.
+    lifecycle = sum(float(item.lifecycle_cost_amount) for item in selected_buys)
+    denominator = loss + lifecycle
+    ratio = positive / denominator if denominator > 1e-12 else 0.0
+    minimum_names = max(int(minimum_evidence_names), 1)
+    if len(evidence) < minimum_names:
+        return {
+            "state": "insufficient_pit_coverage_evidence",
+            "evidence_name_count": len(evidence),
+            "expected_positive_pnl_amount": positive,
+            "expected_loss_pnl_amount": loss,
+            "lifecycle_cost_amount": lifecycle,
+            "profit_coverage_ratio": ratio,
+            "profit_coverage_probability_lower": 0.0,
+            "dependence_assumption": min(max(float(correlation_floor), 0.0), 1.0),
+        }
+    variance = 0.0
+    for item in evidence:
+        probability = min(max(float(item.p_win_lower), 0.0), 1.0)
+        win = max(float(item.avg_win_return), 0.0) * float(item.market_notional_amount)
+        lose = max(float(item.avg_loss_return), 0.0) * float(item.market_notional_amount)
+        variance += probability * (1.0 - probability) * (win + lose) ** 2
+    dependence = _coverage_dependence(
+        tuple(item.symbol for item in evidence),
+        covariance_matrix,
+        floor=correlation_floor,
+    )
+    variance *= 1.0 + max(len(evidence) - 1, 0) * dependence
+    mean_net = positive - loss - lifecycle
+    probability_lower = (
+        mean_net * mean_net / (variance + mean_net * mean_net)
+        if mean_net > 0.0 and variance > 0.0
+        else (1.0 if mean_net > 0.0 else 0.0)
+    )
+    return {
+        "state": "pit_calibrated_cantelli_lower_bound",
+        "evidence_name_count": len(evidence),
+        "expected_positive_pnl_amount": positive,
+        "expected_loss_pnl_amount": loss,
+        "lifecycle_cost_amount": lifecycle,
+        "profit_coverage_ratio": ratio,
+        "profit_coverage_probability_lower": min(max(probability_lower, 0.0), 1.0),
+        "dependence_assumption": dependence,
+    }
+
+
+def _coverage_dependence(
+    symbols: tuple[str, ...],
+    covariance_matrix: pd.DataFrame | None,
+    *,
+    floor: float,
+) -> float:
+    conservative_floor = min(max(float(floor), 0.0), 1.0)
+    unique = tuple(dict.fromkeys(str(symbol) for symbol in symbols))
+    if len(unique) < 2 or covariance_matrix is None or covariance_matrix.empty:
+        return conservative_floor
+    if any(
+        symbol not in covariance_matrix.index or symbol not in covariance_matrix.columns
+        for symbol in unique
+    ):
+        return conservative_floor
+    block = covariance_matrix.loc[list(unique), list(unique)].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    if block.isna().any().any():
+        return conservative_floor
+    diagonal = [max(float(block.loc[symbol, symbol]), 0.0) ** 0.5 for symbol in unique]
+    correlations = []
+    for left_index, left in enumerate(unique):
+        for right_index in range(left_index + 1, len(unique)):
+            scale = diagonal[left_index] * diagonal[right_index]
+            if scale > 1e-12:
+                correlations.append(abs(float(block.loc[left, unique[right_index]]) / scale))
+    empirical = sum(correlations) / len(correlations) if correlations else 0.0
+    return min(max(conservative_floor, empirical), 1.0)
 
 
 def _candidate_units(
@@ -940,6 +1518,14 @@ def _empty_plan(
     current_weights: Mapping[str, float],
     current_exposure: float,
     max_positions: int,
+    minimum_positions: int = 0,
+    minimum_exposure: float = 0.0,
+    target_positions: int = 0,
+    target_exposure: float = 0.0,
+    wealth_materiality_epsilon_amount: float = 0.0,
+    minimum_active_pool_size: int = 0,
+    minimum_effective_n_ratio: float = 0.0,
+    minimum_pool_count: int = 0,
 ) -> ActionPlan:
     """Return the factual no-action portfolio, not a synthetic zero account."""
     projected_exposure = (
@@ -948,6 +1534,15 @@ def _empty_plan(
         else min(max(float(current_exposure), 0.0), 1.0)
     )
     projected_cash = max(float(authorization.current_cash_amount), 0.0)
+    planned_holding_count = sum(int(lots) > 0 for lots in current_lots.values())
+    holding_floor_violation = max(
+        int(minimum_positions) - planned_holding_count,
+        0,
+    )
+    exposure_floor_violation = max(
+        float(minimum_exposure) - projected_exposure,
+        0.0,
+    )
     return ActionPlan(
         decision_id=authorization.decision_id,
         selected_proposal_ids=(),
@@ -971,6 +1566,17 @@ def _empty_plan(
                 projected_cash - authorization.cash_buffer_amount,
                 0.0,
             ),
+            "holding_floor_violation_count": holding_floor_violation,
+            "exposure_floor_violation": exposure_floor_violation,
+            "atomic_pool_violation_count": (
+                max(int(minimum_active_pool_size) - planned_holding_count, 0)
+                if 0 < planned_holding_count < int(minimum_active_pool_size)
+                else 0
+            ),
+            "minimum_effective_n_ratio": max(
+                min(float(minimum_effective_n_ratio), 1.0), 0.0
+            ),
+            "minimum_pool_count": max(int(minimum_pool_count), 0),
             "best_feasible_buy_robust_objective": 0.0,
             "best_feasible_nonbuy_robust_objective": 0.0,
             "buy_plan_dominates_nonbuy": 0,
@@ -1000,4 +1606,22 @@ def _empty_plan(
         risk_model_used=str(authorization.fallback_risk_model),
         risk_horizon_sessions=int(authorization.risk_horizon_sessions),
         risk_episode_id=str(authorization.risk_episode_id),
+        planned_holding_count=planned_holding_count,
+        holding_floor_violation_count=holding_floor_violation,
+        exposure_floor_violation=exposure_floor_violation,
+        wealth_materiality_epsilon_amount=max(
+            float(wealth_materiality_epsilon_amount),
+            0.0,
+        ),
+        objective_components={
+            "holding_floor_violation_count": float(holding_floor_violation),
+            "exposure_floor_violation": float(exposure_floor_violation),
+            "robust_wealth_amount": 0.0,
+            "target_holding_gap": float(
+                abs(int(target_positions) - planned_holding_count)
+            ),
+            "target_exposure_gap": float(
+                abs(float(target_exposure) - projected_exposure)
+            ),
+        },
     )

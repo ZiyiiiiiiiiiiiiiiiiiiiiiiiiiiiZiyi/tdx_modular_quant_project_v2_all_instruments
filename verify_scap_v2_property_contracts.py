@@ -341,10 +341,10 @@ risk_4d = optimize_action_proposals(
 )
 assert abs(
     risk_4d.marginal_risk_penalty_amount
-    - 2.0 * risk_1d.marginal_risk_penalty_amount
+    - risk_1d.marginal_risk_penalty_amount
 ) < 1e-9
-assert risk_4d.risk_model_used == "covariance"
-_pass("daily covariance risk scales by square-root of forecast horizon")
+assert "correlated_tail_loss_proxy" in risk_4d.risk_model_used
+_pass("forecast-horizon downside is not square-root scaled a second time")
 
 cash_ledger = CashReservationLedger(cash_amount=10_000.0, minimum_buffer=2_000.0)
 cash_ledger.reserve("ordinary", 3_000.0)

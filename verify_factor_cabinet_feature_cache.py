@@ -121,7 +121,10 @@ def check_runtime_uses_cache_for_cabinet() -> None:
         [
             "attach_factor_cabinet_feature_cache",
             "if factor_spec.uses_factor_cabinet:",
-            "cabinet_cache_start = effective_start",
+            "cabinet_cache_start = (",
+            '== "aggressive_lean"',
+            "cache_start",
+            "effective_start",
         ],
     )
 

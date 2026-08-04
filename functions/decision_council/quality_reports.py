@@ -141,7 +141,13 @@ def build_governance_quality_reports(
 
 
 def _log_quality_stage(stage: str) -> None:
-    print(f"[governance] quality_reports: {stage}", flush=True)
+    # Console observability is deliberately non-authoritative.  A detached or
+    # timed-out Windows parent process can leave stdout with an invalid handle
+    # (OSError 22); that must not invalidate already-computed economic ledgers.
+    try:
+        print(f"[governance] quality_reports: {stage}", flush=True)
+    except (BrokenPipeError, OSError, ValueError):
+        return
 
 
 def build_module_role_summary(ideal_portfolio_plan: pd.DataFrame) -> pd.DataFrame:
@@ -264,6 +270,7 @@ def build_portfolio_constraint_report(
         "user_hard_position_cap",
         "economic_position_cap",
         "search_position_cap",
+        "sizing_reference_positions",
         "effective_position_cap",
         "effective_n_required",
         "top1_account_weight",
@@ -318,6 +325,9 @@ def build_portfolio_constraint_report(
         search_position_cap = _optional_positive_int(
             row.get("search_position_cap")
         )
+        sizing_reference_positions = _optional_positive_int(
+            row.get("sizing_reference_positions")
+        )
         holding_count = max(int(_coerce_float(row.get("holding_count", 0)) or 0), 0)
         effective_position_cap = _optional_positive_int(
             row.get(
@@ -333,8 +343,15 @@ def build_portfolio_constraint_report(
                 if holding_count > 0 and np.isfinite(sleeve_effective_n)
                 else 0.0
             )
+        # The absolute research floor was previously accepted by the API but
+        # silently ignored.  Cap it at the factual number of held names (cash
+        # is not a diversifying security), then combine it with the
+        # scale-normalized sleeve floor.
         effective_n_required = (
-            float(min_sleeve_effective_n_ratio) * holding_count
+            max(
+                min(float(min_effective_n), float(holding_count)),
+                float(min_sleeve_effective_n_ratio) * holding_count,
+            )
             if holding_count > 0
             else 0.0
         )
@@ -369,6 +386,7 @@ def build_portfolio_constraint_report(
                 "user_hard_position_cap": user_hard_position_cap,
                 "economic_position_cap": economic_position_cap,
                 "search_position_cap": search_position_cap,
+                "sizing_reference_positions": sizing_reference_positions,
                 "effective_position_cap": effective_position_cap,
                 "effective_n_required": effective_n_required,
                 "top1_account_weight": row["top1_account_weight"],

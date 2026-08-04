@@ -23,6 +23,19 @@ FACTOR_PRODUCT_DIRNAME = "holding_factor_curves"
 FACTOR_WORKBOOK_NAME = "SCAP_持仓逐因子曲线.xlsx"
 
 
+def workbook_content_check_failures(summary: dict) -> list[str]:
+    failures: list[str] = []
+    if int(summary.get("covered_holding_symbol_days", 0)) != int(
+        summary.get("holding_symbol_days", 0)
+    ):
+        failures.append("holding_symbol_day_factor_coverage")
+    if int(summary.get("held_symbol_count", 0)) > 0 and int(
+        summary.get("factor_model_count", 0)
+    ) <= 0:
+        failures.append("held_positions_without_factor_models")
+    return failures
+
+
 HOLDING_COLUMNS = [
     "date",
     "symbol",
@@ -50,6 +63,15 @@ DAILY_COLUMNS = [
     "nominal_nav",
     "cash",
     "holding_count",
+    "economic_position_cap",
+    "lot_cash_position_cap",
+    "cost_feasible_position_cap",
+    "risk_feasible_position_cap",
+    "search_position_cap",
+    "effective_position_cap",
+    "grandfathered_excess_names",
+    "sizing_reference_positions",
+    "selected_position_count",
     "actual_exposure",
     "desired_exposure_target",
     "executable_exposure_target",
@@ -62,6 +84,21 @@ DAILY_COLUMNS = [
     "catchup_allowed",
     "catchup_block_reason",
     "allow_normal_rebalance",
+    "coverage_mode",
+    "coverage_penalty_amount",
+    "profit_coverage_ratio",
+    "profit_coverage_probability_lower",
+    "coverage_evidence_name_count",
+    "incremental_expected_wealth_amount",
+    "incremental_cvar_amount",
+    "model_uncertainty_amount",
+    "scenario_risk_penalty_amount",
+    "scenario_evidence_state",
+    "scenario_contract_id",
+    "scenario_risk_measure",
+    "joint_scenario_count",
+    "regime_es_budget_multiplier",
+    "best_rejected_objective_amount",
 ]
 
 
@@ -185,13 +222,52 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
         encoding="utf-8-sig",
     )
 
-    coverage = (
-        factor_long.loc[factor_long["model_name"].notna(), ["date", "symbol"]]
-        .drop_duplicates()
-        .shape[0]
+    factor_model_count = int(factor_long["model_name"].nunique())
+    observed_counts = (
+        factor_long.loc[factor_long["model_name"].notna()]
+        .groupby(["date", "symbol"])["model_name"]
+        .nunique()
+        .rename("observed_factor_count")
+        .reset_index()
     )
-    full_slot = daily["holding_count"].ge(5)
-    full_slot_gap = full_slot & daily["exposure_gap"].gt(0.05)
+    coverage_detail = holding_keys.merge(
+        observed_counts,
+        on=["date", "symbol"],
+        how="left",
+    )
+    coverage_detail["observed_factor_count"] = pd.to_numeric(
+        coverage_detail["observed_factor_count"], errors="coerce"
+    ).fillna(0).astype(int)
+    coverage_detail["expected_factor_count"] = factor_model_count
+    coverage_detail["coverage_complete"] = coverage_detail[
+        "observed_factor_count"
+    ].eq(factor_model_count)
+    coverage_detail["coverage_reason"] = coverage_detail.apply(
+        lambda row: (
+            "complete"
+            if bool(row["coverage_complete"])
+            else (
+                "no_factor_record_for_held_symbol_day"
+                if int(row["observed_factor_count"]) == 0
+                else "partial_factor_record_for_held_symbol_day"
+            )
+        ),
+        axis=1,
+    )
+    coverage_gaps = coverage_detail.loc[~coverage_detail["coverage_complete"]].copy()
+    coverage_gaps.to_csv(output_dir / "holding_factor_coverage_gaps.csv", index=False)
+    coverage = int(coverage_detail["coverage_complete"].sum())
+    holding_count = pd.to_numeric(daily["holding_count"], errors="coerce").fillna(0.0)
+    economic_cap = pd.to_numeric(
+        daily.get("economic_position_cap", pd.Series(index=daily.index, dtype=float)),
+        errors="coerce",
+    )
+    valid_capacity = economic_cap.gt(0.0)
+    capacity_full = valid_capacity & holding_count.ge(economic_cap)
+    capacity_full_gap = capacity_full & pd.to_numeric(
+        daily["exposure_gap"], errors="coerce"
+    ).gt(0.05)
+    capacity_utilization = holding_count.div(economic_cap.where(valid_capacity))
     summary = {
         "source_run": str(run_dir.resolve()),
         "date_start": str(daily["date"].min()),
@@ -199,11 +275,25 @@ def build_dataset(run_dir: Path, output_dir: Path) -> dict:
         "trading_days": int(len(daily)),
         "held_symbol_count": int(holdings["symbol"].nunique()),
         "holding_symbol_days": int(len(holding_keys)),
-        "factor_model_count": int(factor_long["model_name"].nunique()),
+        "factor_model_count": factor_model_count,
         "factor_score_rows": int(len(factor_long)),
         "covered_holding_symbol_days": int(coverage),
-        "full_slot_days": int(full_slot.sum()),
-        "full_slot_gap_gt_5pct_days": int(full_slot_gap.sum()),
+        "holding_factor_coverage_gap_count": int(len(coverage_gaps)),
+        "holding_factor_coverage_gap_preview": coverage_gaps.head(20)[
+            [
+                "date",
+                "symbol",
+                "observed_factor_count",
+                "expected_factor_count",
+                "coverage_reason",
+            ]
+        ].to_dict("records"),
+        "economic_capacity_observed_days": int(valid_capacity.sum()),
+        "economic_capacity_full_days": int(capacity_full.sum()),
+        "economic_capacity_full_gap_gt_5pct_days": int(capacity_full_gap.sum()),
+        "average_capacity_utilization": float(capacity_utilization.mean())
+        if bool(valid_capacity.any())
+        else 0.0,
         "closed_trade_count": int(len(trades)),
         "active_exit_rows": int(len(active_exits)),
         # Compatibility key retained for existing workbook payloads.
@@ -316,7 +406,14 @@ def build_integrated_products(
         "data_dir": str(output_dir),
         "workbook_status": "not_requested",
         "workbook_path": "",
+        "file_generated": False,
+        "content_checks_passed": False,
+        "content_check_failures": [],
+        "visual_verification_status": "not_run",
     }
+    content_failures = workbook_content_check_failures(summary)
+    product_status["content_check_failures"] = content_failures
+    product_status["content_checks_passed"] = not content_failures
     if build_workbook:
         node_path = Path(
             os.environ.get("TDX_ARTIFACT_NODE", str(DEFAULT_ARTIFACT_NODE))
@@ -363,13 +460,55 @@ def build_integrated_products(
                 if strict:
                     raise RuntimeError(message)
             else:
+                verification_dir = output_dir / "_workbook_verification"
+                verifier_path = PROJECT_DIR / "tools" / "verify_scap_factor_workbook.mjs"
+                verification = subprocess.run(
+                    [
+                        str(node_path),
+                        str(verifier_path),
+                        str(workbook_path),
+                        str(verification_dir),
+                    ],
+                    cwd=str(PROJECT_DIR),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                )
+                visual_ok = verification.returncode == 0
                 product_status.update(
                     {
-                        "workbook_status": "ok",
+                        "workbook_status": (
+                            "ok"
+                            if visual_ok and not content_failures
+                            else "failed_content_or_visual_checks"
+                        ),
                         "workbook_path": str(workbook_path),
                         "workbook_bytes": int(workbook_path.stat().st_size),
+                        "file_generated": True,
+                        "visual_verification_status": (
+                            "passed" if visual_ok else "failed"
+                        ),
+                        "visual_verification_dir": str(verification_dir),
+                        "visual_verification_error": (
+                            ""
+                            if visual_ok
+                            else verification.stderr.strip()
+                            or verification.stdout.strip()[-4000:]
+                        ),
                     }
                 )
+                if strict and product_status["workbook_status"] != "ok":
+                    (output_dir / "product_status.json").write_text(
+                        json.dumps(product_status, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    raise RuntimeError(
+                        "factor workbook content/visual verification failed: "
+                        f"{product_status['content_check_failures']} | "
+                        f"{product_status['visual_verification_status']}"
+                    )
     (output_dir / "product_status.json").write_text(
         json.dumps(product_status, ensure_ascii=False, indent=2),
         encoding="utf-8",

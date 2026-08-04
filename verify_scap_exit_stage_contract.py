@@ -1,4 +1,7 @@
 """Verify E0-E4 differ only by their registered exit permissions."""
+from types import SimpleNamespace
+
+from functions.decision_council.runner import GovernanceBacktestRunner
 from functions.decision_council.small_capital_aggressive import (
     build_scap_exit_stage_contract,
 )
@@ -15,4 +18,13 @@ assert not matrix.loc[matrix["exit_stage"].eq("E3"), "profit_giveback_exit_enabl
 assert matrix.loc[matrix["exit_stage"].eq("E4"), "profit_giveback_exit_enabled"].iloc[0]
 assert not matrix["active_replacement_enabled"].any()
 assert matrix["experiment_contract"].nunique() == 1
+lean_runner = SimpleNamespace(
+    governance_control_mode="aggressive_lean",
+    capital_profile={"scap_exit_stage": "E4"},
+)
+assert not GovernanceBacktestRunner._control_enabled(lean_runner, "regime")
+assert not GovernanceBacktestRunner._control_enabled(lean_runner, "regime_overlay")
+assert GovernanceBacktestRunner._control_enabled(
+    lean_runner, "profit_giveback_exit"
+)
 print("[PASS] SCAP E0-E4 single-variable experiment contract")

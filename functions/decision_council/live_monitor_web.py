@@ -325,13 +325,19 @@ HTML = """<!doctype html>
       ["trend_direction_score_mean", "趋势方向均值"],
       ["peak_decay_score_mean", "峰值衰退均值"],
       ["future_loss_risk_score_mean", "未来亏损风险"],
-      ["minimum_required_holding_count", "最低持仓数"],
-      ["soft_target_holding_count", "软目标持仓数"],
-      ["maximum_allowed_holding_count", "持仓硬上限"],
+      ["minimum_required_holding_count", "当日条件最低持仓"],
+      ["soft_target_holding_count", "政策目标持仓"],
+      ["maximum_allowed_holding_count", "当日有效持仓上限"],
       ["user_hard_position_cap", "Web治理硬上限"],
       ["economic_position_cap", "经济可行上限"],
       ["search_position_cap", "求解资源上限"],
       ["effective_position_cap", "当日有效上限"],
+      ["selected_position_count", "选中动作涉及名称数"],
+      ["incremental_expected_wealth_amount", "增量期望财富"],
+      ["incremental_cvar_amount", "增量CVaR"],
+      ["model_uncertainty_amount", "模型不确定性"],
+      ["scenario_risk_penalty_amount", "情景风险罚金"],
+      ["best_rejected_objective_amount", "最佳被拒目标"],
       ["holding_shortfall_count", "软目标不足数"],
       ["idle_cash_ratio", "闲置现金比例"],
       ["scap_v31_positive_c_fallback_count", "C级试探候选"],
@@ -360,7 +366,7 @@ HTML = """<!doctype html>
       ["planned_exposure", "优化器计划仓位"],
       ["target_exposure", "战略期望仓位"],
       ["actual_exposure", "实际仓位"],
-      ["exposure_gap", "仓位缺口"],
+      ["exposure_gap", "交易前低于政策下界"],
       ["valid_invested_nav", "持仓/投入净值"],
       ["benchmark_nav", "前30强基准净值"],
       ["excess_nav", "超额净值"],
@@ -869,8 +875,8 @@ HTML = """<!doctype html>
       }
       const totalReturn = navMultiple - 1.0;
       const actualExposure = Number(exposure.actual_exposure || ms.actual_exposure || 0);
-      const targetExposure = Number(ms.target_exposure || 0);
-      const exposureGap = Number(ms.exposure_gap || Math.max(targetExposure - actualExposure, 0));
+      const targetExposure = Number(ms.policy_exposure_target ?? ms.target_exposure ?? 0);
+      const exposureGap = Number(ms.pretrade_policy_lower_shortfall ?? ms.exposure_gap ?? 0);
       const latestRet = history.length >= 2 && history[history.length - 2].nav > 0
         ? nav / history[history.length - 2].nav - 1.0
         : 0.0;
@@ -960,6 +966,12 @@ HTML = """<!doctype html>
       setMetric("economic_position_cap", String(Number(ms.economic_position_cap || 0)), 0);
       setMetric("search_position_cap", String(Number(ms.search_position_cap || 0)), 0);
       setMetric("effective_position_cap", String(Number(ms.effective_position_cap || 0)), 0);
+      setMetric("selected_position_count", String(Number(ms.selected_position_count ?? 0)), 0);
+      setMetric("incremental_expected_wealth_amount", fmtMoney(Number(ms.incremental_expected_wealth_amount || 0)), Number(ms.incremental_expected_wealth_amount || 0));
+      setMetric("incremental_cvar_amount", fmtMoney(Number(ms.incremental_cvar_amount || 0)), -Number(ms.incremental_cvar_amount || 0));
+      setMetric("model_uncertainty_amount", fmtMoney(Number(ms.model_uncertainty_amount || 0)), -Number(ms.model_uncertainty_amount || 0));
+      setMetric("scenario_risk_penalty_amount", fmtMoney(Number(ms.scenario_risk_penalty_amount || 0)), -Number(ms.scenario_risk_penalty_amount || 0));
+      setMetric("best_rejected_objective_amount", fmtMoney(Number(ms.best_rejected_objective_amount || 0)), Number(ms.best_rejected_objective_amount || 0));
       setMetric("holding_shortfall_count", String(Number(ms.holding_shortfall_count || 0)), -Number(ms.holding_shortfall_count || 0));
       setMetric("idle_cash_ratio", fmtPct(Number(ms.idle_cash_ratio)), -Number(ms.idle_cash_ratio || 0));
       setMetric("scap_v31_positive_c_fallback_count", String(Number(ms.scap_v31_positive_c_fallback_count || 0)), Number(ms.scap_v31_positive_c_fallback_count || 0));
@@ -1017,6 +1029,15 @@ HTML = """<!doctype html>
         `允许追仓              : ${String(Boolean(ms.catchup_allowed || false))}`,
         `追仓档位              : ${String(ms.catchup_tier || "none")}`,
         `追仓拦截原因          : ${String(ms.catchup_block_reason || "--")}`
+      ].join("\\n");
+
+      document.getElementById("exposureText").textContent += [
+        "",
+        `Normal rebalance cadence : ${String(ms.portfolio_normal_rebalance_frequency || "--")} / ${String(ms.portfolio_normal_rebalance_anchor || "--")}`,
+        `Plan execution window    : ${String(ms.monthly_plan_execution_window_sessions ?? 0)} sessions`,
+        `Daily deployment cap     : ${String(ms.max_daily_new_names ?? 0)} names / ${fmtPct(Number(ms.max_daily_new_exposure_ratio || 0))}`,
+        `Capacity cash/cost/risk  : ${String(ms.lot_cash_position_cap ?? 0)} / ${String(ms.cost_feasible_position_cap ?? 0)} / ${String(ms.risk_feasible_position_cap ?? 0)}`,
+        `Effective K / legacy hold: ${String(ms.effective_position_cap ?? 0)} / ${String(ms.grandfathered_excess_names ?? 0)}`
       ].join("\\n");
 
       document.getElementById("entryGateText").textContent = [
@@ -1200,7 +1221,7 @@ HTML = """<!doctype html>
 
       const pendingLines = [`未完成订单（${Number(ms.pending_order_count || 0)}）`, ""];
       for (const item of (ms.pending_preview || [])) {
-        pendingLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} shares=${fmtNum(Number(item.remaining_shares || 0),0).padStart(10)} ${String(item.status || "").padEnd(14)} lock=${fmtNum(Number(item.lock_days || 0),0)} 当前=${String(item.reason || "")} 历史=${String(item.reason_history || item.reason || "")}`);
+        pendingLines.push(`${String(item.side || "").toUpperCase().padEnd(4)} ${String(item.symbol || "").padEnd(10)} shares=${fmtNum(Number(item.remaining_shares || 0),0).padStart(10)} ${String(item.status || "").padEnd(14)} lock=${fmtNum(Number(item.lock_days || 0),0)} policy=${String(item.order_execution_policy || "--")} age=${String(item.signal_age_sessions ?? "--")}/${String(item.maximum_age_sessions ?? "--")} 当前=${String(item.reason || "")} 历史=${String(item.reason_history || item.reason || "")}`);
       }
       if ((ms.pending_preview || []).length === 0) pendingLines.push("暂无有效未完成订单。");
       document.getElementById("pendingText").textContent = pendingLines.join("\\n");

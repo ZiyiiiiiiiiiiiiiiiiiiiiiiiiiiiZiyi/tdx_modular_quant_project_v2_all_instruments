@@ -11,6 +11,12 @@ import math
 
 import pandas as pd
 
+from functions.decision_council.action_utility import (
+    assess_economic_order,
+    estimate_lifecycle_cost,
+    minimum_economic_order_amount,
+)
+
 
 LOT_CASH_COLUMNS = (
     "mainline_v3_one_lot_cash_required",
@@ -28,13 +34,18 @@ class PositionCapacity:
     eligible_symbol_count: int
     economic_position_cap: int
     lot_cash_position_cap: int
+    cost_feasible_position_cap: int
+    risk_feasible_position_cap: int
     effective_position_cap: int
+    sizing_reference_positions: int
     soft_target_positions: int
     spendable_cash: float
     minimum_economic_order_amount: float
     median_one_lot_amount: float
     capacity_risk_room_amount: float
+    grandfathered_excess_names: int
     reason: str
+    risk_capacity_state: str = "not_independently_estimated"
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -83,54 +94,45 @@ def resolve_position_capacity(
     current_invested = nav * min(max(float(current_exposure), 0.0), 1.0)
     risk_room = max(risk_budget - current_invested, 0.0)
     spendable = max(min(max(cash - buffer_amount, 0.0), risk_room), 0.0)
-    minimum_commission = max(
-        float(
-            profile.get(
-                "scap_candidate_minimum_commission",
-                profile.get("minimum_commission", 0.0),
-            )
-            or 0.0
-        ),
-        0.0,
+    minimum_economic_order = minimum_economic_order_amount(cost_profile=profile)
+    hard_minimum_notional_gate = bool(
+        profile.get("scap_minimum_economic_notional_hard_gate_enabled", False)
     )
-    maximum_round_trip_cost_ratio = max(
-        float(
-            profile.get(
-                "scap_max_round_trip_fixed_cost_ratio",
-                0.01,
-            )
-            or 0.01
-        ),
-        1e-6,
+    ranked_lot_cash = _ranked_lot_cash(frame, lot_cash)
+    economic_required_cash = _ranked_economic_required_cash(
+        frame=frame,
+        ranked_lot_cash=ranked_lot_cash,
+        spendable_cash=spendable,
+        cost_profile=profile,
+        search_cap=search_cap,
     )
-    slippage_rate = max(float(profile.get("slippage_rate", 0.0) or 0.0), 0.0)
-    stamp_duty_rate = max(float(profile.get("stamp_duty_rate", 0.0) or 0.0), 0.0)
-    transfer_fee_rate = max(float(profile.get("transfer_fee_rate", 0.0) or 0.0), 0.0)
-    non_commission_round_trip_rate = (
-        2.0 * slippage_rate + stamp_duty_rate + 2.0 * transfer_fee_rate
+    economic_amounts = sorted(
+        [
+        (
+            max(float(value), minimum_economic_order)
+            if hard_minimum_notional_gate
+            else float(value)
+        )
+        for value in economic_required_cash.tolist()
+        if math.isfinite(float(value)) and float(value) > 0.0
+        ]
     )
-    residual_cost_budget = maximum_round_trip_cost_ratio - non_commission_round_trip_rate
-    minimum_economic_order = (
-        2.0 * minimum_commission / residual_cost_budget
-        if minimum_commission > 0.0 and residual_cost_budget > 0.0
-        else float("inf") if minimum_commission > 0.0 else 0.0
+    raw_lot_amounts = sorted(
+        [
+        float(value) for value in ranked_lot_cash.tolist() if float(value) > 0.0
+        ]
     )
-    economic_amounts = [
-        max(float(value), minimum_economic_order)
-        for value in _ranked_lot_cash(frame, lot_cash).tolist()
-        if float(value) > 0.0
-    ]
-    cumulative = 0.0
-    new_name_cap = 0
-    for amount in economic_amounts:
-        if cumulative + amount > spendable + 1e-8:
-            continue
-        cumulative += amount
-        new_name_cap += 1
-        if len(held) + new_name_cap >= search_cap:
-            break
-    lot_cash_cap = len(held) + new_name_cap
-    economic_cap = lot_cash_cap
+    raw_new_name_cap = _cumulative_affordable_count(
+        raw_lot_amounts, spendable=spendable, maximum=max(search_cap - len(held), 0)
+    )
+    new_name_cap = _cumulative_affordable_count(
+        economic_amounts, spendable=spendable, maximum=max(search_cap - len(held), 0)
+    )
+    lot_cash_cap = len(held) + raw_new_name_cap
+    economic_cash_cap = len(held) + new_name_cap
+    cost_feasible_cap = len(held) + int(len(economic_required_cash))
+    risk_feasible_cap = economic_cash_cap
+    economic_cap = min(economic_cash_cap, cost_feasible_cap, risk_feasible_cap)
     if configured is not None and mode == "fixed":
         effective = min(configured, search_cap)
         reason = "fixed_profile_or_user_cap"
@@ -140,10 +142,23 @@ def resolve_position_capacity(
             auto_caps.append(user_hard_cap)
         effective = min(auto_caps)
         reason = (
-            "auto_cash_lot_cost_capacity"
+            "auto_cash_lot_candidate_search_capacity"
             if eligible_count
             else "auto_no_eligible_lot_cash"
         )
+    total_economic_budget = max(risk_budget - buffer_amount, 0.0)
+    if mode == "fixed" and configured is not None:
+        sizing_reference = int(configured)
+    elif math.isfinite(minimum_economic_order) and minimum_economic_order > 0.0:
+        sizing_reference = max(
+            int(math.floor(total_economic_budget / minimum_economic_order)),
+            1,
+        )
+    else:
+        sizing_reference = max(int(effective), 1)
+    sizing_reference = min(sizing_reference, search_cap)
+    if user_hard_cap is not None:
+        sizing_reference = min(sizing_reference, user_hard_cap)
     # The optimizer may select fewer names.  This field is a reporting target,
     # not a minimum-holdings constraint.
     configured_soft = _optional_nonnegative_int(profile.get("soft_target_positions"))
@@ -160,7 +175,10 @@ def resolve_position_capacity(
         eligible_symbol_count=eligible_count,
         economic_position_cap=economic_cap,
         lot_cash_position_cap=lot_cash_cap,
+        cost_feasible_position_cap=cost_feasible_cap,
+        risk_feasible_position_cap=risk_feasible_cap,
         effective_position_cap=max(int(effective), len(held), 1),
+        sizing_reference_positions=max(int(sizing_reference), 1),
         soft_target_positions=max(int(soft_target), 0),
         spendable_cash=spendable,
         minimum_economic_order_amount=minimum_economic_order,
@@ -168,8 +186,157 @@ def resolve_position_capacity(
             float(lot_cash.median()) if not lot_cash.empty else 0.0
         ),
         capacity_risk_room_amount=risk_room,
+        grandfathered_excess_names=max(len(held) - int(effective), 0),
         reason=reason,
+        risk_capacity_state="not_independently_estimated_cash_proxy_only",
     )
+
+
+@dataclass(frozen=True)
+class OptimizerSearchBudget:
+    """Computational limits; none of these fields is a financial constraint."""
+
+    prefilter_symbol_limit: int
+    exact_max_positions: int
+    beam_width: int
+    search_holding_ceiling: int
+    budget_version: str = "scap_optimizer_search_budget_v1"
+
+    def __post_init__(self) -> None:
+        if min(
+            int(self.prefilter_symbol_limit),
+            int(self.exact_max_positions),
+            int(self.beam_width),
+            int(self.search_holding_ceiling),
+        ) <= 0:
+            raise ValueError("optimizer search limits must be positive")
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def resolve_optimizer_search_budget(
+    capital_profile: dict | None,
+) -> OptimizerSearchBudget:
+    """Resolve search resources independently from trade capacity."""
+    profile = dict(capital_profile or {})
+    return OptimizerSearchBudget(
+        prefilter_symbol_limit=max(
+            int(profile.get("scap_optimizer_candidate_limit", 12)),
+            1,
+        ),
+        exact_max_positions=max(
+            int(profile.get("scap_optimizer_exact_max_positions", 5)),
+            1,
+        ),
+        beam_width=max(
+            int(profile.get("scap_optimizer_beam_width", 256)),
+            1,
+        ),
+        search_holding_ceiling=max(
+            int(profile.get("scap_search_position_cap", 32)),
+            1,
+        ),
+    )
+
+
+def _cumulative_affordable_count(amounts, *, spendable: float, maximum: int) -> int:
+    """Maximum feasible name count, independent of alpha ranking.
+
+    The caller supplies ascending unique-symbol cash tickets.  Ranking quality
+    belongs to the portfolio optimizer; using a greedy alpha order here would
+    turn a soft preference for expensive names into a false hard K ceiling.
+    """
+    if int(maximum) <= 0:
+        return 0
+    cumulative = 0.0
+    count = 0
+    for amount in amounts:
+        value = max(float(amount), 0.0)
+        if value <= 0.0 or cumulative + value > float(spendable) + 1e-8:
+            continue
+        cumulative += value
+        count += 1
+        if count >= int(maximum):
+            break
+    return count
+
+
+def _ranked_economic_required_cash(
+    *,
+    frame: pd.DataFrame,
+    ranked_lot_cash: pd.Series,
+    spendable_cash: float,
+    cost_profile: dict,
+    search_cap: int,
+) -> pd.Series:
+    """Minimum candidate-specific cash that passes full lifecycle economics.
+
+    When the calibrated return contract is not yet attached, capacity remains
+    a cash/lot ceiling.  Once it is attached, a cheap one-lot order cannot
+    inflate K unless some integer lot size has positive robust CNY value and
+    passes the same lifecycle-cost contract consumed by the optimizer.
+    """
+    if frame.empty or ranked_lot_cash.empty:
+        return pd.Series(dtype=float)
+    required = {
+        "symbol",
+        "comparable_alpha_lcb",
+    }
+    if not required.issubset(frame.columns):
+        return ranked_lot_cash.copy()
+    price_column = next(
+        (column for column in ("close_nominal", "close", "open_nominal", "open") if column in frame.columns),
+        None,
+    )
+    if price_column is None:
+        return ranked_lot_cash.copy()
+    limited = frame.loc[frame.index.intersection(ranked_lot_cash.index)].copy()
+    amounts: list[float] = []
+    seen_symbols: set[str] = set()
+    for row_index, one_lot_cash in ranked_lot_cash.items():
+        if row_index not in limited.index or len(amounts) >= int(search_cap):
+            continue
+        row = limited.loc[row_index]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        symbol = str(row.get("symbol", ""))
+        if not symbol or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        price = float(pd.to_numeric(pd.Series([row.get(price_column)]), errors="coerce").fillna(0.0).iloc[0])
+        alpha_lcb = float(pd.to_numeric(pd.Series([row.get("comparable_alpha_lcb")]), errors="coerce").fillna(0.0).iloc[0])
+        if price <= 0.0 or alpha_lcb <= 0.0:
+            continue
+        maximum_lots = min(
+            max(int(float(spendable_cash) // max(price * 100.0, 1e-12)), 0),
+            100,
+        )
+        feasible_cash = None
+        for lots in range(1, maximum_lots + 1):
+            shares = float(lots * 100)
+            lifecycle = estimate_lifecycle_cost(
+                symbol=str(symbol),
+                price=price,
+                shares=shares,
+                cost_profile=cost_profile,
+            )
+            notional = price * shares
+            gross = alpha_lcb * notional
+            robust = gross - lifecycle.total_lifecycle_cost_amount
+            assessment = assess_economic_order(
+                market_notional_amount=notional,
+                lifecycle_cost=lifecycle,
+                conservative_gross_profit_amount=gross,
+                robust_net_profit_amount=robust,
+                cost_profile=cost_profile,
+            )
+            if assessment.passed:
+                feasible_cash = notional + lifecycle.buy_cost_amount
+                break
+        if feasible_cash is not None:
+            amounts.append(float(feasible_cash))
+    return pd.Series(amounts, dtype=float)
 
 
 def scaled_position_weight_caps(
@@ -255,7 +422,11 @@ def _candidate_lot_cash(candidates: pd.DataFrame) -> pd.Series:
 
 
 def _ranked_lot_cash(candidates: pd.DataFrame, lot_cash: pd.Series) -> pd.Series:
-    """Order capacity tickets by decision evidence, never by cheapest price."""
+    """Retain deterministic evidence order before economic feasibility review.
+
+    Final hard capacity is computed from ascending feasible cash tickets; this
+    ordering is retained only so the review loop and audit remain stable.
+    """
     if lot_cash.empty:
         return lot_cash
     frame = candidates.loc[lot_cash.index].copy()

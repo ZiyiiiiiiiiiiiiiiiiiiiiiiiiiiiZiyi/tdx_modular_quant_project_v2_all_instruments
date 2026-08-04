@@ -139,6 +139,24 @@ class ActionProposal:
     execution_class: str = "alpha"
     must_execute: bool = False
     authority_snapshot_id: str = ""
+    lifecycle_cost_amount: float = 0.0
+    round_trip_cost_ratio: float = 0.0
+    lifecycle_cost_to_gross_profit_ratio: float = 0.0
+    minimum_economic_order_amount: float = 0.0
+    economic_order_pass: bool = True
+    economic_order_reason: str = "not_applicable"
+    economic_order_warnings: tuple[str, ...] = ()
+    p_win_lower: float = 0.0
+    avg_win_return: float = 0.0
+    avg_loss_return: float = 0.0
+    expected_positive_pnl_amount: float = 0.0
+    expected_loss_pnl_amount: float = 0.0
+    coverage_evidence_authorized: bool = False
+    allocation_sleeve: str = "not_applicable"
+    calibration_evidence_state: str = "unavailable"
+    calibration_effective_sample_size: float = 0.0
+    scenario_contract_id: str = ""
+    decision_return_basis: str = "legacy_unknown"
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -178,6 +196,16 @@ class ActionProposal:
             "primary_rank",
             "unit_capital_robust_return",
             "authority_penalty_amount",
+            "lifecycle_cost_amount",
+            "round_trip_cost_ratio",
+            "lifecycle_cost_to_gross_profit_ratio",
+            "minimum_economic_order_amount",
+            "p_win_lower",
+            "avg_win_return",
+            "avg_loss_return",
+            "expected_positive_pnl_amount",
+            "expected_loss_pnl_amount",
+            "calibration_effective_sample_size",
         ):
             _finite(getattr(self, name), name=name)
         if (
@@ -188,8 +216,16 @@ class ActionProposal:
             or self.buy_cash_required_amount < 0.0
             or self.sell_cash_released_amount < 0.0
             or self.authority_penalty_amount < 0.0
+            or self.lifecycle_cost_amount < 0.0
+            or self.round_trip_cost_ratio < 0.0
+            or self.lifecycle_cost_to_gross_profit_ratio < 0.0
+            or self.minimum_economic_order_amount < 0.0
+            or self.expected_positive_pnl_amount < 0.0
+            or self.expected_loss_pnl_amount < 0.0
+            or self.calibration_effective_sample_size < 0.0
         ):
             raise ValueError("cost and funding amounts must be non-negative")
+        _unit_interval(self.p_win_lower, name="p_win_lower")
         if abs(self.funding_cash_amount - self.buy_cash_required_amount) > 1e-8:
             raise ValueError("funding_cash_amount must equal buy_cash_required_amount")
         if abs(self.cash_release_amount - self.sell_cash_released_amount) > 1e-8:
@@ -315,9 +351,41 @@ class ActionPlan:
     proposal_robust_profit_amount: float = 0.0
     thesis_penalty_amount: float = 0.0
     deployment_penalty_amount: float = 0.0
+    selected_position_count: int = 0
+    coverage_evidence_name_count: int = 0
+    expected_positive_pnl_amount: float = 0.0
+    expected_loss_pnl_amount: float = 0.0
+    lifecycle_cost_amount: float = 0.0
+    profit_coverage_ratio: float = 0.0
+    profit_coverage_probability_lower: float = 0.0
+    coverage_penalty_amount: float = 0.0
+    expected_log_growth: float = 0.0
+    minimum_selected_marginal_utility_amount: float = 0.0
+    maximum_rejected_marginal_utility_amount: float = 0.0
+    coverage_state: str = "unavailable"
+    coverage_mode: str = "diagnostic_shadow"
+    hold_baseline_objective_amount: float = 0.0
+    incremental_expected_wealth_amount: float = 0.0
+    incremental_cvar_amount: float = 0.0
+    model_uncertainty_amount: float = 0.0
+    scenario_risk_penalty_amount: float = 0.0
+    scenario_evidence_state: str = "unavailable"
+    scenario_contract_id: str = ""
+    scenario_risk_measure: str = "correlated_tail_loss_proxy"
+    joint_scenario_count: int = 0
+    best_rejected_proposal_ids: tuple[str, ...] = ()
+    best_rejected_objective_amount: float = 0.0
+    best_rejected_expected_wealth_amount: float = 0.0
+    best_rejected_cvar_amount: float = 0.0
+    best_rejected_model_uncertainty_amount: float = 0.0
     risk_model_used: str = "fallback_per_name_stress_cap"
     risk_horizon_sessions: int = 1
     risk_episode_id: str = ""
+    planned_holding_count: int = 0
+    holding_floor_violation_count: int = 0
+    exposure_floor_violation: float = 0.0
+    wealth_materiality_epsilon_amount: float = 0.0
+    objective_components: Mapping[str, float] | None = None
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -346,8 +414,53 @@ class ActionPlan:
             "proposal_robust_profit_amount",
             "thesis_penalty_amount",
             "deployment_penalty_amount",
+            "expected_positive_pnl_amount",
+            "expected_loss_pnl_amount",
+            "lifecycle_cost_amount",
+            "profit_coverage_ratio",
+            "profit_coverage_probability_lower",
+            "coverage_penalty_amount",
+            "expected_log_growth",
+            "minimum_selected_marginal_utility_amount",
+            "maximum_rejected_marginal_utility_amount",
+            "hold_baseline_objective_amount",
+            "incremental_expected_wealth_amount",
+            "incremental_cvar_amount",
+            "model_uncertainty_amount",
+            "scenario_risk_penalty_amount",
+            "best_rejected_objective_amount",
+            "best_rejected_expected_wealth_amount",
+            "best_rejected_cvar_amount",
+            "best_rejected_model_uncertainty_amount",
         ):
             _finite(getattr(self, name), name=name)
+        if (
+            int(self.selected_position_count) < 0
+            or int(self.coverage_evidence_name_count) < 0
+            or int(self.planned_holding_count) < 0
+            or int(self.holding_floor_violation_count) < 0
+        ):
+            raise ValueError("position and coverage counts must be non-negative")
+        _unit_interval(
+            self.exposure_floor_violation,
+            name="exposure_floor_violation",
+        )
+        if self.wealth_materiality_epsilon_amount < 0.0:
+            raise ValueError("wealth materiality epsilon must be non-negative")
+        if int(self.joint_scenario_count) < 0:
+            raise ValueError("joint_scenario_count must be non-negative")
+        _unit_interval(
+            self.profit_coverage_probability_lower,
+            name="profit_coverage_probability_lower",
+        )
+        if (
+            self.incremental_cvar_amount < 0.0
+            or self.model_uncertainty_amount < 0.0
+            or self.scenario_risk_penalty_amount < 0.0
+            or self.best_rejected_cvar_amount < 0.0
+            or self.best_rejected_model_uncertainty_amount < 0.0
+        ):
+            raise ValueError("incremental risk amounts must be non-negative")
         if int(self.risk_horizon_sessions) <= 0:
             raise ValueError("risk_horizon_sessions must be positive")
 

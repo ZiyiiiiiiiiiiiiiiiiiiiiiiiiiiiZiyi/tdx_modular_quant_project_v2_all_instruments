@@ -5,10 +5,18 @@ import hashlib
 import json
 from pathlib import Path
 
-from config import COMMISSION_RATE, SLIPPAGE_RATE, STAMP_DUTY_RATE, TRANSFER_FEE_RATE
+import pandas as pd
+
+from config import (
+    COMMISSION_RATE,
+    GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS,
+    SLIPPAGE_RATE,
+    STAMP_DUTY_RATE,
+    TRANSFER_FEE_RATE,
+)
 
 
-RUNTIME_IDENTITY_SCHEMA_VERSION = "governance_runtime_identity_v2"
+RUNTIME_IDENTITY_SCHEMA_VERSION = "governance_runtime_identity_v4"
 CONTROL_SCHEMA_VERSION = "scap_control_schema_v1"
 REASON_SCHEMA_VERSION = "scap_reason_schema_v1"
 SCORING_SCHEMA_VERSION = "mainline_v3_scoring_schema_v1"
@@ -63,6 +71,60 @@ def build_runtime_identity(
         "universe_name": str(getattr(runner, "_universe_name", "") or ""),
         "universe_mode": str(getattr(runner, "_universe_mode", "") or ""),
         "alpha_bundle": str(getattr(runner, "_alpha_bundle", "") or ""),
+        # Benchmark construction changes excess return, alpha/beta and every
+        # benchmark-relative diagnostic even when the portfolio path is
+        # unchanged, so it is part of the immutable experiment identity.
+        "performance_benchmark_top_n": int(
+            getattr(runner, "performance_benchmark_top_n", 0) or 0
+        ),
+        "performance_benchmark_rebalance": str(
+            getattr(runner, "performance_benchmark_rebalance", "") or ""
+        ),
+        "size_factor_pit_proxy_contract": "last_observed_cap_div_nominal_close_repriced_v1",
+        "size_factor_pit_proxy_max_sessions": int(
+            GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS
+        ),
+        "portfolio_normal_rebalance_frequency": str(
+            getattr(runner, "portfolio_normal_rebalance_frequency", "") or ""
+        ),
+        "portfolio_normal_rebalance_anchor": str(
+            profile.get("portfolio_normal_rebalance_anchor", "") or ""
+        ),
+        "portfolio_calendar_start": (
+            pd.Timestamp(runner._portfolio_calendar_dates.min()).date().isoformat()
+            if len(getattr(runner, "_portfolio_calendar_dates", ()))
+            else ""
+        ),
+        "portfolio_calendar_end": (
+            pd.Timestamp(runner._portfolio_calendar_dates.max()).date().isoformat()
+            if len(getattr(runner, "_portfolio_calendar_dates", ()))
+            else ""
+        ),
+        "monthly_plan_execution_window_sessions": int(
+            profile.get("scap_monthly_plan_execution_window_sessions", 0) or 0
+        ),
+        "max_daily_new_names": int(
+            profile.get("scap_max_daily_new_names", 0) or 0
+        ),
+        "max_daily_new_exposure_ratio": float(
+            profile.get("scap_max_daily_new_exposure_ratio", 0.0) or 0.0
+        ),
+        "market_regime_diagnostics_enabled": bool(
+            getattr(runner, "market_regime_policy", None) is not None
+        ),
+        "market_regime_es_authorized": bool(
+            getattr(runner, "enable_market_regime_policy", False)
+            and getattr(runner, "market_regime_policy", None) is not None
+            and str(profile.get("scap_market_regime_control_mode", "")).strip().lower()
+            == "bounded_continuous_es_only"
+        ),
+        "invalid_regime_es_multiplier": float(
+            profile.get("scap_invalid_regime_es_multiplier", 1.0) or 1.0
+        ),
+        "safety_benchmark_symbol": str(
+            getattr(getattr(getattr(runner, "engine", None), "safety_agent", None), "proxy_symbol", "")
+            or ""
+        ),
         **factor_summary,
         "pit_runtime_state": str(getattr(runner, "pit_runtime_state", "")),
         "pit_level2_runtime_state": str(getattr(runner, "pit_level2_runtime_state", "")),
