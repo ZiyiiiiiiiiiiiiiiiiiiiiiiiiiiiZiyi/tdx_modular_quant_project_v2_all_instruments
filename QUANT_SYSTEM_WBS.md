@@ -2344,4 +2344,4 @@
 - 提交前验证：纳入的70个Python文件`py_compile`通过，排除正式Markdown后的源代码范围`git diff --check`通过；Markdown全量检查仅报告用于强制换行的行尾双空格和3个额外EOF空行，保留正式审计文本而未做无语义格式改写。
 - 专项回归：35个纳入的`verify_*.py`最终全部通过。30项无参首轮直接通过；4项保存后验收按最终同一运行身份`run20260804_202308`传入`run_dir`后通过，禁止把旧run缺少新字段误报为当前代码失败。`verify_scap_economic_order_contract.py`首次暴露测试夹具仍缺唯一权威候选字段，生产链正确fail closed；仅给夹具补充`scap_action_candidate=True`，经济订单、候选池与Lean链回归随后全部通过，未放宽生产约束。
 - 暂存审计：共91个文件且意外路径数为0；未暂存的运行产物、stdout/stderr、生成目录和旧报告均保留原位，未删除任何文件或目录。
-- 发布证据：待提交、推送、PR合并及远端主干核对完成后补录。
+- 发布证据：代码快照提交为`c93a3c304a991cbedd83b3a908cb4b3cf8f6523f`，已推送远端分支`codex/current-code-snapshot-20260805`。GitHub连接器创建PR因integration权限返回403，按发布流程回退到已认证`gh`并成功创建ready PR `#10`：`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/10`；PR目标为`main`，生成产物仍不在diff中。合并及远端主干最终哈希在完成后核对。
