@@ -80,7 +80,39 @@ evidence_ranked = resolve_position_capacity(
         }
     ),
 )
-assert evidence_ranked.effective_position_cap == 4
+assert evidence_ranked.effective_position_cap == 5
+
+expensive_ranked_first = resolve_position_capacity(
+    capital_profile=auto,
+    nav_amount=20_000.0,
+    cash_amount=20_000.0,
+    risk_exposure_ceiling=0.85,
+    candidates=pd.DataFrame(
+        {
+            "symbol": [f"S{i}" for i in range(10)],
+            "mainline_v3_one_lot_cash_required": [4_000.0] * 4 + [2_000.0] * 6,
+            "primary_score": [1.0 - i * 0.01 for i in range(10)],
+        }
+    ),
+)
+assert expensive_ranked_first.effective_position_cap == 7
+
+legacy_hard_notional = resolve_position_capacity(
+    capital_profile={
+        **auto,
+        "scap_minimum_economic_notional_hard_gate_enabled": True,
+    },
+    nav_amount=20_000.0,
+    cash_amount=20_000.0,
+    risk_exposure_ceiling=0.85,
+    candidates=pd.DataFrame(
+        {
+            "mainline_v3_one_lot_cash_required": [8_000.0, 1_000.0, 1_000.0, 1_000.0, 1_000.0],
+            "primary_score": [1.0, 0.9, 0.8, 0.7, 0.6],
+        }
+    ),
+)
+assert legacy_hard_notional.effective_position_cap == 4
 
 risk_room_limited = resolve_position_capacity(
     capital_profile=auto,
@@ -91,7 +123,7 @@ risk_room_limited = resolve_position_capacity(
     candidates=candidates,
 )
 assert risk_room_limited.capacity_risk_room_amount == 3_000.0
-assert risk_room_limited.effective_position_cap == 1
+assert risk_room_limited.effective_position_cap == 3
 
 held_without_cash = resolve_position_capacity(
     capital_profile=auto,
@@ -149,6 +181,19 @@ auto_authority = attach_scap_v31_authority(
 )
 assert int(fixed_authority.iloc[0]["scap_v31_max_lots"]) == 2
 assert int(auto_authority.iloc[0]["scap_v31_max_lots"]) == 20
+
+grandfathered = resolve_position_capacity(
+    capital_profile=auto,
+    nav_amount=20_000.0,
+    cash_amount=500.0,
+    risk_exposure_ceiling=0.90,
+    candidates=candidates,
+    current_symbols={f"held_{index}" for index in range(13)},
+    current_exposure=0.85,
+)
+assert grandfathered.effective_position_cap >= 13
+assert grandfathered.sizing_reference_positions == 5
+assert grandfathered.sizing_reference_positions < grandfathered.effective_position_cap
 
 launcher = (root / "main_launcher_web.py").read_text(encoding="utf-8")
 assert 'id="initial_cash" min="1" step="1000" value=""' in launcher

@@ -323,6 +323,7 @@ class RollingEntryCalibrator:
             "p_win_lower",
             "avg_win",
             "avg_loss",
+            "loss_cvar95",
         )
         exact_effective = pd.to_numeric(
             exact["effective_sample_size"], errors="coerce"
@@ -369,6 +370,9 @@ class RollingEntryCalibrator:
         scored[f"p_win_{horizon_days}d_wilson_lower"] = scored["p_win_lower"].astype(float)
         scored[f"avg_win_{horizon_days}d_by_bucket"] = scored["avg_win"].astype(float)
         scored[f"avg_loss_{horizon_days}d_by_bucket"] = scored["avg_loss"].astype(float)
+        scored[f"downside_cvar_{horizon_days}d_by_bucket"] = scored[
+            "loss_cvar95"
+        ].astype(float)
         scored[f"expected_edge_{horizon_days}d"] = edge.astype(float)
         scored[f"conservative_expected_edge_{horizon_days}d"] = conservative_edge.astype(float)
         scored[f"edge_to_risk_{horizon_days}d"] = (edge / volatility).astype(float)
@@ -560,6 +564,7 @@ def _empirical_stats(frame: pd.DataFrame, *, min_samples: int) -> dict | None:
         "p_win_lower": _wilson_lower(int((returns > 0.0).sum()), int(len(returns))),
         "avg_win": max(avg_win, 0.002),
         "avg_loss": max(avg_loss, 0.002),
+        "loss_cvar95": _loss_cvar95(returns),
     }
 
 
@@ -571,6 +576,7 @@ def _group_stats(frame: pd.DataFrame, key_columns: list[str]) -> pd.DataFrame:
         "p_win_lower",
         "avg_win",
         "avg_loss",
+        "loss_cvar95",
     ]
     if frame is None or frame.empty or "forward_return" not in frame.columns:
         return pd.DataFrame(columns=output_columns)
@@ -587,6 +593,7 @@ def _group_stats(frame: pd.DataFrame, key_columns: list[str]) -> pd.DataFrame:
         p_win_lower=lambda values: _wilson_lower(int((values > 0.0).sum()), int(len(values))),
         avg_win=lambda values: max(float(values[values > 0.0].mean()) if (values > 0.0).any() else 0.0, 0.002),
         avg_loss=lambda values: max(abs(float(values[values <= 0.0].mean())) if (values <= 0.0).any() else 0.0, 0.002),
+        loss_cvar95=lambda values: _loss_cvar95(values),
     ).reset_index()
     if "entry_day_index" in data.columns:
         effective = (
@@ -613,6 +620,7 @@ def _lookup_stats(scored: pd.DataFrame, table: pd.DataFrame, *, key_columns: lis
         "p_win_lower",
         "avg_win",
         "avg_loss",
+        "loss_cvar95",
     ]
     empty = pd.DataFrame({column: pd.NA for column in stat_columns}, index=scored.index)
     if table is None or table.empty:
@@ -668,6 +676,7 @@ def _fallback_frame(scored: pd.DataFrame, *, horizon_days: int, cost_buffer: flo
             "p_win_lower": p_win_lower.astype(float),
             "avg_win": avg_win.astype(float),
             "avg_loss": avg_loss.astype(float),
+            "loss_cvar95": 0.15,
         },
         index=index,
     )
@@ -693,7 +702,20 @@ def _fallback_stats(row, *, horizon_days: int, cost_buffer: float) -> dict:
         "p_win_lower": float(min(max(p_win - 0.08, 0.30), 0.58)),
         "avg_win": float(0.018 * scale + max(expected, 0.0) * 0.50),
         "avg_loss": float(0.016 * scale + abs(min(expected, 0.0)) * 0.50),
+        "loss_cvar95": 0.15,
     }
+
+
+def _loss_cvar95(values) -> float:
+    """Positive loss magnitude in the empirical worst five-percent tail."""
+    returns = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if returns.empty:
+        return 0.15
+    cutoff = float(returns.quantile(0.05))
+    tail = returns[returns <= cutoff]
+    if tail.empty:
+        tail = returns.nsmallest(1)
+    return max(abs(float(tail.mean())), 0.002)
 
 
 def _wilson_lower(wins: int, n: int, z: float = 1.96) -> float:

@@ -273,6 +273,10 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_profit_factor_admission": 1.15,
         "scap_loser_averaging_enabled": True,
         "scap_winner_pyramiding_enabled": True,
+        # Proposal generation remains reachable for research, but the latest
+        # six-add sample has negative forward value; trading authority stays
+        # closed until a rolling OOS counterfactual grants it.
+        "scap_winner_pyramiding_trading_authorized": False,
         "scap_active_replacement_max_pairs_per_day": 1,
         "scap_winner_pyramiding_trigger_returns": (0.05, 0.10),
         "scap_signal_failure_confirmation_days": 3,
@@ -296,12 +300,22 @@ BACKTEST_CAPITAL_PROFILES = {
         "position_cap_mode": "auto",
         "scap_search_position_cap": 32,
         "soft_target_positions": 4,
+        # Portfolio trading cadence is independent from the performance
+        # benchmark cadence.  Normal entries/replacements are decided monthly;
+        # risk and lifecycle exits remain daily.
+        "portfolio_normal_rebalance_frequency": "monthly",
+        "portfolio_normal_rebalance_anchor": "last_trading_session_of_month",
+        "scap_monthly_plan_execution_window_sessions": 5,
+        "scap_max_daily_new_names": 2,
+        "scap_max_daily_new_exposure_ratio": 0.35,
+        "scap_invalid_regime_es_multiplier": 1.0,
         "affordability_first": True,
         "skip_unaffordable_symbols": True,
         "retail_lot_adapter": True,
         "retail_single_position_cap": 0.40,
         "retail_one_lot_position_cap": 0.40,
-        "scap_single_position_soft_cap": 0.25,
+        "scap_single_position_soft_cap": 0.15,
+        "scap_diversified_single_position_hard_cap": 0.20,
         "capital_usage_mode": "allow_cash",
         "min_holdings": 0,
         "force_deploy_target_exposure_normal": 0.90,
@@ -311,9 +325,9 @@ BACKTEST_CAPITAL_PROFILES = {
         "objective_metric": "terminal_net_profit_after_all_costs",
         "trade_quality_gate": "terminal_net_profit_primary_profit_factor_health",
         "risk_tolerance": "aggressive_drawdown_tolerant_no_leverage",
-        "special_strategy_version": "small_capital_aggressive_profit_v3_2",
+        "special_strategy_version": "small_capital_aggressive_profit_v3_3",
         "scap_contract_version": "scap_v3_2_contracts_v1",
-        "scap_optimizer_objective_version": "scap_v32_robust_wealth_deployment_breadth_v1",
+        "scap_optimizer_objective_version": "scap_v34_incremental_scenario_cvar_v1",
         "scap_candidate_pool_contract": "scap_v32_thesis_pool_preserving_v1",
         "scap_authority_contract": "scap_v32_abcd_sizing_only_v1",
         "scap_risk_episode_contract": "scap_v32_hysteresis_reentry_v1",
@@ -325,6 +339,8 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_loss_stop_confirmation_days": 2,
         "scap_loss_soft_base": -0.16,
         "scap_loss_tail_tightening": 0.04,
+        "scap_loss_soft_tightest": -0.12,
+        "scap_loss_disaster_stop": -0.18,
         "scap_profit_protection_arm": 0.12,
         "scap_profit_protection_min_net_profit": 0.03,
         "scap_profit_protection_giveback": 0.55,
@@ -332,6 +348,7 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_new_entry_freeze_drawdown": 0.40,
         "scap_loser_averaging_enabled": False,
         "scap_winner_pyramiding_enabled": True,
+        "scap_winner_pyramiding_trading_authorized": False,
         "scap_active_replacement_max_pairs_per_day": 0,
         "scap_winner_pyramiding_trigger_returns": (0.04, 0.08),
         "scap_max_winner_add_layers": 2,
@@ -340,6 +357,43 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_warmup_sessions": 252,
         "scap_candidate_minimum_commission": 5.0,
         "scap_max_round_trip_fixed_cost_ratio": 0.005,
+        # Diagnostic alerts. Final-size lifecycle-cost coverage and robust CNY
+        # expectancy own trading authority, so these are not duplicate vetoes.
+        "scap_round_trip_cost_ratio_hard_gate_enabled": False,
+        "scap_minimum_economic_notional_hard_gate_enabled": False,
+        "scap_economic_order_contract_enabled": True,
+        "scap_max_lifecycle_cost_to_gross_profit_ratio": 0.30,
+        "scap_hard_max_lifecycle_cost_to_gross_profit_ratio": 0.60,
+        "scap_minimum_robust_profit_hurdle_amount": 15.0,
+        "scap_expected_add_probability": 0.0,
+        "scap_expected_replacement_probability": 0.0,
+        "scap_high_confidence_small_order_exception_enabled": False,
+        "scap_economic_order_contract_version": "scap_economic_order_v2_positive_net_soft_quality_bands",
+        "scap_minimum_profit_coverage_ratio": 1.25,
+        "scap_minimum_profit_coverage_probability": 0.55,
+        # PCR/PCP cannot force ordinary entries.  They receive narrow trading
+        # authority only for expanding beyond the policy target to K_max;
+        # without sufficient PIT evidence the portfolio remains capped at the
+        # target count.  Never turn a ratio shortfall into a NAV-sized penalty.
+        "scap_profit_coverage_mode": "authorized_ceiling_only",
+        "scap_coverage_correlation_floor": 0.35,
+        "scap_minimum_coverage_evidence_names": 1,
+        "scap_profit_coverage_contract_version": "scap_pit_coverage_diagnostic_v2",
+        "scap_incremental_scenario_contract_version": "scap_incremental_scenario_cvar_v2_single_risk_charge",
+        "scap_incremental_cvar_confidence": 0.95,
+        "scap_incremental_cvar_risk_aversion": 0.01,
+        "scap_model_uncertainty_risk_aversion": 0.10,
+        "scap_per_name_stress_budget_ratio": 0.03,
+        "scap_portfolio_es_budget_ratio": 0.08,
+        "scap_market_regime_control_mode": "bounded_continuous_es_only",
+        "scap_regime_es_multiplier_min": 0.70,
+        "scap_regime_es_multiplier_max": 1.10,
+        "scap_calibration_warming_effective_samples": 30,
+        "scap_calibration_mature_effective_samples": 100,
+        "scap_exploration_sleeve_target": 0.35,
+        "scap_core_winner_sleeve_target": 0.50,
+        "scap_cash_reserve_sleeve_target": 0.15,
+        "scap_sleeve_targets_are_hard_caps": False,
         "execution_cost_profile_id": "cn_a_share_retail_min5_v1",
         "commission_rate": COMMISSION_RATE,
         "minimum_commission": 5.0,
@@ -354,7 +408,6 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_tier_a_uncertainty_rate": 0.0000,
         "scap_tier_b_uncertainty_rate": 0.0005,
         "scap_tier_c_uncertainty_rate": 0.0010,
-        "scap_cash_gap_penalty_rate": 0.0020,
         "scap_breadth_near_optimal_tolerance_rate": 0.0015,
         "scap_name_concentration_penalty_rate": 0.25,
         "scap_safety_no_trade_band": 0.015,
@@ -362,7 +415,73 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_risk_reentry_cooldown_days": 3,
         "scap_block_new_entry_during_high_risk": True,
         "scap_candidate_pool_top_m": 8,
-        "scap_optimizer_candidate_limit": 24,
+        "scap_candidate_pool_limit": 32,
+        "scap_candidate_pool_per_thesis": 2,
+        "scap_optimizer_candidate_limit": 32,
+        # Computational limits are not financial position constraints.
+        "scap_optimizer_exact_max_positions": 5,
+        "scap_optimizer_beam_width": 256,
+        "scap_wealth_materiality_epsilon_amount": 1.00,
+        "scap_recovery_daily_exposure_cap": 0.15,
+        "scap_recovery_max_new_names_per_day": 1,
+        "scap_recovery_window_sessions": 5,
+        "scap_policy_band_version": "scap_policy_band_v1",
+        "scap_policy_bands": {
+            "normal_neutral": {
+                "holding_floor": 5,
+                "holding_target": 6,
+                "holding_ceiling": 7,
+                "minimum_active_pool_size": 5,
+                "minimum_effective_n_ratio": 0.75,
+                "minimum_pool_count": 3,
+                "maximum_names_per_pool": 4,
+                "exposure_lower": 0.60,
+                "exposure_target": 0.75,
+                "exposure_upper": 0.85,
+                "disaster_ceiling": 0.90,
+            },
+            "weak": {
+                "holding_floor": 3,
+                "holding_target": 4,
+                "holding_ceiling": 5,
+                "minimum_active_pool_size": 3,
+                "minimum_effective_n_ratio": 0.75,
+                "minimum_pool_count": 2,
+                "maximum_names_per_pool": 3,
+                "exposure_lower": 0.40,
+                "exposure_target": 0.55,
+                "exposure_upper": 0.65,
+                "disaster_ceiling": 0.70,
+            },
+            "high_risk": {
+                "holding_floor": 0,
+                "holding_target": 0,
+                "holding_ceiling": 4,
+                "minimum_active_pool_size": 3,
+                "minimum_effective_n_ratio": 0.75,
+                "minimum_pool_count": 2,
+                "maximum_names_per_pool": 2,
+                "exposure_lower": 0.00,
+                "exposure_target": 0.25,
+                "exposure_upper": 0.35,
+                "disaster_ceiling": 0.35,
+            },
+            "crisis": {
+                "holding_floor": 0,
+                "holding_target": 0,
+                "holding_ceiling": 0,
+                "minimum_active_pool_size": 0,
+                "minimum_effective_n_ratio": 0.0,
+                "minimum_pool_count": 0,
+                "maximum_names_per_pool": 1,
+                "exposure_lower": 0.00,
+                "exposure_target": 0.00,
+                "exposure_upper": 0.00,
+                "disaster_ceiling": 0.00,
+            },
+        },
+        # Deprecated compatibility aliases.  Lean policy resolution consumes
+        # scap_policy_bands; these values remain readable by older identities.
         "strategic_exposure_normal": 0.90,
         "strategic_exposure_weak": 0.65,
         "strategic_exposure_high": 0.35,
@@ -945,6 +1064,12 @@ GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_DIR = PROCESSED_DIR / "candidate_factor_cache
 GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_BUNDLE = "pre_screen_promote_bundle"
 GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_VERSION = "pre_screen_promote_v1_20260702"
 GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS = 260
+# A market-cap vendor tail can arrive later than daily prices.  Size factors may
+# bridge only a short, explicitly audited PIT gap by carrying the last observed
+# share-count proxy (market cap / same-day nominal close) forward and repricing
+# it with the current nominal close.  Longer gaps remain missing and block the
+# factor daily-coverage contract.
+GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS = 20
 GOVERNANCE_PRE_SCREEN_FACTOR_ROLE_WEIGHTS = {
     "liquidity_reversal_entry": {
         "state_machine_target": "entry_alpha_and_timing",
@@ -1326,7 +1451,7 @@ GOVERNANCE_PROTECTING_PROFIT_MIN_HOLD_DAYS = 3
 GOVERNANCE_BUY_SELL_CONFLICT_COOLDOWN_DAYS = 20
 # Hard-stop is a profit-protection stop, not an entry-failure stop. It only arms
 # after the position's net MFE clears the configured profit threshold.
-GOVERNANCE_HARD_STOP_LOSS = -0.10  # legacy diagnostic only; not used as the live hard-stop trigger.
+GOVERNANCE_HARD_STOP_LOSS = -0.10  # non-SCAP fallback; SCAP uses explicit disaster/soft limits.
 GOVERNANCE_PROFIT_HARD_STOP_ARM_TRIGGER = 0.30
 GOVERNANCE_PROFIT_HARD_STOP_TRAIL_GIVEBACK = 0.35
 GOVERNANCE_PROFIT_HARD_STOP_MIN_NET_PROFIT = 0.0
@@ -1581,8 +1706,127 @@ def validate_configuration() -> list[str]:
         errors.append("MULTI_WINDOW_DEFAULT_STEP_MONTHS must be positive")
     if int(GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N) <= 0:
         errors.append("GOVERNANCE_PERFORMANCE_BENCHMARK_TOP_N must be positive")
+    if not 1 <= int(GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS) <= 20:
+        errors.append(
+            "GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS must be between 1 and 20"
+        )
     if str(GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE).lower() not in {"daily", "weekly", "monthly"}:
         errors.append("GOVERNANCE_PERFORMANCE_BENCHMARK_REBALANCE must be daily, weekly, or monthly")
+    lean = BACKTEST_CAPITAL_PROFILES.get("small_capital_lean", {})
+    if str(lean.get("portfolio_normal_rebalance_frequency", "monthly")).lower() not in {
+        "daily", "weekly", "monthly"
+    }:
+        errors.append("small_capital_lean portfolio_normal_rebalance_frequency must be daily, weekly, or monthly")
+    if int(lean.get("scap_monthly_plan_execution_window_sessions", 0) or 0) <= 0:
+        errors.append("small_capital_lean monthly plan execution window must be positive")
+    if int(lean.get("scap_max_daily_new_names", 0) or 0) <= 0:
+        errors.append("small_capital_lean max daily new names must be positive")
+    daily_new_exposure = float(lean.get("scap_max_daily_new_exposure_ratio", 0.0) or 0.0)
+    if not 0.0 < daily_new_exposure <= 1.0:
+        errors.append("small_capital_lean max daily new exposure ratio must be in (0, 1]")
+    if float(lean.get("scap_invalid_regime_es_multiplier", 1.0) or 1.0) != 1.0:
+        errors.append("small_capital_lean invalid regime ES multiplier must fail neutral at 1.0")
+    if lean:
+        policy_bands = lean.get("scap_policy_bands")
+        required_states = {"normal_neutral", "weak", "high_risk", "crisis"}
+        if not isinstance(policy_bands, dict) or not required_states.issubset(
+            policy_bands
+        ):
+            errors.append(
+                "small_capital_lean scap_policy_bands must define normal_neutral, weak, high_risk and crisis"
+            )
+        else:
+            for state in sorted(required_states):
+                band = dict(policy_bands[state] or {})
+                try:
+                    floor = int(band["holding_floor"])
+                    target_count = int(band["holding_target"])
+                    ceiling_count = int(band["holding_ceiling"])
+                    active_pool_minimum = int(band["minimum_active_pool_size"])
+                    effective_n_ratio = float(band["minimum_effective_n_ratio"])
+                    minimum_pool_count = int(band["minimum_pool_count"])
+                    maximum_names_per_pool = int(band["maximum_names_per_pool"])
+                    lower = float(band["exposure_lower"])
+                    target_exposure = float(band["exposure_target"])
+                    upper = float(band["exposure_upper"])
+                    disaster_ceiling = float(band["disaster_ceiling"])
+                except (KeyError, TypeError, ValueError):
+                    errors.append(f"small_capital_lean invalid policy band: {state}")
+                    continue
+                if not 0 <= floor <= target_count <= ceiling_count:
+                    errors.append(
+                        f"small_capital_lean {state} holding policy requires 0 <= floor <= target <= ceiling"
+                    )
+                if not 0 <= active_pool_minimum <= ceiling_count:
+                    errors.append(
+                        f"small_capital_lean {state} active pool minimum exceeds ceiling"
+                    )
+                if not 0.0 <= effective_n_ratio <= 1.0:
+                    errors.append(
+                        f"small_capital_lean {state} effective-N ratio must be in [0,1]"
+                    )
+                if minimum_pool_count < 0 or maximum_names_per_pool <= 0:
+                    errors.append(
+                        f"small_capital_lean {state} pool constraints are invalid"
+                    )
+                if not (
+                    0.0
+                    <= lower
+                    <= target_exposure
+                    <= upper
+                    <= disaster_ceiling
+                    <= 1.0
+                ):
+                    errors.append(
+                        f"small_capital_lean {state} exposure policy is not monotone"
+                    )
+        for resource_name in (
+            "scap_optimizer_candidate_limit",
+            "scap_candidate_pool_limit",
+            "scap_candidate_pool_per_thesis",
+            "scap_optimizer_exact_max_positions",
+            "scap_optimizer_beam_width",
+            "scap_search_position_cap",
+        ):
+            if int(lean.get(resource_name, 0)) <= 0:
+                errors.append(
+                    f"small_capital_lean {resource_name} must be positive"
+                )
+        if float(lean.get("scap_wealth_materiality_epsilon_amount", -1.0)) < 0.0:
+            errors.append(
+                "small_capital_lean wealth materiality epsilon must be non-negative"
+            )
+        disaster = float(lean.get("scap_loss_disaster_stop", -0.18))
+        soft_base = float(lean.get("scap_loss_soft_base", -0.16))
+        soft_tightest = float(lean.get("scap_loss_soft_tightest", -0.12))
+        if not disaster < soft_base <= soft_tightest < 0.0:
+            errors.append(
+                "small_capital_lean requires disaster < soft_base <= soft_tightest < 0"
+            )
+        coverage_mode = str(lean.get("scap_profit_coverage_mode", "")).strip().lower()
+        if coverage_mode not in {
+            "diagnostic_shadow",
+            "diagnostic_only",
+            "authorized_ceiling_only",
+        }:
+            errors.append(
+                "small_capital_lean profit coverage mode is unsupported"
+            )
+        confidence = float(lean.get("scap_incremental_cvar_confidence", 0.95))
+        if not 0.50 <= confidence < 1.0:
+            errors.append("small_capital_lean incremental CVaR confidence must be in [0.50, 1)")
+        for name in (
+            "scap_incremental_cvar_risk_aversion",
+            "scap_model_uncertainty_risk_aversion",
+        ):
+            if float(lean.get(name, 0.0)) < 0.0:
+                errors.append(f"small_capital_lean {name} must not be negative")
+        warming = int(lean.get("scap_calibration_warming_effective_samples", 30))
+        mature = int(lean.get("scap_calibration_mature_effective_samples", 100))
+        if warming <= 0 or mature < warming:
+            errors.append(
+                "small_capital_lean calibration samples require 0 < warming <= mature"
+            )
     if errors:
         return errors
     return []

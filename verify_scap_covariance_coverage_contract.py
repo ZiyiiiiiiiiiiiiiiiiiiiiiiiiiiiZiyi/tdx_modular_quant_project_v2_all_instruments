@@ -1,4 +1,4 @@
-"""Verify cold-start and incomplete covariance never masquerade as active risk."""
+"""Verify covariance labels and conservative scenario fallback stay truthful."""
 import pandas as pd
 
 from functions.decision_council.integer_action_optimizer import (
@@ -55,7 +55,8 @@ fallback_plan = optimize_action_proposals(
     covariance_matrix=incomplete,
 )
 assert fallback_plan.risk_model_used == "thesis_and_per_name_stress_caps"
-assert fallback_plan.marginal_risk_penalty_amount == 0.0
+assert fallback_plan.scenario_risk_penalty_amount > 0.0
+assert fallback_plan.scenario_evidence_state == "conservative_prior_incremental_scenario"
 
 complete = pd.DataFrame([[0.01]], index=["B"], columns=["B"])
 complete.attrs["pair_coverage_ratio"] = 1.0
@@ -65,7 +66,9 @@ covariance_plan = optimize_action_proposals(
     max_positions=7,
     covariance_matrix=complete,
 )
-assert covariance_plan.risk_model_used == "covariance"
+assert covariance_plan.risk_model_used == "covariance_with_correlated_tail_loss_proxy"
+assert covariance_plan.scenario_risk_measure == "correlated_tail_loss_proxy"
+assert covariance_plan.scenario_risk_penalty_amount > 0.0
 assert covariance_runtime_state(day_index=19, covariance_matrix=complete) == "cold_start"
 three_names = pd.DataFrame(
     [[0.01, 0.0, 0.0], [0.0, 0.02, 0.0], [0.0, 0.0, 0.03]],

@@ -14,7 +14,38 @@ import pandas as pd
 from functions.execution.cost_model import cost_kwargs_from_profile, estimate_trade_costs
 
 
-ACTION_UTILITY_CONTRACT_VERSION = "unified_action_utility_v3"
+ACTION_UTILITY_CONTRACT_VERSION = "unified_action_utility_v4_single_net_value"
+
+
+@dataclass(frozen=True)
+class LifecycleCostEstimate:
+    buy_cost_amount: float
+    sell_cost_amount: float
+    expected_add_cost_amount: float
+    expected_replacement_cost_amount: float
+    total_lifecycle_cost_amount: float
+    round_trip_cost_ratio: float
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class EconomicOrderAssessment:
+    passed: bool
+    reason: str
+    market_notional_amount: float
+    minimum_economic_order_amount: float
+    lifecycle_cost_amount: float
+    round_trip_cost_ratio: float
+    lifecycle_cost_to_gross_profit_ratio: float
+    robust_net_profit_amount: float
+    robust_profit_hurdle_amount: float
+    exception_used: bool = False
+    warnings: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -68,6 +99,194 @@ def round_trip_cost_amount(
         **cost_kwargs_from_profile(cost_profile),
     )
     return float(pd.to_numeric(costs["total_cost"], errors="coerce").fillna(0.0).sum())
+
+
+def minimum_economic_order_amount(*, cost_profile=None) -> float:
+    """Return the notional where the configured round trip meets its cost cap.
+
+    This closed form is a capacity hint.  Real orders must still pass
+    :func:`assess_economic_order`, which uses exact side-specific costs.
+    """
+    profile = dict(cost_profile or {})
+    minimum_commission = max(
+        float(
+            profile.get(
+                "scap_candidate_minimum_commission",
+                profile.get("minimum_commission", 0.0),
+            )
+            or 0.0
+        ),
+        0.0,
+    )
+    maximum_ratio = max(
+        float(profile.get("scap_max_round_trip_fixed_cost_ratio", 0.01) or 0.01),
+        1e-12,
+    )
+    variable_rate = (
+        2.0 * max(float(profile.get("slippage_rate", 0.0) or 0.0), 0.0)
+        + max(float(profile.get("stamp_duty_rate", 0.0) or 0.0), 0.0)
+        + 2.0 * max(float(profile.get("transfer_fee_rate", 0.0) or 0.0), 0.0)
+    )
+    residual = maximum_ratio - variable_rate
+    if minimum_commission <= 0.0:
+        return 0.0
+    if residual <= 0.0:
+        return float("inf")
+    return float(2.0 * minimum_commission / residual)
+
+
+def estimate_lifecycle_cost(
+    *,
+    symbol: str,
+    price: float,
+    shares: float,
+    trade_date=None,
+    cost_profile=None,
+    expected_add_probability: float | None = None,
+    expected_replacement_probability: float | None = None,
+) -> LifecycleCostEstimate:
+    """Estimate all expected cost legs known at the entry decision.
+
+    The factual entry/exit round trip is always included. Optional future add
+    and replacement legs are probability weighted and separately disclosed;
+    defaults are explicit profile parameters rather than hidden constants.
+    """
+    profile = dict(cost_profile or {})
+    notional = max(float(price), 0.0) * max(float(shares), 0.0)
+    buy_cost = single_side_cost_amount(
+        symbol=symbol,
+        side="buy",
+        price=price,
+        shares=shares,
+        trade_date=trade_date,
+        cost_profile=profile,
+    )
+    sell_cost = single_side_cost_amount(
+        symbol=symbol,
+        side="sell",
+        price=price,
+        shares=shares,
+        trade_date=trade_date,
+        cost_profile=profile,
+    )
+    add_probability = min(
+        max(
+            float(
+                profile.get("scap_expected_add_probability", 0.0)
+                if expected_add_probability is None
+                else expected_add_probability
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    replacement_probability = min(
+        max(
+            float(
+                profile.get("scap_expected_replacement_probability", 0.0)
+                if expected_replacement_probability is None
+                else expected_replacement_probability
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    round_trip = buy_cost + sell_cost
+    expected_add = add_probability * round_trip
+    expected_replacement = replacement_probability * round_trip
+    total = round_trip + expected_add + expected_replacement
+    return LifecycleCostEstimate(
+        buy_cost_amount=float(buy_cost),
+        sell_cost_amount=float(sell_cost),
+        expected_add_cost_amount=float(expected_add),
+        expected_replacement_cost_amount=float(expected_replacement),
+        total_lifecycle_cost_amount=float(total),
+        round_trip_cost_ratio=(float(round_trip / notional) if notional > 0.0 else float("inf")),
+    )
+
+
+def assess_economic_order(
+    *,
+    market_notional_amount: float,
+    lifecycle_cost: LifecycleCostEstimate,
+    conservative_gross_profit_amount: float,
+    robust_net_profit_amount: float,
+    cost_profile=None,
+    high_confidence_exception: bool = False,
+) -> EconomicOrderAssessment:
+    """Require positive conservative net value; keep quality ratios diagnostic."""
+    profile = dict(cost_profile or {})
+    notional = max(float(market_notional_amount), 0.0)
+    minimum_amount = minimum_economic_order_amount(cost_profile=profile)
+    maximum_round_trip_ratio = max(
+        float(profile.get("scap_max_round_trip_fixed_cost_ratio", 0.01) or 0.01),
+        0.0,
+    )
+    maximum_cost_share = max(
+        float(profile.get("scap_max_lifecycle_cost_to_gross_profit_ratio", 0.30) or 0.30),
+        0.0,
+    )
+    hard_maximum_cost_share = max(
+        float(profile.get("scap_hard_max_lifecycle_cost_to_gross_profit_ratio", 0.60) or 0.60),
+        maximum_cost_share,
+    )
+    minimum_hurdle = max(
+        float(profile.get("scap_minimum_robust_profit_hurdle_amount", 15.0) or 15.0),
+        0.0,
+    )
+    gross_profit = max(float(conservative_gross_profit_amount), 0.0)
+    cost_share = (
+        float(lifecycle_cost.total_lifecycle_cost_amount / gross_profit)
+        if gross_profit > 0.0
+        else float("inf")
+    )
+    exception_enabled = bool(profile.get("scap_high_confidence_small_order_exception_enabled", False))
+    exception_used = bool(exception_enabled and high_confidence_exception)
+    hard_ratio_gate = bool(
+        profile.get("scap_round_trip_cost_ratio_hard_gate_enabled", False)
+    )
+    hard_minimum_notional_gate = bool(
+        profile.get("scap_minimum_economic_notional_hard_gate_enabled", False)
+    )
+    checks = (
+        (notional > 0.0, "non_positive_notional"),
+        (
+            not hard_ratio_gate
+            or lifecycle_cost.round_trip_cost_ratio <= maximum_round_trip_ratio + 1e-12,
+            "round_trip_cost_ratio",
+        ),
+        (
+            cost_share <= hard_maximum_cost_share + 1e-12,
+            "extreme_lifecycle_cost_share",
+        ),
+        (float(robust_net_profit_amount) > 1e-12, "non_positive_conservative_net_value"),
+    )
+    failed = [reason for passed, reason in checks if not passed]
+    below_minimum = notional + 1e-8 < minimum_amount and not exception_used
+    if hard_minimum_notional_gate and below_minimum:
+        failed.insert(0, "minimum_economic_notional")
+    warnings = []
+    if below_minimum:
+        warnings.append("minimum_economic_notional")
+    if lifecycle_cost.round_trip_cost_ratio > maximum_round_trip_ratio + 1e-12:
+        warnings.append("round_trip_cost_ratio")
+    if cost_share > maximum_cost_share + 1e-12:
+        warnings.append("lifecycle_cost_share_quality_band")
+    if 0.0 < float(robust_net_profit_amount) < minimum_hurdle - 1e-12:
+        warnings.append("robust_profit_below_quality_hurdle")
+    return EconomicOrderAssessment(
+        passed=not failed,
+        reason="economic_order_pass" if not failed else "|".join(dict.fromkeys(failed)),
+        market_notional_amount=notional,
+        minimum_economic_order_amount=float(minimum_amount),
+        lifecycle_cost_amount=float(lifecycle_cost.total_lifecycle_cost_amount),
+        round_trip_cost_ratio=float(lifecycle_cost.round_trip_cost_ratio),
+        lifecycle_cost_to_gross_profit_ratio=float(cost_share),
+        robust_net_profit_amount=float(robust_net_profit_amount),
+        robust_profit_hurdle_amount=float(minimum_hurdle),
+        exception_used=exception_used,
+        warnings=tuple(dict.fromkeys(warnings)),
+    )
 
 
 def single_side_cost_amount(

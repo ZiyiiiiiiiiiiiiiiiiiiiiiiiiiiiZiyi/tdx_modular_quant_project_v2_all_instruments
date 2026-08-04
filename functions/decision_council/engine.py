@@ -15,7 +15,10 @@ from config import (
 )
 from functions.decision_council.contracts import DecisionContext
 from functions.decision_council.outputs import GovernanceLedgerBundle
-from functions.decision_council.pending_orders import PendingOrderBook
+from functions.decision_council.pending_orders import (
+    PendingOrderBook,
+    build_pending_order_snapshot,
+)
 from functions.decision_council.policy import RulesBasedPresidentPolicy
 from functions.decision_council.preflight import (
     build_environment_manifest,
@@ -83,6 +86,7 @@ class PhaseOneDecisionCouncilEngine:
         active_replacement_max_pairs_per_day: int = 1,
         target_exposure_cap: float | None = None,
         covariance_matrix: pd.DataFrame | None = None,
+        scenario_return_matrix: pd.DataFrame | None = None,
         nav_amount: float = 1.0,
         cash_amount: float = 0.0,
         cash_buffer_amount: float = 0.0,
@@ -100,6 +104,9 @@ class PhaseOneDecisionCouncilEngine:
         hard_exposure_ceiling: float | None = None,
         confirmed_derisk_target: float | None = None,
         current_lots_by_symbol: dict[str, int] | None = None,
+        policy_band=None,
+        recovery_episode_id: str = "",
+        recovery_episode_day: int = 0,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
         decision_date = pd.Timestamp(decision_date)
         if decision_date not in self.safety_signals.index:
@@ -136,6 +143,7 @@ class PhaseOneDecisionCouncilEngine:
             ),
             hard_qualification_symbols=frozenset(str(symbol) for symbol in hard_qualification_symbols),
             covariance_matrix=covariance_matrix,
+            scenario_return_matrix=scenario_return_matrix,
             nav_amount=max(float(nav_amount), 1e-12),
             cash_amount=max(float(cash_amount), 0.0),
             cash_buffer_amount=max(float(cash_buffer_amount), 0.0),
@@ -157,6 +165,9 @@ class PhaseOneDecisionCouncilEngine:
             hard_exposure_ceiling=hard_exposure_ceiling,
             confirmed_derisk_target=confirmed_derisk_target,
             current_lots_by_symbol=dict(current_lots_by_symbol or {}),
+            policy_band=policy_band,
+            recovery_episode_id=str(recovery_episode_id or ""),
+            recovery_episode_day=max(int(recovery_episode_day), 0),
         )
         ideal, orders, diagnostics = self.policy.decide(context)
         diagnostics["raw_safety_exposure_cap"] = raw_safety_exposure_cap
@@ -207,6 +218,14 @@ class PhaseOneDecisionCouncilEngine:
         )
         self.ledgers.append("pending_order_ledger", ledger)
         return ledger
+
+    def record_terminal_pending_order_snapshot(self, snapshot_date) -> None:
+        """Persist orders created on the final simulated day before saving."""
+        snapshot = build_pending_order_snapshot(
+            self.pending_orders.orders,
+            snapshot_date=snapshot_date,
+        )
+        self.ledgers.append("pending_order_ledger", snapshot)
 
     def record_exposure(self, payload: dict):
         self.ledgers.append("actual_exposure_ledger", payload)

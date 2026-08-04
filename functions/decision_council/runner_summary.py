@@ -1,6 +1,7 @@
 """Summary and diagnostics builders for governance backtest outputs."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from config import *  # noqa: F403 - summary preserves the runner's config-driven formulas.
@@ -633,6 +634,13 @@ def _latest_bool(values) -> bool:
     return bool(series.iloc[-1])
 
 
+def _last_text(data: pd.DataFrame, column: str, default: str = "") -> str:
+    if data is None or data.empty or column not in data.columns:
+        return str(default)
+    values = data[column].dropna().astype(str)
+    return str(values.iloc[-1]) if not values.empty else str(default)
+
+
 def _safe_float(value, default=0.0) -> float:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").dropna()
     if numeric.empty:
@@ -1174,6 +1182,20 @@ def build_governance_summary(
     initial_nav = float(nominal_nav_series.iloc[0])
     final_liquidatable_nav = float(liquidatable_nav_series.iloc[-1])
     daily_returns = liquidatable_nav_series.pct_change(fill_method=None).dropna()
+    daily_log_returns = np.log1p(daily_returns.clip(lower=-0.999999999))
+    total_log_return = float(daily_log_returns.sum()) if not daily_log_returns.empty else 0.0
+    positive_log_returns = daily_log_returns[daily_log_returns > 0.0].sort_values(
+        ascending=False
+    )
+    def _top_positive_log_share(count: int):
+        if abs(total_log_return) <= 1e-12:
+            return pd.NA
+        return float(positive_log_returns.head(count).sum() / total_log_return)
+    return_without_top5_days = (
+        float(np.expm1(total_log_return - positive_log_returns.head(5).sum()))
+        if not daily_log_returns.empty
+        else pd.NA
+    )
     trading_days = int(len(liquidatable_nav_series))
     total_return = final_liquidatable_nav / initial_nav - 1.0 if initial_nav > 0 else pd.NA
     annual_return = (
@@ -1400,6 +1422,10 @@ def build_governance_summary(
                 "sharpe": sharpe,
                 "max_drawdown": max_drawdown,
                 "win_rate": win_rate,
+                "top1_positive_day_log_return_share": _top_positive_log_share(1),
+                "top5_positive_day_log_return_share": _top_positive_log_share(5),
+                "top10_positive_day_log_return_share": _top_positive_log_share(10),
+                "return_without_top5_positive_days": return_without_top5_days,
                 "avg_actual_exposure": avg_actual_exposure,
                 "invested_capital_return": invested_capital_return,
                 "valid_invested_capital_return": valid_invested_capital_return,
@@ -1515,6 +1541,31 @@ def build_governance_summary(
                 "top20pct_sleeve_weight_sum": float(pd.to_numeric(data.get("top20pct_sleeve_weight_sum", pd.Series(dtype=float)), errors="coerce").mean()),
                 "sleeve_effective_n_ratio": float(pd.to_numeric(data.get("sleeve_effective_n_ratio", pd.Series(dtype=float)), errors="coerce").mean()),
                 "sleeve_weight_hhi": float(pd.to_numeric(data.get("sleeve_weight_hhi", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_sizing_reference_positions": float(pd.to_numeric(data.get("sizing_reference_positions", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_selected_action_symbol_count": float(pd.to_numeric(data.get("selected_position_count", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_planned_holding_count": float(pd.to_numeric(data.get("optimizer_planned_holding_count", data.get("planned_holding_count", pd.Series(dtype=float))), errors="coerce").mean()),
+                # Deprecated compatibility alias: this is an action-symbol
+                # count, not a planned portfolio holding count.
+                "average_selected_position_count": float(pd.to_numeric(data.get("selected_position_count", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_profit_coverage_ratio": float(pd.to_numeric(data.get("profit_coverage_ratio", pd.Series(dtype=float)), errors="coerce").replace([np.inf, -np.inf], np.nan).mean()),
+                "average_profit_coverage_probability_lower": float(pd.to_numeric(data.get("profit_coverage_probability_lower", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_coverage_evidence_name_count": float(pd.to_numeric(data.get("coverage_evidence_name_count", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_lifecycle_cost_amount": float(pd.to_numeric(data.get("lifecycle_cost_amount", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_expected_log_growth": float(pd.to_numeric(data.get("expected_log_growth", pd.Series(dtype=float)), errors="coerce").mean()),
+                "minimum_selected_marginal_utility_amount": float(pd.to_numeric(data.get("minimum_selected_marginal_utility_amount", pd.Series(dtype=float)), errors="coerce").min()),
+                "maximum_rejected_marginal_utility_amount": float(pd.to_numeric(data.get("maximum_rejected_marginal_utility_amount", pd.Series(dtype=float)), errors="coerce").max()),
+                "coverage_mode": _last_text(data, "coverage_mode", "diagnostic_shadow"),
+                "maximum_coverage_penalty_amount": float(pd.to_numeric(data.get("coverage_penalty_amount", pd.Series(dtype=float)), errors="coerce").max()),
+                "average_incremental_expected_wealth_amount": float(pd.to_numeric(data.get("incremental_expected_wealth_amount", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_incremental_cvar_amount": float(pd.to_numeric(data.get("incremental_cvar_amount", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_model_uncertainty_amount": float(pd.to_numeric(data.get("model_uncertainty_amount", pd.Series(dtype=float)), errors="coerce").mean()),
+                "average_scenario_risk_penalty_amount": float(pd.to_numeric(data.get("scenario_risk_penalty_amount", pd.Series(dtype=float)), errors="coerce").mean()),
+                "latest_scenario_evidence_state": _last_text(data, "scenario_evidence_state", "unavailable"),
+                "latest_scenario_contract_id": _last_text(data, "scenario_contract_id", ""),
+                "latest_scenario_risk_measure": _last_text(data, "scenario_risk_measure", "correlated_tail_loss_proxy"),
+                "maximum_joint_scenario_count": float(pd.to_numeric(data.get("joint_scenario_count", pd.Series(dtype=float)), errors="coerce").max()),
+                "average_regime_es_budget_multiplier": float(pd.to_numeric(data.get("regime_es_budget_multiplier", pd.Series(dtype=float)), errors="coerce").mean()),
+                "maximum_best_rejected_objective_amount": float(pd.to_numeric(data.get("best_rejected_objective_amount", pd.Series(dtype=float)), errors="coerce").max()),
                 "top20pct_risk_contribution_sum": float(pd.to_numeric(data.get("top20pct_risk_contribution_sum", pd.Series(dtype=float)), errors="coerce").mean()),
                 "risk_effective_n_ratio": float(pd.to_numeric(data.get("risk_effective_n_ratio", pd.Series(dtype=float)), errors="coerce").mean()),
                 "risk_contribution_hhi": float(pd.to_numeric(data.get("risk_contribution_hhi", pd.Series(dtype=float)), errors="coerce").mean()),
@@ -1537,6 +1588,12 @@ def build_governance_summary(
                 ),
                 "performance_benchmark_top_n": int(runner.performance_benchmark_top_n),
                 "performance_benchmark_rebalance": str(runner.performance_benchmark_rebalance),
+                "portfolio_normal_rebalance_frequency": str(
+                    getattr(runner, "portfolio_normal_rebalance_frequency", "")
+                ),
+                "portfolio_normal_rebalance_anchor": str(
+                    runner.capital_profile.get("portfolio_normal_rebalance_anchor", "")
+                ),
                 "safety_benchmark_symbol": str(runner.engine.safety_agent.proxy_symbol),
                 "governance_variant": runner.governance_variant,
                 "safety_proxy_mode": runner.engine.safety_agent.proxy_mode,

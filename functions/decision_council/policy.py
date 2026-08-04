@@ -48,6 +48,7 @@ ORDER_PRIORITIES = {
     "single_name_risk_trim": 5,
     "normal_sell": 4,
     "normal_buy": 5,
+    "exposure_catchup_buy": 5,
     "force_deploy_diversify_buy": 5,
     "force_deploy_defensive_buy": 6,
 }
@@ -80,6 +81,9 @@ ORDER_COLUMNS = [
     "action_proposal_id",
     "action_plan_selected",
     "action_plan_contract",
+    "plan_hard_exposure_ceiling",
+    "plan_target_exposure",
+    "constraint_contract_version",
     "scap_v31_authority_tier",
     "scap_v31_authority_contract",
     "scap_candidate_utility",
@@ -422,17 +426,27 @@ class RulesBasedPresidentPolicy:
                         else "normal_sell"
                     )
             elif proposal.action_type == "winner_add":
-                new = old + lot_weight * int(proposal.requested_lots)
+                new = old + max(float(proposal.exposure_delta), 0.0)
                 reason = "winner_pyramiding_buy"
             elif proposal.action_type == "loser_add":
-                new = old + lot_weight * int(proposal.requested_lots)
+                new = old + max(float(proposal.exposure_delta), 0.0)
                 reason = "loser_averaging_buy"
             elif proposal.action_type == "replacement_buy":
-                new = old + lot_weight * int(proposal.requested_lots)
+                new = old + max(float(proposal.exposure_delta), 0.0)
                 reason = "replacement_opportunity_buy"
             else:
-                new = lot_weight * int(proposal.requested_lots)
-                reason = "normal_buy"
+                new = max(float(proposal.exposure_delta), 0.0)
+                reason = (
+                    "exposure_catchup_buy"
+                    if bool(
+                        decision.diagnostics.get(
+                            "post_mandatory_recovery_authorized",
+                            False,
+                        )
+                    )
+                    and not bool(context.allow_normal_rebalance)
+                    else "normal_buy"
+                )
             order = self._order_row(
                 context,
                 symbol,
@@ -445,6 +459,15 @@ class RulesBasedPresidentPolicy:
             order["action_proposal_id"] = proposal.proposal_id
             order["action_plan_selected"] = True
             order["action_plan_contract"] = decision.plan.contract_version
+            order["plan_hard_exposure_ceiling"] = float(
+                decision.authorization.hard_exposure_ceiling
+            )
+            order["plan_target_exposure"] = float(
+                decision.authorization.desired_exposure_target
+            )
+            order["constraint_contract_version"] = str(
+                decision.plan.contract_version
+            )
             order["unified_action_selected"] = proposal.action_type
             order["unified_action_contract"] = "scap_v3_lean_single_plan_v1"
             order["planned_entry_lots"] = int(proposal.requested_lots)
@@ -480,9 +503,18 @@ class RulesBasedPresidentPolicy:
             str(item.get("proposal_id", "")): str(item.get("reason", ""))
             for item in decision.plan.rejected_proposals
         }
+        from functions.decision_council.exposure_contract import build_record_lineage
+
         diagnostics["_action_proposal_rows"] = [
             {
                 **proposal.as_dict(),
+                **build_record_lineage(
+                    decision_id=proposal.decision_id,
+                    record_stage="candidate_economic_assessment",
+                    record_id=proposal.proposal_id,
+                    immutable_payload=proposal.as_dict(),
+                    formula_version=str(proposal.contract_version),
+                ),
                 "decision_date": pd.Timestamp(context.decision_date),
                 "selected_by_plan": proposal.proposal_id in selected_ids,
                 "optimizer_rejection_reason": rejection_by_id.get(
@@ -495,7 +527,26 @@ class RulesBasedPresidentPolicy:
         ]
         diagnostics["_action_plan_rows"] = [
             {
-                **decision.plan.as_dict(),
+                **{
+                    key: value
+                    for key, value in decision.plan.as_dict().items()
+                    if key != "rejected_proposals"
+                },
+                "rejected_proposal_count": len(
+                    decision.plan.rejected_proposals
+                ),
+                "rejected_proposal_ids": tuple(
+                    str(item.get("proposal_id", ""))
+                    for item in decision.plan.rejected_proposals
+                ),
+                "rejected_detail_storage": "governance_action_proposal_ledger",
+                **build_record_lineage(
+                    decision_id=decision.plan.decision_id,
+                    record_stage="portfolio_action_plan",
+                    record_id=decision.plan.plan_id,
+                    immutable_payload=decision.plan.as_dict(),
+                    formula_version=str(decision.plan.contract_version),
+                ),
                 "decision_date": pd.Timestamp(context.decision_date),
                 "authority_snapshot_id": (
                     decision.authorization.authority_snapshot_id
@@ -513,7 +564,12 @@ class RulesBasedPresidentPolicy:
         ]
         diagnostics.update(
             {
-                "target_exposure": float(decision.plan.projected_exposure),
+                "target_exposure": float(
+                    decision.authorization.desired_exposure_target
+                ),
+                "optimizer_planned_exposure": float(
+                    decision.plan.projected_exposure
+                ),
                 "effective_target_exposure_cap": float(
                     decision.authorization.risk_exposure_ceiling
                 ),
@@ -861,7 +917,14 @@ class RulesBasedPresidentPolicy:
             }
             is_active_replacement = reason in {"replacement_opportunity_exit", "replacement_opportunity_buy"}
             if not is_forced_sell and not is_active_replacement:
-                if not context.allow_normal_rebalance and not is_catchup_buy and not is_confirmed_entry_buy:
+                # Normal construction is calendar-authorized; independently
+                # authorized low-exposure recovery may execute between monthly
+                # dates within its own daily budget.
+                if (
+                    not context.allow_normal_rebalance
+                    and delta > 0
+                    and not is_catchup_buy
+                ):
                     continue
                 if delta > 0 and safety_shortfall > 1e-12:
                     continue
@@ -983,6 +1046,14 @@ class RulesBasedPresidentPolicy:
         delta = float(new) - float(old)
         get = candidate_row.get if candidate_row is not None else lambda key, default=None: default
         canonical_reason = canonical_exit_reason(reason)
+        if (
+            delta > 0
+            and float(old) <= 1e-12
+            and bool(context.catchup_allowed)
+            and not bool(context.allow_normal_rebalance)
+            and canonical_reason == "normal_buy"
+        ):
+            canonical_reason = "exposure_catchup_buy"
         add_decision_type = str(get("add_decision_type", "") or "")
         action_arbitration = arbitrate_position_actions(
             {

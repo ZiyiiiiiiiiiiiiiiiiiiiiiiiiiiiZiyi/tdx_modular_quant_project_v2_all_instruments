@@ -8,16 +8,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import time
 
 import pandas as pd
 
 from functions.decision_council.action_utility import (
+    assess_economic_order,
     buy_cash_required_amount,
+    estimate_lifecycle_cost,
     round_trip_cost_amount,
     sell_cash_released_amount,
     single_side_cost_amount,
 )
-from functions.decision_council.capital_scaling import scaled_candidate_budgets
+from functions.decision_council.capital_scaling import (
+    resolve_optimizer_search_budget,
+    scaled_candidate_budgets,
+)
+from functions.decision_council.candidate_pool_contract import (
+    CANDIDATE_POOL_CONTRACT_VERSION,
+    select_feasible_candidate_pool,
+)
 from functions.execution.security_trading_rules import trading_rule_for
 from functions.decision_council.integer_action_optimizer import (
     optimize_action_proposals,
@@ -30,10 +40,16 @@ from functions.decision_council.scap_v2_contracts import (
 from functions.decision_council.scap_v31_authority import (
     attach_scap_v31_authority,
 )
+from functions.decision_council.portfolio_constraint_contract import (
+    PolicyBand,
+    authorize_recovery,
+    project_mandatory_actions,
+    resolve_conditional_deployment_bounds,
+)
 
 
-LEAN_VERSION = "small_capital_aggressive_profit_v3_2"
-LEAN_PROPOSAL_CONTRACT = "scap_v32_pool_preserving_proposal_factory_v1"
+LEAN_VERSION = "small_capital_aggressive_profit_v3_3"
+LEAN_PROPOSAL_CONTRACT = "scap_v33_economic_portfolio_proposal_factory_v1"
 
 
 @dataclass(frozen=True)
@@ -98,11 +114,45 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ).items()
         if int(lots) > 0
     }
-    raw_entry_signal_symbols: set[str] = set()
+    raw_entry_signal_symbols: set[str] = {
+        symbol
+        for symbol, row in rows.items()
+        if float(context.current_weights.get(symbol, 0.0)) <= 0.0
+        and (
+            _number(row.get("scap_v31_decision_expected_return")) > 0.0
+            or _number(row.get("scap_candidate_utility")) > 0.0
+        )
+    }
     structural_entry_symbols: set[str] = set()
     proposal_entry_symbols: set[str] = set()
+    if "scap_action_candidate" in data.columns:
+        entry_shortlist = frozenset(
+            data.loc[
+                data["scap_action_candidate"].fillna(False).astype(bool),
+                "symbol",
+            ].astype(str)
+        )
+        candidate_pool_runtime_state = "upstream_authoritative_pool"
+    else:
+        # Explicit compatibility for direct contract tests.  It calls the same
+        # shared pool contract; there is no second Lean ranking formula.
+        selected_index, _, _ = select_feasible_candidate_pool(
+            data,
+            limit=max(int(profile.get("scap_candidate_pool_limit", 32) or 32), 1),
+            per_pool_reserve=max(
+                int(profile.get("scap_candidate_pool_per_thesis", 2) or 2), 1
+            ),
+        )
+        entry_shortlist = frozenset(data.loc[selected_index, "symbol"].astype(str))
+        candidate_pool_runtime_state = "shared_contract_compatibility_fallback"
+    proposal_source_rows = {
+        symbol: row
+        for symbol, row in rows.items()
+        if float(context.current_weights.get(symbol, 0.0)) > 0.0
+        or symbol in entry_shortlist
+    }
 
-    for symbol, row in rows.items():
+    for symbol, row in proposal_source_rows.items():
         old_weight = current_weights.get(symbol, 0.0)
         minimum_quantity = max(
             int(_number(row.get("mainline_v3_minimum_buy_quantity"), 100.0)),
@@ -169,6 +219,13 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         utility = _number(row.get("scap_candidate_utility"))
         authority_tier = str(row.get("scap_v31_authority_tier", "D") or "D")
         decision_return = _number(row.get("scap_v31_decision_expected_return"))
+        decision_return_basis = str(
+            row.get(
+                "scap_decision_return_basis",
+                profile.get("scap_candidate_reward_basis", "lcb"),
+            )
+            or "lcb"
+        ).strip().lower()
         point_return = _number(
             row.get("scap_expected_return_point", decision_return)
         )
@@ -184,6 +241,9 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         if hard_vetoes:
             continue
         structural_entry_symbols.add(symbol)
+        # Build economically comparable proposals before final authorization.
+        # A mandatory exit can create a same-plan recovery requirement, which
+        # is unknowable from the pre-trade catch-up flag.
         max_by_name = int(
             math.floor(max(float(context.per_name_structural_cap), 0.0) / lot_weight)
         ) if lot_weight > 0.0 else 0
@@ -214,10 +274,9 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 trade_date=context.decision_date,
                 cost_profile=context.execution_cost_profile,
             )
-            concentration_penalty = max(
-                lots * lot_weight - 0.30, 0.0
-            ) * float(context.nav_amount) * 0.01
-            risk_penalty = _number(row.get("scap_risk_penalty_amount")) * lots
+            # Candidate value contains conservative return and full lifecycle
+            # cost only. Tail and concentration risk are charged once by the
+            # portfolio objective.
             authority_penalty_rate = max(
                 float(
                     profile.get(
@@ -237,6 +296,61 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 0.0,
             )
             authority_penalty = market_notional * authority_penalty_rate
+            horizon = max(int(context.forecast_horizon_sessions), 1)
+            p_win_lower = min(
+                max(_number(row.get(f"p_win_{horizon}d_wilson_lower")), 0.0),
+                1.0,
+            )
+            avg_win_return = max(
+                _number(row.get(f"avg_win_{horizon}d_by_bucket")), 0.0
+            )
+            avg_loss_return = max(
+                _number(row.get(f"avg_loss_{horizon}d_by_bucket")), 0.0
+            )
+            calibration_state = str(
+                row.get(f"entry_calibration_state_{horizon}d", "prior_only")
+                or "prior_only"
+            ).lower()
+            calibration_effective_samples = max(
+                _number(
+                    row.get(
+                        f"entry_calibration_effective_sample_size_{horizon}d"
+                    )
+                ),
+                0.0,
+            )
+            warming_effective_samples = max(
+                int(profile.get("scap_calibration_warming_effective_samples", 30)),
+                1,
+            )
+            coverage_authorized = bool(
+                calibration_state in {"calibrated", "recovering"}
+                and calibration_effective_samples >= warming_effective_samples
+                and p_win_lower > 0.0
+                and avg_win_return > 0.0
+                and avg_loss_return > 0.0
+            )
+            expected_positive_pnl = (
+                p_win_lower * avg_win_return * market_notional
+                if coverage_authorized
+                else 0.0
+            )
+            expected_loss_pnl = (
+                (1.0 - p_win_lower) * avg_loss_return * market_notional
+                if coverage_authorized
+                else 0.0
+            )
+            tail_loss_rate = max(
+                _number(row.get(f"downside_cvar_{horizon}d_by_bucket"), 0.15),
+                0.002,
+            )
+            lifecycle_cost = estimate_lifecycle_cost(
+                symbol=symbol,
+                price=price,
+                shares=float(minimum_quantity * lots),
+                trade_date=context.decision_date,
+                cost_profile=context.execution_cost_profile,
+            )
             if decision_return > 0.0:
                 expected_profit = (
                     point_return * market_notional - exact_cost
@@ -244,13 +358,39 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 robust_profit = (
                     decision_return * market_notional
                     - exact_cost
-                    - risk_penalty
-                    - concentration_penalty
                 )
             else:
                 # Compatibility for already-net synthetic/legacy proposals.
                 expected_profit = utility * lots
-                robust_profit = utility * lots - concentration_penalty
+                robust_profit = utility * lots
+            robust_profit -= max(
+                lifecycle_cost.total_lifecycle_cost_amount - exact_cost,
+                0.0,
+            )
+            economic_assessment = (
+                assess_economic_order(
+                    market_notional_amount=market_notional,
+                    lifecycle_cost=lifecycle_cost,
+                    conservative_gross_profit_amount=(
+                        expected_positive_pnl
+                        if coverage_authorized
+                        else max(decision_return, 0.0) * market_notional
+                    ),
+                    robust_net_profit_amount=robust_profit - authority_penalty,
+                    cost_profile=context.execution_cost_profile,
+                    high_confidence_exception=bool(
+                        authority_tier == "A" and coverage_authorized
+                    ),
+                )
+                if bool(profile.get("scap_economic_order_contract_enabled", False))
+                else None
+            )
+            economic_vetoes = (
+                ("economic_order:" + economic_assessment.reason,)
+                if economic_assessment is not None and not economic_assessment.passed
+                else ()
+            )
+            calendar_vetoes = ()
             proposal = _proposal(
                 context,
                 symbol=symbol,
@@ -258,7 +398,7 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 lots=lots,
                 expected=expected_profit,
                 robust=robust_profit,
-                downside=market_notional * 0.15,
+                downside=market_notional * tail_loss_rate,
                 cost=exact_cost,
                 funding=buy_cash,
                 market_notional=market_notional,
@@ -287,6 +427,50 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                     / max(market_notional, 1.0)
                 ),
                 authority_penalty_amount=authority_penalty,
+                hard_veto_reasons=economic_vetoes + calendar_vetoes,
+                lifecycle_cost_amount=lifecycle_cost.total_lifecycle_cost_amount,
+                round_trip_cost_ratio=lifecycle_cost.round_trip_cost_ratio,
+                lifecycle_cost_to_gross_profit_ratio=(
+                    economic_assessment.lifecycle_cost_to_gross_profit_ratio
+                    if economic_assessment is not None
+                    else 0.0
+                ),
+                minimum_economic_order_amount=(
+                    economic_assessment.minimum_economic_order_amount
+                    if economic_assessment is not None
+                    else 0.0
+                ),
+                economic_order_pass=(
+                    economic_assessment.passed
+                    if economic_assessment is not None
+                    else True
+                ),
+                economic_order_reason=(
+                    economic_assessment.reason
+                    if economic_assessment is not None
+                    else "contract_disabled"
+                ),
+                economic_order_warnings=(
+                    economic_assessment.warnings
+                    if economic_assessment is not None
+                    else ()
+                ),
+                p_win_lower=p_win_lower if coverage_authorized else 0.0,
+                avg_win_return=avg_win_return if coverage_authorized else 0.0,
+                avg_loss_return=avg_loss_return if coverage_authorized else 0.0,
+                expected_positive_pnl_amount=expected_positive_pnl,
+                expected_loss_pnl_amount=expected_loss_pnl,
+                coverage_evidence_authorized=coverage_authorized,
+                allocation_sleeve="exploration",
+                calibration_evidence_state=calibration_state,
+                calibration_effective_sample_size=calibration_effective_samples,
+                scenario_contract_id=str(
+                    profile.get(
+                        "scap_incremental_scenario_contract_version",
+                        "scap_incremental_scenario_cvar_v1",
+                    )
+                ),
+                decision_return_basis=str(decision_return_basis),
             )
             proposals.append(proposal)
             proposal_rows[proposal.proposal_id] = row
@@ -334,11 +518,75 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         derisk_confirmed=confirmed_derisk_target is not None,
     )
+    policy_band = getattr(context, "policy_band", None)
+    if policy_band is None:
+        policy_band = PolicyBand(
+            state="compatibility",
+            holding_floor=0,
+            holding_target=max(int(context.soft_target_positions), 0),
+            exposure_lower=0.0,
+            exposure_target=strategic_budget,
+            exposure_upper=max(strategic_budget, hard_exposure_ceiling),
+            disaster_ceiling=max(strategic_budget, hard_exposure_ceiling),
+            policy_version="compatibility_context_v1",
+        )
+    mandatory_projection = project_mandatory_actions(
+        current_lots=current_lots,
+        current_weights=current_weights,
+        current_cash=float(context.cash_amount),
+        proposals=proposals,
+    )
+    wealth_epsilon_amount = max(
+        float(profile.get("scap_wealth_materiality_epsilon_amount", 1.0)),
+        0.0,
+    )
+    # Product policy owns the position ceiling.  Runtime capacity may make the
+    # policy infeasible, but it must never silently broaden it.  Existing
+    # holdings are grandfathered long enough for explicit exit proposals.
+    effective_holding_ceiling = max(
+        min(
+            max(int(context.top_n), 0),
+            max(int(policy_band.holding_ceiling), 0),
+        ),
+        int(mandatory_projection.post_mandatory_holding_count),
+        1,
+    )
+    deployment_bounds = resolve_conditional_deployment_bounds(
+        policy_band=policy_band,
+        mandatory_projection=mandatory_projection,
+        hard_holding_ceiling=effective_holding_ceiling,
+        hard_exposure_ceiling=hard_exposure_ceiling,
+        positive_feasible_proposals=proposals,
+        wealth_epsilon_amount=wealth_epsilon_amount,
+    )
+    post_mandatory_recovery = authorize_recovery(
+        decision_id=str(context.decision_id),
+        mandatory_projection=mandatory_projection,
+        bounds=deployment_bounds,
+        configured_max_new_names=int(
+            profile.get("scap_recovery_max_new_names_per_day", 1)
+        ),
+        configured_daily_exposure_cap=float(
+            profile.get("scap_recovery_daily_exposure_cap", 0.15)
+        ),
+        deadline_sessions=int(profile.get("scap_recovery_window_sessions", 5)),
+        safety_blocked=bool(
+            context.safety.hard_freeze_active
+            or str(context.safety.risk_level).strip().lower() in {"critical"}
+            or str(context.safety.structural_regime_level).strip().lower()
+            in {"crisis"}
+        ),
+        prior_episode_id=str(getattr(context, "recovery_episode_id", "") or ""),
+        prior_episode_day=max(
+            int(getattr(context, "recovery_episode_day", 0) or 0),
+            0,
+        ),
+    )
     signal_supported, integer_feasible = _constructive_entry_exposure_bounds(
         proposals=proposals,
         current_lots=current_lots,
         current_exposure=current_exposure,
-        max_positions=max(int(context.top_n), 1),
+        max_positions=effective_holding_ceiling,
         available_cash=max(float(context.cash_amount), 0.0),
         cash_buffer=max(float(context.cash_buffer_amount), 0.0),
         strategic_budget=strategic_budget,
@@ -405,17 +653,30 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         per_name_structural_cap=min(
             max(float(context.per_name_structural_cap), 0.0), 1.0
         ),
-        per_name_stress_budget_amount=float(context.nav_amount)
-        * float(context.per_name_structural_cap)
-        * 0.40,
+        per_name_stress_budget_amount=min(
+            float(context.nav_amount)
+            * float(context.per_name_structural_cap)
+            * 0.40,
+            float(context.nav_amount)
+            * float(profile.get("scap_per_name_stress_budget_ratio", 0.03) or 0.03),
+        ),
         portfolio_stress_budget_amount=max(
             float(context.portfolio_stress_budget_amount), 0.0
         ),
         new_entry_allowed=(
             not bool(context.safety.hard_freeze_active)
-            and planned_safety_sell_weight <= 1e-12
-            and not risk_episode_active
-            and current_exposure < strategic_budget - 1e-12
+            and bool(
+                context.allow_normal_rebalance
+                or context.catchup_allowed
+                or post_mandatory_recovery.authorized
+            )
+            and (
+                not risk_episode_active
+                or bool(context.catchup_allowed)
+                or post_mandatory_recovery.authorized
+            )
+            and mandatory_projection.post_mandatory_exposure
+            < strategic_budget - 1e-12
             and not (
                 bool(profile.get("scap_block_new_entry_during_high_risk", True))
                 and risk_level == "high"
@@ -452,10 +713,6 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                 0.0,
             ),
             float(context.per_name_structural_cap),
-        ),
-        cash_gap_penalty_rate=max(
-            float(profile.get("scap_cash_gap_penalty_rate", 0.0) or 0.0),
-            0.0,
         ),
         name_concentration_penalty_rate=max(
             float(
@@ -501,7 +758,7 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         1,
     )
     scalable_budgets = scaled_candidate_budgets(
-        effective_position_cap=max(int(context.top_n), 1),
+        effective_position_cap=effective_holding_ceiling,
         pool_count=pool_count,
         optimizer_multiple=float(
             profile.get("scap_optimizer_candidate_multiple", 4.0) or 4.0
@@ -510,6 +767,7 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             profile.get("scap_optimizer_candidate_search_cap", 96) or 96
         ),
     )
+    search_budget = resolve_optimizer_search_budget(profile)
     fixed_mode = str(profile.get("position_cap_mode", "fixed")).lower() == "fixed"
     thesis_hard_max = (
         3
@@ -521,6 +779,11 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         if fixed_mode
         else scalable_budgets["optimizer_candidate_limit"]
     )
+    optimizer_candidate_limit = min(
+        int(optimizer_candidate_limit),
+        int(search_budget.prefilter_symbol_limit),
+    )
+    optimizer_started = time.perf_counter()
     plan = optimize_action_proposals(
         proposals,
         authorization=authorization,
@@ -536,10 +799,82 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
             )
             for symbol, row in rows.items()
         },
-        max_names_per_thesis=thesis_hard_max,
+        max_names_per_thesis=min(
+            int(thesis_hard_max),
+            int(policy_band.maximum_names_per_pool),
+        ),
         covariance_matrix=covariance,
+        scenario_return_matrix=context.scenario_return_matrix,
         candidate_limit=optimizer_candidate_limit,
+        minimum_profit_coverage_ratio=float(
+            profile.get("scap_minimum_profit_coverage_ratio", 1.25) or 1.25
+        ),
+        minimum_profit_coverage_probability=float(
+            profile.get("scap_minimum_profit_coverage_probability", 0.55)
+            or 0.55
+        ),
+        coverage_correlation_floor=float(
+            profile.get("scap_coverage_correlation_floor", 0.35)
+        ),
+        minimum_coverage_evidence_names=int(
+            max(
+                int(profile.get("scap_minimum_coverage_evidence_names", 1) or 1),
+                int(policy_band.holding_target),
+            )
+        ),
+        coverage_mode=str(
+            profile.get("scap_profit_coverage_mode", "diagnostic_shadow")
+            or "diagnostic_shadow"
+        ),
+        incremental_cvar_confidence=float(
+            profile.get("scap_incremental_cvar_confidence", 0.95)
+        ),
+        incremental_cvar_risk_aversion=float(
+            profile.get("scap_incremental_cvar_risk_aversion", 0.05)
+        ),
+        model_uncertainty_risk_aversion=float(
+            profile.get("scap_model_uncertainty_risk_aversion", 0.10)
+        ),
+        calibration_warming_effective_samples=int(
+            profile.get("scap_calibration_warming_effective_samples", 30)
+        ),
+        calibration_mature_effective_samples=int(
+            profile.get("scap_calibration_mature_effective_samples", 100)
+        ),
+        max_new_buy_names=(
+            int(post_mandatory_recovery.max_new_names_today)
+            if bool(
+                post_mandatory_recovery.authorized
+                and not context.allow_normal_rebalance
+            )
+            else None
+        ),
+        max_incremental_buy_exposure=(
+            float(post_mandatory_recovery.max_buy_exposure_today)
+            if bool(
+                post_mandatory_recovery.authorized
+                and not context.allow_normal_rebalance
+            )
+            else None
+        ),
+        minimum_positions=int(deployment_bounds.conditional_holding_floor),
+        minimum_exposure=float(deployment_bounds.conditional_exposure_floor),
+        target_positions=min(
+            int(policy_band.holding_target),
+            int(deployment_bounds.hard_holding_ceiling),
+        ),
+        target_exposure=min(
+            float(policy_band.exposure_target),
+            float(deployment_bounds.hard_exposure_ceiling),
+        ),
+        wealth_materiality_epsilon_amount=float(wealth_epsilon_amount),
+        minimum_active_pool_size=int(policy_band.minimum_active_pool_size),
+        minimum_effective_n_ratio=float(policy_band.minimum_effective_n_ratio),
+        minimum_pool_count=int(policy_band.minimum_pool_count),
+        exhaustive_max_positions=int(search_budget.exact_max_positions),
+        beam_width=int(search_budget.beam_width),
     )
+    optimizer_elapsed_seconds = time.perf_counter() - optimizer_started
     selected_types = [
         proposal.action_type
         for proposal in proposals
@@ -598,15 +933,136 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
     liveness_pass = bool(not liveness_required or selected_buy_count > 0)
     diagnostics = {
         "scap_v3_lean_version": LEAN_VERSION,
+        "policy_band_state": str(policy_band.state),
+        "policy_holding_floor": int(policy_band.holding_floor),
+        "policy_holding_target": int(policy_band.holding_target),
+        "policy_holding_ceiling": int(policy_band.holding_ceiling),
+        "policy_minimum_active_pool_size": int(
+            policy_band.minimum_active_pool_size
+        ),
+        "policy_minimum_effective_n_ratio": float(
+            policy_band.minimum_effective_n_ratio
+        ),
+        "policy_minimum_pool_count": int(policy_band.minimum_pool_count),
+        "policy_maximum_names_per_pool": int(
+            policy_band.maximum_names_per_pool
+        ),
+        "policy_exposure_lower": float(policy_band.exposure_lower),
+        "policy_exposure_target": float(policy_band.exposure_target),
+        "policy_exposure_upper": float(policy_band.exposure_upper),
+        "policy_disaster_exposure_ceiling": float(
+            policy_band.disaster_ceiling
+        ),
+        "post_mandatory_holding_count": int(
+            mandatory_projection.post_mandatory_holding_count
+        ),
+        "post_mandatory_exposure": float(
+            mandatory_projection.post_mandatory_exposure
+        ),
+        "post_mandatory_cash": float(
+            mandatory_projection.post_mandatory_cash
+        ),
+        "conditional_holding_floor": int(
+            deployment_bounds.conditional_holding_floor
+        ),
+        "conditional_exposure_floor": float(
+            deployment_bounds.conditional_exposure_floor
+        ),
+        "daily_effective_holding_ceiling": int(
+            deployment_bounds.hard_holding_ceiling
+        ),
+        "daily_effective_exposure_ceiling": float(
+            deployment_bounds.hard_exposure_ceiling
+        ),
+        "positive_feasible_new_name_count": int(
+            deployment_bounds.positive_feasible_new_name_count
+        ),
+        "post_mandatory_recovery_authorized": bool(
+            post_mandatory_recovery.authorized
+        ),
+        "post_mandatory_recovery_reason": str(
+            post_mandatory_recovery.block_reason
+        ),
+        "post_mandatory_recovery_episode_id": str(
+            post_mandatory_recovery.episode_id
+        ),
+        "post_mandatory_recovery_episode_day": int(
+            post_mandatory_recovery.episode_day
+        ),
+        "post_mandatory_recovery_holding_deficit": int(
+            post_mandatory_recovery.holding_deficit
+        ),
+        "post_mandatory_recovery_exposure_deficit": float(
+            post_mandatory_recovery.exposure_deficit
+        ),
+        "post_mandatory_recovery_max_new_names_today": int(
+            post_mandatory_recovery.max_new_names_today
+        ),
+        "post_mandatory_recovery_max_buy_exposure_today": float(
+            post_mandatory_recovery.max_buy_exposure_today
+        ),
+        "post_mandatory_recovery_deadline_sessions": int(
+            post_mandatory_recovery.deadline_sessions
+        ),
+        "wealth_materiality_epsilon_amount": float(wealth_epsilon_amount),
+        "planned_holding_count": int(plan.planned_holding_count),
+        "holding_floor_violation_count": int(
+            plan.holding_floor_violation_count
+        ),
+        "exposure_floor_violation": float(plan.exposure_floor_violation),
+        "policy_holding_floor_violation_count": max(
+            int(policy_band.holding_floor) - int(plan.planned_holding_count),
+            0,
+        ),
+        "policy_floor_feasible_pre_optimizer": bool(
+            deployment_bounds.policy_floor_feasible
+        ),
+        "atomic_pool_violation_count": int(
+            plan.constraint_slacks.get("atomic_pool_violation_count", 0)
+        ),
+        "planned_effective_n": float(
+            plan.constraint_slacks.get("planned_effective_n", 0.0)
+        ),
+        "effective_n_violation": float(
+            plan.constraint_slacks.get("effective_n_violation", 0.0)
+        ),
+        "planned_pool_count": int(
+            plan.constraint_slacks.get("planned_pool_count", 0)
+        ),
+        "pool_count_violation": int(
+            plan.constraint_slacks.get("pool_count_violation", 0)
+        ),
+        "orphan_pool_recovery_active": bool(
+            0
+            < mandatory_projection.post_mandatory_holding_count
+            < int(policy_band.minimum_active_pool_size)
+            and post_mandatory_recovery.authorized
+        ),
+        "orphan_pool_breach": bool(
+            0
+            < int(plan.planned_holding_count)
+            < int(policy_band.minimum_active_pool_size)
+        ),
+        "orphan_pool_recovery_deadline_breached": bool(
+            0
+            < int(plan.planned_holding_count)
+            < int(policy_band.minimum_active_pool_size)
+            and int(post_mandatory_recovery.episode_day)
+            > int(post_mandatory_recovery.deadline_sessions)
+        ),
         "proposal_contract": LEAN_PROPOSAL_CONTRACT,
         "action_proposal_count": int(len(proposals)),
         "action_plan_count": 1,
         "optimizer_invocation_count": 1,
+        "optimizer_elapsed_seconds": float(optimizer_elapsed_seconds),
         "action_plan_id": plan.plan_id,
         "action_plan_selected_count": int(len(plan.selected_proposal_ids)),
         "action_plan_rejected_count": int(len(plan.rejected_proposals)),
         "selected_action_types": "|".join(selected_types),
         "lean_raw_entry_signal_count": len(raw_entry_signal_symbols),
+        "lean_pre_cost_entry_shortlist_count": len(entry_shortlist),
+        "candidate_pool_contract_version": CANDIDATE_POOL_CONTRACT_VERSION,
+        "candidate_pool_runtime_state": candidate_pool_runtime_state,
         "lean_structural_feasible_entry_count": len(structural_entry_symbols),
         "lean_cash_feasible_entry_count": len(proposal_entry_symbols),
         "lean_slot_feasible_entry_count": (
@@ -635,6 +1091,59 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         "deployment_gap": float(plan.deployment_gap),
         "breadth_score": float(plan.breadth_score),
+        "selected_position_count": int(plan.selected_position_count),
+        "profit_coverage_ratio": float(plan.profit_coverage_ratio),
+        "profit_coverage_probability_lower": float(
+            plan.profit_coverage_probability_lower
+        ),
+        "coverage_evidence_name_count": int(
+            plan.coverage_evidence_name_count
+        ),
+        "expected_positive_pnl_amount": float(
+            plan.expected_positive_pnl_amount
+        ),
+        "expected_loss_pnl_amount": float(plan.expected_loss_pnl_amount),
+        "lifecycle_cost_amount": float(plan.lifecycle_cost_amount),
+        "coverage_penalty_amount": float(plan.coverage_penalty_amount),
+        "expected_log_growth": float(plan.expected_log_growth),
+        "minimum_selected_marginal_utility_amount": float(
+            plan.minimum_selected_marginal_utility_amount
+        ),
+        "maximum_rejected_marginal_utility_amount": float(
+            plan.maximum_rejected_marginal_utility_amount
+        ),
+        "coverage_state": str(plan.coverage_state),
+        "coverage_mode": str(plan.coverage_mode),
+        "hold_baseline_objective_amount": float(
+            plan.hold_baseline_objective_amount
+        ),
+        "incremental_expected_wealth_amount": float(
+            plan.incremental_expected_wealth_amount
+        ),
+        "incremental_cvar_amount": float(plan.incremental_cvar_amount),
+        "model_uncertainty_amount": float(plan.model_uncertainty_amount),
+        "scenario_risk_penalty_amount": float(
+            plan.scenario_risk_penalty_amount
+        ),
+        "scenario_evidence_state": str(plan.scenario_evidence_state),
+        "scenario_contract_id": str(plan.scenario_contract_id),
+        "scenario_risk_measure": str(plan.scenario_risk_measure),
+        "joint_scenario_count": int(plan.joint_scenario_count),
+        "best_rejected_proposal_ids": tuple(
+            plan.best_rejected_proposal_ids
+        ),
+        "best_rejected_objective_amount": float(
+            plan.best_rejected_objective_amount
+        ),
+        "best_rejected_expected_wealth_amount": float(
+            plan.best_rejected_expected_wealth_amount
+        ),
+        "best_rejected_cvar_amount": float(
+            plan.best_rejected_cvar_amount
+        ),
+        "best_rejected_model_uncertainty_amount": float(
+            plan.best_rejected_model_uncertainty_amount
+        ),
         "authority_penalty_amount": float(plan.authority_penalty_amount),
         "concentration_penalty_amount": float(
             plan.concentration_penalty_amount
@@ -1013,6 +1522,16 @@ def _append_held_proposals(
             trade_date=decision_date,
             cost_profile=context.execution_cost_profile,
         )
+        lifecycle_cost = estimate_lifecycle_cost(
+            symbol=symbol,
+            price=inferred_price,
+            shares=lot_shares * add_lots,
+            trade_date=decision_date,
+            cost_profile=context.execution_cost_profile,
+            # This proposal is the add leg itself; do not recursively charge
+            # another expected add on top of the factual add lifecycle.
+            expected_add_probability=0.0,
+        )
         one_lot_cost = max(
             _number(row.get("scap_estimated_total_cost_amount")),
             0.0,
@@ -1020,7 +1539,9 @@ def _append_held_proposals(
         gross_robust_profit = (
             max(base_utility, 0.0) + one_lot_cost
         ) * add_lots
-        scaled_base_utility = gross_robust_profit - exact_total_cost
+        scaled_base_utility = (
+            gross_robust_profit - lifecycle_cost.total_lifecycle_cost_amount
+        )
         if scaled_base_utility <= 0.0:
             return
         scaled_robust = scaled_base_utility
@@ -1030,6 +1551,19 @@ def _append_held_proposals(
             shares=lot_shares * add_lots,
             trade_date=decision_date,
             cost_profile=context.execution_cost_profile,
+        )
+        profile = dict(context.execution_cost_profile or {})
+        economic_assessment = (
+            assess_economic_order(
+                market_notional_amount=lot_market_notional * add_lots,
+                lifecycle_cost=lifecycle_cost,
+                conservative_gross_profit_amount=gross_robust_profit,
+                robust_net_profit_amount=scaled_robust,
+                cost_profile=profile,
+                high_confidence_exception=bool(current_authority_tier == "A"),
+            )
+            if bool(profile.get("scap_economic_order_contract_enabled", False))
+            else None
         )
         proposal = _proposal(
             context,
@@ -1048,6 +1582,35 @@ def _append_held_proposals(
             authority_tier=current_authority_tier,
             authority_snapshot_id=authority_snapshot_id,
             thesis=str(row.get("entry_thesis", "") or ""),
+            hard_veto_reasons=(
+                ("economic_order:" + economic_assessment.reason,)
+                if economic_assessment is not None
+                and not economic_assessment.passed
+                else ()
+            ),
+            lifecycle_cost_amount=lifecycle_cost.total_lifecycle_cost_amount,
+            round_trip_cost_ratio=lifecycle_cost.round_trip_cost_ratio,
+            lifecycle_cost_to_gross_profit_ratio=(
+                economic_assessment.lifecycle_cost_to_gross_profit_ratio
+                if economic_assessment is not None
+                else 0.0
+            ),
+            minimum_economic_order_amount=(
+                economic_assessment.minimum_economic_order_amount
+                if economic_assessment is not None
+                else 0.0
+            ),
+            economic_order_pass=(
+                economic_assessment.passed
+                if economic_assessment is not None
+                else True
+            ),
+            economic_order_reason=(
+                economic_assessment.reason
+                if economic_assessment is not None
+                else "contract_disabled"
+            ),
+            allocation_sleeve="core_winner",
         )
         proposals.append(proposal)
         proposal_rows[proposal.proposal_id] = row
@@ -1111,6 +1674,25 @@ def _proposal(
     execution_class=None,
     must_execute=None,
     authority_snapshot_id=None,
+    hard_veto_reasons=(),
+    lifecycle_cost_amount=0.0,
+    round_trip_cost_ratio=0.0,
+    lifecycle_cost_to_gross_profit_ratio=0.0,
+    minimum_economic_order_amount=0.0,
+    economic_order_pass=True,
+    economic_order_reason="not_applicable",
+    economic_order_warnings=(),
+    p_win_lower=0.0,
+    avg_win_return=0.0,
+    avg_loss_return=0.0,
+    expected_positive_pnl_amount=0.0,
+    expected_loss_pnl_amount=0.0,
+    coverage_evidence_authorized=False,
+    allocation_sleeve="not_applicable",
+    calibration_evidence_state="unavailable",
+    calibration_effective_sample_size=0.0,
+    scenario_contract_id="",
+    decision_return_basis="legacy_unknown",
 ) -> ActionProposal:
     return ActionProposal(
         proposal_id=f"{context.decision_id}|{symbol}|{suffix}",
@@ -1159,6 +1741,35 @@ def _proposal(
         authority_snapshot_id=str(
             authority_snapshot_id or f"{context.decision_id}|authority"
         ),
+        hard_veto_reasons=tuple(str(value) for value in hard_veto_reasons),
+        lifecycle_cost_amount=max(float(lifecycle_cost_amount), 0.0),
+        round_trip_cost_ratio=max(float(round_trip_cost_ratio), 0.0),
+        lifecycle_cost_to_gross_profit_ratio=max(
+            float(lifecycle_cost_to_gross_profit_ratio), 0.0
+        ),
+        minimum_economic_order_amount=max(
+            float(minimum_economic_order_amount), 0.0
+        ),
+        economic_order_pass=bool(economic_order_pass),
+        economic_order_reason=str(economic_order_reason),
+        economic_order_warnings=tuple(
+            str(value) for value in economic_order_warnings
+        ),
+        p_win_lower=min(max(float(p_win_lower), 0.0), 1.0),
+        avg_win_return=max(float(avg_win_return), 0.0),
+        avg_loss_return=max(float(avg_loss_return), 0.0),
+        expected_positive_pnl_amount=max(
+            float(expected_positive_pnl_amount), 0.0
+        ),
+        expected_loss_pnl_amount=max(float(expected_loss_pnl_amount), 0.0),
+        coverage_evidence_authorized=bool(coverage_evidence_authorized),
+        allocation_sleeve=str(allocation_sleeve),
+        calibration_evidence_state=str(calibration_evidence_state),
+        calibration_effective_sample_size=max(
+            float(calibration_effective_sample_size), 0.0
+        ),
+        scenario_contract_id=str(scenario_contract_id),
+        decision_return_basis=str(decision_return_basis),
     )
 
 

@@ -8,7 +8,6 @@ from config import (
     GOVERNANCE_CATCHUP_EXTRA_BUDGET_NORMAL,
     GOVERNANCE_CATCHUP_EXTRA_BUDGET_WARNING,
     GOVERNANCE_CATCHUP_GAP_TRIGGER,
-    GOVERNANCE_CATCHUP_MAX_BUDGET,
     GOVERNANCE_CATCHUP_MAX_LIQUIDITY_STRESS,
     GOVERNANCE_CATCHUP_MIN_ENTRY_COUNT,
     GOVERNANCE_CATCHUP_RATE_NORMAL_BEAR,
@@ -33,6 +32,10 @@ class ExposureCatchupDecision:
     catchup_tier: str = "none"
     accuracy_multiplier: float = 0.0
     catchup_gap_trigger: float = 0.0
+    authority_mode: str = "none"
+    recovery_max_new_names: int = 0
+    recovery_window_sessions: int = 0
+    research_gate_warning: str = ""
 
 
 def decide_exposure_catchup(
@@ -52,16 +55,24 @@ def decide_exposure_catchup(
     risk_symbol_count: int = 999,
     hard_risk_gate_enabled: bool = False,
     representative_one_lot_weight: float | None = None,
+    strategic_lower_bound: float | None = None,
+    recovery_daily_exposure_cap: float = 0.15,
+    recovery_max_new_names: int = 1,
+    recovery_window_sessions: int = 5,
 ) -> ExposureCatchupDecision:
-    """Decide whether and how much extra buy budget can pursue target exposure."""
+    """Authorize low-exposure recovery independently from rebalance research gates."""
     actual = max(float(actual_exposure), 0.0)
     target = max(float(target_exposure), 0.0)
-    gap = max(target - actual, 0.0)
+    lower = min(
+        max(float(target if strategic_lower_bound is None else strategic_lower_bound), 0.0),
+        target,
+    )
+    gap = max(lower - actual, 0.0)
     risk = str(risk_level).lower()
     regime = str(structural_regime_level).lower()
     rate = _catchup_rate(risk, regime)
     extra_budget = _extra_turnover_budget(risk)
-    tier, tier_multiplier = _catchup_tier(int(qualified_entry_count))
+    tier, _ = _catchup_tier(int(qualified_entry_count))
     accuracy_multiplier = _accuracy_multiplier(trailing_buy_accuracy_5d)
     configured_gap_trigger = float(GOVERNANCE_CATCHUP_GAP_TRIGGER)
     if (
@@ -78,46 +89,43 @@ def decide_exposure_catchup(
     block_reason = "allowed"
     if not ENABLE_GOVERNANCE_EXPOSURE_CATCHUP:
         block_reason = "disabled"
-    elif transition_only:
-        block_reason = "transition_only"
     elif gap < adaptive_gap_trigger:
         block_reason = "gap_below_trigger"
-    elif risk not in {"normal", "warning"}:
+    elif risk in {"critical"} or regime in {"crisis"}:
         block_reason = "risk_level_blocks_catchup"
     elif float(market_liquidity_stress_ratio) > float(GOVERNANCE_CATCHUP_MAX_LIQUIDITY_STRESS):
         block_reason = "liquidity_stress"
-    elif tier == "none":
-        block_reason = "insufficient_confirmed_entries"
-    elif bool(hard_risk_gate_enabled) and not bool(risk_contribution_gate_pass):
-        block_reason = "risk_contribution_gate_blocks_catchup"
-    elif bool(hard_risk_gate_enabled) and (
-        float(top20pct_risk_contribution_sum) > 0.55
-        or float(risk_effective_n_ratio) < 0.55
-    ):
-        block_reason = "scale_normalized_risk_contribution_blocks_catchup"
-    elif rate <= 0.0:
-        block_reason = "zero_catchup_rate"
+    elif int(qualified_entry_count) <= 0:
+        block_reason = "no_candidate_evidence"
 
     allowed = block_reason == "allowed"
     budget = min(
-        gap * rate * tier_multiplier * accuracy_multiplier,
-        extra_budget,
-        float(GOVERNANCE_CATCHUP_MAX_BUDGET),
+        gap,
+        max(float(recovery_daily_exposure_cap), 0.0),
     ) if allowed else 0.0
+    warning_parts = []
+    if not bool(risk_contribution_gate_pass):
+        warning_parts.append("research_risk_gate_failed_diagnostic_only")
+    if float(top20pct_risk_contribution_sum) > 0.55 or float(risk_effective_n_ratio) < 0.55:
+        warning_parts.append("concentration_research_warning")
 
     return ExposureCatchupDecision(
         actual_exposure=actual,
         target_exposure=target,
         exposure_gap=gap,
         catchup_allowed=allowed,
-        catchup_rate=rate,
+        catchup_rate=(1.0 if allowed else 0.0),
         catchup_buy_budget=max(float(budget), 0.0),
         catchup_extra_turnover_budget=extra_budget if allowed else 0.0,
         catchup_block_reason=block_reason,
         qualified_entry_count=int(qualified_entry_count),
-        catchup_tier=tier if allowed else "none",
-        accuracy_multiplier=accuracy_multiplier if allowed else 0.0,
+        catchup_tier="recovery" if allowed else "none",
+        accuracy_multiplier=accuracy_multiplier,
         catchup_gap_trigger=float(adaptive_gap_trigger),
+        authority_mode="exposure_recovery" if allowed else "none",
+        recovery_max_new_names=max(int(recovery_max_new_names), 1) if allowed else 0,
+        recovery_window_sessions=max(int(recovery_window_sessions), 1) if allowed else 0,
+        research_gate_warning="|".join(warning_parts),
     )
 
 

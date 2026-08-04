@@ -4,6 +4,26 @@ from __future__ import annotations
 import pandas as pd
 
 
+def observed_feature_sessions(feature_path, start_date, end_date) -> pd.DatetimeIndex:
+    """Return all distinct observed sessions in an inclusive requested window."""
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    observed = pd.read_parquet(
+        feature_path,
+        columns=["date"],
+        filters=[("date", ">=", start), ("date", "<=", end)],
+    )
+    sessions = pd.DatetimeIndex(
+        pd.to_datetime(observed["date"], errors="coerce")
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    if sessions.empty:
+        raise ValueError(f"No observed feature session in {start.date()}..{end.date()}")
+    return sessions.normalize()
+
+
 def first_observed_feature_session(feature_path, start_date, end_date) -> pd.Timestamp:
     """Return the first stored market session within an inclusive window."""
     start = pd.Timestamp(start_date)

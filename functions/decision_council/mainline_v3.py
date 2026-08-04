@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import pandas as pd
 
+from functions.decision_council.candidate_pool_contract import (
+    CANDIDATE_POOL_CONTRACT_VERSION,
+    select_feasible_candidate_pool,
+)
+
 from config import ALLOW_BSE_MARKET, ALLOW_STAR_MARKET
 from functions.decision_council.mainline_v2 import MAINLINE_V3_VERSIONS
 from functions.decision_council.scap_v2_contracts import validate_score_columns
@@ -49,6 +54,8 @@ def apply_mainline_v3_entry_policy(
     scap_candidate_minimum_commission: float = 5.0,
     scap_candidate_reward_basis: str = "lcb",
     selection_enabled: bool = True,
+    scap_candidate_pool_limit: int = 32,
+    scap_candidate_pool_per_thesis: int = 2,
 ) -> pd.DataFrame:
     """Use cabinet-native ranking while preserving only factual/state hard vetoes."""
     if candidates is None or candidates.empty:
@@ -204,55 +211,28 @@ def apply_mainline_v3_entry_policy(
     data["mainline_v3_slot_feasible"] = cash_signal & bool(remaining_slots > 0)
     selected_index = []
     if bool(use_scap_candidate_utility):
-        # Mainline is now a Pareto candidate reducer only.  Final integer-lot
-        # authority belongs to policy's unique ActionPlan optimizer.
-        pool = data.loc[eligible & ~is_held].copy()
-        pool["_utility_amount"] = pd.to_numeric(
-            pool.get("scap_candidate_utility"), errors="coerce"
-        ).fillna(float("-inf"))
-        pool["_capital_efficiency"] = (
-            pool["_utility_amount"]
-            / pd.to_numeric(
-                pool.get("mainline_v3_one_lot_cash_required"), errors="coerce"
-            ).replace(0.0, pd.NA)
-        ).fillna(float("-inf"))
-        pool = pool[pool["_utility_amount"].gt(0.0)].copy()
-        union = []
-        for column in ("_utility_amount", "_capital_efficiency", "primary_score"):
-            union.extend(
-                pool.sort_values([column, "symbol"], ascending=[False, True])
-                .head(8)
-                .index.tolist()
-            )
-        thesis_column = "cabinet_entry_thesis"
-        if thesis_column in pool.columns:
-            for _, group in pool.groupby(thesis_column, dropna=False):
-                union.extend(
-                    group.sort_values(
-                        ["_utility_amount", "symbol"], ascending=[False, True]
-                    )
-                    .head(2)
-                    .index.tolist()
-                )
-        if "scap_v31_authority_tier" in pool.columns:
-            for _, group in pool.groupby(
-                pool["scap_v31_authority_tier"].fillna("D").astype(str),
-                dropna=False,
-            ):
-                union.extend(
-                    group.sort_values(
-                        ["_utility_amount", "symbol"],
-                        ascending=[False, True],
-                    )
-                    .head(2)
-                    .index.tolist()
-                )
-        selected_index = list(dict.fromkeys(union))[:15]
+        # This is the sole financial-feasibility and computational-compression
+        # contract.  Lean must consume this result and may not reselect from the
+        # unfiltered table.
+        selected_index, factual_pool, positive_pool = select_feasible_candidate_pool(
+            data,
+            limit=max(int(scap_candidate_pool_limit), 1),
+            per_pool_reserve=max(int(scap_candidate_pool_per_thesis), 1),
+        )
         data["scap_action_candidate"] = data.index.isin(selected_index)
+        data["scap_candidate_pool_factual_feasible"] = factual_pool.reindex(
+            data.index, fill_value=False
+        )
+        data["scap_candidate_pool_positive_feasible"] = positive_pool.reindex(
+            data.index, fill_value=False
+        )
+        data["scap_candidate_pool_contract_version"] = (
+            CANDIDATE_POOL_CONTRACT_VERSION
+        )
         data["scap_optimizer_selected"] = False
         data["scap_optimizer_objective"] = pd.NA
-        data["scap_optimizer_candidate_pool_size"] = int(len(pool))
-        data["scap_optimizer_status"] = "pareto_reducer_only"
+        data["scap_optimizer_candidate_pool_size"] = int(positive_pool.sum())
+        data["scap_optimizer_status"] = "authoritative_feasible_pool_only"
     else:
         for index in score[eligible & ~is_held].sort_values(ascending=False).index:
             if len(selected_index) >= remaining_slots:

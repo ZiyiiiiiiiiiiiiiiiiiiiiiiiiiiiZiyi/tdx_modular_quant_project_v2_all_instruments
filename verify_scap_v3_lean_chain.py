@@ -58,7 +58,7 @@ def context(*, cash: float = 19_000.0) -> DecisionContext:
 
 
 def frame() -> pd.DataFrame:
-    return pd.DataFrame(
+    data = pd.DataFrame(
         [
             {
                 "symbol": "H",
@@ -118,6 +118,11 @@ def frame() -> pd.DataFrame:
             },
         ]
     )
+    # Production consumes the authoritative upstream pool.  The fixture marks
+    # the two non-held rows explicitly instead of relying on a removed Lean
+    # shortlist implementation.
+    data["scap_action_candidate"] = data["symbol"].isin({"A", "B"})
+    return data
 
 
 base = build_lean_decision(context(), frame())
@@ -135,6 +140,26 @@ lean_funnel_counts = [
 ]
 assert all(right <= left for left, right in zip(lean_funnel_counts, lean_funnel_counts[1:]))
 passed("one decision creates exactly one optimizer invocation and one ActionPlan")
+
+closed_calendar = build_lean_decision(
+    replace(context(), allow_normal_rebalance=False),
+    frame(),
+)
+closed_selected = {
+    proposal.proposal_id: proposal for proposal in closed_calendar.proposals
+    if proposal.proposal_id in set(closed_calendar.plan.selected_proposal_ids)
+}
+assert not any(
+    proposal.action_type == "new_entry"
+    for proposal in closed_selected.values()
+)
+assert any(
+    proposal.action_type == "new_entry"
+    for proposal in closed_calendar.proposals
+)
+passed(
+    "Lean idle days retain comparable proposals but authorize no buy unless post-exit recovery requires it"
+)
 
 selected = [
     proposal
@@ -313,8 +338,8 @@ multi_lot_candidate = pd.DataFrame(
             "mainline_v3_minimum_buy_quantity": 100,
             "mainline_v3_lot_feasible": True,
             "scap_candidate_utility": -4.0,
-            "scap_decision_expected_return": 0.0040,
-            "scap_expected_return_point": 0.0045,
+            "scap_decision_expected_return": 0.0250,
+            "scap_expected_return_point": 0.0275,
             "scap_risk_penalty_amount": 0.0,
             "scap_estimated_total_cost_amount": 10.0,
             "cabinet_entry_thesis": "momentum",
@@ -322,6 +347,7 @@ multi_lot_candidate = pd.DataFrame(
         }
     ]
 )
+multi_lot_candidate["scap_action_candidate"] = True
 multi_context = replace(
     context(),
     candidates=multi_lot_candidate,
@@ -337,7 +363,7 @@ multi_selected = [
 assert multi_selected
 assert multi_selected[0].requested_lots > 1
 assert multi_selected[0].robust_net_profit_amount > 0.0
-passed("multi-lot order pays minimum commission once and can rescue a negative one-lot utility")
+passed("economically strong multi-lot order pays minimum commission once and can rescue a negative one-lot utility")
 
 lean_risk_dates = pd.date_range("2024-09-02", periods=80, freq="B")
 lean_return_pivot = pd.DataFrame(

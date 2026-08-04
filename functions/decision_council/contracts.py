@@ -6,6 +6,8 @@ from typing import Mapping
 
 import pandas as pd
 
+from functions.decision_council.portfolio_constraint_contract import PolicyBand
+
 
 @dataclass(frozen=True)
 class SafetyDecision:
@@ -54,6 +56,7 @@ class DecisionContext:
     active_replacement_max_pairs_per_day: int = 1
     hard_qualification_symbols: frozenset[str] = frozenset()
     covariance_matrix: pd.DataFrame | None = None
+    scenario_return_matrix: pd.DataFrame | None = None
     nav_amount: float = 1.0
     cash_amount: float = 0.0
     cash_buffer_amount: float = 0.0
@@ -71,3 +74,6 @@ class DecisionContext:
     hard_exposure_ceiling: float | None = None
     confirmed_derisk_target: float | None = None
     current_lots_by_symbol: Mapping[str, int] | None = None
+    policy_band: PolicyBand | None = None
+    recovery_episode_id: str = ""
+    recovery_episode_day: int = 0

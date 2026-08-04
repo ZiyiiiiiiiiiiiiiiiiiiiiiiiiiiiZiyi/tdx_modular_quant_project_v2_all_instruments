@@ -108,7 +108,19 @@ def adapt_retail_buy_order(
 
     target_exposure = 0.0
     if runner.exposure_rows:
-        target_exposure = _safe_float(runner.exposure_rows[-1].get("target_exposure"), default=0.0)
+        exposure_contract_row = runner.exposure_rows[-1]
+        target_exposure = _safe_float(
+            exposure_contract_row.get(
+                "hard_exposure_ceiling"
+                if action_plan_authorized
+                else "target_exposure"
+            ),
+            default=0.0,
+        )
+        if action_plan_authorized:
+            # The ActionPlan already optimized against the policy target.  The
+            # execution adapter may re-check only the factual hard ceiling.
+            exposure_tolerance = 0.0
     current_exposure = 0.0
     if runner.exposure_rows:
         current_exposure = _safe_float(runner.exposure_rows[-1].get("nominal_exposure"), default=0.0)
@@ -118,10 +130,24 @@ def adapt_retail_buy_order(
     if action_plan_authorized:
         # The unique ActionPlan already consumed every soft score, forecast,
         # and action conflict. Execution may still reject factual cash, lot,
-        # position-state, or exposure violations above, but cannot re-score.
-        if initial_shares >= minimum_buy_quantity:
-            return initial_shares, "action_plan_unchanged", ""
-        return minimum_buy_quantity, "action_plan_one_lot", ""
+        # position-state, or exposure violations, but cannot re-score or resize.
+        if initial_shares < minimum_buy_quantity:
+            return 0.0, "blocked", "action_plan_quantity_below_board_lot"
+        full_cash_required = retail_cash_required(
+            runner, side="buy", price=order_price, shares=initial_shares
+        )
+        if full_cash_required > affordable_cash + 1e-9:
+            return 0.0, "blocked", "action_plan_cash_insufficient"
+        full_weight = float(order_price) * float(initial_shares) / max(float(nominal_nav), 1e-12)
+        if current_weight + full_weight > single_cap + 1e-12:
+            return 0.0, "blocked", "action_plan_single_position_cap"
+        if (
+            target_exposure > 1e-12
+            and current_exposure + full_weight
+            > target_exposure + exposure_tolerance + 1e-12
+        ):
+            return 0.0, "blocked", "action_plan_target_exposure_tolerance"
+        return initial_shares, "action_plan_unchanged", ""
 
     if initial_shares >= minimum_buy_quantity:
         return initial_shares, "unchanged", ""

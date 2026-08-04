@@ -64,8 +64,16 @@ def main() -> int:
     target = pd.to_numeric(daily["target_exposure"], errors="coerce")
     results.append(_check(target.between(0.0, 1.0).all(), "target exposure bounded"))
     holdings = pd.to_numeric(daily["holding_count"], errors="coerce")
-    configured = pd.to_numeric(daily["configured_max_positions"], errors="coerce")
-    results.append(_check((holdings <= configured).all(), "position count bounded"))
+    effective_cap = pd.to_numeric(daily["effective_position_cap"], errors="coerce")
+    grandfathered = pd.to_numeric(
+        daily.get("grandfathered_excess_names", 0), errors="coerce"
+    ).fillna(0.0)
+    results.append(
+        _check(
+            (holdings <= effective_cap + grandfathered).all(),
+            "position count bounded by effective dynamic capacity",
+        )
+    )
 
     integrity = frames["governance_runtime_integrity_audit.csv"]
     results.append(
@@ -98,8 +106,16 @@ def main() -> int:
             & order_plan["action_plan_selected"].astype(str).str.lower().eq("true")
         ][["decision_id", "symbol"]].drop_duplicates()
     if "registration_key" in pending.columns:
-        keys = pending["registration_key"].dropna().astype(str)
-        results.append(_check(not keys.duplicated().any(), "pending registration keys unique"))
+        snapshot_keys = pending.loc[
+            pending["registration_key"].notna(),
+            ["registration_key", "snapshot_date", "event_type"],
+        ].astype(str)
+        results.append(
+            _check(
+                not snapshot_keys.duplicated().any(),
+                "pending registration keys unique within each ledger event",
+            )
+        )
     else:
         results.append(_check(pending.empty, "pending schema/no registration keys consistent"))
 

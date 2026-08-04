@@ -23,6 +23,8 @@ def main() -> int:
                 "date": "2024-01-03",
                 "actual_exposure": 0.20,
                 "effective_target_exposure_cap": 0.50,
+                "holding_count": 1,
+                "effective_position_cap": 3,
             }
         ]
     )

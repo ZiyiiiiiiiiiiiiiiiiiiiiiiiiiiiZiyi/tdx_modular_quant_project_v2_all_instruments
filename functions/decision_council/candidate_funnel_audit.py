@@ -404,11 +404,51 @@ def build_exposure_reconciliation(exposure: pd.DataFrame) -> pd.DataFrame:
     def numeric(name: str) -> pd.Series:
         source = data[name] if name in data.columns else pd.Series(0.0, index=data.index)
         return pd.to_numeric(source, errors="coerce").fillna(0.0)
-    target = numeric("target_exposure")
+    policy_target = (
+        numeric("policy_exposure_target")
+        if "policy_exposure_target" in data.columns
+        else numeric("strategic_exposure_target")
+    )
+    policy_lower = (
+        numeric("policy_exposure_lower")
+        if "policy_exposure_lower" in data.columns
+        else numeric("strategic_exposure_lower_bound")
+    )
     actual = numeric("actual_exposure")
-    reported_gap = numeric("exposure_gap")
-    data["reconciled_exposure_gap"] = target - actual
-    data["reconciliation_error"] = data["reconciled_exposure_gap"] - reported_gap
+    post_mandatory = (
+        numeric("post_mandatory_exposure")
+        if "post_mandatory_exposure" in data.columns
+        else actual
+    )
+    plan = (
+        numeric("optimizer_planned_exposure")
+        if "optimizer_planned_exposure" in data.columns
+        else post_mandatory
+    )
+    data["pretrade_policy_target_gap"] = (policy_target - actual).clip(lower=0.0)
+    data["pretrade_policy_lower_shortfall"] = (policy_lower - actual).clip(lower=0.0)
+    data["post_mandatory_lower_shortfall"] = (
+        policy_lower - post_mandatory
+    ).clip(lower=0.0)
+    data["execution_to_plan_exposure_gap"] = (plan - actual).clip(lower=0.0)
+    reported_target_gap = (
+        numeric("strategic_exposure_gap")
+        if "strategic_exposure_gap" in data.columns
+        else data["pretrade_policy_target_gap"]
+    )
+    reported_lower_gap = (
+        numeric("exposure_gap")
+        if "exposure_gap" in data.columns
+        else data["pretrade_policy_lower_shortfall"]
+    )
+    data["target_gap_reconciliation_error"] = (
+        data["pretrade_policy_target_gap"] - reported_target_gap
+    )
+    data["lower_gap_reconciliation_error"] = (
+        data["pretrade_policy_lower_shortfall"] - reported_lower_gap
+    )
+    data["reconciled_exposure_gap"] = data["pretrade_policy_lower_shortfall"]
+    data["reconciliation_error"] = data["lower_gap_reconciliation_error"]
     data["candidate_shortfall_flag"] = numeric("qualified_entry_count").le(0)
     data["capital_constraint_flag"] = numeric("retail_blocked_count").gt(0)
     data["lot_size_constraint_flag"] = numeric("retail_lot_cash_insufficient_count").gt(0)
@@ -419,6 +459,10 @@ def build_exposure_reconciliation(exposure: pd.DataFrame) -> pd.DataFrame:
     )
     keep = [
         "date", "decision_id", "target_exposure", "actual_exposure", "exposure_gap",
+        "policy_exposure_target", "policy_exposure_lower",
+        "pretrade_policy_target_gap", "pretrade_policy_lower_shortfall",
+        "post_mandatory_lower_shortfall", "execution_to_plan_exposure_gap",
+        "target_gap_reconciliation_error", "lower_gap_reconciliation_error",
         "reconciled_exposure_gap", "reconciliation_error", "qualified_entry_count",
         "retail_blocked_count", "retail_lot_cash_insufficient_count",
         "candidate_shortfall_flag", "capital_constraint_flag", "lot_size_constraint_flag",

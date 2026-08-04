@@ -35,6 +35,14 @@ class FactorRuntimeAudit:
     missing_families: list[str] | None = None
     cabinet_manifest_hash: str = ""
     runtime_contract_verified: bool = False
+    data_coverage_contract_verified: bool = False
+    coverage_window_start: str = ""
+    coverage_window_end: str = ""
+    authorized_role_daily_coverage: dict[str, dict[str, Any]] | None = None
+    coverage_failures: list[str] | None = None
+    size_factor_pit_proxy_rows: int = 0
+    size_factor_pit_proxy_dates: int = 0
+    size_factor_pit_proxy_max_age_sessions: int = 0
 
     @property
     def factor_count(self) -> int:
@@ -51,6 +59,9 @@ def build_factor_runtime_audit(
     *,
     requested_factor_source: str | None = None,
     available_columns=None,
+    feature_frame: pd.DataFrame | None = None,
+    decision_start=None,
+    decision_end=None,
 ) -> FactorRuntimeAudit:
     """Build an auditable runtime record from the resolved factor-source spec."""
     requested = str(requested_factor_source or spec.factor_source or "").strip()
@@ -105,6 +116,48 @@ def build_factor_runtime_audit(
         fallback_detected = True
         fallback_reason = "runtime_contract_incomplete"
 
+    coverage_verified = False
+    coverage_start = ""
+    coverage_end = ""
+    role_coverage: dict[str, dict[str, Any]] = {}
+    coverage_failures: list[str] = []
+    proxy_rows = 0
+    proxy_dates = 0
+    proxy_max_age = 0
+    if (
+        spec.uses_factor_cabinet
+        and feature_frame is not None
+        and decision_start is not None
+        and decision_end is not None
+    ):
+        coverage_verified = True
+        coverage_start = pd.Timestamp(decision_start).strftime("%Y-%m-%d")
+        coverage_end = pd.Timestamp(decision_end).strftime("%Y-%m-%d")
+        role_coverage, coverage_failures = _audit_authorized_role_daily_coverage(
+            feature_frame,
+            context=context,
+            decision_start=decision_start,
+            decision_end=decision_end,
+        )
+        if coverage_failures:
+            fallback_detected = True
+            fallback_reason = "authorized_factor_daily_coverage_incomplete"
+        window_dates = pd.to_datetime(feature_frame["date"], errors="coerce")
+        proxy_window = feature_frame.loc[window_dates.between(pd.Timestamp(decision_start), pd.Timestamp(decision_end), inclusive="both")]
+        if "factor_size_pit_proxy_used" in proxy_window.columns:
+            proxy_used = proxy_window["factor_size_pit_proxy_used"].fillna(False).astype(bool)
+            proxy_rows = int(proxy_used.sum())
+            if proxy_rows:
+                proxy_dates = int(pd.to_datetime(proxy_window.loc[proxy_used, "date"], errors="coerce").nunique())
+                if "factor_size_pit_proxy_age_sessions" in proxy_window.columns:
+                    proxy_max_age = int(
+                        pd.to_numeric(
+                            proxy_window.loc[proxy_used, "factor_size_pit_proxy_age_sessions"],
+                            errors="coerce",
+                        ).max()
+                        or 0
+                    )
+
     return FactorRuntimeAudit(
         factor_source=spec.factor_source,
         factor_cabinet_run_id=str(spec.factor_cabinet_run_id or ""),
@@ -123,7 +176,114 @@ def build_factor_runtime_audit(
         missing_families=missing_families,
         cabinet_manifest_hash=spec.cabinet_manifest_hash,
         runtime_contract_verified=runtime_contract_verified,
+        data_coverage_contract_verified=coverage_verified,
+        coverage_window_start=coverage_start,
+        coverage_window_end=coverage_end,
+        authorized_role_daily_coverage=role_coverage,
+        coverage_failures=coverage_failures,
+        size_factor_pit_proxy_rows=proxy_rows,
+        size_factor_pit_proxy_dates=proxy_dates,
+        size_factor_pit_proxy_max_age_sessions=proxy_max_age,
     )
+
+
+def _audit_authorized_role_daily_coverage(
+    feature_frame: pd.DataFrame,
+    *,
+    context,
+    decision_start,
+    decision_end,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Verify that every trade-authorized factor role remains observable.
+
+    Schema availability is insufficient: a column can exist while its entire
+    cross-section is NaN after an upstream data source stops.  Entry authority
+    is currently granted only to the strict ``entry_alpha`` role.  Proxy entry
+    factors remain diagnostic unless a future immutable run contract grants
+    them trading authority explicitly.
+    """
+    data = feature_frame
+    if "date" not in data.columns:
+        return {}, ["feature_frame_missing_date"]
+    dates = pd.to_datetime(data["date"], errors="coerce")
+    start = pd.Timestamp(decision_start)
+    end = pd.Timestamp(decision_end)
+    window = data.loc[dates.between(start, end, inclusive="both")].copy()
+    window["date"] = pd.to_datetime(window["date"], errors="coerce")
+    observed_dates = pd.Index(window["date"].dropna().drop_duplicates().sort_values())
+    if observed_dates.empty:
+        return {}, [f"no_observed_feature_dates:{start.date()}:{end.date()}"]
+
+    model_feature_map = dict(getattr(context, "model_feature_map", {}) or {})
+    primary_roles = dict(getattr(context, "primary_role_map", {}) or {})
+    family_map = dict(getattr(context, "family_map", {}) or {})
+    authorized_roles = {"entry_alpha"}
+    output: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for role in sorted(authorized_roles):
+        models = [name for name in model_feature_map if str(primary_roles.get(name, "")) == role]
+        columns = [model_feature_map[name] for name in models]
+        if not models:
+            failures.append(f"authorized_role_has_no_models:{role}")
+            output[role] = {"configured_model_count": 0, "invalid_dates": []}
+            continue
+        missing = sorted(column for column in columns if column not in window.columns)
+        invalid_dates: list[str] = []
+        daily_active_models: list[int] = []
+        daily_active_families: list[int] = []
+        daily_valid_rows: list[int] = []
+        for date in observed_dates:
+            day = window.loc[window["date"].eq(date)]
+            active = 0
+            active_names: list[str] = []
+            valid_rows = pd.Series(False, index=day.index)
+            for model_name, column in zip(models, columns):
+                if column not in day.columns:
+                    continue
+                numeric = pd.to_numeric(day[column], errors="coerce")
+                finite = numeric.notna()
+                if bool(finite.any()):
+                    active += 1
+                    active_names.append(model_name)
+                    valid_rows = valid_rows | finite
+            daily_active_models.append(active)
+            daily_active_families.append(
+                len({str(family_map.get(name, "unknown")) for name in active_names})
+            )
+            daily_valid_rows.append(int(valid_rows.sum()))
+            if active <= 0 or int(valid_rows.sum()) <= 0:
+                invalid_dates.append(pd.Timestamp(date).strftime("%Y-%m-%d"))
+        output[role] = {
+            "configured_model_count": len(models),
+            "configured_family_count": len(
+                {str(family_map.get(name, "unknown")) for name in models}
+            ),
+            "configured_columns": columns,
+            "missing_columns": missing,
+            "observed_date_count": len(observed_dates),
+            "minimum_active_model_count": min(daily_active_models, default=0),
+            "minimum_active_family_count": min(daily_active_families, default=0),
+            "minimum_valid_cross_section_rows": min(daily_valid_rows, default=0),
+            "first_invalid_date": invalid_dates[0] if invalid_dates else "",
+            "last_valid_date": (
+                max(
+                    pd.Timestamp(date)
+                    for date, active, rows in zip(observed_dates, daily_active_models, daily_valid_rows)
+                    if active > 0 and rows > 0
+                ).strftime("%Y-%m-%d")
+                if any(active > 0 and rows > 0 for active, rows in zip(daily_active_models, daily_valid_rows))
+                else ""
+            ),
+            "invalid_dates": invalid_dates,
+        }
+        if missing:
+            failures.append(f"authorized_role_missing_columns:{role}:{','.join(missing)}")
+        if invalid_dates:
+            failures.append(
+                f"authorized_role_has_zero_daily_coverage:{role}:"
+                f"{invalid_dates[0]}:{invalid_dates[-1]}:{len(invalid_dates)}"
+            )
+    return output, failures
 
 
 def save_factor_runtime_audit(audit: FactorRuntimeAudit, output_dir: str | Path) -> Path:

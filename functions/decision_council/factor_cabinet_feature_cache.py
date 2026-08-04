@@ -8,9 +8,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from config import FEATURE_DAILY_PARQUET, GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS
+from config import (
+    FEATURE_DAILY_PARQUET,
+    GOVERNANCE_PRE_SCREEN_FACTOR_CACHE_LOOKBACK_DAYS,
+    GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS,
+)
 from functions.decision_council.candidate_factor_cache import (
     FACTOR_CACHE_INDEX_COLUMNS,
     candidate_factor_source_columns,
@@ -32,6 +37,17 @@ from functions.pipeline_cache import file_fingerprint
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FACTOR_CABINET_FEATURE_CACHE_ROOT = PROJECT_ROOT / "results" / "factor_cabinet_feature_cache"
+
+SIZE_FACTOR_PIT_PROXY_COLUMNS = (
+    "cand_size_total_cap_neg",
+    "cand_size_float_cap_neg",
+    "cand_size_float_cap_rank_small",
+    "cand_grid_base_rank__size_total_neg",
+    "cand_grid_base_rank__size_float_neg",
+    "cand_matrix_base_rank__barra_size_neg",
+)
+SIZE_FACTOR_PIT_PROXY_USED_COLUMN = "factor_size_pit_proxy_used"
+SIZE_FACTOR_PIT_PROXY_AGE_COLUMN = "factor_size_pit_proxy_age_sessions"
 
 
 def factor_cabinet_feature_cache_paths(
@@ -471,7 +487,11 @@ def attach_factor_cabinet_feature_cache(
         return data
     columns_to_attach = tuple(column for column in raw_columns if column not in data.columns)
     if not columns_to_attach:
-        return data
+        return repair_bounded_size_factor_coverage(
+            data,
+            requested_columns=raw_columns,
+            max_sessions=GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS,
+        )
     cache = load_factor_cabinet_feature_cache(
         spec,
         start_date,
@@ -491,7 +511,134 @@ def attach_factor_cabinet_feature_cache(
     missing = sorted(column for column in raw_columns if column not in merged.columns)
     if missing:
         raise ValueError(f"factor_cabinet feature cache merge failed for columns: {missing}")
-    return merged
+    return repair_bounded_size_factor_coverage(
+        merged,
+        requested_columns=raw_columns,
+        max_sessions=GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS,
+    )
+
+
+def repair_bounded_size_factor_coverage(
+    data: pd.DataFrame,
+    *,
+    requested_columns=None,
+    max_sessions: int = GOVERNANCE_SIZE_FACTOR_PIT_PROXY_MAX_SESSIONS,
+) -> pd.DataFrame:
+    """Bridge a short PIT market-cap tail without carrying factor values.
+
+    The last observed share-count proxy is ``market_cap / nominal_close``.
+    Repricing that fixed proxy with each current nominal close preserves daily
+    cross-sectional movement and uses no future information.  The bridge is
+    bounded by observations per symbol; missing values beyond the bound are
+    deliberately left untouched for the runtime coverage audit to reject.
+    """
+    requested = set(requested_columns or SIZE_FACTOR_PIT_PROXY_COLUMNS)
+    targets = [
+        column for column in SIZE_FACTOR_PIT_PROXY_COLUMNS
+        if column in requested and column in data.columns
+    ]
+    data[SIZE_FACTOR_PIT_PROXY_USED_COLUMN] = False
+    data[SIZE_FACTOR_PIT_PROXY_AGE_COLUMN] = np.int16(0)
+    if not targets or int(max_sessions) <= 0 or data.empty:
+        return data
+    required = {"date", "symbol"}
+    price_column = "close_nominal" if "close_nominal" in data.columns else "close"
+    if not required.issubset(data.columns) or price_column not in data.columns:
+        return data
+    cap_columns = {
+        "total": ("stabilized_total_cap", "total_cap"),
+        "float": ("stabilized_float_cap", "float_cap"),
+    }
+    if not any(column in data.columns for columns in cap_columns.values() for column in columns):
+        return data
+
+    missing_target = data[targets].apply(pd.to_numeric, errors="coerce").isna().any(axis=1)
+    if not bool(missing_target.any()):
+        return data
+    missing_dates = pd.to_datetime(data.loc[missing_target, "date"], errors="coerce").dropna()
+    if missing_dates.empty:
+        return data
+    first_missing = missing_dates.min()
+    last_missing = missing_dates.max()
+    # The multiplier is only a memory bound; the actual authorization bound is
+    # the per-symbol observation age checked below.
+    slice_start = first_missing - pd.Timedelta(days=int(max_sessions) * 4 + 14)
+    all_dates = pd.to_datetime(data["date"], errors="coerce")
+    work_mask = all_dates.between(slice_start, last_missing, inclusive="both")
+    source_columns = ["date", "symbol", price_column]
+    source_columns.extend(
+        column for columns in cap_columns.values() for column in columns
+        if column in data.columns and column not in source_columns
+    )
+    work = data.loc[work_mask, source_columns].copy()
+    if work.empty:
+        return data
+    work["_original_index"] = work.index
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work.sort_values(["symbol", "date"], inplace=True, kind="mergesort")
+    price = pd.to_numeric(work[price_column], errors="coerce").where(lambda value: value > 0.0)
+
+    reconstructed_caps: dict[str, pd.Series] = {}
+    ages: dict[str, pd.Series] = {}
+    position = work.groupby("symbol", sort=False).cumcount()
+    for cap_kind, columns in cap_columns.items():
+        cap = pd.Series(np.nan, index=work.index, dtype="float64")
+        for column in columns:
+            if column in work.columns:
+                candidate = pd.to_numeric(work[column], errors="coerce").where(lambda value: value > 0.0)
+                cap = cap.fillna(candidate)
+        observed = cap.notna() & price.notna()
+        share_proxy = (cap / price).where(observed)
+        carried_shares = share_proxy.groupby(work["symbol"], sort=False).ffill()
+        last_position = position.where(observed).groupby(work["symbol"], sort=False).ffill()
+        age = (position - last_position).where(last_position.notna())
+        authorized = age.between(1, int(max_sessions), inclusive="both") & price.notna()
+        reconstructed_caps[cap_kind] = (carried_shares * price).where(authorized)
+        ages[cap_kind] = age.where(authorized)
+
+    factor_input = pd.DataFrame(
+        {
+            "date": work["date"],
+            "symbol": work["symbol"],
+            "close": price,
+            "stabilized_total_cap": reconstructed_caps["total"],
+            "stabilized_float_cap": reconstructed_caps["float"],
+        },
+        index=work.index,
+    )
+    generated = append_candidate_factors(
+        factor_input,
+        close_col="close",
+        include_columns=set(targets),
+        include_ultra_grid=True,
+    )
+    original_index = work["_original_index"]
+    used_by_work = pd.Series(False, index=work.index)
+    age_by_work = pd.Series(0.0, index=work.index)
+    for column in targets:
+        if column not in generated.columns:
+            continue
+        destination_index = original_index.to_numpy()
+        current = pd.to_numeric(data.loc[destination_index, column], errors="coerce")
+        replacement = pd.to_numeric(generated[column], errors="coerce").to_numpy()
+        fill_mask = current.isna().to_numpy() & np.isfinite(replacement)
+        if not bool(fill_mask.any()):
+            continue
+        fill_index = destination_index[fill_mask]
+        data.loc[fill_index, column] = replacement[fill_mask].astype("float32")
+        used_by_work.loc[work.index[fill_mask]] = True
+        relevant_age = ages["float"] if "float" in column else ages["total"]
+        age_by_work.loc[work.index[fill_mask]] = np.maximum(
+            age_by_work.loc[work.index[fill_mask]].to_numpy(),
+            pd.to_numeric(relevant_age.loc[work.index[fill_mask]], errors="coerce").fillna(0.0).to_numpy(),
+        )
+    if bool(used_by_work.any()):
+        used_index = original_index.loc[used_by_work].to_numpy()
+        data.loc[used_index, SIZE_FACTOR_PIT_PROXY_USED_COLUMN] = True
+        data.loc[used_index, SIZE_FACTOR_PIT_PROXY_AGE_COLUMN] = (
+            age_by_work.loc[used_by_work].clip(lower=0, upper=int(max_sessions)).astype("int16").to_numpy()
+        )
+    return data
 
 
 def _read_manifest(path: Path) -> dict:

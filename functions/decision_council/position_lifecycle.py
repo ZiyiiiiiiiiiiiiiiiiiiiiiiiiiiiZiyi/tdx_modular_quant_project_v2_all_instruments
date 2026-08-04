@@ -57,16 +57,26 @@ def resolve_scap_loss_limits(
     an independent one-day circuit breaker and therefore never gets widened by
     the adaptive formula.
     """
-    disaster = float(disaster_floor)
+    disaster = float(profile.get("scap_loss_disaster_stop", disaster_floor))
     configured = float(profile.get("scap_loss_stop", disaster))
     mode = str(profile.get("scap_loss_stop_mode", "fixed") or "fixed").strip().lower()
     if mode != "adaptive_volatility_or_disaster_floor":
+        if not disaster < configured < 0.0:
+            raise ValueError("loss limits must satisfy disaster_stop < soft_stop < 0")
         return configured, disaster
     tail_proxy = _clip01(tail_risk_proxy)
     soft_base = float(profile.get("scap_loss_soft_base", -0.16))
     tail_tightening = max(float(profile.get("scap_loss_tail_tightening", 0.04)), 0.0)
-    adaptive_soft = soft_base + tail_tightening * tail_proxy
-    return max(disaster, adaptive_soft), disaster
+    soft_tightest = float(profile.get("scap_loss_soft_tightest", -0.12))
+    if not disaster < soft_base <= soft_tightest < 0.0:
+        raise ValueError(
+            "adaptive loss limits must satisfy disaster < soft_base <= soft_tightest < 0"
+        )
+    adaptive_soft = min(
+        max(soft_base + tail_tightening * tail_proxy, soft_base),
+        soft_tightest,
+    )
+    return adaptive_soft, disaster
 
 
 def _dynamic_giveback_limit(

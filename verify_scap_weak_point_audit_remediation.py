@@ -78,8 +78,8 @@ def main() -> None:
         signal_failure=False,
     )
     _check(
-        priority_reason == "profit_giveback_exit",
-        "paper exit reason preserves the registered reason priority",
+        priority_reason == "loss_containment_exit",
+        "paper exit reason preserves the registered protective-exit priority",
     )
 
 
