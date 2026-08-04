@@ -129,6 +129,16 @@ def attach_cabinet_native_scores(
             output[f"cabinet_family_{safe_name}_score"] = output["symbol"].map(mapping)
         entry_family = family[family["primary_role"].isin({"entry_alpha", "entry_alpha_proxy"})].copy()
         if not entry_family.empty:
+            # Preserve entry-role family evidence separately. Generic family
+            # columns collapse the same economic family across entry, timing,
+            # risk, and hold roles and cannot exactly reproduce the thesis.
+            entry_family_pivot = entry_family.pivot_table(
+                index="symbol", columns="economic_family", values="family_score", aggfunc="max"
+            )
+            for family_name in entry_family_pivot.columns:
+                safe_name = _safe_family_column(family_name)
+                mapping = entry_family_pivot[family_name].to_dict()
+                output[f"cabinet_entry_family_{safe_name}_score"] = output["symbol"].map(mapping)
             entry_family = entry_family.sort_values(
                 ["symbol", "family_score", "economic_family"], ascending=[True, False, True]
             ).drop_duplicates("symbol", keep="first")

@@ -110,6 +110,21 @@ class GovernanceLiveMonitor:
             "cash": exposure.get("cash"),
             "invested_value": exposure.get("invested_value"),
             "actual_exposure": exposure.get("actual_exposure", monitor_values.get("actual_exposure")),
+            "actual_holding_count": exposure.get("holding_count"),
+            "optimizer_planned_holding_count": monitor_values.get(
+                "optimizer_planned_holding_count",
+                monitor_values.get("planned_holding_count"),
+            ),
+            "minimum_required_holding_count": monitor_values.get(
+                "minimum_required_holding_count"
+            ),
+            "soft_target_holding_count": monitor_values.get(
+                "soft_target_holding_count"
+            ),
+            "maximum_allowed_holding_count": monitor_values.get(
+                "maximum_allowed_holding_count"
+            ),
+            "policy_band_state": monitor_values.get("policy_band_state"),
         }
         if self._chart_history and self._chart_history[-1].get("day_index") == int(day_index):
             self._chart_history[-1] = chart_point
@@ -176,7 +191,7 @@ class GovernanceLiveMonitor:
                 "total_days": self.total_days,
                 "progress_pct": progress_pct,
                 "completed": completed_days >= self.total_days,
-                "message": message or "回测完成。窗口会保持打开，关闭浏览器标签即可。",
+                "message": message or "???????????????????????",
                 "chart_history": list(self._chart_history),
                 "output_dir": self._output_dir,
                 "factor_curves_path": "/factors",
@@ -208,7 +223,7 @@ class GovernanceLiveMonitor:
     def _start_browser_monitor(self) -> None:
         script_path = Path(__file__).with_name("live_monitor_web.py")
         if not script_path.exists():
-            print("治理实时监控已禁用：浏览器监控脚本不存在。")
+            print("?????????????????????")
             self._closed = True
             return
         state_dir = Path(tempfile.gettempdir()) / "tdx_governance_live_monitor"
@@ -223,11 +238,11 @@ class GovernanceLiveMonitor:
                 [sys.executable, "-u", str(script_path), str(self._state_path)],
                 cwd=str(Path(__file__).resolve().parents[2]),
             )
-            print("治理实时监控已在外部浏览器模式启动。")
+            print("??????????????????")
         except Exception as exc:
             self._proc = None
             self._closed = True
-            print(f"治理实时监控已禁用：{exc}")
+            print(f"??????????{exc}")
 
     def _prime_state_for_new_monitor(self) -> None:
         if self._state_path is None:
@@ -293,8 +308,8 @@ class GovernanceLiveMonitor:
         self._write_failures += 1
         if self._write_failures in {1, 5, 25}:
             print(
-                "治理实时监控跳过了一次状态更新，因为 Windows 锁定了监控文件。"
-                f"回测会继续运行。最后错误：{last_error}"
+                "?????????????????? Windows ????????"
+                f"?????????????{last_error}"
             )
 
     def _close_existing_monitor_process(self) -> None:

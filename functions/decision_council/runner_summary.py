@@ -1631,6 +1631,19 @@ def build_governance_summary(
                     runner.enable_market_regime_policy
                     and runner._control_enabled("regime")
                 ),
+                "market_state_semantics_contract_version": "v1_explicit_authority",
+                "safety_market_state_active": bool(runner.enable_safety_agent),
+                "safety_market_state_authority": (
+                    "hard_safety_cap_and_scap_policy_band"
+                    if runner.enable_safety_agent else "disabled"
+                ),
+                "optional_regime_overlay_enabled": bool(runner.enable_market_regime_policy),
+                "optional_regime_overlay_authorized": bool(
+                    runner.enable_market_regime_policy
+                    and runner._control_enabled("regime")
+                ),
+                "performance_benchmark_authority": "attribution_only_no_trade_authority",
+                "safety_benchmark_authority": "safety_market_state_input",
                 "cooldown_control_enabled": runner._control_enabled("cooldown"),
                 "hard_stop_control_enabled": runner._control_enabled("hard_stop_exit"),
                 "alpha_collapse_exit_enabled": runner.alpha_collapse_exit_enabled,

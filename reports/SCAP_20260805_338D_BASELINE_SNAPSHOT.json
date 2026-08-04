@@ -1,0 +1,73 @@
+{
+  "contract": "governance_run_read_only_evidence_snapshot_v1",
+  "source_run": "F:\\?????\\tdx_modular_quant_project_v2_all_instruments\\results\\decision_council\\scap\\cab_c6dae8d4d69c\\e4_l1200\\v3\\run20260804_221302",
+  "date_min": "2025-01-02",
+  "date_max": "2026-05-29",
+  "trading_days": 338,
+  "terminal_nav_amount": 24946.325530980303,
+  "total_return": 0.2473162765490151,
+  "max_drawdown": -0.1432294211844342,
+  "average_exposure": 0.6150423376544929,
+  "closed_trade_count": 75,
+  "runtime_identity_hash": "dfd4e14447ee211f1ca4aeb3e2cadd4c6e5a091e4c4e1241e9284746220725c4",
+  "code_fingerprint": "a6259b7849a546731a118f276337e2811f7c31f9d566d95f5fcd90eefbcc82e9",
+  "experiment_sample_role": "development_audit",
+  "files": {
+    "governance_daily_result.csv": {
+      "exists": true,
+      "size_bytes": 728344,
+      "sha256": "9944ca851e77d8565869b7e0e24ee1f63ac9a70f9c69470ba6b47ecdc4ab036e"
+    },
+    "governance_alpha_proposals.csv": {
+      "exists": true,
+      "size_bytes": 128056215,
+      "sha256": "5b149373bbaf854203411d894dcf1fe03fcd6fc00e594ede89d463f4b63f5171"
+    },
+    "governance_action_proposal_ledger.csv": {
+      "exists": true,
+      "size_bytes": 13299218,
+      "sha256": "bcf1a86b3dbe840e9afe7e46c0a0c3a54dcb84dbdfed90b83a2c92b58340e1b5"
+    },
+    "governance_action_plan_ledger.csv": {
+      "exists": true,
+      "size_bytes": 1435779,
+      "sha256": "8e36c583620328cf6dd80158cf582db263704e6572e7dbc77dc3672232a61174"
+    },
+    "governance_execution_ledger.csv": {
+      "exists": true,
+      "size_bytes": 238901,
+      "sha256": "2156c8fdcaa4a65ec206ade86afed58731e114f6c88dfef63ae838db8cb3cec7"
+    },
+    "governance_trade_pairs.csv": {
+      "exists": true,
+      "size_bytes": 40201,
+      "sha256": "b0b6c778ce03d48d39a36dfac6c65c9740bfbc2ba1fb5b2fe935b34f3720f596"
+    },
+    "governance_research_gate_report.csv": {
+      "exists": true,
+      "size_bytes": 1295,
+      "sha256": "59f70a26e457c2577c864fcfec9743c97bcbd8c5c5979bf665eaa1fdb864f2e3"
+    },
+    "governance_unified_research_gate.csv": {
+      "exists": true,
+      "size_bytes": 1440,
+      "sha256": "679bc1f81e0ed66af3ed2ab3bdddfd6cbffe9dd7dadae680ecf3a3f5fd914325"
+    },
+    "governance_scap_admission_report.csv": {
+      "exists": true,
+      "size_bytes": 1794,
+      "sha256": "8c7c45de87666c0eb06a03527a6242b976b8df8764e72b10ec7eaed8baa46c5b"
+    },
+    "artifact_manifest.json": {
+      "exists": true,
+      "size_bytes": 2227,
+      "sha256": "d6740b57dfa1effe1909f28961cd18894d86e3d10f1f0180aa17696d55707bd1"
+    },
+    "run_checkpoint.json": {
+      "exists": true,
+      "size_bytes": 598,
+      "sha256": "e71196db25edbd4a165ec978c8d6af0aa02ccb284c19b0c43746a64d95127d46"
+    }
+  },
+  "mutation_policy": "source_run_read_only_snapshot_written_outside_run"
+}
