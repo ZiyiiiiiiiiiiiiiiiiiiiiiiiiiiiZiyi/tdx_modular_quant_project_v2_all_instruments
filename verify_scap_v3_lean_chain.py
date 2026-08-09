@@ -10,6 +10,10 @@ import functions.decision_council.policy as policy_module
 from functions.decision_council.contracts import DecisionContext, SafetyDecision
 from functions.decision_council.entry_calibration import RollingEntryCalibrator
 from functions.decision_council.policy import RulesBasedPresidentPolicy
+from functions.decision_council.portfolio_constraint_contract import PolicyBand
+from functions.decision_council.position_sizing_contract import (
+    resolve_portfolio_sizing_intent,
+)
 from functions.decision_council.quality_reports import build_risk_contribution_ledger
 from functions.decision_council.retail_execution import adapt_retail_buy_order
 from functions.decision_council.scap_v3_lean import build_lean_decision
@@ -128,6 +132,32 @@ def frame() -> pd.DataFrame:
 base = build_lean_decision(context(), frame())
 assert base.diagnostics["optimizer_invocation_count"] == 1
 assert base.diagnostics["action_plan_count"] == 1
+test_sizing_intent = resolve_portfolio_sizing_intent(
+    decision_id="lean_20250110",
+    nav_amount=20_000.0,
+    current_exposure=0.20,
+    current_holding_count=1,
+    policy_band=PolicyBand(
+        state="normal",
+        holding_floor=2,
+        holding_target=4,
+        holding_ceiling=5,
+        exposure_lower=0.40,
+        exposure_target=0.75,
+        exposure_upper=0.85,
+        disaster_ceiling=0.90,
+    ),
+    hard_holding_ceiling=5,
+    hard_exposure_ceiling=0.85,
+)
+traced_context = replace(context(), sizing_intent=test_sizing_intent)
+traced = build_lean_decision(traced_context, frame())
+assert traced.plan.sizing_contract_id == test_sizing_intent.sizing_contract_id
+assert all(
+    proposal.sizing_contract_id == test_sizing_intent.sizing_contract_id
+    for proposal in traced.proposals
+)
+passed("DecisionContext sizing identity propagates through proposals and ActionPlan")
 lean_funnel_counts = [
     base.diagnostics[name]
     for name in (

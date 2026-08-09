@@ -17,6 +17,7 @@ def attach_scap_v31_authority(
     target_position_cash: float | None = None,
     authority_snapshot_id: str = "",
     allow_synthetic_compatibility: bool = False,
+    evidence_only: bool = False,
 ) -> pd.DataFrame:
     """Attach A/B/C/D authority and a cost-before decision return.
 
@@ -40,6 +41,12 @@ def attach_scap_v31_authority(
             )
             data["scap_v31_authority_reason"] = "missing_authority_evidence"
             data["scap_authority_snapshot_id"] = str(authority_snapshot_id)
+            data["scap_authority_fraction"] = 0.0
+            data["scap_v32_authority_role"] = (
+                "evidence_only_no_size_authority"
+                if evidence_only
+                else "legacy_evidence_discount_and_starter_size"
+            )
             return data
         legacy_return = pd.to_numeric(
             data.get(
@@ -55,11 +62,15 @@ def attach_scap_v31_authority(
         allowed = legacy_return.gt(0.0) | legacy_utility.gt(0.0)
         data["scap_v31_authority_tier"] = allowed.map({True: "A", False: "D"})
         data["scap_v31_decision_expected_return"] = legacy_return
-        data["scap_v31_max_lots"] = _scaled_max_lots(
-            data,
-            tier=allowed.map({True: "A", False: "D"}),
-            position_cap_mode=position_cap_mode,
-            target_position_cash=target_position_cash,
+        data["scap_v31_max_lots"] = (
+            0
+            if evidence_only
+            else _scaled_max_lots(
+                data,
+                tier=allowed.map({True: "A", False: "D"}),
+                position_cap_mode=position_cap_mode,
+                target_position_cash=target_position_cash,
+            )
         )
         data["scap_v31_authority_contract"] = (
             AUTHORITY_CONTRACT + "|synthetic_compatibility"
@@ -71,6 +82,14 @@ def attach_scap_v31_authority(
             }
         )
         data["scap_authority_snapshot_id"] = str(authority_snapshot_id)
+        data["scap_authority_fraction"] = allowed.map(
+            {True: 1.0, False: 0.0}
+        )
+        data["scap_v32_authority_role"] = (
+            "evidence_only_no_size_authority"
+            if evidence_only
+            else "legacy_evidence_discount_and_starter_size"
+        )
         return data
     n_eff = _numeric(data, f"entry_calibration_effective_sample_size_{suffix}")
     sessions = _numeric(data, f"entry_calibration_unique_session_count_{suffix}")
@@ -133,11 +152,15 @@ def attach_scap_v31_authority(
 
     data["scap_v31_authority_tier"] = tier
     data["scap_v31_decision_expected_return"] = decision_return
-    data["scap_v31_max_lots"] = _scaled_max_lots(
-        data,
-        tier=tier,
-        position_cap_mode=position_cap_mode,
-        target_position_cash=target_position_cash,
+    data["scap_v31_max_lots"] = (
+        0
+        if evidence_only
+        else _scaled_max_lots(
+            data,
+            tier=tier,
+            position_cap_mode=position_cap_mode,
+            target_position_cash=target_position_cash,
+        )
     )
     data["scap_v32_authority_size_mode"] = (
         "capital_risk_scaled"
@@ -148,7 +171,14 @@ def attach_scap_v31_authority(
     data["scap_v32_authority_uncertainty_rank"] = tier.map(
         {"A": 0, "B": 1, "C": 2, "D": 3}
     ).astype(int)
-    data["scap_v32_authority_role"] = "evidence_discount_and_starter_size_only"
+    data["scap_authority_fraction"] = tier.map(
+        {"A": 1.00, "B": 0.60, "C": 0.35, "D": 0.0}
+    ).fillna(0.0)
+    data["scap_v32_authority_role"] = (
+        "evidence_only_no_size_authority"
+        if evidence_only
+        else "legacy_evidence_discount_and_starter_size"
+    )
     data["scap_v31_authority_contract"] = AUTHORITY_CONTRACT
     data["scap_v31_authority_reason"] = [
         _reason(t, ne, ss, ic, sl, ds)

@@ -84,6 +84,8 @@ ORDER_COLUMNS = [
     "plan_hard_exposure_ceiling",
     "plan_target_exposure",
     "constraint_contract_version",
+    "sizing_contract_id",
+    "authorized_lots",
     "scap_v31_authority_tier",
     "scap_v31_authority_contract",
     "scap_candidate_utility",
@@ -468,6 +470,11 @@ class RulesBasedPresidentPolicy:
             order["constraint_contract_version"] = str(
                 decision.plan.contract_version
             )
+            order["sizing_contract_id"] = str(
+                decision.plan.sizing_contract_id
+                or proposal.sizing_contract_id
+            )
+            order["authorized_lots"] = int(proposal.requested_lots)
             order["unified_action_selected"] = proposal.action_type
             order["unified_action_contract"] = "scap_v3_lean_single_plan_v1"
             order["planned_entry_lots"] = int(proposal.requested_lots)

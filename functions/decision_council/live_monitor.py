@@ -124,6 +124,40 @@ class GovernanceLiveMonitor:
             "maximum_allowed_holding_count": monitor_values.get(
                 "maximum_allowed_holding_count"
             ),
+            "executable_target_holding_count": monitor_values.get(
+                "executable_target_holding_count"
+            ),
+            "authority_attainable_holding_count": monitor_values.get(
+                "authority_attainable_holding_count"
+            ),
+            "policy_exposure_lower": monitor_values.get("policy_exposure_lower"),
+            "policy_exposure_target": monitor_values.get("policy_exposure_target"),
+            "daily_effective_exposure_ceiling": monitor_values.get(
+                "daily_effective_exposure_ceiling"
+            ),
+            "executable_target_exposure": monitor_values.get(
+                "executable_target_exposure"
+            ),
+            "authority_attainable_exposure": monitor_values.get(
+                "authority_attainable_exposure"
+            ),
+            "optimizer_planned_exposure": monitor_values.get(
+                "optimizer_planned_exposure",
+                monitor_values.get("planned_exposure"),
+            ),
+            "sizing_contract_id": monitor_values.get("sizing_contract_id"),
+            "sizing_contract_version": monitor_values.get(
+                "sizing_contract_version"
+            ),
+            "sizing_base_new_name_target_amount": monitor_values.get(
+                "sizing_base_new_name_target_amount"
+            ),
+            "policy_floor_feasible_after_authority": monitor_values.get(
+                "policy_floor_feasible_after_authority"
+            ),
+            "structural_floor_shortfall_reasons": monitor_values.get(
+                "structural_floor_shortfall_reasons"
+            ),
             "policy_band_state": monitor_values.get("policy_band_state"),
         }
         if self._chart_history and self._chart_history[-1].get("day_index") == int(day_index):

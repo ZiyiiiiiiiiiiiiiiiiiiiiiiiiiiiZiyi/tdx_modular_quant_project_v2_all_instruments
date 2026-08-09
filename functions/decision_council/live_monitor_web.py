@@ -6,6 +6,8 @@ This avoids Tk/Spyder event-loop failures.
 from __future__ import annotations
 
 import json
+import csv
+import io
 import math
 import os
 import socket
@@ -16,6 +18,47 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+
+SIZING_STATE_FIELDS = (
+    "sizing_contract_id",
+    "sizing_contract_version",
+    "policy_band_state",
+    "policy_holding_floor",
+    "policy_holding_target",
+    "policy_holding_ceiling",
+    "policy_exposure_lower",
+    "policy_exposure_target",
+    "policy_exposure_upper",
+    "executable_target_holding_count",
+    "executable_target_exposure",
+    "authority_attainable_holding_count",
+    "authority_attainable_exposure",
+    "optimizer_planned_holding_count",
+    "optimizer_planned_exposure",
+    "actual_exposure",
+    "policy_floor_feasible_before_authority",
+    "policy_floor_feasible_after_authority",
+    "structural_floor_shortfall_reasons",
+    "plan_floor_contract_violation",
+)
+
+
+def _current_sizing_contract(payload: dict) -> dict:
+    monitor = dict(payload.get("monitor_state") or {})
+    exposure = dict(payload.get("exposure") or {})
+    values = {key: monitor.get(key) for key in SIZING_STATE_FIELDS}
+    values["actual_holding_count"] = exposure.get("holding_count")
+    values["actual_exposure"] = exposure.get(
+        "actual_exposure", values.get("actual_exposure")
+    )
+    version = values.get("sizing_contract_version")
+    return {
+        "status": "ok" if version else "legacy_contract_unavailable",
+        "run_id": payload.get("run_id"),
+        "date": payload.get("date"),
+        "contract": values,
+    }
 
 
 HTML = """<!doctype html>
@@ -1431,6 +1474,43 @@ def main(argv: list[str]) -> int:
             if parsed.path == "/state":
                 body = json.dumps(_read_payload(state_path), ensure_ascii=False).encode("utf-8")
                 self._send_bytes(body, "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/sizing-contract":
+                body = json.dumps(
+                    _current_sizing_contract(_read_payload(state_path)),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                self._send_bytes(body, "application/json; charset=utf-8")
+                return
+            if parsed.path == "/api/sizing-export":
+                payload = _read_payload(state_path)
+                query = parse_qs(parsed.query)
+                output_format = str(query.get("format", ["json"])[0]).lower()
+                if output_format not in {"json", "csv"}:
+                    self.send_error(400, "format must be json or csv")
+                    return
+                rows = list(payload.get("chart_history") or [])
+                if output_format == "json":
+                    body = json.dumps(
+                        {"run_id": payload.get("run_id"), "rows": rows},
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    ).encode("utf-8")
+                    self._send_bytes(body, "application/json; charset=utf-8")
+                    return
+                fieldnames = sorted(
+                    {str(key) for row in rows for key in dict(row).keys()}
+                )
+                stream = io.StringIO(newline="")
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                if fieldnames:
+                    writer.writeheader()
+                    writer.writerows(rows)
+                self._send_bytes(
+                    stream.getvalue().encode("utf-8-sig"),
+                    "text/csv; charset=utf-8",
+                )
                 return
             if parsed.path in {"/factors", "/factors/"}:
                 self._send_bytes(FACTOR_HTML.encode("utf-8"), "text/html; charset=utf-8")

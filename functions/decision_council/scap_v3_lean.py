@@ -6,7 +6,7 @@ the sole optimizer exactly once.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import time
 
@@ -40,6 +40,10 @@ from functions.decision_council.scap_v2_contracts import (
 from functions.decision_council.scap_v31_authority import (
     attach_scap_v31_authority,
 )
+from functions.decision_council.position_sizing_contract import (
+    attach_entry_sizing_envelopes,
+    resolve_portfolio_sizing_intent,
+)
 from functions.decision_council.portfolio_constraint_contract import (
     PolicyBand,
     authorize_recovery,
@@ -67,12 +71,61 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         "scap_v31_authority_tier",
         "scap_v31_decision_expected_return",
         "scap_v31_max_lots",
+        "scap_sizing_contract_id",
     }
     if authority_columns.issubset(candidates.columns):
         data = candidates.copy()
     else:
         # Direct callers and contract tests may not have executed the runner's
         # daily authority stage. Compute it once here as a fail-closed fallback.
+        fallback_policy_band = getattr(context, "policy_band", None)
+        if fallback_policy_band is None:
+            fallback_policy_band = PolicyBand(
+                state="compatibility",
+                holding_floor=0,
+                holding_target=min(
+                    max(int(context.soft_target_positions), 0),
+                    max(int(context.top_n), 1),
+                ),
+                exposure_lower=0.0,
+                exposure_target=min(
+                    max(float(context.safety.exposure_cap), 0.0), 1.0
+                ),
+                exposure_upper=min(
+                    max(float(context.safety.exposure_cap), 0.0), 1.0
+                ),
+                disaster_ceiling=min(
+                    max(float(context.safety.exposure_cap), 0.0), 1.0
+                ),
+                holding_ceiling=max(int(context.top_n), 1),
+                policy_version="compatibility_context_v2",
+            )
+        sizing_intent = getattr(context, "sizing_intent", None)
+        if sizing_intent is None:
+            sizing_intent = resolve_portfolio_sizing_intent(
+                decision_id=str(context.decision_id),
+                nav_amount=float(context.nav_amount),
+                current_exposure=min(
+                    max(sum(float(v) for v in context.current_weights.values()), 0.0),
+                    1.0,
+                ),
+                current_holding_count=sum(
+                    float(value) > 0.0 for value in context.current_weights.values()
+                ),
+                policy_band=fallback_policy_band,
+                hard_holding_ceiling=max(int(context.top_n), 1),
+                hard_exposure_ceiling=min(
+                    max(
+                        float(
+                            context.hard_exposure_ceiling
+                            if context.hard_exposure_ceiling is not None
+                            else context.safety.exposure_cap
+                        ),
+                        0.0,
+                    ),
+                    1.0,
+                ),
+            )
         data = attach_scap_v31_authority(
             candidates,
             horizon_days=max(int(context.forecast_horizon_sessions), 1),
@@ -82,11 +135,6 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                     "fixed",
                 )
             ),
-            target_position_cash=(
-                float(context.safety.exposure_cap)
-                * float(context.nav_amount)
-                / max(int(context.top_n), 1)
-            ),
             authority_snapshot_id=f"{context.decision_id}|authority",
             allow_synthetic_compatibility=bool(
                 (context.execution_cost_profile or {}).get(
@@ -94,6 +142,17 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
                     False,
                 )
             ),
+            evidence_only=True,
+        )
+        data = attach_entry_sizing_envelopes(
+            data,
+            intent=sizing_intent,
+            spendable_cash_amount=max(
+                float(context.cash_amount) - float(context.cash_buffer_amount),
+                0.0,
+            ),
+            per_name_hard_cap=float(context.per_name_structural_cap),
+            add_authorized=bool(context.winner_add_enabled),
         )
     if "scap_authority_snapshot_id" not in data.columns:
         data["scap_authority_snapshot_id"] = f"{context.decision_id}|authority"
@@ -874,6 +933,27 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         exhaustive_max_positions=int(search_budget.exact_max_positions),
         beam_width=int(search_budget.beam_width),
     )
+    decision_sizing_contract_id = str(
+        getattr(
+            getattr(context, "sizing_intent", None),
+            "sizing_contract_id",
+            "",
+        )
+    )
+    if (
+        decision_sizing_contract_id
+        and plan.sizing_contract_id
+        and plan.sizing_contract_id != decision_sizing_contract_id
+    ):
+        raise RuntimeError(
+            "ActionPlan sizing contract does not match DecisionContext: "
+            f"{plan.sizing_contract_id} != {decision_sizing_contract_id}"
+        )
+    if decision_sizing_contract_id and not plan.sizing_contract_id:
+        # Empty-candidate and hold-only plans cannot inherit the contract from
+        # a proposal.  Keep every daily plan traceable to the factual sizing
+        # intent without introducing a second optimizer invocation.
+        plan = replace(plan, sizing_contract_id=decision_sizing_contract_id)
     optimizer_elapsed_seconds = time.perf_counter() - optimizer_started
     selected_types = [
         proposal.action_type
@@ -934,6 +1014,35 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
     diagnostics = {
         "scap_v3_lean_version": LEAN_VERSION,
         "policy_band_state": str(policy_band.state),
+        "sizing_contract_id": str(
+            getattr(getattr(context, "sizing_intent", None), "sizing_contract_id", "")
+            or data.get("scap_sizing_contract_id", pd.Series([""])).iloc[0]
+        ),
+        "sizing_contract_version": str(
+            getattr(getattr(context, "sizing_intent", None), "contract_version", "")
+            or data.get("scap_sizing_contract_version", pd.Series([""])).iloc[0]
+        ),
+        "executable_target_holding_count": int(
+            getattr(
+                getattr(context, "sizing_intent", None),
+                "executable_target_holding_count",
+                policy_band.holding_target,
+            )
+        ),
+        "executable_target_exposure": float(
+            getattr(
+                getattr(context, "sizing_intent", None),
+                "executable_target_exposure",
+                policy_band.exposure_target,
+            )
+        ),
+        "sizing_base_new_name_target_amount": float(
+            getattr(
+                getattr(context, "sizing_intent", None),
+                "base_new_name_target_amount",
+                0.0,
+            )
+        ),
         "policy_holding_floor": int(policy_band.holding_floor),
         "policy_holding_target": int(policy_band.holding_target),
         "policy_holding_ceiling": int(policy_band.holding_ceiling),
@@ -976,6 +1085,32 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         ),
         "positive_feasible_new_name_count": int(
             deployment_bounds.positive_feasible_new_name_count
+        ),
+        "authority_attainable_holding_count": int(
+            deployment_bounds.authority_attainable_holding_count
+        ),
+        "authority_attainable_exposure": float(
+            deployment_bounds.authority_attainable_exposure
+        ),
+        "integer_attainable_holding_count": int(
+            deployment_bounds.integer_attainable_holding_count
+        ),
+        "integer_attainable_exposure": float(
+            deployment_bounds.integer_attainable_exposure
+        ),
+        "policy_floor_feasible_before_authority": bool(
+            deployment_bounds.policy_floor_feasible_before_authority
+        ),
+        "policy_floor_feasible_after_authority": bool(
+            deployment_bounds.policy_floor_feasible_after_authority
+        ),
+        "plan_floor_feasibility_proven": bool(
+            deployment_bounds.policy_floor_feasible_after_authority
+            and int(plan.constraint_slacks.get("solver_optimality_proven", 0)) == 1
+        ),
+        "plan_floor_search_scope": str(plan.solver_status),
+        "structural_floor_shortfall_reasons": "|".join(
+            deployment_bounds.structural_shortfall_reasons
         ),
         "post_mandatory_recovery_authorized": bool(
             post_mandatory_recovery.authorized
@@ -1770,6 +1905,13 @@ def _proposal(
         ),
         scenario_contract_id=str(scenario_contract_id),
         decision_return_basis=str(decision_return_basis),
+        sizing_contract_id=str(
+            getattr(
+                getattr(context, "sizing_intent", None),
+                "sizing_contract_id",
+                "",
+            )
+        ),
     )
 
 

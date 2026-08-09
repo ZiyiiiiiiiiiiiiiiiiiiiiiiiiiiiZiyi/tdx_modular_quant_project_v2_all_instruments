@@ -105,6 +105,7 @@ class PhaseOneDecisionCouncilEngine:
         confirmed_derisk_target: float | None = None,
         current_lots_by_symbol: dict[str, int] | None = None,
         policy_band=None,
+        sizing_intent=None,
         recovery_episode_id: str = "",
         recovery_episode_day: int = 0,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
@@ -166,6 +167,7 @@ class PhaseOneDecisionCouncilEngine:
             confirmed_derisk_target=confirmed_derisk_target,
             current_lots_by_symbol=dict(current_lots_by_symbol or {}),
             policy_band=policy_band,
+            sizing_intent=sizing_intent,
             recovery_episode_id=str(recovery_episode_id or ""),
             recovery_episode_day=max(int(recovery_episode_day), 0),
         )

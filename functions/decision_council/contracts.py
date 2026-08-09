@@ -7,6 +7,7 @@ from typing import Mapping
 import pandas as pd
 
 from functions.decision_council.portfolio_constraint_contract import PolicyBand
+from functions.decision_council.position_sizing_contract import PortfolioSizingIntent
 
 
 @dataclass(frozen=True)
@@ -75,5 +76,6 @@ class DecisionContext:
     confirmed_derisk_target: float | None = None
     current_lots_by_symbol: Mapping[str, int] | None = None
     policy_band: PolicyBand | None = None
+    sizing_intent: PortfolioSizingIntent | None = None
     recovery_episode_id: str = ""
     recovery_episode_day: int = 0
