@@ -2459,3 +2459,14 @@
 - 合并前门控：conda Python 3.10环境下受影响模块`py_compile`、配置验证、尺度/权限/单优化器/执行/Web/schema专项及20日独立产物验收均已通过；`git diff --check`通过。研究门和生产门状态不因Git合并改变，继续`blocked`。
 - 主干兼容处理：PR #11先于本PR进入`main`，其WBS、Web仪表盘和`verify_web_holding_count_curve.py`存在中文乱码/整文件编码漂移。rebase到最新主干时保留已清理的WBS/Web业务内容，并把旧测试中的乱码断言恢复为“历史状态没有持仓数量字段”；不得为了通过测试把正确页面改回乱码。
 - 发布结果：新分支`codex/capacity-sizing-contract-20260810`已推送；GitHub PR #12（`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/12`）以head `11b675a372e90b300dc178d49d772fd2f5ed7f45`合并到`main`，merge commit为`4d938bf785ec3f3f64322665b0ef07374ae2640f`。本地主干已fast-forward到同一提交；合并后尺度/单优化器/执行/Web/checkpoint及20日保存产物回归通过，未纳入历史未跟踪报告。
+
+### CHANGE-20260810-02：8月9日至10日338日结果与2026年3月后回撤只读归因
+
+- 审计对象：唯一主run为`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1200/v3/run20260809_214739`，状态complete，覆盖2025-01-02至2026-05-29共338个交易日；旧`run20260804_221302`只作容量修复前工程对照，不把不同代码身份的收益差当作单变量研究结论。2026-03-08为周日，事件窗口按03-06/03-09相邻交易日和03-11局部峰值解释。
+- 全窗口证据：新run期末NAV 26,495.55元、总收益+32.48%、最大回撤-12.30%、平均实际暴露59.71%、平均持仓4.92；旧基线分别为24,946.33元、+24.73%、-14.32%、61.50%和5.28。由此否定“容量—持仓修复再次失效”，但不构成新策略生产有效性证明。
+- 回撤分解：03-11至04-03策略-9.90%、研究基准-10.19%、几何超额+0.32%，第一段主要为市场共振；04-01至05-29策略-1.99%、研究基准+19.35%、几何超额-17.88%，后段转为明确相对失效。03-09前后闭合交易胜率由73.53%降至50.00%，平均单笔收益由+4.04%降至-0.54%。
+- 代码归因：`position_lifecycle.py`在mainline v3且control mode非`aggressive_profit`时把`active_post_entry_failure`关闭；本run为`aggressive_lean`，导致已检测的早期失败不进入active exit arbitration。输出字段`post_entry_failure_exit`又使用raw signal而非active authority，可能显示True但授权原因为空，属于审计语义缺陷。安全层短期等级主要由5日冲击驱动，03-31虽20日收益-4.60%、距峰值回撤9.27%，仍恢复normal目标并于04-01把实际暴露提至约70.3%。
+- 买入质量：03-16至03-25四个补入信号中三只10日收益为负；其`p_win_lower/avg_win/avg_loss`均为0且校准状态`drifted`，但C级fallback仍以33.61至56.60元robust profit对380.34至628.93元downside CVaR获得正提案。15元robust hurdle当前为warning而非hard veto。以上支持“低证据补买、恢复过快、退出滞后”的叠加归因，不支持只调持仓数量或只换市场基准。
+- 因子证据边界：本run IC时序只到2025-03-31，交易却到2026-05-29；`governance_factor_layer_return_report.csv`为空，不能引用全样本validation冒充2026年3至5月状态—因子OOS证据。必须补算`family × safety structural state × horizon`的严格PIT walk-forward IC/ICIR/正IC比例/价差，弱势样本不足时fail closed。
+- 后续顺序：P0先修detected/paper/control/authority/veto审计语义；P1冻结身份做post-entry-failure单变量退出消融；P2做无交易权限的20日收益/underwater恢复滞回shadow；P3校准缺失或漂移时把低证据C级降权或fail closed；P4补齐至2026-05-29的状态—因子OOS证据。方案未实施，不反向修改已合并的容量修复。
+- 门控与报告：工程门仅对既有容量修复成立；本run研究门`blocked`、生产门`blocked`，不得上线。完整证据见`reports/SCAP_20260810_RUN20260809_214739_POST_20260308_ANALYSIS.md`。影响链复核为WBS-00.07运行身份/可比性 → WBS-07/08因子与入场证据 → WBS-09市场状态 → WBS-10/11退出权限与仓位 → WBS-13研究门 → WBS-14/15审计与Web → WBS-16生产准入。
