@@ -157,6 +157,7 @@ class ActionProposal:
     calibration_effective_sample_size: float = 0.0
     scenario_contract_id: str = ""
     decision_return_basis: str = "legacy_unknown"
+    sizing_contract_id: str = ""
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -386,6 +387,7 @@ class ActionPlan:
     exposure_floor_violation: float = 0.0
     wealth_materiality_epsilon_amount: float = 0.0
     objective_components: Mapping[str, float] | None = None
+    sizing_contract_id: str = ""
     contract_version: str = SCAP_V2_CONTRACT_VERSION
 
     def __post_init__(self) -> None:

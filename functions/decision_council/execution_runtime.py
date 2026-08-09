@@ -232,6 +232,8 @@ def execute_pending(runner, date, daily):
             "unified_action_contract": order.get("unified_action_contract", ""),
             "action_plan_id": order.get("action_plan_id", ""),
             "action_proposal_id": order.get("action_proposal_id", ""),
+            "sizing_contract_id": order.get("sizing_contract_id", ""),
+            "authorized_lots": order.get("authorized_lots", pd.NA),
             "action_plan_selected": order.get("action_plan_selected", False),
             "action_plan_contract": order.get("action_plan_contract", ""),
             "scap_v31_authority_tier": order.get(
@@ -776,6 +778,8 @@ def register_orders(runner, orders, daily, nominal_nav):
             "unified_action_contract": order.get("unified_action_contract", ""),
             "action_plan_id": order.get("action_plan_id", ""),
             "action_proposal_id": order.get("action_proposal_id", ""),
+            "sizing_contract_id": order.get("sizing_contract_id", ""),
+            "authorized_lots": order.get("authorized_lots", pd.NA),
             "action_plan_selected": order.get("action_plan_selected", False),
             "action_plan_contract": order.get("action_plan_contract", ""),
             "scap_v31_authority_tier": order.get(

@@ -112,7 +112,14 @@ class DeploymentBounds:
     exposure_floor_shortfall_reason: str = ""
     policy_holding_ceiling: int = 32
     policy_floor_feasible: bool = False
-    contract_version: str = "scap_deployment_bounds_v2_policy_floor_persistent"
+    authority_attainable_holding_count: int = 0
+    authority_attainable_exposure: float = 0.0
+    integer_attainable_holding_count: int = 0
+    integer_attainable_exposure: float = 0.0
+    policy_floor_feasible_before_authority: bool = False
+    policy_floor_feasible_after_authority: bool = False
+    structural_shortfall_reasons: tuple[str, ...] = ()
+    contract_version: str = "scap_deployment_bounds_v3_authority_attainable"
 
     def __post_init__(self) -> None:
         values = (
@@ -121,6 +128,8 @@ class DeploymentBounds:
             int(self.conditional_holding_floor),
             int(self.hard_holding_ceiling),
             int(self.positive_feasible_new_name_count),
+            int(self.authority_attainable_holding_count),
+            int(self.integer_attainable_holding_count),
         )
         if any(value < 0 for value in values):
             raise ValueError("holding bounds and feasible counts must be non-negative")
@@ -138,6 +147,14 @@ class DeploymentBounds:
         feasible = _ratio(
             self.positive_feasible_exposure_ceiling,
             name="positive_feasible_exposure_ceiling",
+        )
+        _ratio(
+            self.authority_attainable_exposure,
+            name="authority_attainable_exposure",
+        )
+        _ratio(
+            self.integer_attainable_exposure,
+            name="integer_attainable_exposure",
         )
         if policy_lower > policy_target:
             raise ValueError("policy exposure lower cannot exceed target")
@@ -241,7 +258,9 @@ def resolve_conditional_deployment_bounds(
     ceiling_k = max(int(hard_holding_ceiling), 0)
     ceiling_e = _ratio(hard_exposure_ceiling, name="hard_exposure_ceiling")
     epsilon = max(_finite(wealth_epsilon_amount, name="wealth_epsilon_amount"), 0.0)
-    best_by_symbol: dict[str, float] = {}
+    minimum_by_symbol: dict[str, float] = {}
+    maximum_by_symbol: dict[str, float] = {}
+    implied_nav_values: list[float] = []
     for proposal in positive_feasible_proposals:
         action_type = str(getattr(proposal, "action_type", ""))
         if action_type not in {"new_entry", "winner_add", "loser_add", "replacement_buy"}:
@@ -267,21 +286,44 @@ def resolve_conditional_deployment_bounds(
             _finite(getattr(proposal, "exposure_delta", 0.0), name="exposure_delta"),
             0.0,
         )
-        previous = best_by_symbol.get(symbol)
+        previous = minimum_by_symbol.get(symbol)
         if previous is None or exposure_delta < previous:
             # One-lot/minimum feasible increments produce a conservative count
             # and the broadest jointly fundable lower-bound estimate.
-            best_by_symbol[symbol] = exposure_delta
-    feasible_new_count = len(best_by_symbol)
+            minimum_by_symbol[symbol] = exposure_delta
+        maximum_by_symbol[symbol] = max(
+            maximum_by_symbol.get(symbol, 0.0), exposure_delta
+        )
+        market_notional = max(
+            _finite(
+                getattr(proposal, "market_notional_amount", 0.0),
+                name="market_notional_amount",
+            ),
+            0.0,
+        )
+        if market_notional > 0.0 and exposure_delta > 1e-12:
+            implied_nav_values.append(market_notional / exposure_delta)
+    feasible_new_count = len(minimum_by_symbol)
     # Computational compression and today's candidate quality may explain why
     # a policy is infeasible, but they are not allowed to rewrite the policy
     # requirement.  The optimizer records any remaining violation explicitly.
     conditional_k = min(max(int(policy_band.holding_floor), 0), ceiling_k)
+    authority_exposure = mandatory_projection.post_mandatory_exposure + sum(
+        maximum_by_symbol.values()
+    )
+    if implied_nav_values:
+        implied_nav_values.sort()
+        implied_nav = implied_nav_values[len(implied_nav_values) // 2]
+        cash_exposure_ceiling = (
+            mandatory_projection.post_mandatory_exposure
+            + mandatory_projection.post_mandatory_cash / max(implied_nav, 1e-12)
+        )
+    else:
+        cash_exposure_ceiling = mandatory_projection.post_mandatory_exposure
     feasible_exposure = min(
         ceiling_e,
         max(
-            mandatory_projection.post_mandatory_exposure
-            + sum(best_by_symbol.values()),
+            min(authority_exposure, cash_exposure_ceiling),
             mandatory_projection.post_mandatory_exposure,
         ),
     )
@@ -305,6 +347,15 @@ def resolve_conditional_deployment_bounds(
             if conditional_e <= ceiling_e
             else "hard_exposure_ceiling_binds"
         )
+    shortfall_reasons = tuple(
+        reason
+        for reason in (holding_reason, exposure_reason)
+        if reason
+    )
+    attainable_k = min(
+        mandatory_projection.post_mandatory_holding_count + feasible_new_count,
+        ceiling_k,
+    )
     return DeploymentBounds(
         policy_holding_floor=policy_band.holding_floor,
         policy_holding_target=policy_band.holding_target,
@@ -320,6 +371,18 @@ def resolve_conditional_deployment_bounds(
         exposure_floor_shortfall_reason=exposure_reason,
         policy_holding_ceiling=int(policy_band.holding_ceiling),
         policy_floor_feasible=bool(policy_k_feasible and policy_e_feasible),
+        authority_attainable_holding_count=attainable_k,
+        authority_attainable_exposure=feasible_exposure,
+        integer_attainable_holding_count=attainable_k,
+        integer_attainable_exposure=feasible_exposure,
+        policy_floor_feasible_before_authority=bool(
+            int(policy_band.holding_floor) <= ceiling_k
+            and float(policy_band.exposure_lower) <= ceiling_e + 1e-12
+        ),
+        policy_floor_feasible_after_authority=bool(
+            policy_k_feasible and policy_e_feasible
+        ),
+        structural_shortfall_reasons=shortfall_reasons,
     )
 
 

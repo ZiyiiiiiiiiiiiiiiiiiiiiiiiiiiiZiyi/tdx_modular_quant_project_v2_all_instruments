@@ -54,6 +54,8 @@ PENDING_ORDER_COLUMNS = [
     "action_proposal_id",
     "action_plan_selected",
     "action_plan_contract",
+    "sizing_contract_id",
+    "authorized_lots",
     "scap_v31_authority_tier",
     "scap_v31_authority_contract",
     "cash_reservation_id",

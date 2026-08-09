@@ -733,6 +733,14 @@ def optimize_action_proposals(
             "breadth_score": float(breadth_score),
             "exact_cost_amount": float(cost),
         },
+        sizing_contract_id=next(
+            (
+                str(proposal.sizing_contract_id)
+                for proposal in candidate_pool
+                if str(getattr(proposal, "sizing_contract_id", ""))
+            ),
+            "",
+        ),
     )
 
 

@@ -143,6 +143,10 @@ from functions.decision_council.capital_scaling import (
     resolve_position_capacity,
     scaled_position_weight_caps,
 )
+from functions.decision_council.position_sizing_contract import (
+    attach_entry_sizing_envelopes,
+    resolve_portfolio_sizing_intent,
+)
 from functions.decision_council.exposure_runtime import (
     current_weights as current_weights_runtime,
     latest_price_frame_for_trade_pairing as latest_price_frame_for_trade_pairing_runtime,
@@ -863,6 +867,7 @@ class GovernanceBacktestRunner:
         self.position_state_rows = []
         self.retail_execution_rows = []
         self.entry_formula_audit_rows = []
+        self.entry_sizing_audit_rows = []
         self.candidate_gate_rows = []
         # Keep this internal path short: deep experiment paths can exceed the
         # legacy Windows MAX_PATH limit before monthly CSV names are appended.
@@ -1420,10 +1425,55 @@ class GovernanceBacktestRunner:
                 / max(float(exposure.get("nominal_nav", self.initial_cash) or self.initial_cash), 1e-12)
             ),
         )
+        sizing_policy = (
+            resolve_policy_band(
+                risk_level=str(risk_level),
+                structural_regime_level=str(structural_regime_level),
+                policy_bands=self.capital_profile.get("scap_policy_bands"),
+            )
+            if self.governance_control_mode == "aggressive_lean"
+            else None
+        )
+        current_exposure_ratio = (
+            float(exposure.get("invested_value", 0.0) or 0.0)
+            / max(
+                float(
+                    exposure.get("nominal_nav", self.initial_cash)
+                    or self.initial_cash
+                ),
+                1e-12,
+            )
+        )
+        sizing_intent = (
+            resolve_portfolio_sizing_intent(
+                decision_id=f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
+                nav_amount=float(
+                    exposure.get("nominal_nav", self.initial_cash)
+                ),
+                current_exposure=current_exposure_ratio,
+                current_holding_count=len(self.positions),
+                policy_band=sizing_policy,
+                hard_holding_ceiling=position_capacity.effective_position_cap,
+                hard_exposure_ceiling=preliminary_risk_cap,
+                legacy_sizing_reference_positions=(
+                    position_capacity.sizing_reference_positions
+                ),
+            )
+            if sizing_policy is not None
+            else None
+        )
         if position_capacity.mode == "auto":
             dynamic_soft_cap, dynamic_hard_cap = scaled_position_weight_caps(
-                target_exposure=preliminary_risk_cap,
-                effective_position_cap=position_capacity.sizing_reference_positions,
+                target_exposure=(
+                    sizing_intent.executable_target_exposure
+                    if sizing_intent is not None
+                    else preliminary_risk_cap
+                ),
+                effective_position_cap=(
+                    sizing_intent.executable_target_holding_count
+                    if sizing_intent is not None
+                    else position_capacity.effective_position_cap
+                ),
                 absolute_soft_cap=float(
                     self.capital_profile.get(
                         "scap_single_position_soft_cap",
@@ -1538,16 +1588,52 @@ class GovernanceBacktestRunner:
                         or 10
                     ),
                     position_cap_mode=position_capacity.mode,
-                    target_position_cash=(
-                        preliminary_risk_cap
-                        * float(exposure.get("nominal_nav", self.initial_cash))
-                        / max(position_capacity.sizing_reference_positions, 1)
-                    ),
                     authority_snapshot_id=(
                         f"{pd.Timestamp(date).date().isoformat()}|"
                         f"{self.strategy_logic_version}|authority"
                     ),
+                    evidence_only=True,
                 )
+                candidates = attach_entry_sizing_envelopes(
+                    candidates,
+                    intent=sizing_intent,
+                    spendable_cash_amount=position_capacity.spendable_cash,
+                    per_name_hard_cap=dynamic_hard_cap,
+                    add_authorized=scap_winner_add_trading_authorized(
+                        self.capital_profile
+                    ),
+                )
+                sizing_columns = [
+                    column
+                    for column in (
+                        "symbol",
+                        "scap_v31_authority_tier",
+                        "scap_v31_authority_reason",
+                        "scap_authority_fraction",
+                        "mainline_v3_one_lot_cash_required",
+                        "close_nominal",
+                        "scap_sizing_base_target_amount",
+                        "scap_sizing_authority_target_amount",
+                        "scap_sizing_base_lots",
+                        "scap_sizing_cash_max_lots",
+                        "scap_sizing_single_name_max_lots",
+                        "scap_sizing_authority_max_lots",
+                        "scap_sizing_final_max_lots",
+                        "scap_sizing_binding_constraint",
+                        "scap_sizing_contract_id",
+                        "scap_sizing_contract_version",
+                        "scap_v32_authority_role",
+                    )
+                    if column in candidates.columns
+                ]
+                sizing_audit = candidates.loc[:, sizing_columns].copy()
+                sizing_audit.insert(0, "date", pd.Timestamp(date))
+                sizing_audit.insert(
+                    0,
+                    "decision_id",
+                    f"gov_{pd.Timestamp(date).strftime('%Y%m%d')}",
+                )
+                self.entry_sizing_audit_rows.append(sizing_audit)
             # Attach the one authoritative final score before lifecycle. This
             # pass deliberately cannot select; the optimizer runs once only
             # after lifecycle/state constraints have been evaluated.
@@ -1765,15 +1851,7 @@ class GovernanceBacktestRunner:
         desired_exposure_target = float(target_exposure_proxy)
         risk_exposure_ceiling = float(target_exposure_proxy)
         lot_feasible_target_exposure = float(target_exposure_proxy)
-        strategic_policy = (
-            resolve_policy_band(
-                risk_level=str(risk_level),
-                structural_regime_level=str(structural_regime_level),
-                policy_bands=self.capital_profile.get("scap_policy_bands"),
-            )
-            if self.governance_control_mode == "aggressive_lean"
-            else None
-        )
+        strategic_policy = sizing_policy
         strategic_band = (
             resolve_strategic_exposure_band(
                 risk_level=str(risk_level),
@@ -2014,7 +2092,11 @@ class GovernanceBacktestRunner:
             forecast_kappa=float(
                 self.capital_profile.get("scap_forecast_kappa", 0.50) or 0.50
             ),
-            soft_target_positions=position_capacity.soft_target_positions,
+            soft_target_positions=(
+                int(strategic_policy.holding_target)
+                if strategic_policy is not None
+                else position_capacity.soft_target_positions
+            ),
             execution_cost_profile=self.capital_profile,
             desired_exposure_target=float(desired_exposure_target),
             hard_exposure_ceiling=float(
@@ -2090,6 +2172,7 @@ class GovernanceBacktestRunner:
                 if float(position.shares) > 0.0
             },
             policy_band=strategic_policy,
+            sizing_intent=sizing_intent,
             recovery_episode_id=self._scap_recovery_episode_id,
             recovery_episode_day=self._scap_recovery_episode_day,
         )
@@ -2484,6 +2567,20 @@ class GovernanceBacktestRunner:
                 "daily_effective_holding_ceiling": int(diagnostics.get("daily_effective_holding_ceiling", position_capacity.effective_position_cap) or 0),
                 "daily_effective_exposure_ceiling": float(diagnostics.get("daily_effective_exposure_ceiling", risk_exposure_ceiling) or 0.0),
                 "positive_feasible_new_name_count": int(diagnostics.get("positive_feasible_new_name_count", 0) or 0),
+                "sizing_contract_id": str(diagnostics.get("sizing_contract_id", "")),
+                "sizing_contract_version": str(diagnostics.get("sizing_contract_version", "")),
+                "executable_target_holding_count": int(diagnostics.get("executable_target_holding_count", 0) or 0),
+                "executable_target_exposure": float(diagnostics.get("executable_target_exposure", 0.0) or 0.0),
+                "sizing_base_new_name_target_amount": float(diagnostics.get("sizing_base_new_name_target_amount", 0.0) or 0.0),
+                "authority_attainable_holding_count": int(diagnostics.get("authority_attainable_holding_count", 0) or 0),
+                "authority_attainable_exposure": float(diagnostics.get("authority_attainable_exposure", 0.0) or 0.0),
+                "integer_attainable_holding_count": int(diagnostics.get("integer_attainable_holding_count", 0) or 0),
+                "integer_attainable_exposure": float(diagnostics.get("integer_attainable_exposure", 0.0) or 0.0),
+                "policy_floor_feasible_before_authority": bool(diagnostics.get("policy_floor_feasible_before_authority", False)),
+                "policy_floor_feasible_after_authority": bool(diagnostics.get("policy_floor_feasible_after_authority", False)),
+                "plan_floor_feasibility_proven": bool(diagnostics.get("plan_floor_feasibility_proven", False)),
+                "plan_floor_search_scope": str(diagnostics.get("plan_floor_search_scope", "")),
+                "structural_floor_shortfall_reasons": str(diagnostics.get("structural_floor_shortfall_reasons", "")),
                 "post_mandatory_recovery_authorized": bool(diagnostics.get("post_mandatory_recovery_authorized", False)),
                 "post_mandatory_recovery_reason": str(diagnostics.get("post_mandatory_recovery_reason", "")),
                 "post_mandatory_recovery_episode_id": str(diagnostics.get("post_mandatory_recovery_episode_id", "")),
@@ -2497,6 +2594,28 @@ class GovernanceBacktestRunner:
                 "planned_holding_count": int(diagnostics.get("planned_holding_count", 0) or 0),
                 "holding_floor_violation_count": int(diagnostics.get("holding_floor_violation_count", 0) or 0),
                 "exposure_floor_violation": float(diagnostics.get("exposure_floor_violation", 0.0) or 0.0),
+                "plan_floor_contract_violation": bool(
+                    diagnostics.get("plan_floor_feasibility_proven", False)
+                    and (
+                        int(diagnostics.get("holding_floor_violation_count", 0) or 0) > 0
+                        or float(diagnostics.get("exposure_floor_violation", 0.0) or 0.0) > 1e-12
+                    )
+                ),
+                "structural_floor_infeasible": bool(
+                    not diagnostics.get("policy_floor_feasible_after_authority", False)
+                    and (
+                        int(diagnostics.get("holding_floor_violation_count", 0) or 0) > 0
+                        or float(diagnostics.get("exposure_floor_violation", 0.0) or 0.0) > 1e-12
+                    )
+                ),
+                "floor_violation_unresolved_search": bool(
+                    diagnostics.get("policy_floor_feasible_after_authority", False)
+                    and not diagnostics.get("plan_floor_feasibility_proven", False)
+                    and (
+                        int(diagnostics.get("holding_floor_violation_count", 0) or 0) > 0
+                        or float(diagnostics.get("exposure_floor_violation", 0.0) or 0.0) > 1e-12
+                    )
+                ),
                 "policy_holding_ceiling": int(diagnostics.get("policy_holding_ceiling", 0) or 0),
                 "policy_minimum_active_pool_size": int(diagnostics.get("policy_minimum_active_pool_size", 0) or 0),
                 "policy_minimum_effective_n_ratio": float(diagnostics.get("policy_minimum_effective_n_ratio", 0.0) or 0.0),
@@ -3155,6 +3274,23 @@ class GovernanceBacktestRunner:
                 self.capital_profile.get("scap_max_daily_new_exposure_ratio", 0.0) or 0.0
             ),
             "sizing_reference_positions": int(factual_exposure_row.get("sizing_reference_positions", 0) or 0),
+            "sizing_contract_id": str(factual_exposure_row.get("sizing_contract_id", "") or ""),
+            "sizing_contract_version": str(factual_exposure_row.get("sizing_contract_version", "") or ""),
+            "executable_target_holding_count": int(factual_exposure_row.get("executable_target_holding_count", 0) or 0),
+            "executable_target_exposure": float(factual_exposure_row.get("executable_target_exposure", 0.0) or 0.0),
+            "sizing_base_new_name_target_amount": float(factual_exposure_row.get("sizing_base_new_name_target_amount", 0.0) or 0.0),
+            "authority_attainable_holding_count": int(factual_exposure_row.get("authority_attainable_holding_count", 0) or 0),
+            "authority_attainable_exposure": float(factual_exposure_row.get("authority_attainable_exposure", 0.0) or 0.0),
+            "integer_attainable_holding_count": int(factual_exposure_row.get("integer_attainable_holding_count", 0) or 0),
+            "integer_attainable_exposure": float(factual_exposure_row.get("integer_attainable_exposure", 0.0) or 0.0),
+            "policy_floor_feasible_before_authority": bool(factual_exposure_row.get("policy_floor_feasible_before_authority", False)),
+            "policy_floor_feasible_after_authority": bool(factual_exposure_row.get("policy_floor_feasible_after_authority", False)),
+            "plan_floor_feasibility_proven": bool(factual_exposure_row.get("plan_floor_feasibility_proven", False)),
+            "plan_floor_search_scope": str(factual_exposure_row.get("plan_floor_search_scope", "") or ""),
+            "structural_floor_shortfall_reasons": str(factual_exposure_row.get("structural_floor_shortfall_reasons", "") or ""),
+            "plan_floor_contract_violation": bool(factual_exposure_row.get("plan_floor_contract_violation", False)),
+            "structural_floor_infeasible": bool(factual_exposure_row.get("structural_floor_infeasible", False)),
+            "floor_violation_unresolved_search": bool(factual_exposure_row.get("floor_violation_unresolved_search", False)),
             "selected_position_count": int(factual_exposure_row.get("selected_position_count", 0) or 0),
             "optimizer_planned_holding_count": int(factual_exposure_row.get("optimizer_planned_holding_count", factual_exposure_row.get("planned_holding_count", 0)) or 0),
             "planned_holding_count": int(factual_exposure_row.get("planned_holding_count", 0) or 0),
@@ -5367,6 +5503,11 @@ class GovernanceBacktestRunner:
                 ],
             ),
             "governance_entry_formula_audit": pd.DataFrame(self.entry_formula_audit_rows),
+            "governance_entry_sizing_audit": (
+                pd.concat(self.entry_sizing_audit_rows, ignore_index=True)
+                if self.entry_sizing_audit_rows
+                else pd.DataFrame()
+            ),
             "governance_candidate_gate_audit": self._load_candidate_gate_audit(),
             "governance_candidate_gate_partition_index": self._candidate_gate_partition_index(),
             "governance_retail_executable_rank": pd.DataFrame(self.retail_executable_rank_rows),

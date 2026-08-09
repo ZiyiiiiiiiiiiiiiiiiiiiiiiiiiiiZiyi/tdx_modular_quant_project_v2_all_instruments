@@ -68,7 +68,7 @@ def main() -> int:
         "function drawStepLine",
         "nullableNumber(row.actual_holding_count)",
         "nullableNumber(row.optimizer_planned_holding_count)",
-        'return drawEmpty(ctx,"????????????")',
+        'return drawEmpty(ctx,"历史状态没有持仓数量字段")',
     ):
         check(f"dashboard contains {required}", required in dashboard)
     check(

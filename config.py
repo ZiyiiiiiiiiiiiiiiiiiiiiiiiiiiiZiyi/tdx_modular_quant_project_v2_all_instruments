@@ -330,6 +330,11 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_optimizer_objective_version": "scap_v34_incremental_scenario_cvar_v1",
         "scap_candidate_pool_contract": "scap_v32_thesis_pool_preserving_v1",
         "scap_authority_contract": "scap_v32_abcd_sizing_only_v1",
+        "scap_sizing_contract_version": "scap_portfolio_sizing_v2",
+        "scap_sizing_reference_mode": "policy_executable_target",
+        "scap_authority_sizing_mode": "final_when_add_unavailable",
+        "scap_floor_violation_gate_mode": "strict_when_factually_feasible",
+        "scap_legacy_sizing_shadow_enabled": True,
         "scap_risk_episode_contract": "scap_v32_hysteresis_reentry_v1",
         "scap_exit_contract": "scap_v32_adaptive_loss_signed_counterfactual_v1",
         "scap_exit_stage": "E4",
@@ -1727,6 +1732,16 @@ def validate_configuration() -> list[str]:
     if float(lean.get("scap_invalid_regime_es_multiplier", 1.0) or 1.0) != 1.0:
         errors.append("small_capital_lean invalid regime ES multiplier must fail neutral at 1.0")
     if lean:
+        if str(lean.get("scap_sizing_contract_version", "")) != "scap_portfolio_sizing_v2":
+            errors.append("small_capital_lean sizing contract version must be scap_portfolio_sizing_v2")
+        if str(lean.get("scap_sizing_reference_mode", "")) != "policy_executable_target":
+            errors.append("small_capital_lean sizing reference must use policy_executable_target")
+        if str(lean.get("scap_authority_sizing_mode", "")) != "final_when_add_unavailable":
+            errors.append("small_capital_lean authority sizing mode must fail final when add is unavailable")
+        if str(lean.get("scap_floor_violation_gate_mode", "")) not in {
+            "audit", "strict_when_factually_feasible"
+        }:
+            errors.append("small_capital_lean floor violation gate mode is unsupported")
         policy_bands = lean.get("scap_policy_bands")
         required_states = {"normal_neutral", "weak", "high_risk", "crisis"}
         if not isinstance(policy_bands, dict) or not required_states.issubset(
