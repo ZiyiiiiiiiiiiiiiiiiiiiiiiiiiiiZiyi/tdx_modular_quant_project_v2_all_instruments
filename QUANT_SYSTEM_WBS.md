@@ -2458,3 +2458,4 @@
 - 分支策略：从当前`codex/scap-338d-evidence-fixes-20260805`已验证代码状态创建新`codex/capacity-sizing-contract-20260810`；该基线比`main`多两笔相依的8月5日治理证据修复提交，随同本次修复进入同一PR，避免遗漏运行证据依赖。
 - 合并前门控：conda Python 3.10环境下受影响模块`py_compile`、配置验证、尺度/权限/单优化器/执行/Web/schema专项及20日独立产物验收均已通过；`git diff --check`通过。研究门和生产门状态不因Git合并改变，继续`blocked`。
 - 主干兼容处理：PR #11先于本PR进入`main`，其WBS、Web仪表盘和`verify_web_holding_count_curve.py`存在中文乱码/整文件编码漂移。rebase到最新主干时保留已清理的WBS/Web业务内容，并把旧测试中的乱码断言恢复为“历史状态没有持仓数量字段”；不得为了通过测试把正确页面改回乱码。
+- 发布结果：新分支`codex/capacity-sizing-contract-20260810`已推送；GitHub PR #12（`https://github.com/ZiyiiiiiiiiiiiiiiiiiiiiiiiiiiiZiyi/tdx_modular_quant_project_v2_all_instruments/pull/12`）以head `11b675a372e90b300dc178d49d772fd2f5ed7f45`合并到`main`，merge commit为`4d938bf785ec3f3f64322665b0ef07374ae2640f`。本地主干已fast-forward到同一提交；合并后尺度/单优化器/执行/Web/checkpoint及20日保存产物回归通过，未纳入历史未跟踪报告。
