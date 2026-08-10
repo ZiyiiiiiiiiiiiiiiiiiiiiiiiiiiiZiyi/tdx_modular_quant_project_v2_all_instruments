@@ -842,6 +842,34 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         int(optimizer_candidate_limit),
         int(search_budget.prefilter_symbol_limit),
     )
+    entry_quality_mode = str(
+        profile.get("scap_entry_quality_mode", "diagnostic") or "diagnostic"
+    ).strip().lower()
+    full_universe_oos_status = str(
+        profile.get("scap_full_universe_oos_status", "unavailable")
+        or "unavailable"
+    ).strip().lower()
+    entry_quality_block_count = 0
+    if entry_quality_mode == "trading" and full_universe_oos_status not in {
+        "pass", "eligible", "qualified"
+    }:
+        restricted_actions = {
+            "new_entry", "replacement_buy", "winner_add", "loser_add"
+        }
+        restricted = []
+        for proposal in proposals:
+            if (
+                proposal.action_type in restricted_actions
+                and str(proposal.authority_tier).upper() == "C"
+            ):
+                proposal = replace(
+                    proposal,
+                    hard_veto_reasons=tuple(proposal.hard_veto_reasons)
+                    + ("entry_quality:tier_c_full_universe_oos_unavailable",),
+                )
+                entry_quality_block_count += 1
+            restricted.append(proposal)
+        proposals = restricted
     optimizer_started = time.perf_counter()
     plan = optimize_action_proposals(
         proposals,
@@ -1190,6 +1218,9 @@ def build_lean_decision(context, candidates: pd.DataFrame) -> LeanDecision:
         "action_plan_count": 1,
         "optimizer_invocation_count": 1,
         "optimizer_elapsed_seconds": float(optimizer_elapsed_seconds),
+        "entry_quality_authority_mode": entry_quality_mode,
+        "entry_quality_full_universe_oos_status": full_universe_oos_status,
+        "entry_quality_tier_c_block_count": int(entry_quality_block_count),
         "action_plan_id": plan.plan_id,
         "action_plan_selected_count": int(len(plan.selected_proposal_ids)),
         "action_plan_rejected_count": int(len(plan.rejected_proposals)),

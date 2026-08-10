@@ -458,6 +458,14 @@ POSITION_STATE_LEDGER_COLUMNS = [
     "paper_profit_giveback_exit",
     "post_entry_failure_exit",
     "paper_post_entry_failure_exit",
+    "post_entry_failure_detected",
+    "post_entry_failure_paper_active",
+    "post_entry_failure_policy_enabled",
+    "post_entry_failure_authority_mode",
+    "post_entry_failure_control_enabled",
+    "post_entry_failure_authority_active",
+    "post_entry_failure_authority_veto_reasons",
+    "post_entry_failure_selected_exit",
     "alpha_collapse_exit",
     "paper_alpha_collapse_exit",
     "signal_failure_exit",
@@ -737,6 +745,9 @@ class GovernanceBacktestRunner:
         self.capital_profile = dict(capital_profile or {})
         self._scap_recovery_episode_id = ""
         self._scap_recovery_episode_day = 0
+        self._market_recovery_state = "BLOCKED"
+        self._market_recovery_healthy_streak = 0
+        self._current_market_recovery_contract: dict = {}
         self._user_hard_position_cap = (
             int(self.capital_profile.get("user_hard_position_cap"))
             if self.capital_profile.get("user_hard_position_cap") not in (None, "", 0, "0")
@@ -1929,6 +1940,93 @@ class GovernanceBacktestRunner:
                 float(lot_feasible_target_exposure), 0.60
             )
             high_exposure_cap_applied = True
+        from functions.decision_council.post_drawdown_diagnostics import (
+            advance_market_recovery_state,
+            effective_market_deployment_cap,
+        )
+
+        market_recovery_mode = str(
+            self.capital_profile.get("scap_market_recovery_mode", "diagnostic")
+            or "diagnostic"
+        ).strip().lower()
+        benchmark_return_5d = pd.to_numeric(
+            pd.Series([safety_row.get("benchmark_return_5d")]), errors="coerce"
+        ).iloc[0]
+        benchmark_return_20d = pd.to_numeric(
+            pd.Series([safety_row.get("benchmark_return_20d")]), errors="coerce"
+        ).iloc[0]
+        (
+            self._market_recovery_state,
+            self._market_recovery_healthy_streak,
+            market_recovery_hard_block,
+            market_recovery_healthy,
+        ) = advance_market_recovery_state(
+            self._market_recovery_state,
+            self._market_recovery_healthy_streak,
+            fast_state=str(getattr(risk_level, "value", risk_level)),
+            hard_freeze_active=bool(safety_row.get("hard_freeze_active", False)),
+            return_5d=(
+                float(benchmark_return_5d)
+                if pd.notna(benchmark_return_5d)
+                else None
+            ),
+            return_20d=(
+                float(benchmark_return_20d)
+                if pd.notna(benchmark_return_20d)
+                else None
+            ),
+            confirmation_days=int(
+                self.capital_profile.get(
+                    "scap_market_recovery_confirmation_days", 3
+                )
+                or 3
+            ),
+        )
+        market_recovery_caps = effective_market_deployment_cap(
+            hard_safety_cap=float(safety_exposure_cap),
+            base_deployment_target=float(desired_exposure_target),
+            structural_state=str(structural_regime_level),
+            recovery_state=self._market_recovery_state,
+            sizing_attainable_cap=float(lot_feasible_target_exposure),
+        )
+        self._current_market_recovery_contract = {
+            "market_recovery_authority_mode": market_recovery_mode,
+            "market_recovery_state": self._market_recovery_state,
+            "market_recovery_healthy_streak": int(
+                self._market_recovery_healthy_streak
+            ),
+            "market_recovery_hard_block": bool(market_recovery_hard_block),
+            "market_recovery_healthy": bool(market_recovery_healthy),
+            "market_recovery_structural_multiplier": float(
+                market_recovery_caps["structural_multiplier"]
+            ),
+            "market_recovery_structural_cap": float(
+                market_recovery_caps["structural_cap"]
+            ),
+            "market_recovery_cap": float(market_recovery_caps["recovery_cap"]),
+            "market_recovery_effective_deployment_cap": float(
+                market_recovery_caps["effective_deployment_cap"]
+            ),
+            "market_recovery_trading_cap_applied": bool(
+                market_recovery_mode == "trading"
+            ),
+        }
+        if market_recovery_mode == "trading":
+            recovery_effective_cap = float(
+                market_recovery_caps["effective_deployment_cap"]
+            )
+            target_exposure_proxy = min(
+                float(target_exposure_proxy), recovery_effective_cap
+            )
+            desired_exposure_target = min(
+                float(desired_exposure_target), recovery_effective_cap
+            )
+            risk_exposure_ceiling = min(
+                float(risk_exposure_ceiling), recovery_effective_cap
+            )
+            lot_feasible_target_exposure = min(
+                float(lot_feasible_target_exposure), recovery_effective_cap
+            )
         catchup_decision = decide_exposure_catchup(
             actual_exposure=actual_exposure,
             target_exposure=(
@@ -2179,6 +2277,7 @@ class GovernanceBacktestRunner:
         action_proposal_rows = diagnostics.pop("_action_proposal_rows", [])
         action_plan_rows = diagnostics.pop("_action_plan_rows", [])
         diagnostics["regime_es_budget_multiplier"] = float(regime_es_multiplier)
+        diagnostics.update(self._current_market_recovery_contract)
         diagnostics["portfolio_search_active"] = portfolio_search_active
         diagnostics["scenario_build_elapsed_seconds"] = float(
             scenario_build_elapsed_seconds
@@ -5604,6 +5703,75 @@ class GovernanceBacktestRunner:
         extra["governance_trade_pairs"] = trade_pairs
         extra["governance_open_positions"] = open_positions
         extra["governance_trade_pair_summary"] = pd.DataFrame([trade_summary])
+        self._log_save_stage("post_drawdown_diagnostic_products")
+        from functions.decision_council.post_drawdown_diagnostics import (
+            build_benchmark_bundle,
+            build_entry_quality_authority,
+            build_exit_delay_counterfactual,
+            build_exit_signal_authority_ledger,
+            build_market_state_ledger,
+            build_recovery_episode_ledger,
+        )
+
+        safety_decisions = self.engine.ledgers.frame("safety_decision_ledger")
+        exit_authority_ledger = build_exit_signal_authority_ledger(
+            extra["governance_position_state_ledger"],
+            extra["governance_execution_ledger"],
+        )
+        extra["governance_exit_signal_authority_ledger"] = exit_authority_ledger
+        extra["governance_exit_delay_counterfactual"] = (
+            build_exit_delay_counterfactual(exit_authority_ledger, self.audit_prices)
+        )
+        market_state_ledger = build_market_state_ledger(
+            extra["governance_daily_result"],
+            safety_decisions,
+            authority_mode=str(
+                self.capital_profile.get("scap_market_recovery_mode", "diagnostic")
+                or "diagnostic"
+            ),
+            recovery_confirm_days=int(
+                self.capital_profile.get(
+                    "scap_market_recovery_confirmation_days", 3
+                )
+                or 3
+            ),
+        )
+        extra["governance_market_state_ledger"] = market_state_ledger
+        extra["governance_market_recovery_episode_ledger"] = (
+            build_recovery_episode_ledger(market_state_ledger)
+        )
+        extra["governance_entry_quality_authority"] = (
+            build_entry_quality_authority(
+                extra["governance_action_proposal_ledger"],
+                extra["governance_daily_result"],
+                authority_mode=str(
+                    self.capital_profile.get("scap_entry_quality_mode", "diagnostic")
+                    or "diagnostic"
+                ),
+            )
+        )
+        extra["governance_benchmark_bundle"] = build_benchmark_bundle(
+            extra["governance_performance_benchmark"], safety_decisions
+        )
+        extra["governance_regime_factor_product_status"] = pd.DataFrame(
+            [
+                {
+                    "status": "pending_standard_save",
+                    "authority_mode": str(
+                        self.capital_profile.get("scap_regime_factor_mode", "shadow")
+                        or "shadow"
+                    ),
+                    "trading_authority": False,
+                    "full_universe_oos_status": str(
+                        self.capital_profile.get(
+                            "scap_full_universe_oos_status", "unavailable"
+                        )
+                        or "unavailable"
+                    ),
+                    "reason": "full_universe OOS requires a separate frozen cache and is never inferred from the audit candidate sample",
+                }
+            ]
+        )
         extra["governance_ideal_vs_executed"] = _ideal_vs_executed(
             extra["governance_entry_formula_audit"],
             extra["governance_execution_ledger"],
@@ -5832,6 +6000,121 @@ class GovernanceBacktestRunner:
         for name, frame in extra.items():
             path = self.output_dir / f"{name}.csv"
             saved[name] = write_governance_csv(frame, path)
+        self._log_save_stage("regime_factor_products")
+        regime_product_status = "not_applicable"
+        if self.governance_variant == "governance_layer_validation":
+            diagnostic_output_dir = (
+                self.output_dir / "diagnostics" / "regime_factor_diagnostics"
+            )
+            try:
+                from functions.decision_council.regime_factor_diagnostics import (
+                    build_regime_factor_diagnostics,
+                )
+
+                regime_manifest = build_regime_factor_diagnostics(
+                    self.output_dir, diagnostic_output_dir
+                )
+                regime_product_names = (
+                    "governance_regime_factor_ic_daily",
+                    "governance_regime_factor_summary",
+                    "governance_regime_factor_family_summary",
+                    "governance_regime_factor_stability",
+                    "governance_candidate_gate_partition_manifest",
+                )
+                for product_name in regime_product_names:
+                    source_path = diagnostic_output_dir / f"{product_name}.csv"
+                    product = pd.read_csv(source_path)
+                    saved[product_name] = write_governance_csv(
+                        product, self.output_dir / f"{product_name}.csv"
+                    )
+                regime_product_status = "complete"
+                status_frame = pd.DataFrame(
+                    [
+                        {
+                            "status": regime_product_status,
+                            "authority_mode": str(
+                                self.capital_profile.get(
+                                    "scap_regime_factor_mode", "shadow"
+                                )
+                                or "shadow"
+                            ),
+                            "trading_authority": False,
+                            "full_universe_oos_status": str(
+                                self.capital_profile.get(
+                                    "scap_full_universe_oos_status",
+                                    "unavailable",
+                                )
+                                or "unavailable"
+                            ),
+                            "summary_rows": int(
+                                regime_manifest.get("summary_rows", 0)
+                            ),
+                            "candidate_outcome_dates": int(
+                                regime_manifest.get(
+                                    "candidate_outcome_dates", 0
+                                )
+                            ),
+                            "research_gate": "blocked",
+                            "production_gate": "blocked",
+                            "reason": "conditional audit diagnostics complete; strict full-universe rolling OOS remains unavailable",
+                        }
+                    ]
+                )
+                saved["governance_regime_factor_product_status"] = (
+                    write_governance_csv(
+                        status_frame,
+                        self.output_dir
+                        / "governance_regime_factor_product_status.csv",
+                    )
+                )
+                update_artifact_manifest(
+                    self.output_dir,
+                    stage="regime_factor_products_complete",
+                    status="saving",
+                    research_products_complete=True,
+                    artifact_name="regime_factor_products",
+                    artifact_status="complete_diagnostic_only",
+                )
+            except Exception as exc:
+                regime_product_status = "failed"
+                failure = pd.DataFrame(
+                    [
+                        {
+                            "status": "failed",
+                            "authority_mode": "shadow",
+                            "trading_authority": False,
+                            "full_universe_oos_status": "unavailable",
+                            "research_gate": "blocked",
+                            "production_gate": "blocked",
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    ]
+                )
+                saved["governance_regime_factor_product_status"] = (
+                    write_governance_csv(
+                        failure,
+                        self.output_dir
+                        / "governance_regime_factor_product_status.csv",
+                    )
+                )
+                update_artifact_manifest(
+                    self.output_dir,
+                    stage="regime_factor_products_failed",
+                    status="saving",
+                    research_products_complete=False,
+                    artifact_name="regime_factor_products",
+                    artifact_status="failed_non_core",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+        else:
+            update_artifact_manifest(
+                self.output_dir,
+                stage="regime_factor_products_not_applicable",
+                status="saving",
+                research_products_complete=False,
+                artifact_name="regime_factor_products",
+                artifact_status=regime_product_status,
+            )
         update_artifact_manifest(
             self.output_dir,
             stage="audit_csv_saved",

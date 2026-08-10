@@ -44,6 +44,118 @@ SIZING_STATE_FIELDS = (
 )
 
 
+DIAGNOSTIC_PRODUCTS = {
+    "market-state": {
+        "filename": "governance_market_state_ledger.csv",
+        "authority": "diagnostic_or_explicit_trading_by_runtime_mode",
+    },
+    "benchmarks": {
+        "filename": "governance_benchmark_bundle.csv",
+        "authority": "role_scoped_no_cross_role_substitution",
+    },
+    "exit-authority": {
+        "filename": "governance_exit_signal_authority_ledger.csv",
+        "authority": "factual_exit_authority_audit",
+    },
+    "entry-quality": {
+        "filename": "governance_entry_quality_authority.csv",
+        "authority": "diagnostic_or_explicit_trading_by_runtime_mode",
+    },
+    "regime-factors": {
+        "filename": "governance_regime_factor_summary.csv",
+        "authority": "shadow_only_no_trading_authority",
+    },
+    "gates": {
+        "filename": "governance_regime_factor_product_status.csv",
+        "authority": "gate_status_only",
+    },
+}
+
+
+def _diagnostic_output_dir(payload: dict) -> Path | None:
+    value = str(payload.get("output_dir", "") or "").strip()
+    return Path(value) if value else None
+
+
+def _read_artifact_manifest(output_dir: Path) -> dict:
+    path = output_dir / "artifact_manifest.json"
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _diagnostic_product_payload(
+    payload: dict,
+    product_name: str,
+    query: dict[str, list[str]] | None = None,
+) -> dict:
+    """Read one fixed diagnostic product with a truthful status envelope."""
+    spec = DIAGNOSTIC_PRODUCTS.get(str(product_name))
+    if spec is None:
+        raise KeyError(product_name)
+    output_dir = _diagnostic_output_dir(payload)
+    if output_dir is None:
+        return {
+            "status": "pending", "product": product_name, "rows": [],
+            "authority": spec["authority"], "message": "run output directory is not available",
+        }
+    path = output_dir / spec["filename"]
+    manifest = _read_artifact_manifest(output_dir)
+    if not path.is_file():
+        manifest_status = str(manifest.get("status", "") or "")
+        failed = bool(manifest.get("error")) or manifest_status == "failed"
+        return {
+            "status": "failed" if failed else "pending",
+            "product": product_name, "rows": [], "authority": spec["authority"],
+            "message": str(manifest.get("error") or "product has not been saved"),
+            "artifact_stage": manifest.get("stage"),
+        }
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except Exception as exc:
+        return {
+            "status": "failed", "product": product_name, "rows": [],
+            "authority": spec["authority"],
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+    query = query or {}
+    filters = {
+        key: str(query.get(key, [""])[0]).strip()
+        for key in (
+            "date", "decision_date", "symbol", "signal_type", "role",
+            "state_label", "state_dimension", "horizon_days", "score_level",
+            "trade_mode", "recovery_state",
+        )
+        if str(query.get(key, [""])[0]).strip()
+    }
+    if "date" in filters and "decision_date" not in filters:
+        filters["decision_date"] = filters.pop("date")
+    for key, value in filters.items():
+        rows = [row for row in rows if str(row.get(key, "")) == value]
+    try:
+        limit = min(max(int(query.get("limit", [500])[0]), 1), 5000)
+    except (TypeError, ValueError):
+        limit = 500
+    total_rows = len(rows)
+    if str(query.get("latest", [""])[0]).lower() in {"1", "true", "yes"} and rows:
+        date_key = "decision_date" if "decision_date" in rows[0] else "last_date"
+        latest = max(str(row.get(date_key, "")) for row in rows)
+        rows = [row for row in rows if str(row.get(date_key, "")) == latest]
+    rows = rows[:limit]
+    return {
+        "status": "ok", "product": product_name, "rows": rows,
+        "row_count": len(rows), "filtered_row_count": total_rows,
+        "authority": spec["authority"], "source_file": spec["filename"],
+        "artifact_stage": manifest.get("stage"),
+        "research_products_complete": manifest.get("research_products_complete", False),
+    }
+
+
 def _current_sizing_contract(payload: dict) -> dict:
     monitor = dict(payload.get("monitor_state") or {})
     exposure = dict(payload.get("exposure") or {})
@@ -1502,6 +1614,66 @@ def main(argv: list[str]) -> int:
                 fieldnames = sorted(
                     {str(key) for row in rows for key in dict(row).keys()}
                 )
+                stream = io.StringIO(newline="")
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                if fieldnames:
+                    writer.writeheader()
+                    writer.writerows(rows)
+                self._send_bytes(
+                    stream.getvalue().encode("utf-8-sig"),
+                    "text/csv; charset=utf-8",
+                )
+                return
+            diagnostic_endpoint = {
+                "/api/market-state": "market-state",
+                "/api/benchmarks": "benchmarks",
+                "/api/exit-authority": "exit-authority",
+                "/api/entry-quality": "entry-quality",
+                "/api/regime-factors": "regime-factors",
+                "/api/gates": "gates",
+            }.get(parsed.path)
+            if diagnostic_endpoint is not None:
+                try:
+                    product = _diagnostic_product_payload(
+                        _read_payload(state_path),
+                        diagnostic_endpoint,
+                        parse_qs(parsed.query),
+                    )
+                except KeyError:
+                    self.send_error(404, "unknown diagnostic product")
+                    return
+                self._send_bytes(
+                    json.dumps(
+                        product, ensure_ascii=False, allow_nan=False
+                    ).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+                return
+            if parsed.path == "/api/diagnostic-export":
+                query = parse_qs(parsed.query)
+                product_name = str(query.get("product", [""])[0]).strip()
+                output_format = str(
+                    query.get("format", ["csv"])[0]
+                ).strip().lower()
+                if product_name not in DIAGNOSTIC_PRODUCTS:
+                    self.send_error(400, "unknown product")
+                    return
+                if output_format not in {"json", "csv"}:
+                    self.send_error(400, "format must be json or csv")
+                    return
+                product = _diagnostic_product_payload(
+                    _read_payload(state_path), product_name, query
+                )
+                if output_format == "json":
+                    self._send_bytes(
+                        json.dumps(
+                            product, ensure_ascii=False, allow_nan=False
+                        ).encode("utf-8"),
+                        "application/json; charset=utf-8",
+                    )
+                    return
+                rows = list(product.get("rows") or [])
+                fieldnames = list(rows[0].keys()) if rows else []
                 stream = io.StringIO(newline="")
                 writer = csv.DictWriter(stream, fieldnames=fieldnames)
                 if fieldnames:

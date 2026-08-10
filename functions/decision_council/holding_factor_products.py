@@ -20,7 +20,10 @@ DEFAULT_ARTIFACT_NODE = Path(
     r"\dependencies\node\bin\node.exe"
 )
 FACTOR_PRODUCT_DIRNAME = "holding_factor_curves"
-FACTOR_WORKBOOK_NAME = "SCAP_???????.xlsx"
+# This name crosses a Python -> Node subprocess boundary on Windows.  Keep the
+# machine path ASCII-stable; localized download labels belong to HTTP headers,
+# not the filesystem contract.
+FACTOR_WORKBOOK_NAME = "SCAP_holding_factor_curves.xlsx"
 
 
 def workbook_content_check_failures(summary: dict) -> list[str]:

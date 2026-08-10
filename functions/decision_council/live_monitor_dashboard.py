@@ -166,6 +166,13 @@ HTML = r"""<!doctype html>
     .negative { color: var(--red) !important; }
     .neutral { color: var(--ink) !important; }
     .empty { padding: 22px; color: var(--muted); text-align: center; }
+    .diagnostic-controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .diagnostic-controls input, .diagnostic-controls select, .diagnostic-controls button {
+      min-height: 30px; padding: 5px 8px; border: 1px solid var(--line-strong);
+      border-radius: 4px; background: #fff; color: var(--ink);
+    }
+    .diagnostic-downloads { display:flex; flex-wrap:wrap; gap:7px; }
+    .diagnostic-downloads a { color:var(--blue); text-decoration:none; font-size:11px; }
     @media (max-width: 1380px) {
       .kpi-grid { grid-template-columns: repeat(4, minmax(130px, 1fr)); }
       .detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -203,6 +210,7 @@ HTML = r"""<!doctype html>
           <a class="product-link" href="/factor-workbook" target="_blank">下载逐因子Excel</a>
           <a class="product-link" href="/api/sizing-contract" target="_blank">查看仓位合同JSON</a>
           <a class="product-link" href="/api/sizing-export?format=csv" target="_blank">下载仓位合同CSV</a>
+          <a class="product-link" href="/api/gates" target="_blank">研究/生产门</a>
         </div>
       </div>
       <div class="run-state">
@@ -222,6 +230,7 @@ HTML = r"""<!doctype html>
       <button class="tab" data-tab="execution">候选与执行</button>
       <button class="tab" data-tab="factors">因子权重</button>
       <button class="tab" data-tab="holdings">持仓路径</button>
+      <button class="tab" data-tab="diagnostics">回撤诊断</button>
     </nav>
 
     <section class="tab-panel active" id="tab-overview">
@@ -327,6 +336,36 @@ HTML = r"""<!doctype html>
       </article>
       <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">持仓生命周期</div><div class="panel-note">入场、浮盈亏和退出警报使用同一持仓状态快照</div></div><div class="table-scroll"><table><thead><tr><th>代码</th><th>入场</th><th>浮盈亏</th><th>MFE</th><th>MAE</th><th>回吐</th><th>趋势</th><th>峰值衰减</th><th>亏损风险</th><th>状态</th><th>警报</th></tr></thead><tbody id="lifecycleBody"></tbody></table></div></article>
     </section>
+
+    <section class="tab-panel" id="tab-diagnostics">
+      <article class="panel">
+        <div class="panel-header">
+          <div><div class="panel-title">回撤后证据中心</div><div class="panel-note">只读；diagnostic/shadow 不改变订单，缺失与失败不会显示为 0</div></div>
+          <div class="diagnostic-controls">
+            <label>日期 <input id="diagnosticDate" type="date"></label>
+            <label>退出信号 <select id="diagnosticSignal"><option value="">全部</option><option>post_entry_failure_exit</option><option>signal_failure_exit</option><option>thesis_failure_exit</option><option>loss_containment_exit</option><option>profit_giveback_exit</option><option>profit_hard_stop_exit</option><option>stale_time_exit</option></select></label>
+            <button id="refreshDiagnostics" type="button">刷新</button>
+          </div>
+        </div>
+        <div class="panel-body diagnostic-downloads">
+          <a href="/api/diagnostic-export?product=market-state&format=csv">市场状态CSV</a>
+          <a href="/api/diagnostic-export?product=benchmarks&format=csv">四基准CSV</a>
+          <a href="/api/diagnostic-export?product=exit-authority&format=csv">退出权限CSV</a>
+          <a href="/api/diagnostic-export?product=entry-quality&format=csv">买入质量CSV</a>
+          <a href="/api/diagnostic-export?product=regime-factors&format=csv">状态—因子CSV</a>
+        </div>
+      </article>
+      <div class="layout-third">
+        <article class="panel"><div class="panel-header"><div class="panel-title">三层市场状态与恢复</div><div class="panel-note">fast / structural / recovery</div></div><div class="panel-body"><pre class="text-report" id="marketStateProduct">等待保存产品</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">四基准角色</div><div class="panel-note">performance / opportunity / style / safety</div></div><div class="panel-body"><pre class="text-report" id="benchmarkProduct">等待保存产品</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">三门状态</div><div class="panel-note">工程门不等于研究门或生产门</div></div><div class="panel-body"><pre class="text-report" id="gateProduct">等待保存产品</pre></div></article>
+      </div>
+      <div class="layout-half">
+        <article class="panel"><div class="panel-header"><div class="panel-title">退出八阶段事实链</div><div class="panel-note">检测→影子→控制→权限→选择→订单→成交→反事实</div></div><div class="panel-body"><pre class="text-report" id="exitProduct">等待保存产品</pre></div></article>
+        <article class="panel"><div class="panel-header"><div class="panel-title">买入质量权限</div><div class="panel-note">人民币 CE 与证据等级；C 级无严格 OOS 时影子观察</div></div><div class="panel-body"><pre class="text-report" id="entryProduct">等待保存产品</pre></div></article>
+      </div>
+      <article class="panel" style="margin-top:12px"><div class="panel-header"><div class="panel-title">状态—因子/家族 IC、IR 与 FDR</div><div class="panel-note">带样本范围与 authority 徽章；候选审计样本不得冒充全市场 OOS</div></div><div class="panel-body"><pre class="text-report" id="factorProduct">等待保存产品</pre></div></article>
+    </section>
   </main>
 
   <script>
@@ -414,6 +453,9 @@ HTML = r"""<!doctype html>
         drawAllCharts();
       }));
       window.addEventListener("resize", () => requestAnimationFrame(drawAllCharts));
+      document.getElementById("refreshDiagnostics").addEventListener("click", loadDiagnosticProducts);
+      document.getElementById("diagnosticDate").addEventListener("change", loadDiagnosticProducts);
+      document.getElementById("diagnosticSignal").addEventListener("change", loadDiagnosticProducts);
       for (const id of ["perfChart","excessChart","drawdownChart","holdingCountChart"]) {
         document.getElementById(id).addEventListener("mousemove", event => {
           const rect = event.currentTarget.getBoundingClientRect();
@@ -616,9 +658,43 @@ HTML = r"""<!doctype html>
       if(stageCommand){const progress=Math.max(lastProgressPct,Math.min(Math.max(finite(payload.progress_pct),0),100));setStatus(payload.message||payload.step||"准备数据",progress,payload.detail||payload.step||"");}
       if(finishCommand){setStatus(payload.message||"运行完成",Math.max(lastProgressPct,finite(payload.progress_pct,100)),"complete");document.getElementById("statusDot").style.background="#82d5b1";}
     }
+    function diagnosticText(payload, columns) {
+      const header = [`status=${payload.status||"unknown"}`, `authority=${payload.authority||"unavailable"}`, `rows=${payload.row_count??0}`];
+      if(payload.message) header.push(`message=${payload.message}`);
+      const rows = (payload.rows||[]).slice(0,12);
+      if(!rows.length) return header.join("\n");
+      return header.concat("", rows.map((row,index)=>`${String(index+1).padStart(2,"0")}  ${columns.map(column=>`${column}=${row[column]??"--"}`).join(" | ")}`)).join("\n");
+    }
+    async function fetchDiagnostic(path) {
+      try {
+        const response = await fetch(`${path}${path.includes("?")?"&":"?"}ts=${Date.now()}`, {cache:"no-store"});
+        if(!response.ok) return {status:"failed",message:`HTTP ${response.status}`,rows:[]};
+        return await response.json();
+      } catch(error) { return {status:"failed",message:String(error),rows:[]}; }
+    }
+    async function loadDiagnosticProducts() {
+      const date = String(document.getElementById("diagnosticDate").value||"");
+      const signal = String(document.getElementById("diagnosticSignal").value||"");
+      const dateQuery = date ? `date=${encodeURIComponent(date)}` : "latest=true";
+      const exitQuery = [dateQuery, signal?`signal_type=${encodeURIComponent(signal)}`:""] .filter(Boolean).join("&");
+      const [market,benchmarks,exits,entries,factors,gates] = await Promise.all([
+        fetchDiagnostic(`/api/market-state?${dateQuery}&limit=20`),
+        fetchDiagnostic(`/api/benchmarks?${dateQuery}&limit=20`),
+        fetchDiagnostic(`/api/exit-authority?${exitQuery}&limit=100`),
+        fetchDiagnostic(`/api/entry-quality?${dateQuery}&limit=100`),
+        fetchDiagnostic(`/api/regime-factors?limit=100`),
+        fetchDiagnostic(`/api/gates?limit=20`),
+      ]);
+      document.getElementById("marketStateProduct").textContent=diagnosticText(market,["decision_date","fast_shock_state","structural_state","recovery_state","effective_deployment_cap","authority_mode","data_quality_state"]);
+      document.getElementById("benchmarkProduct").textContent=diagnosticText(benchmarks,["decision_date","role","benchmark_id","return_valid","coverage_ratio","authority","degraded_reasons"]);
+      document.getElementById("exitProduct").textContent=diagnosticText(exits,["decision_date","symbol","signal_type","detected","paper_active","control_enabled","authority_active","selected_for_exit","veto_reasons","sell_execution_date"]);
+      document.getElementById("entryProduct").textContent=diagnosticText(entries,["decision_date","symbol","authority_tier","calibration_state","risk_adjusted_ce_amount","trade_mode","selected_by_plan","blocked_reasons"]);
+      document.getElementById("factorProduct").textContent=diagnosticText(factors,["score_scope","score_level","score_name","economic_family","horizon_days","state_dimension","state_label","observed_days","mean_daily_rank_ic","ic_ir","fdr_q_value","minimum_30_days_pass"]);
+      document.getElementById("gateProduct").textContent=diagnosticText(gates,["status","authority_mode","trading_authority","full_universe_oos_status","research_gate","production_gate","reason"]);
+    }
     function setStatus(message,progress,detail){lastProgressPct=Math.max(0,Math.min(finite(progress),100));document.getElementById("status").textContent=message||"运行中";document.getElementById("runDetail").textContent=`${lastProgressPct.toFixed(1)}% · ${detail||""}`;document.getElementById("progressBar").style.width=`${lastProgressPct}%`;}
     async function poll(){try{const response=await fetch(`/state?ts=${Date.now()}`,{cache:"no-store"});if(response.ok)renderState(await response.json());else setStatus("状态接口异常",lastProgressPct,`HTTP ${response.status}`);}catch(error){setStatus("监控连接中断",lastProgressPct,String(error));document.getElementById("statusDot").style.background="#bd3d39";}setTimeout(poll,1000);}
-    buildStaticUi(); drawAllCharts(); poll();
+    buildStaticUi(); drawAllCharts(); loadDiagnosticProducts(); setInterval(loadDiagnosticProducts,5000); poll();
   </script>
 </body>
 </html>

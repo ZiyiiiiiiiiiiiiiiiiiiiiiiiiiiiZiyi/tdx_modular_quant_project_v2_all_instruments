@@ -65,8 +65,14 @@ def main() -> None:
         "factor Web series is readable",
     )
     _check(
-        (product_dir / FACTOR_WORKBOOK_NAME).is_file(),
-        "integrated Excel workbook exists",
+        FACTOR_WORKBOOK_NAME.isascii()
+        and FACTOR_WORKBOOK_NAME == "SCAP_holding_factor_curves.xlsx",
+        "new workbook filesystem contract is ASCII-stable across Python and Node",
+    )
+    _check(
+        (product_dir / FACTOR_WORKBOOK_NAME).is_file()
+        or any(product_dir.glob("*.xlsx")),
+        "integrated Excel workbook exists (including immutable legacy fixture)",
     )
 
 

@@ -337,6 +337,20 @@ BACKTEST_CAPITAL_PROFILES = {
         "scap_legacy_sizing_shadow_enabled": True,
         "scap_risk_episode_contract": "scap_v32_hysteresis_reentry_v1",
         "scap_exit_contract": "scap_v32_adaptive_loss_signed_counterfactual_v1",
+        # Post-drawdown remediation contracts default to evidence production.
+        # A trading mode must be an explicit, runtime-identified experiment;
+        # the 20-day engineering run must not gain authority implicitly.
+        "scap_post_entry_failure_mode": "diagnostic",
+        "scap_market_recovery_mode": "diagnostic",
+        "scap_entry_quality_mode": "diagnostic",
+        "scap_regime_factor_mode": "shadow",
+        "scap_benchmark_bundle_mode": "diagnostic",
+        "scap_exit_authority_contract_version": "scap_exit_authority_v2",
+        "scap_market_state_contract_version": "scap_market_state_vector_v1",
+        "scap_entry_quality_contract_version": "scap_entry_quality_authority_v1",
+        "scap_benchmark_bundle_contract_version": "scap_benchmark_bundle_v1",
+        "scap_market_recovery_confirmation_days": 3,
+        "scap_full_universe_oos_status": "unavailable",
         "scap_exit_stage": "E4",
         "scap_loss_stop": -0.18,
         "scap_loss_stop_mode": "adaptive_volatility_or_disaster_floor",
@@ -1742,6 +1756,19 @@ def validate_configuration() -> list[str]:
             "audit", "strict_when_factually_feasible"
         }:
             errors.append("small_capital_lean floor violation gate mode is unsupported")
+        for mode_name, allowed_modes in {
+            "scap_post_entry_failure_mode": {"diagnostic", "shadow", "trading"},
+            "scap_market_recovery_mode": {"diagnostic", "shadow", "trading"},
+            "scap_entry_quality_mode": {"diagnostic", "shadow", "trading"},
+            "scap_regime_factor_mode": {"diagnostic", "shadow"},
+            "scap_benchmark_bundle_mode": {"diagnostic"},
+        }.items():
+            if str(lean.get(mode_name, "")).strip().lower() not in allowed_modes:
+                errors.append(f"small_capital_lean {mode_name} is unsupported")
+        if int(lean.get("scap_market_recovery_confirmation_days", 0)) <= 0:
+            errors.append(
+                "small_capital_lean market recovery confirmation days must be positive"
+            )
         policy_bands = lean.get("scap_policy_bands")
         required_states = {"normal_neutral", "weak", "high_risk", "crisis"}
         if not isinstance(policy_bands, dict) or not required_states.issubset(

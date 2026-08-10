@@ -132,6 +132,38 @@ def frame() -> pd.DataFrame:
 base = build_lean_decision(context(), frame())
 assert base.diagnostics["optimizer_invocation_count"] == 1
 assert base.diagnostics["action_plan_count"] == 1
+trading_quality_context = replace(
+    context(),
+    execution_cost_profile={
+        **context().execution_cost_profile,
+        "scap_entry_quality_mode": "trading",
+        "scap_full_universe_oos_status": "unavailable",
+    },
+)
+trading_quality_frame = frame().assign(
+    entry_calibration_effective_sample_size_10d=10.0,
+    entry_calibration_unique_session_count_10d=10,
+    forecast_rank_ic_10d=0.0,
+    forecast_calibration_slope_10d=0.0,
+    forecast_drift_streak_10d=3,
+    entry_calibration_state_10d="drifted",
+    comparable_alpha_lcb=0.02,
+    comparable_expected_alpha=0.025,
+    comparable_value_contract="pit_factor_family_return_v1",
+)
+trading_quality = build_lean_decision(
+    replace(trading_quality_context, candidates=trading_quality_frame),
+    trading_quality_frame,
+)
+assert trading_quality.diagnostics["entry_quality_authority_mode"] == "trading"
+assert trading_quality.diagnostics["entry_quality_tier_c_block_count"] > 0
+assert not any(
+    proposal.action_type in {"new_entry", "winner_add", "loser_add", "replacement_buy"}
+    and proposal.proposal_id in set(trading_quality.plan.selected_proposal_ids)
+    for proposal in trading_quality.proposals
+    if proposal.authority_tier == "C"
+)
+passed("explicit entry-quality trading mode blocks C exposure without strict full-universe OOS evidence")
 test_sizing_intent = resolve_portfolio_sizing_intent(
     decision_id="lean_20250110",
     nav_amount=20_000.0,
