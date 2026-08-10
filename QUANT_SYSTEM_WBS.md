@@ -2534,3 +2534,4 @@
 - 证据边界：338日状态—家族产品显示反转与波动率在当前候选门条件样本较稳定，价值和订单流方向为负，且不同市场状态存在差异；但scope仍是candidate-gate conditional，严格full-universe rolling OOS不可用，338日又已参与问题发现，不得据此动态改权或取得交易权。
 - 后续批次：A批建立74因子的方向/单位/PIT/时间尺度真值表，拆分执行流动性与非流动性溢价，纠正论点血缘并重新定位规模风格；B批以shadow实现论点状态机、冲突账本和只读Web；C批执行同代码development消融及不少于504日严格PIT全市场滚动OOS。每批必须先静态、构造和性质测试，再运行；禁止多模块同时启用后宣称单变量改善。
 - 影响链：WBS-07因子语义/柜权威 → WBS-08入场论点 → WBS-09市场状态权限 → WBS-10持有/退出论点 → WBS-11组合仲裁与尺寸 → WBS-13严格OOS/多重检验 → WBS-14/15账本与Web → WBS-16门控。完整报告为`reports/SCAP_20260810_FACTOR_FAMILY_STATE_MACHINE_ANALYSIS.md`；当前仍为`analysis_complete_implementation_not_authorized`，研究门与生产门继续`blocked`。
+- 发布记录：分析报告与本WBS以分支`codex/factor-family-state-machine-analysis-20260810`提交`1b33640`，通过GitHub PR #15合并到`main`，merge commit为`1066ed2fad81519c3619da4a84dc9a5a011a67dc`；发布只含两份文档，未纳入用户既有baseline snapshot修改、历史run目录或日志。
