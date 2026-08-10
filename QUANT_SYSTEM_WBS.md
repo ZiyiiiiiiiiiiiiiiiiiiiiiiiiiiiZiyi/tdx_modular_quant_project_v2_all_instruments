@@ -2516,3 +2516,10 @@
 - 经济与金融结论：最终NAV 17,862.239640元，总收益-10.6888%，最大回撤-12.0735%，研究基准-8.7206%，几何超额-2.1563%；3笔闭合交易全亏、已实现-1,113.739173元，期末4仓均浮亏。47条退出观察中43条维持diagnostic veto；115条C级入场缺严格full-universe OOS。工程门通过但研究门6项失败，研究门与生产门继续`blocked`。
 - 最终验证：受影响模块`py_compile`通过；post-drawdown诊断/Web、regime factor、full-universe OOS、Lean权威/仲裁/ActionPlan/执行、黄金恢复、Web持仓曲线/布局、保存韧性、factor workbook integration全部PASS；`git diff --check`仅提示用户既有`SCAP_20260805_338D_BASELINE_SNAPSHOT.json`换行格式，不纳入本次提交。
 - 比较边界：338日`run20260809_214739`与最终20日的代码身份和E4止损参数不同，仅用于历史事实与候选状态—因子研究，不作单变量因果比较；9—12月并非连续绝对下跌，主要相对缺口来自9月未跟上牛市。任何交易权开启必须另做同代码单变量development A/B与不少于504日严格PIT滚动OOS。
+
+### CHANGE-20260810-07：回撤修复分支发布与主干合并
+
+- 发布范围：仅本轮19个源码、测试、WBS、方案和分析报告文件；明确排除用户既有修改`reports/SCAP_20260805_338D_BASELINE_SNAPSHOT.json`、全部历史运行目录、临时日志和未跟踪产物。暂存采用显式路径，未使用`git add -A`。
+- 实现提交：分支`codex/scap-post-drawdown-remediation-20260810`，commit `e44c4ab`（`fix post-drawdown governance diagnostics`），推送后创建GitHub PR #13。
+- 合并结果：PR #13状态`MERGED`，GitHub合并前判定`MERGEABLE/CLEAN`且无待运行远端检查；merge commit `22e411e5c0f39209b52fe0ba47b0f74a3f444461`已进入`origin/main`，并通过ancestor核对确认包含实现提交。本地主干引用同步至同一远端主干。
+- 门控边界：Git合并只发布已验证工程能力，不改变`diagnostic/shadow`默认权限，也不解除研究门或生产门；完整20日证据和后续限制继续以CHANGE-20260810-06及正式报告为准。
