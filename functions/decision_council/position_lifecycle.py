@@ -18,6 +18,9 @@ from functions.decision_council.action_utility import (
     build_incremental_action_utility,
     round_trip_cost_amount,
 )
+from functions.decision_council.post_drawdown_diagnostics import (
+    resolve_post_entry_failure_authority,
+)
 
 
 def _safe_float(value, default=0.0) -> float:
@@ -925,13 +928,26 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         post_entry_failure_signal = bool(
             early_post_entry_failure or row.get("post_entry_failure_exit", False)
         )
-        active_post_entry_failure = post_entry_failure_signal
-        if (
-            is_mainline_v3_version(getattr(runner, "strategy_logic_version", ""))
-            and str(getattr(runner, "governance_control_mode", "")).strip().lower()
-            != "aggressive_profit"
-        ):
-            active_post_entry_failure = False
+        post_entry_failure_control_enabled = bool(
+            runner._control_enabled("post_entry_failure_exit")
+        )
+        post_entry_failure_mode = str(
+            runner.capital_profile.get("scap_post_entry_failure_mode", "legacy")
+            or "legacy"
+        )
+        preliminary_post_entry_authority = resolve_post_entry_failure_authority(
+            signal_detected=post_entry_failure_signal,
+            strategy_logic_version=getattr(runner, "strategy_logic_version", ""),
+            control_mode=getattr(runner, "governance_control_mode", ""),
+            control_enabled=post_entry_failure_control_enabled,
+            configured_mode=post_entry_failure_mode,
+        )
+        post_entry_failure_policy_enabled = bool(
+            preliminary_post_entry_authority["policy_enabled"]
+        )
+        active_post_entry_failure = bool(
+            post_entry_failure_signal and post_entry_failure_policy_enabled
+        )
         signal_failure_raw_any = bool(
             raw_signal_failure or thesis_failure or downtrend_exit
         )
@@ -987,6 +1003,21 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
         exit_reason = active_arbitration.active_reason
         paper_exit_reason = paper_arbitration.paper_reason
         exit_state = bool(exit_reason)
+        post_entry_authority = resolve_post_entry_failure_authority(
+            signal_detected=post_entry_failure_signal,
+            strategy_logic_version=getattr(runner, "strategy_logic_version", ""),
+            control_mode=getattr(runner, "governance_control_mode", ""),
+            control_enabled=post_entry_failure_control_enabled,
+            authorized_reasons=active_arbitration.authorized_reasons,
+            selected_reason=exit_reason,
+            configured_mode=post_entry_failure_mode,
+        )
+        post_entry_failure_authority_active = bool(
+            post_entry_authority["authority_active"]
+        )
+        post_entry_failure_veto_reasons = list(
+            post_entry_authority["veto_reasons"]
+        )
 
         buy_count = int(lifecycle.get("buy_count", 1 if is_held else 0) or 0)
         next_layer = min(buy_count + 1, max_layers)
@@ -1256,8 +1287,23 @@ def apply_position_state_constraints(runner, candidates: pd.DataFrame, *, date, 
             ),
             "profit_giveback_exit": bool(profit_giveback or peak_decay_exit) and runner._control_enabled("profit_giveback_exit"),
             "paper_profit_giveback_exit": bool(profit_giveback or peak_decay_exit),
-            "post_entry_failure_exit": post_entry_failure and runner._control_enabled("post_entry_failure_exit"),
+            # Legacy *_exit fields mean actual trading authority.  Raw/paper
+            # observations are kept separately and must never masquerade as an
+            # authorized exit in reports or Web surfaces.
+            "post_entry_failure_exit": post_entry_failure_authority_active,
             "paper_post_entry_failure_exit": post_entry_failure,
+            "post_entry_failure_detected": post_entry_failure_signal,
+            "post_entry_failure_paper_active": post_entry_failure_signal,
+            "post_entry_failure_policy_enabled": post_entry_failure_policy_enabled,
+            "post_entry_failure_authority_mode": post_entry_failure_mode,
+            "post_entry_failure_control_enabled": post_entry_failure_control_enabled,
+            "post_entry_failure_authority_active": post_entry_failure_authority_active,
+            "post_entry_failure_authority_veto_reasons": "|".join(
+                post_entry_failure_veto_reasons
+            ),
+            "post_entry_failure_selected_exit": bool(
+                post_entry_authority["selected_for_exit"]
+            ),
             "signal_failure_exit": bool(
                 (raw_signal_failure or downtrend_exit)
                 and signal_failure_confirmed

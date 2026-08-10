@@ -216,6 +216,7 @@
 | WBS-08.17 | `small_capital_lean`独立档位固定20,000元、默认1,000元缓冲、软目标4只/硬上限5只；Web空值继承档位，任何显式覆盖必须进入启动确认、runtime identity与输出身份 | `config.py`、`main_launcher_web.py`、`runtime_identity.py`；待修复 | 09、11、14、15、16 |
 | WBS-08.18 | V3.1使用A/B/C/D分层交易权：A为0.50SE成熟权威，B为0.25SE且每只仅一手/总暴露不超40%，C只消费独立PIT规则回退分布且全组合最多一个一手，B+C探索合计不超55%，负证据D无交易权；normal/bull持仓少于4只且A/B正效用与全部硬约束有slack时，空新入场计划属于性质测试失败 | `entry_calibration.py`、新 forecast authority gate、`scap_v3_lean.py`、`integer_action_optimizer.py`；设计冻结候选 | 09、10、11、13、14、16 |
 | WBS-08.19 | 容量名称数只能定义交易硬上限，禁止作为NAV分仓分母；新增唯一`PortfolioSizingIntent`连接政策可执行目标、逐票权限整数手数域和ActionPlan。无加仓权时starter必须按最终授权尺寸解释；旧`sizing_reference_positions`仅影子披露 | `capital_scaling.py`、`position_sizing_contract.py`、`scap_v31_authority.py`、`runner.py`、`scap_v3_lean.py`；implemented，20日全链验证通过，82/338/504日门控待完成 | 09、11、13、14、15、16 |
+| WBS-08.20 | 校准缺失/漂移时C级fallback必须消费同状态同家族的严格PIT全宇宙滚动OOS证据；统一人民币CE扣除生命周期成本、唯一ES风险和模型不确定性后方可形成正提案，条件候选统计与固定金额warning均无独立交易权 | `scap_v31_authority.py`、`scap_v3_lean.py`、`action_utility.py`、`full_universe_factor_oos.py`；proposed | 10、11、13、14、16 |
 
 ### WBS-09 订单、费用与成交
 
@@ -262,6 +263,7 @@
 | WBS-10.20 | 整手优化不得把人民币效用与无量纲碎片/风险惩罚直接相加；必须把惩罚转换为人民币 certainty equivalent，并实际接入行业/论点/收益相关性、组合边际风险和非线性最低佣金；相关矩阵缺失或奇异时使用可披露的保守收缩回退 | 现 `small_capital_aggressive.py`，目标为唯一 action optimizer；待修复 | 08、09、11、12、13、14、16 |
 | WBS-10.21 | `ActionProposal` 必须声明动作、股票、手数域、执行起点、期限、无动作基准、情景增量财富、逐腿成本、硬约束和证据来源；提案本身无交易权，只有通过唯一优化器并形成 `ActionPlan` 才可注册订单 | 新动作接口、`policy.py`、`execution_runtime.py`；设计冻结候选 | 08、09、11、12、13、14、16 |
 | WBS-10.22 | V3 Lean所有软动作统一使用10日PIT收缩预测和`mu_shrunk-0.50×cluster_se`激进口径；新开仓、两类加仓、替换和软退出不得分别选择point/LCB，软证据进入效用而非硬AND | `entry_calibration.py`、`action_utility.py`、proposal factory；proposed | 08、09、11、13、14、16 |
+| WBS-10.23 | 每个退出信号必须拆分detected、paper_active、control_enabled、confirmation、authority_active、veto、order和fill；legacy `*_exit`只能等于真实authority，检测到但未授权的延迟损失另建反事实账本且无交易权 | `position_lifecycle.py`、`decision_arbitration.py`、`runner.py`、Web；proposed | 09、12、13、14、15、16 |
 
 ### WBS-11 组合风险与暴露
 
@@ -278,6 +280,7 @@
 | WBS-11.09 | 协方差、相关系数、波动率、CVaR和人民币风险CE必须使用显式单位合同；禁止把收益协方差当相关系数乘人民币利润。收缩只能由一个权威风险入口执行，缺失时不得以零相关伪装无风险 | `runner.py:_rolling_candidate_covariance`、`scap_v3_lean.py`、`integer_action_optimizer.py`；待修复 | 08、10、13、14、16 |
 | WBS-11.10 | 同一ActionPlan风险只允许一个人民币主惩罚：CVaR可用时不再叠加相关利润折扣，只有协方差时使用边际波动CE，两者缺失时只用单股/论点/压力硬上限；禁止风险证据重复扣减造成隐性保守 | 新风险单位合同、`integer_action_optimizer.py`；设计冻结候选 | 08、10、13、14、16 |
 | WBS-11.11 | `DeploymentBounds`必须分别披露权限前、权限后和整数整手后的最大可达持仓/暴露；条件floor事实可行时ActionPlan不得违约，不可行时不得强买负稳健净值股票且必须返回结构化短缺原因 | `portfolio_constraint_contract.py`、`integer_action_optimizer.py`；implemented，20日可达性/短缺分类验证通过 | 08、09、13、14、16 |
+| WBS-11.12 | 市场状态必须同时保存短期冲击、长期结构和恢复阶段；有效部署上限为hard safety、结构乘数、恢复滞回和可达性上限的最小值，风险恶化立即生效、恢复分阶梯且unknown不得取得新增暴露权 | `safety.py`、`market_state_semantics.py`、新market recovery contract；proposed | 08、09、13、14、15、16 |
 
 ### WBS-12 回测记账
 
@@ -312,6 +315,7 @@
 | WBS-13.13 | 期末收益算术差、逐日复合主动收益和相对财富比必须分列命名并披露公式，不得共用“相对基准”模糊标签 | `runner_summary.py`、Web、Excel；设计冻结候选 | 14、15、16 |
 | WBS-13.14 | 已用于问题发现、阈值选择或B0—B11择优的338日窗口一律标记development/audit，不得再称最终样本外；正式结论使用预注册主假设、未触碰前瞻窗口或纸面运行 | 比较运行器、run manifest、`scap_admission.py`；设计冻结候选 | 14、16 |
 | WBS-13.15 | 多期限、多个模块和多组实验的择优必须报告有效样本量、重叠收益依赖、block bootstrap置信区间及多重比较校正；固定60条样本不得直接视为充分 | `evaluation.py`、`scap_admission.py`；设计冻结候选 | 14、16 |
+| WBS-13.16 | 绩效主基准、策略机会集基准、风格匹配基准和安全代理组成带角色权限的`BenchmarkBundle`；状态—因子只有full-universe滚动OOS可进入研究门，candidate/proposal conditional永远只读诊断 | performance benchmark、`regime_factor_diagnostics.py`、`full_universe_factor_oos.py`；proposed | 11、14、15、16 |
 
 ### WBS-14 报告与审计产物
 
@@ -335,6 +339,7 @@
 | WBS-14.17 | 每日落盘评分单位审计、预测权审计、候选缩减审计、动作提案表、唯一 ActionPlan、授权暴露、现金保留和执行对账；必须能从成交反推唯一决策模块和边际价值 | 报告构建器、新审计产品；设计冻结候选 | 用户、13、15、16 |
 | WBS-14.18 | 大型产物按依赖 DAG 流式生成并逐件原子写临时文件后重命名；`core_complete`、`audit_complete`、`web_complete` 分阶段标记，单个附属表失败不得抹掉已完成核心回测 | `runner.py:_save`、artifact manifest；设计冻结候选 | 用户、15、16 |
 | WBS-14.19 | 仓位尺度审计必须按事实、政策、容量、尺度意图、权限可达、计划、订单和成交分层落盘；每个proposal/plan/order/fill携带唯一sizing contract血缘，并分列结构性floor违约、计划违约与搜索未决 | `runner.py`、`runner_summary.py`、`governance_entry_sizing_audit.csv`；implemented，20日保存产物逐层勾稽通过 | 用户、13、15、16 |
+| WBS-14.20 | 标准保存必须新增市场恢复、退出授权、退出延迟反事实、入场质量权限、基准bundle和状态—因子OOS产品；每件产物记录schema、scope、authority、日期覆盖、行数和SHA256，附属诊断失败只阻断研究门而不抹掉核心回测 | `runner.py:_save`、artifact manifest、各诊断构建器；proposed | 用户、13、15、16 |
 
 ### WBS-15 Web 启动与监控
 
@@ -353,6 +358,7 @@
 | WBS-15.12 | Web 分别展示计算、核心保存、审计保存、Excel和因子页状态；每个入口绑定当前 run manifest，保存失败显示具体 artifact、重试资格和最后成功检查点，不得用空白页代表运行中 | `main_launcher_web.py`、`live_monitor_web.py`、artifact manifest；设计冻结候选 | 用户、14、16 |
 | WBS-15.13 | Web启动的独立worker默认使用`visible_interruptible`命令窗口模式，窗口持续显示无缓冲stdout/stderr；自动化可显式切换`background_logged`，健康/进度API必须披露实际模式 | `main_launcher_web.py` | 用户、01、16 |
 | WBS-15.14 | 风险页新增政策→容量→可执行尺度→权限可达→计划→成交六层仓位合同，持仓数/暴露曲线共享时间轴；0、缺失、legacy和失败分开显示，页面只读且禁止在线改生产仓位参数 | `live_monitor.py`、`live_monitor_dashboard.py`、`live_monitor_web.py`；implemented，Web契约/端点/持仓曲线专项验证通过 | 用户、14、16 |
+| WBS-15.15 | Web新增四基准事件总览、fast/structural/recovery状态轴、退出八阶段抽屉、入场质量表、状态—因子scope热力图和三门中心；全页只读、日期/股票联动、URL可复现，unknown/legacy/pending/partial/failed不得伪装为0或完成 | `live_monitor.py`、`live_monitor_dashboard.py`、`live_monitor_web.py`；proposed | 用户、14、16 |
 
 ### WBS-16 验证与发布
 
@@ -378,6 +384,7 @@
 | WBS-16.19 | Ctrl+C验收必须证明命令窗口可见、退出码130、全局进度为interrupted、run checkpoint保留最后完成日且非stale；策略修复另需验证校准warm-up起点不变性、补仓可达性和单日整数优化调用恰为一次 | `verify_runtime_checkpoint_and_schema_v2.py`及待补专项 | 发布 |
 | WBS-16.20 | V3 Lean发布前自动生成实盘权威调用图，并断言每个decision_id优化器调用一次、Plan后无软否决、每张订单可反查唯一提案/计划、同单位字段单写入、warm-up起点不变；WBS末梢必须具备proposed/implemented/verified/released/deprecated状态和代码指纹 | 新架构一致性与性质测试；proposed | 发布 |
 | WBS-16.23 | 仓位尺度修复固定按影子双写→5日→20日资本档→82日单变量矩阵→338日development A/B→不少于504日正式OOS推进；验收覆盖资本缩放性质、权限后可达性、floor可行零违约、全链勾稽和Web四态，工程通过不自动解除研究/生产门 | `SCAP_20260809_CAPACITY_SIZING_FULL_REMEDIATION_SPEC.md`、`verify_position_sizing_contract.py`、`verify_scap_sizing_20d_output.py`；20日工程验证通过，长窗研究/生产门仍blocked | 发布 |
+| WBS-16.24 | 2026年3月后修复按真值合同无交易等价→影子退出/恢复/质量/OOS产品→单变量交易消融→组合候选→338日development→不少于504日未触碰OOS推进；事件20日窗固定为2026-03-09至04-03，任何同窗择优不取得生产权 | `reports/SCAP_20260810_POST_DRAWDOWN_FULL_REMEDIATION_SPEC.md`及新增专项脚本；proposed | 发布 |
 | WBS-16.21 | 黄金复原验收固定为配置/费用单一事实源→漏斗与拒绝血缘→风险单位→论点非恶化→购买软证据→赢家加仓→退出锦标赛；每阶段先静态检查与性质测试，再20日全链，最后同口径开发窗、滚动窗和未触碰留出窗 | `reports/SCAP_V3_1_GOLDEN_RESTORE_FULL_MODEL_SPEC_20260727.md`及待补验证脚本；设计冻结候选 | 发布 |
 | WBS-16.22 | 激进性验收不得用机械满仓率，但必须验证非空计划可达性、A/B/C层级边界、同论点软2硬3、风险不重复扣减，以及“提高证据/现金不得减少可行买单、负证据不得通过回退取得交易权” | 新V3.1严格度与liveness性质测试；设计冻结候选 | 发布 |
 
@@ -2470,3 +2477,42 @@
 - 因子证据边界：本run IC时序只到2025-03-31，交易却到2026-05-29；`governance_factor_layer_return_report.csv`为空，不能引用全样本validation冒充2026年3至5月状态—因子OOS证据。必须补算`family × safety structural state × horizon`的严格PIT walk-forward IC/ICIR/正IC比例/价差，弱势样本不足时fail closed。
 - 后续顺序：P0先修detected/paper/control/authority/veto审计语义；P1冻结身份做post-entry-failure单变量退出消融；P2做无交易权限的20日收益/underwater恢复滞回shadow；P3校准缺失或漂移时把低证据C级降权或fail closed；P4补齐至2026-05-29的状态—因子OOS证据。方案未实施，不反向修改已合并的容量修复。
 - 门控与报告：工程门仅对既有容量修复成立；本run研究门`blocked`、生产门`blocked`，不得上线。完整证据见`reports/SCAP_20260810_RUN20260809_214739_POST_20260308_ANALYSIS.md`。影响链复核为WBS-00.07运行身份/可比性 → WBS-07/08因子与入场证据 → WBS-09市场状态 → WBS-10/11退出权限与仓位 → WBS-13研究门 → WBS-14/15审计与Web → WBS-16生产准入。
+
+### CHANGE-20260810-03：2026年3月后回撤完整修复方案冻结
+
+- 用户要求：给出完整修复方案，详细到接口、模型、埋点和全部交互；依照“先方案、后代码”约束，本条只冻结设计、测试和批次，不修改交易公式、不启动回测、不改变订单/NAV或门控状态。
+- 复用边界：保留已实现的`PortfolioSizingIntent`、权限后可达性、持仓数曲线和市场状态权限语义；复用`regime_factor_diagnostics.py`、`full_universe_factor_oos.py`、`buy_quality_diagnostics.py`及唯一ActionPlan，不重复建设第二套IC、买入事实链或优化器。新工作集中于WBS-08.20、10.23、11.12、13.16、14.20、15.15和16.24。
+- 接口设计：新增带角色权限的`BenchmarkBundle`、分离fast/structural/recovery的`MarketStateVector`、拆分检测与授权的`ExitSignalObservation/ExitAuthorityDecision`、连接校准/fallback/OOS/人民币CE的`EntryEvidenceSnapshot/EntryQualityAuthority`，以及带scope和样本充分性的`RegimeFactorEvidence`。所有合同必须PIT、不可变、进入runtime identity，并明确diagnostic/research/trading权限。
+- 模型设计：有效部署上限取hard safety、结构乘数、恢复滞回和可达性上限最小值；风险恶化立即、恢复分阶梯。入场使用统一人民币CE=`notional×mu_LCB-生命周期成本-唯一增量ES-模型不确定性-机会成本`，固定15元只保留兼容诊断；C级只有同状态同家族严格PIT全宇宙滚动OOS合格时才可能取得新增暴露权。post-entry failure先修真值和影子反事实，未经单变量消融不直接清仓。
+- 产品与交互：标准保存新增市场恢复、退出授权、退出延迟、入场质量、四基准和状态—因子产品；API只增加GET，统一ok/pending/partial/legacy_unavailable/failed与authority/data-quality envelope；Web增加四基准事件联动、三层状态轴、退出八阶段抽屉、买入质量表、带scope权限徽章的状态—因子热力图和三门中心，保持只读且禁止在线应用权重/阈值。
+- 实施批次：批次1落真值合同和埋点且要求交易逐日等价；批次2落影子模型、标准产品、API/Web且仍无交易权；批次3按control、单退出、单恢复、单质量、通过后的组合候选顺序做预注册消融，动态因子权重继续独立shadow。运行阶梯为5日构造→固定2026-03-09至04-03的20日事件窗→60日development→338日development A/B→不少于504日未触碰OOS/前瞻paper。
+- 验收与状态：每批先静态检查PIT、单位、风险单扣、现金、唯一权限和基准角色，再执行py_compile、性质/构造/链路/API/浏览器/保存验收。工程等价通过不解除研究门；本338日已参与问题发现，任何同窗改善无生产权。正式方案为`reports/SCAP_20260810_POST_DRAWDOWN_FULL_REMEDIATION_SPEC.md`，当前状态`plan_frozen_awaiting_implementation`，研究门与生产门继续`blocked`。
+
+### CHANGE-20260810-04：2026年3月后回撤全模块实施启动
+
+- 用户授权：实施`CHANGE-20260810-03`全部模块；每个模块完成后执行静态调用链、PIT时序、单位和数学金融合理性审查以及专项Bug测试，全部代码完成后以2026-03-09至2026-04-03固定20交易日窗口从决策到保存做全流程验证。
+- 实现分支与基线：从`main@a64470761652a469f0d00b360435e0c7255829a8`创建`codex/scap-post-drawdown-remediation-20260810`；保留工作区历史运行产物和无关未跟踪文件，不删除、不批量移动、不纳入本次范围。
+- 权限边界：工程实现覆盖交易候选接口，但新增退出、恢复、入场质量和状态因子模式默认`diagnostic`或`shadow`；20日工程实验不自动取得生产交易权。任何实际交易消融仍必须显式配置、冻结runtime identity并单变量运行。
+- 当前状态：`implementation_in_progress_batch_1`；研究门与生产门继续`blocked`。
+
+### CHANGE-20260810-05：回撤修复批次1/2合同、模型、产品与Web阶段验收
+
+- 实施范围：完成WBS-10.23退出真值、WBS-09/11.12三层市场状态与恢复上限、WBS-08.20买入证据权限、WBS-14.20四基准/标准产品、WBS-15.15只读API/Web以及WBS-13.16状态—因子诊断接入；修改集中于`contracts.py`、`position_lifecycle.py`、`post_drawdown_diagnostics.py`、`runner.py`、`scap_v3_lean.py`、`regime_factor_diagnostics.py`、`artifact_manifest.py`、`live_monitor_web.py`、`live_monitor_dashboard.py`和`config.py`。默认模式分别为`diagnostic/diagnostic/diagnostic/shadow`，不改变本次20日工程运行的交易权限。
+- 退出真值：`post_entry_failure`现拆分为detected、paper、policy、control、authority、selected、veto和fill；legacy `post_entry_failure_exit`只表示真实权限，不再把raw signal伪装为卖出。显式`trading`模式才可进入仲裁；diagnostic/shadow固定无权。
+- 数学金融模型：市场有效部署上限为hard safety、结构预算、恢复阶梯和整手可达上限的最小值，恶化立即、恢复需连续3个健康交易日逐级`BLOCKED→STABILIZING→STEP1→STEP2→OPEN`；结构状态使用绝对风险预算而非对已结构化目标重复相乘。买入人民币CE以生命周期成本后robust profit减独立authority/scenario/model-uncertainty罚金，各项只扣一次；C级在严格全市场滚动OOS缺失时只能shadow，显式trading模式会hard veto新增暴露。
+- 标准产品：保存链新增`governance_exit_signal_authority_ledger.csv`、`governance_exit_delay_counterfactual.csv`、`governance_market_state_ledger.csv`、`governance_market_recovery_episode_ledger.csv`、`governance_entry_quality_authority.csv`、`governance_benchmark_bundle.csv`和状态—因子系列；因子产品失败只标记`research_products_complete=false`，不得破坏已完成核心账本。performance/opportunity/style/safety四个基准角色不可互相替代；未物化的PIT机会集与风格匹配基准明确为`legacy_unavailable`。
+- API/Web：新增只读`/api/market-state`、`/api/benchmarks`、`/api/exit-authority`、`/api/entry-quality`、`/api/regime-factors`、`/api/gates`和白名单`/api/diagnostic-export`；Web新增日期/退出原因联动、六个证据面板和CSV下载。pending/failed/legacy_unavailable与真实0分开，页面无在线改权、改阈值或改因子接口。
+- 阶段验证：受影响文件`py_compile`及`git diff --check`通过；`verify_post_drawdown_diagnostic_contracts.py`、`verify_post_drawdown_web_contract.py`、`verify_regime_factor_diagnostics.py`、`verify_full_universe_factor_oos.py`、`verify_scap_v3_lean_chain.py`、`verify_scap_v3_lean_static_authority.py`、`verify_decision_arbitration_contract.py`、`verify_scap_unified_action_contract.py`、`verify_scap_v31_golden_restore.py`、Web仓位/布局/输出韧性回归均通过。显式交易模式的C级OOS阻断测试通过，默认黄金行为未改变。
+- 事实输出复核：以`run20260809_214739`的338日保存结果只读重建状态—因子产品，覆盖66,295个候选结果、1,354,866条proposal、74个因子、11个家族、338个交易日，形成244,638条日度指标和1,773条汇总；输出在`reports/codex_post_drawdown_regime_product_run20260809_214739/`。其scope仍是proposal audit/candidate gate conditional，严格full-universe rolling OOS仍`unavailable`，研究门与生产门继续`blocked`。
+- 当前状态：`implementation_batch_2_complete_save_smoke_pending`。下一步先做1日从决策到保存冒烟，再执行固定2026-03-09至2026-04-03的20交易日全流程；工程通过不得自动解除研究门或生产门。
+
+### CHANGE-20260810-06：保存缺陷闭环与固定20日全流程最终验收
+
+- 对应节点：WBS-08.20、WBS-09/11.12、WBS-10.23、WBS-13.16、WBS-14.20、WBS-15.15、WBS-16.24。最终报告：`reports/SCAP_20260810_POST_DRAWDOWN_REMEDIATION_20D_REPORT.md`。
+- 工作簿缺陷：Python/Node 间原中文文件名被破坏为问号路径，统一改为 `SCAP_holding_factor_curves.xlsx`；artifact evaluator 对单日 `INDEX(range,ROWS(range))` 返回 `#VALUE!`，改为数学等价的已知末行直接引用，并恢复工作簿中文标签。`run20260810_193206` 的产物重建后 content/visual 均 passed；1日完整 smoke `run20260810_194056` checkpoint/manifest complete。
+- 首轮20日发现缺陷：`run20260810_194455` 虽全流程 complete，但恢复 episode 表为空；根因为持久化首日已从隐式 BLOCKED 进入 STABILIZING，旧汇总器只接受显式 BLOCKED 起点。修复为任意非 OPEN 状态启动、首次 OPEN 闭合，并新增 `persisted recovery beginning at STABILIZING remains an episode` 性质测试。
+- 最终20日 run：`results/decision_council/scap/cab_c6dae8d4d69c/e4_l1800/v3/run20260810_200024`，2026-03-09至2026-04-03共20日，退出码0，checkpoint/manifest complete，最后日期2026-04-03，146个顶层CSV，research products complete，工作簿内容与视觉验证通过且因子覆盖缺口0。恢复 episode 1条、20日、未到OPEN。
+- 非侵入性证据：最终run与首轮20日的逐日`nominal_nav/cash/actual_exposure/holding_count/invested_value`最大差异均为0，证明episode修复只改变诊断汇总，不改变订单、成交、持仓、现金或NAV。
+- 经济与金融结论：最终NAV 17,862.239640元，总收益-10.6888%，最大回撤-12.0735%，研究基准-8.7206%，几何超额-2.1563%；3笔闭合交易全亏、已实现-1,113.739173元，期末4仓均浮亏。47条退出观察中43条维持diagnostic veto；115条C级入场缺严格full-universe OOS。工程门通过但研究门6项失败，研究门与生产门继续`blocked`。
+- 最终验证：受影响模块`py_compile`通过；post-drawdown诊断/Web、regime factor、full-universe OOS、Lean权威/仲裁/ActionPlan/执行、黄金恢复、Web持仓曲线/布局、保存韧性、factor workbook integration全部PASS；`git diff --check`仅提示用户既有`SCAP_20260805_338D_BASELINE_SNAPSHOT.json`换行格式，不纳入本次提交。
+- 比较边界：338日`run20260809_214739`与最终20日的代码身份和E4止损参数不同，仅用于历史事实与候选状态—因子研究，不作单变量因果比较；9—12月并非连续绝对下跌，主要相对缺口来自9月未跟上牛市。任何交易权开启必须另做同代码单变量development A/B与不少于504日严格PIT滚动OOS。

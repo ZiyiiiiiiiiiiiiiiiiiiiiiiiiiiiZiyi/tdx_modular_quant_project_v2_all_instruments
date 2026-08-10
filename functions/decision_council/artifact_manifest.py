@@ -20,6 +20,7 @@ def update_artifact_manifest(
     core_complete: bool | None = None,
     audit_complete: bool | None = None,
     web_complete: bool | None = None,
+    research_products_complete: bool | None = None,
     artifact_name: str = "",
     artifact_status: str = "",
 ) -> Path:
@@ -43,6 +44,7 @@ def update_artifact_manifest(
     payload.setdefault("core_complete", False)
     payload.setdefault("audit_complete", False)
     payload.setdefault("web_complete", False)
+    payload.setdefault("research_products_complete", False)
     payload.setdefault("stages", [])
     payload.setdefault("artifacts", {})
     if core_complete is not None:
@@ -51,6 +53,10 @@ def update_artifact_manifest(
         payload["audit_complete"] = bool(audit_complete)
     if web_complete is not None:
         payload["web_complete"] = bool(web_complete)
+    if research_products_complete is not None:
+        payload["research_products_complete"] = bool(
+            research_products_complete
+        )
     if not payload["stages"] or payload["stages"][-1].get("stage") != str(stage):
         payload["stages"].append(
             {"stage": str(stage), "status": str(status), "at": now}

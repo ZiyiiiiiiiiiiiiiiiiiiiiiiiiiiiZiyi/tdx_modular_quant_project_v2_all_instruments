@@ -18,6 +18,21 @@ import pandas as pd
 HORIZONS = (5, 10, 20)
 FAMILY_PREFIX = "cabinet_family_"
 FAMILY_SUFFIX = "_score"
+DAILY_METRIC_COLUMNS = [
+    "date", "rank_ic", "sample_count", "direction_accuracy",
+    "top_bottom_spread", "score_scope", "score_level", "score_name",
+    "economic_family", "module", "horizon_days", "state_dimension",
+    "state_label",
+]
+PARTITION_MANIFEST_COLUMNS = [
+    "partition", "row_count", "date_count", "first_date", "last_date",
+    "family_count", "size_bytes", "sha256",
+]
+STABILITY_COLUMNS = [
+    "score_scope", "score_level", "score_name", "economic_family", "module",
+    "horizon_days", "calendar_month", "observed_days", "observed_rows",
+    "mean_daily_rank_ic", "positive_ic_day_ratio", "mean_top_bottom_spread",
+]
 
 
 def _sha256(path: Path) -> str:
@@ -218,12 +233,18 @@ def _load_partitioned_family_scores(run_dir: Path) -> tuple[pd.DataFrame, pd.Dat
             }
         )
     if not frames:
-        return pd.DataFrame(columns=["date", "symbol", "score_name", "score"]), pd.DataFrame(manifest_rows)
+        return (
+            pd.DataFrame(columns=["date", "symbol", "score_name", "score"]),
+            pd.DataFrame(manifest_rows, columns=PARTITION_MANIFEST_COLUMNS),
+        )
     wide = pd.concat(frames, ignore_index=True)
     family_columns = [column for column in wide.columns if column.startswith(FAMILY_PREFIX) and column.endswith(FAMILY_SUFFIX)]
     long = wide.melt(id_vars=["signal_date", "symbol"], value_vars=family_columns, var_name="score_name", value_name="score")
     long["score_name"] = long["score_name"].str.removeprefix(FAMILY_PREFIX).str.removesuffix(FAMILY_SUFFIX)
-    return long.rename(columns={"signal_date": "date"}), pd.DataFrame(manifest_rows)
+    return (
+        long.rename(columns={"signal_date": "date"}),
+        pd.DataFrame(manifest_rows, columns=PARTITION_MANIFEST_COLUMNS),
+    )
 
 
 def build_regime_factor_diagnostics(run_dir: str | Path, output_dir: str | Path | None = None) -> dict:
@@ -273,7 +294,23 @@ def build_regime_factor_diagnostics(run_dir: str | Path, output_dir: str | Path 
         score_scope="candidate_gate_conditional", score_level="family",
     )
     daily_metrics = pd.concat([factor_daily, family_daily], ignore_index=True)
+    if daily_metrics.empty:
+        daily_metrics = pd.DataFrame(columns=DAILY_METRIC_COLUMNS)
     summary = summarize_daily_metrics(daily_metrics)
+    if summary.empty:
+        summary = pd.DataFrame(
+            columns=[
+                "score_scope", "score_level", "score_name",
+                "economic_family", "module", "horizon_days",
+                "state_dimension", "state_label", "first_date", "last_date",
+                "observed_days", "observed_rows", "mean_daily_rank_ic",
+                "std_daily_rank_ic", "ic_ir", "positive_ic_day_ratio",
+                "mean_direction_accuracy", "mean_top_bottom_spread",
+                "newey_west_se", "newey_west_z", "p_value", "ci95_lower",
+                "ci95_upper", "fdr_q_value", "fdr_10pct_pass",
+                "minimum_30_days_pass", "diagnostic_only",
+            ]
+        )
 
     stability = daily_metrics.copy()
     if not stability.empty:
@@ -286,6 +323,8 @@ def build_regime_factor_diagnostics(run_dir: str | Path, output_dir: str | Path 
             .agg(observed_days=("date", "nunique"), observed_rows=("sample_count", "sum"), mean_daily_rank_ic=("rank_ic", "mean"), positive_ic_day_ratio=("rank_ic", lambda x: float(pd.Series(x).gt(0).mean())), mean_top_bottom_spread=("top_bottom_spread", "mean"))
             .reset_index()
         )
+    else:
+        stability = pd.DataFrame(columns=STABILITY_COLUMNS)
 
     daily_metrics.to_csv(output_dir / "governance_regime_factor_ic_daily.csv", index=False, encoding="utf-8-sig")
     summary.to_csv(output_dir / "governance_regime_factor_summary.csv", index=False, encoding="utf-8-sig")
