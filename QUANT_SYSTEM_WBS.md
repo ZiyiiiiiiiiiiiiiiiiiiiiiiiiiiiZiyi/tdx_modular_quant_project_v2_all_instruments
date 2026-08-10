@@ -2523,3 +2523,14 @@
 - 实现提交：分支`codex/scap-post-drawdown-remediation-20260810`，commit `e44c4ab`（`fix post-drawdown governance diagnostics`），推送后创建GitHub PR #13。
 - 合并结果：PR #13状态`MERGED`，GitHub合并前判定`MERGEABLE/CLEAN`且无待运行远端检查；merge commit `22e411e5c0f39209b52fe0ba47b0f74a3f444461`已进入`origin/main`，并通过ancestor核对确认包含实现提交。本地主干引用同步至同一远端主干。
 - 门控边界：Git合并只发布已验证工程能力，不改变`diagnostic/shadow`默认权限，也不解除研究门或生产门；完整20日证据和后续限制继续以CHANGE-20260810-06及正式报告为准。
+
+### CHANGE-20260810-08：因子族群金融语义与论点状态机只读方案
+
+- 用户目标：在确认当前修复代码已通过PR #13/#14进入`main`后，系统解释现有因子族群的含义、公式和金融逻辑，并审查“不同族群应对应不同买卖状态机、共同打分会模糊金融概念”的观点。本条只形成分析和实施前规格，不修改交易公式、阈值、订单、持仓或历史run。
+- 现有事实：当前固定因子柜共74个原始因子，角色分布为6个`entry_alpha`、12个`entry_alpha_proxy`、16个`timing_filter`、16个`risk_override`、12个`hold_validation`和12个`liquidity_filter`；运行中约压缩为28个经验簇。6个严格入场因子全部属于`size_style`，因此严格alpha实际主要表达小盘风格；默认`timing_weight=0`，严格覆盖充分时价值/成长/反转/动量代理通常无排序权。
+- 高置信语义缺口：`cabinet_entry_thesis`按最高家族支持度命名而未约束实际权威贡献；最终20日run中存在标为growth/value但最终分数完全等于strict size分数的买单。`amihud_neg`越高代表更高流动性，而柜内多个`rank_gate_lo`可能把更差流动性当健康度；`turtle_breakout`和`orderflow_close_drive`标为`lower_better`也与公式金融方向冲突。以上只登记为待构造测试确认的P0合同问题，未直接改向。
+- 时间尺度：74个因子中66个记录的最佳检验期为20日，但被分配到短期时机、风险和流动性角色；后续必须拆分native horizon与消费角色，禁止以20日相关性直接授予1—5日控制权。`risk_override`又主要由反转/动量构成，收益机会和风险门控需分离。
+- 方案决策：不为每个原始因子建立状态机，而按反转、动量、突破、基本面重估和低波防御五类经济论点建立状态机；市场状态机只决定暴露与允许论点；执行流动性、风险、基本面质量、成本/整手和数据权威作为正交门控。买入论点必须按真实权威贡献锁定，退出验证同一论点，组合冲突不得用无语义平均消解。
+- 证据边界：338日状态—家族产品显示反转与波动率在当前候选门条件样本较稳定，价值和订单流方向为负，且不同市场状态存在差异；但scope仍是candidate-gate conditional，严格full-universe rolling OOS不可用，338日又已参与问题发现，不得据此动态改权或取得交易权。
+- 后续批次：A批建立74因子的方向/单位/PIT/时间尺度真值表，拆分执行流动性与非流动性溢价，纠正论点血缘并重新定位规模风格；B批以shadow实现论点状态机、冲突账本和只读Web；C批执行同代码development消融及不少于504日严格PIT全市场滚动OOS。每批必须先静态、构造和性质测试，再运行；禁止多模块同时启用后宣称单变量改善。
+- 影响链：WBS-07因子语义/柜权威 → WBS-08入场论点 → WBS-09市场状态权限 → WBS-10持有/退出论点 → WBS-11组合仲裁与尺寸 → WBS-13严格OOS/多重检验 → WBS-14/15账本与Web → WBS-16门控。完整报告为`reports/SCAP_20260810_FACTOR_FAMILY_STATE_MACHINE_ANALYSIS.md`；当前仍为`analysis_complete_implementation_not_authorized`，研究门与生产门继续`blocked`。
